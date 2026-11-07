@@ -62,6 +62,7 @@ function heartbeatInfo(currentJobId = '') {
   return {
     status: currentJobId ? 'busy' : 'idle',
     currentJobId,
+    deviceId: config.deviceId(),
     version: VERSION,
     platform: platform(),
     capabilities: capabilities()
