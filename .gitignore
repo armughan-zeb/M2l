@@ -20,6 +20,13 @@ temp/
 logs/
 *.log
 
+# Muse worker state (never commit: contains the worker bearer token)
+.muse-agent.json
+.muse-agent.json.*
+work/
+run/
+*.pid
+
 # Sensitive credentials & environment
 .env
 .env.local

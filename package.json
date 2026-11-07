@@ -1,0 +1,19 @@
+{
+  "name": "vidzeo-muse-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pairing, heartbeat and job transport for a Vidzeo Muse rendering worker",
+  "type": "commonjs",
+  "main": "muse-agent.js",
+  "scripts": {
+    "pair": "node muse-agent.js pair",
+    "start": "node muse-agent.js start",
+    "status": "node muse-agent.js status",
+    "doctor": "node muse-agent.js doctor",
+    "claim": "node muse-agent.js claim",
+    "deliver": "node muse-agent.js deliver"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}
