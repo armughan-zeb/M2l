@@ -1,0 +1,26 @@
+{
+  "basePath": "/sound-effects/vidzeo",
+  "catalog": {
+    "transition": ["whoosh", "whoosh_soft", "whoosh_air", "whoosh_snap", "reverse_swell", "transition_suck"],
+    "impact": ["impact", "bass_drop", "sub_boom", "impact_soft", "impact_metal", "impact_glass", "impact_wood"],
+    "chapter": ["riser", "whoosh_dark", "reveal_chime"],
+    "evidence": ["paper_flip", "stamp_hit", "paper_rustle", "pencil_mark", "marker_scratch"],
+    "archive": ["archive_drone", "vinyl_crackle", "film_splice", "projector", "wind_room"],
+    "investigation": ["signal_ping", "radio_static", "sonar", "technical_tick", "suspense_pulse"],
+    "data": ["data_tick", "ui_tick", "clock_tick", "coin_tick", "cash_counter", "notification_up", "notification_down"],
+    "tension": ["tension_string", "heartbeat", "low_rumble", "suspense_pulse", "clock_tick"],
+    "reveal": ["reveal_chime", "whoosh_soft", "reverse_swell", "camera_shutter"],
+    "map": ["map_pulse", "map_draw", "route_ping", "sonar"],
+    "typewriter": ["typewriter", "typing_burst", "keyboard_single", "mouse_click"],
+    "news": ["news_sting", "telegraph", "notification_up"],
+    "photo": ["photo_slide", "lens_click", "camera_shutter", "camera_wind"],
+    "ambient": ["room_tone", "wind_room", "crowd_murmur", "water_pulse"],
+    "calendar": ["calendar_flip", "page_stack", "paper_tear"],
+    "countdown": ["clock_tick", "decision_tick", "heartbeat"]
+  },
+  "defaultCue": {
+    "volume": 0.12,
+    "fadeIn": 0.05,
+    "fadeOut": 0.1
+  }
+}

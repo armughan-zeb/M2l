@@ -1,0 +1,2423 @@
+﻿{
+    "criticalFilesVerified":  [
+                                  "VIDNETS_AGENT.cmd",
+                                  "AGENT_ACCESS.md",
+                                  "server\\headless_agent.py",
+                                  "server\\services\\agent_bridge.py",
+                                  "server\\services\\agent_access.py",
+                                  "src\\remotion\\engine\\RecoveryContent.js",
+                                  "src\\remotion\\components\\MissingSceneMotionGraphic.jsx",
+                                  "main.js",
+                                  "preload.js",
+                                  "server\\app.py",
+                                  "server\\config.py",
+                                  "server\\services\\generation_cost_policy.py",
+                                  "server\\services\\research_search_worker.py",
+                                  "src\\renderer.js",
+                                  "src\\remotion\\DocumentaryComposition.jsx",
+                                  "public\\update-build.json",
+                                  "node_modules\\electron\\dist\\electron.exe",
+                                  "node_modules\\.remotion\\chrome-headless-shell\\win64\\chrome-headless-shell-win64\\chrome-headless-shell.exe",
+                                  "tools\\python\\python.exe",
+                                  "tools\\node\\node.exe",
+                                  "tools\\ffmpeg\\ffmpeg.exe",
+                                  ".env.defaults",
+                                  "server\\services\\youtube_pipeline_v2.py",
+                                  "server\\services\\pipeline_v2_media_adapter.py",
+                                  "server\\services\\visual_intelligence\\semantic_guard.py",
+                                  "server\\services\\visual_requirement.py",
+                                  "server\\services\\native_render_policy.py",
+                                  "server\\services\\editorial_director\\pixel_revision.py",
+                                  "server\\services\\editorial_director\\release_review.py",
+                                  "server\\services\\editorial_director\\review_context.py",
+                                  "server\\services\\semantic_edit_engine.py"
+                              ],
+    "files":  [
+                  {
+                      "sha256":  "b96c6643bbb886c73744a336ebaff299551bba208c76026f03a38368d75c57bd",
+                      "path":  "server\\app.py"
+                  },
+                  {
+                      "sha256":  "08348c43412b610a5aa2420f7e153358f748df652ea4d0e9270fb7590a23eb7d",
+                      "path":  "server\\audit_manifest.py"
+                  },
+                  {
+                      "sha256":  "5e67d3337fb606dd5b701b7f68f0c5e37c33448226cd7e68f3208be7e9d76bdc",
+                      "path":  "server\\check_latest_output.py"
+                  },
+                  {
+                      "sha256":  "5f846d58c3bed8cdd13906ae7d3a771eae9771c229e6e955ae37a946b6d01707",
+                      "path":  "server\\config.py"
+                  },
+                  {
+                      "sha256":  "dd269bdb0e8efe050a0c10a23701c1efdc36bbc9875df85c69ecc0af3e15e2a9",
+                      "path":  "server\\debug_yandex_attr.py"
+                  },
+                  {
+                      "sha256":  "a5aeb6fc5ddf48bffafe7a4f61aee8f75905ab10e77251b92b6a5fcd1cab3825",
+                      "path":  "server\\debug_yandex_parser.py"
+                  },
+                  {
+                      "sha256":  "f0519fd5591192d96edee1cf7cda93fe21a047cf659e312ca8da82b7f403b397",
+                      "path":  "server\\debug_yandex_response.py"
+                  },
+                  {
+                      "sha256":  "6da45f5a87b23bdf3a48ff96676943501fbf407bd747aa1e9d08478dcd991476",
+                      "path":  "server\\detective_agent.py"
+                  },
+                  {
+                      "sha256":  "01ba0023ff5d61d1425a84e3f193b3f11ef8922a9b73e6530eed0468c8ddd68f",
+                      "path":  "server\\find_attribute_name.py"
+                  },
+                  {
+                      "sha256":  "af946df1c4ab80cdfc61568f52a1fa3f10755a9dffaba95f4d7d260c1469d4f8",
+                      "path":  "server\\headless_agent.py"
+                  },
+                  {
+                      "sha256":  "f56351dd86b94b2e801fe2deb83f033998d063888bcaa74b0179d9c50ec64445",
+                      "path":  "server\\inspect_gta_storyboard.py"
+                  },
+                  {
+                      "sha256":  "3e50152a7de72df87f5267bd3c15318ae47d98963321243f2dbbc59c8c4a5f2e",
+                      "path":  "server\\inspect_yandex_html.py"
+                  },
+                  {
+                      "sha256":  "b4238cc5e5814bfb6950d8120a443c7a61afe4eafa8ed385adc196ace472c76b",
+                      "path":  "server\\inspect_yandex_state.py"
+                  },
+                  {
+                      "sha256":  "7cb0ec063b31af00432c4c7caee61a7bbfb8198d0bedd88f3ae5dd209dc1b81a",
+                      "path":  "server\\production_readiness_boot.log.err"
+                  },
+                  {
+                      "sha256":  "dfc3c459774592c7307be88ea776e1f8ae6b631ae13c983c70727fbac766bcc3",
+                      "path":  "server\\requirements.txt"
+                  },
+                  {
+                      "sha256":  "bc60bed156d0bcf62b2cbc5b639e879c2c1e1c917f21bd7defe81ab87a7e433e",
+                      "path":  "server\\run_1min_listicle_test.py"
+                  },
+                  {
+                      "sha256":  "a629527833e81f9014320cb87a751053479513a724d44f9763703cfde325edf5",
+                      "path":  "server\\run_5min_car_speed_test.py"
+                  },
+                  {
+                      "sha256":  "b4266e163035205f0a0db74d4a9677e154e16389eb469e4047af8faf561cf932",
+                      "path":  "server\\run_5min_speed_test.py"
+                  },
+                  {
+                      "sha256":  "cd497b46c73993f92c15db855fd1d5192efaa09cf84b1492d4a6effffe627883",
+                      "path":  "server\\run_ae101_1min_real.py"
+                  },
+                  {
+                      "sha256":  "83fde90679d9dec4964e23a8604b9ab1bd3b7284e4cdc5d809dbe81bd9c714af",
+                      "path":  "server\\run_antwerp_director_qc.py"
+                  },
+                  {
+                      "sha256":  "4a6af96b1e7b0e33dc38b69ee8668239f218b6f2be58e6a5152e0b54b63f2738",
+                      "path":  "server\\run_china_superpower_production.py"
+                  },
+                  {
+                      "sha256":  "2517a7c6c461327317dd6a3fa53160c3fb5f66a59a745349e342e995793578ab",
+                      "path":  "server\\run_corolla_success_story_2min.py"
+                  },
+                  {
+                      "sha256":  "642d7907380e4cbf2837ec55d72e94dc18c391eecc983b6a2c3b35a19b1dec95",
+                      "path":  "server\\run_crime_production.py"
+                  },
+                  {
+                      "sha256":  "977c5c86e2e16f3884a51dd0962fb2a2582cf5fba2cfeced19230715bd3b32a5",
+                      "path":  "server\\run_e2e_flask_video_creation.py"
+                  },
+                  {
+                      "sha256":  "491c4b2ca1c605be75a52dd34bdbd5841d0f180a705c0a8a1abf1ccc38a7ad09",
+                      "path":  "server\\run_fast_cadence_render_verification.py"
+                  },
+                  {
+                      "sha256":  "8c5c5b587c46a26cab8783b0d932b7b1c8b998b50011b8cb5a2aaa510e506dca",
+                      "path":  "server\\run_gta_production.py"
+                  },
+                  {
+                      "sha256":  "c10af761968e6c067fd28e3e098fa44a25131d562a16a1d0af343405222fdfcb",
+                      "path":  "server\\run_gta_vi_1min_production.py"
+                  },
+                  {
+                      "sha256":  "27f75a8e4086eb30d2f6b4c6c9f6509bbfd48c056add17de21b1eda579fbf2d8",
+                      "path":  "server\\run_gta_vi_1min_youtube_only.py"
+                  },
+                  {
+                      "sha256":  "23423829529a1aa0835222b3bdffd0b968852dcaf575533da4c580ee4ff42b37",
+                      "path":  "server\\run_jaguar_e_type_10_minute_video.py"
+                  },
+                  {
+                      "sha256":  "81b210bc1fc1f674ba35363e9ecd21cd992e9098df9298160bb108234ef672d9",
+                      "path":  "server\\run_jaguar_e_type_2min_video.py"
+                  },
+                  {
+                      "sha256":  "45b039c40a8f1b0c7d0f805a02b3decf70387dd6233732c930bca8125f5c403f",
+                      "path":  "server\\run_jaguar_e_type_relevance_harness.py"
+                  },
+                  {
+                      "sha256":  "364e64a5fc9b2225777b9bae712cceeede5f61b1dabf6610b234d22ff64fe570",
+                      "path":  "server\\run_king_charles_news_2min.py"
+                  },
+                  {
+                      "sha256":  "0abf2673c54022adb4cd4980ab0dd4d39d7e8323acbffdadd0b5b0281f6a4772",
+                      "path":  "server\\run_king_charles_news_controlled_render.py"
+                  },
+                  {
+                      "sha256":  "52c32cb6f2223e661bd0530dd6323f8ba9f9979c5ea24d16758272d19dcbbf8c",
+                      "path":  "server\\run_multi_scenario_production_harness.py"
+                  },
+                  {
+                      "sha256":  "d65bdd5a10d513a64b8d2a6a0e31563b2c61095ecb510125a1b26f805821f67d",
+                      "path":  "server\\run_new_mixed_test.py"
+                  },
+                  {
+                      "sha256":  "9ac57cab305fbcef5909e462076a5661de501cdcf260738a90dd923ad32b78dc",
+                      "path":  "server\\run_prince_charles_mixed_video.py"
+                  },
+                  {
+                      "sha256":  "242818b2d7372f6302bd2b6d8cfb0c85cb6381cbe9aaa95d094e313fe6c9231f",
+                      "path":  "server\\run_prince_charles_video.py"
+                  },
+                  {
+                      "sha256":  "451643cec3067c06843cf3e660ddd21c7859be05d8eb6d96ff8101e2ed5b43a5",
+                      "path":  "server\\run_prince_harry_production.py"
+                  },
+                  {
+                      "sha256":  "ffd1faa07fa6f60547248b72fb098a0ea23e544785a52ef34ba8788c943ffabb",
+                      "path":  "server\\run_production_harness.py"
+                  },
+                  {
+                      "sha256":  "b7417afe3e87a663ab6698b6e6362d74e3a5c5e2d488697eacf2b4aaeabce624",
+                      "path":  "server\\run_quick_test_web_yt.py"
+                  },
+                  {
+                      "sha256":  "0f1168c31448f27156612863e7965f10151a3baec49e64b970a0b8abef5d4040",
+                      "path":  "server\\run_ronaldo_1min_production.py"
+                  },
+                  {
+                      "sha256":  "25d044977a6ccdc9c981f7f5fa074fb5b41447741b3d0476fe0aa45d969121c1",
+                      "path":  "server\\run_royal_family_two_minute_footage.py"
+                  },
+                  {
+                      "sha256":  "101c9446fbbcee81c360b2e47b455e1edd4e0be53424ac4c2792eba4400f74cb",
+                      "path":  "server\\run_speed_optimized_car_test.py"
+                  },
+                  {
+                      "sha256":  "b74589e4664932d253008de7f38abb4dba5219f4dbe00d2506d795fc5fb99063",
+                      "path":  "server\\run_template_test.py"
+                  },
+                  {
+                      "sha256":  "ef614b6379aa5f1fe547eb4a50bcd2d9a83acfbfe4670288f6637f517f2a23b5",
+                      "path":  "server\\run_timed_wrapper.py"
+                  },
+                  {
+                      "sha256":  "f93964bc34448245dece7ffda081538d61de621f6058920660590587d38411c8",
+                      "path":  "server\\run_titanic_1min_youtube_production.py"
+                  },
+                  {
+                      "sha256":  "24bbdbc8d29a3d3b185129a01d9657393f5130e7ce57703b23b8cc8af7057544",
+                      "path":  "server\\run_titanic_full_video_production.py"
+                  },
+                  {
+                      "sha256":  "2f5969bc73785ace2b0fabadb46b450918f56c8bb35fc7c917c60c33532a61b9",
+                      "path":  "server\\run_titanic_mixed_production.py"
+                  },
+                  {
+                      "sha256":  "66b8e593df68bf3516bc6a261c480f4bc5060708d46de31432acdee9fb8c2233",
+                      "path":  "server\\run_titanic_production_harness.py"
+                  },
+                  {
+                      "sha256":  "abe82a7d87ca1bdeaea5ee4333f10c063100baaf01bd91dc4aa7e47568c52f7e",
+                      "path":  "server\\run_titanic_yt_only_test.py"
+                  },
+                  {
+                      "sha256":  "2df9147b5378aa09de47f8e2907594073f9ef86088dfa87ed6bc986cac95eded",
+                      "path":  "server\\run_top5_footballers_production.py"
+                  },
+                  {
+                      "sha256":  "1348a41a3163bdcff99ebcef5d9d6d22c66333e1a44efb8924d7d7dcfd20fb89",
+                      "path":  "server\\run_top5_shipwrecks_production.py"
+                  },
+                  {
+                      "sha256":  "a88bbb66aba9c428d57e70f3f44292453fba84929e16407b597ff6bc700fb86f",
+                      "path":  "server\\run_train_crew_2min_production.py"
+                  },
+                  {
+                      "sha256":  "efdd8a0203205a7ee11af65603ae5fc206d3addc9e34b72aae6683ee4f89f9b3",
+                      "path":  "server\\run_train_crew_2min_real.py"
+                  },
+                  {
+                      "sha256":  "d032636de712f7d7406cc70a3cd0abdc813055c1496def5d4af01980e2c63a1b",
+                      "path":  "server\\run_train_crew_2min_stock.py"
+                  },
+                  {
+                      "sha256":  "896ee13107a241600927fe569b7bf40e5e990a149d951f5878a8c62edd97002e",
+                      "path":  "server\\run_train_crew_life_3min.py"
+                  },
+                  {
+                      "sha256":  "936342025513e7a6b0c77f8852e50ea2004b54212ca2a3d6ddeca90791ea0767",
+                      "path":  "server\\run_verifier_repro_harness.py"
+                  },
+                  {
+                      "sha256":  "4ab6e05a6a4b6a03db5dcadf6b8511a820cbcc5978f880720e8e38f621729a8e",
+                      "path":  "server\\run_yandex_only_web_images_two_minute.py"
+                  },
+                  {
+                      "sha256":  "fb51d8762d1e1a21661efc07e8d5ccc61f9ac776f745a1bda3ed9d25781cba45",
+                      "path":  "server\\run_youtube_clips_production_harness.py"
+                  },
+                  {
+                      "sha256":  "a4eeea3234fc5248ce27be5f75a542b99a22af0ada4fc921656206bd83cc6f84",
+                      "path":  "server\\run_yt_branch_debug.py"
+                  },
+                  {
+                      "sha256":  "f33acebb7de2bd5d582af0c9105d713890b6416465eece48cb67db98e594c5c3",
+                      "path":  "server\\run_yt_clips_full_production.py"
+                  },
+                  {
+                      "sha256":  "ab048639035e84899d5d26ec3f2ef95f2dfbe63011c5a87d025856df460c4cc0",
+                      "path":  "server\\test_e2e_editorial_pipeline.py"
+                  },
+                  {
+                      "sha256":  "acfbb52493b1a5fee0400412368458c07d01625ada0c15edc420d27146eaf2fb",
+                      "path":  "server\\test_flask_server_video_creation.py"
+                  },
+                  {
+                      "sha256":  "12f5ae03c40b2983c2db08a4053e8d677ddbfdf2ba3549e1e79e7e2b017433c8",
+                      "path":  "server\\test_production_harness.py"
+                  },
+                  {
+                      "sha256":  "2c711344cbe9356b3fb9013fc053c12fc7c484f0864f125593f555806a8c8ae6",
+                      "path":  "server\\test_scrapers_live.py"
+                  },
+                  {
+                      "sha256":  "1363ffe6b6752b79ea42b8b355924bc9e030be23e25b87393f11ad49be3365d8",
+                      "path":  "server\\test_yandex_full.py"
+                  },
+                  {
+                      "sha256":  "b5fda8fca572f2b236dc85004eb0f57e15e94cd9f29a4317a202c4f52fb22430",
+                      "path":  "server\\tmp_inspect_queries.py"
+                  },
+                  {
+                      "sha256":  "98afbb1ee651b791464c755d717f6a5d4b65bdf37951846ee9f9cf36055b0729",
+                      "path":  "server\\tmp_search_diag2.py"
+                  },
+                  {
+                      "sha256":  "dde74ade8604eca2c6ec1c9123d60c81d6d6c42c63b21400509308d193887398",
+                      "path":  "server\\_verify_pools.py"
+                  },
+                  {
+                      "sha256":  "178cff4626a18feaafa948b079ae8ec61cdd537ad1c959b061efad48eb99dab4",
+                      "path":  "server\\data\\retrieval_policy.json"
+                  },
+                  {
+                      "sha256":  "513d60d7188612b995aa2aa5d8901c1a71fe5a18754278f16368ddcf122bb682",
+                      "path":  "server\\services\\agent_access.py"
+                  },
+                  {
+                      "sha256":  "71445655408f737a504ff10808477d64b5259bc4ac1e011a01874e497bed46cf",
+                      "path":  "server\\services\\agent_bridge.py"
+                  },
+                  {
+                      "sha256":  "1f9cd6c91ab2708e6bb8dede8402756187115bbde7382ff811a7ab2b7e1003c8",
+                      "path":  "server\\services\\audio_checkpoint.py"
+                  },
+                  {
+                      "sha256":  "0b65526055aa8815c3b7c4290edb0acea374e9dba74cb54c11229ef483ea953c",
+                      "path":  "server\\services\\audio_first_pipeline.py"
+                  },
+                  {
+                      "sha256":  "e696ef45757af4bfac95596111ce50d1c313a1cc764da7e2f605918f47b9a75d",
+                      "path":  "server\\services\\audio_timeline_validation.py"
+                  },
+                  {
+                      "sha256":  "b09306064a8621579075c89056e80bd0b3030acd84378f70ee540a2efd41530a",
+                      "path":  "server\\services\\auth_service.py"
+                  },
+                  {
+                      "sha256":  "e4d6e5a5578aa920fdb562192741953e0069d30961891c284334e107bc669c70",
+                      "path":  "server\\services\\bounded_http.py"
+                  },
+                  {
+                      "sha256":  "4d852b58527a31621d95508eb4e5762fdea3c15ef851d4137383efe810c3b608",
+                      "path":  "server\\services\\build_info.py"
+                  },
+                  {
+                      "sha256":  "f9c61fa849e4911a040e87727aa3d484a2fbae37c7127f62b3f487f574b8c678",
+                      "path":  "server\\services\\cancellation.py"
+                  },
+                  {
+                      "sha256":  "0c29fd95cf37462b84e601f8136e5a7d1e60ae313e39eb411fd9cde02365e55a",
+                      "path":  "server\\services\\chatgpt_accounts.py"
+                  },
+                  {
+                      "sha256":  "f9eacf2e3b777906a713670133cc3983b5c706beaabf775204e126862690d4eb",
+                      "path":  "server\\services\\chatgpt_inference.py"
+                  },
+                  {
+                      "sha256":  "b6b4af7751ddfbd2100b62a982f405ec5c2d255ffaff6fee2f9f567bec2d8020",
+                      "path":  "server\\services\\container_guard.py"
+                  },
+                  {
+                      "sha256":  "4f67928f5193af1204cae55b2c999e6f2b12c3da1a7bfc714a455979615147c8",
+                      "path":  "server\\services\\delivery_budget.py"
+                  },
+                  {
+                      "sha256":  "0573a07774329614271fc99e6597b83da2be967a6d9f599b4da2d6b54ad79f30",
+                      "path":  "server\\services\\delivery_quality.py"
+                  },
+                  {
+                      "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                      "path":  "server\\services\\disk_space_guard.py"
+                  },
+                  {
+                      "sha256":  "fa994903d5cb21d6bb9ff9f686f507100ae67c087ce3ef59b927807f08de09a1",
+                      "path":  "server\\services\\documentary_editing.py"
+                  },
+                  {
+                      "sha256":  "f567bfa2001ca4a0a62a2f621adb611afbe3870101b0f170e7f750354dbb5380",
+                      "path":  "server\\services\\documentary_subject.py"
+                  },
+                  {
+                      "sha256":  "1fa2527e80953202a4ee5900fc49616ecafe17110b6da8a087c9448ba9db4c25",
+                      "path":  "server\\services\\documentary_template_system.py"
+                  },
+                  {
+                      "sha256":  "d76b3f8cd46f6e7af5ae1037e72fa90ab90e8d248cb7f134a81ab8c73a0cf8a7",
+                      "path":  "server\\services\\duration_policy.py"
+                  },
+                  {
+                      "sha256":  "c893348826515efcfa910c127cbbb1b204693200df0ce33d79402ad2461c9d5d",
+                      "path":  "server\\services\\edge_tts_service.py"
+                  },
+                  {
+                      "sha256":  "872e19468799e365117e533d32d96bf6c862024526a0f2a654101596094193ae",
+                      "path":  "server\\services\\editing_libraries.py"
+                  },
+                  {
+                      "sha256":  "5e95d912a8b8e6373bd493811c99c701a30dcd094ffe491cc3874293c4817c37",
+                      "path":  "server\\services\\editing_profile.py"
+                  },
+                  {
+                      "sha256":  "57a5706e2990cf561fde4c898c7d619c725dae99d024a0c3395dacdcc47c6943",
+                      "path":  "server\\services\\editorial_brain.py"
+                  },
+                  {
+                      "sha256":  "a951623d8637654e3f973b4aff06e8d8eb67b203ee489db04707e22ec3e65955",
+                      "path":  "server\\services\\editorial_cue_planner.py"
+                  },
+                  {
+                      "sha256":  "c1d3d3fc9a6c85ec18c5f5a6cf777d6faf523cb6a6792690251ba61ffdfbbd8e",
+                      "path":  "server\\services\\edit_variation_audit.py"
+                  },
+                  {
+                      "sha256":  "dc070935cde1cf33c42b58bbefc5673479315703e25d3641ff876d15736893a9",
+                      "path":  "server\\services\\export_entitlements.py"
+                  },
+                  {
+                      "sha256":  "6adab3bb90c145fff52184bfd3c2623fbb369f5ba0d11b3386be3d814e14804c",
+                      "path":  "server\\services\\footage_signal_engine.py"
+                  },
+                  {
+                      "sha256":  "1e560b3b0fb1de09d8fa182ca5304c18ac8fa66b7e6d5656e809bc6fd39168af",
+                      "path":  "server\\services\\generation_cost_policy.py"
+                  },
+                  {
+                      "sha256":  "e9d539388ca5c2fdecb2a0b5c2963fe0cb1ccf446bc94639823bb7f9682d2bd7",
+                      "path":  "server\\services\\generation_registry.py"
+                  },
+                  {
+                      "sha256":  "d267f8a718fc72359ed611f780140538ef750f0439d980c67daf02199f57c387",
+                      "path":  "server\\services\\generation_request.py"
+                  },
+                  {
+                      "sha256":  "de78efd6ff5693f265d6d0419c02f5388ddf4bab013932e952bce0eaff155343",
+                      "path":  "server\\services\\geographic_regions.py"
+                  },
+                  {
+                      "sha256":  "080cf71159619953fb1ead67cd14790d2574ab6c1bacd2259ca9d32534a4d0e7",
+                      "path":  "server\\services\\globe_map_service.py"
+                  },
+                  {
+                      "sha256":  "e7d99ac6d835d9a3d349d1ba28e162ff8d215f4019b557ab58ace5428f6b89ef",
+                      "path":  "server\\services\\gpu_accelerator.py"
+                  },
+                  {
+                      "sha256":  "16b4ef7ca0a459d57069c09987525bb216730cfa5dcb525240cc4ed938c71764",
+                      "path":  "server\\services\\groq_brain_client.py"
+                  },
+                  {
+                      "sha256":  "0e2bded9eb016ec91c70457c94a770a7f13d5b63ad9dbe3eb68340df88f6f4d7",
+                      "path":  "server\\services\\groq_llm.py"
+                  },
+                  {
+                      "sha256":  "194e784c8bd6fbfe84c4b7980672e91769ce9494681587310dd4ab2be092f151",
+                      "path":  "server\\services\\groq_query_brain.py"
+                  },
+                  {
+                      "sha256":  "dc2a48f640b9a472bc8da1dfa2697164a734df73af6c6d13a72481b0548ae5cb",
+                      "path":  "server\\services\\highlight_selector.py"
+                  },
+                  {
+                      "sha256":  "9903f5e52d4b302eb9d54e7c16e83dd84205d6723cc447d6112efd4967bef2c4",
+                      "path":  "server\\services\\jev_decision_service.py"
+                  },
+                  {
+                      "sha256":  "489ff6a73dca9d15a1ce2cfbc75027874c5b9ecb25054977fa8d92901e9e9370",
+                      "path":  "server\\services\\job_context.py"
+                  },
+                  {
+                      "sha256":  "35ec41c4d5cafc447c3e6ee3b04c9d9a2b9fa7345ecb33d7f16c06040b084947",
+                      "path":  "server\\services\\local_scene_systems.py"
+                  },
+                  {
+                      "sha256":  "249b070dee7b5b07850de4b86f8ba38b0ac645c0897e11a3afddb32b0046daf0",
+                      "path":  "server\\services\\local_speech.ps1"
+                  },
+                  {
+                      "sha256":  "279a917e0893dac6c344481a949ac2c6ac1e344388fb9852b95faaa9889b5530",
+                      "path":  "server\\services\\local_speech_service.py"
+                  },
+                  {
+                      "sha256":  "809f5b4fc814b94c050062980d51aa9e6f0b215c1993ee3094dbd85851c0eeca",
+                      "path":  "server\\services\\mechanical_query_bundle.py"
+                  },
+                  {
+                      "sha256":  "0be5f37493fc54c104998e67dbefabd15a17e889312497e02d94a81ab484b360",
+                      "path":  "server\\services\\media_asset_policy.py"
+                  },
+                  {
+                      "sha256":  "f4ccf1ecfa12e47219c2cb88c69dd867ffcac3c193278b428649cf94bd08ebd0",
+                      "path":  "server\\services\\media_checkpoint_history.py"
+                  },
+                  {
+                      "sha256":  "1e0e96ba20fe1f0a8c2527b6645d5f7bb4761e21e315daf0439c8e1cefeebf26",
+                      "path":  "server\\services\\media_delivery_gate.py"
+                  },
+                  {
+                      "sha256":  "86b916c6676816369134037a5e4802b44c861d71effdf0d806e8047e68f04bd5",
+                      "path":  "server\\services\\media_integrity.py"
+                  },
+                  {
+                      "sha256":  "baad75d4b61968aac78ec91306ac08132fe229a4e88646076cd3a6745dffc937",
+                      "path":  "server\\services\\media_provenance.py"
+                  },
+                  {
+                      "sha256":  "bce6c48997583d51d310c43fec7a1e06339c402eba197177c85d8e9752f8474f",
+                      "path":  "server\\services\\media_quality_recovery.py"
+                  },
+                  {
+                      "sha256":  "7245b81ea95e5a24187069259e4175a5f4d61f142c0f2c45ee15682118b4e47a",
+                      "path":  "server\\services\\media_query_strategy.py"
+                  },
+                  {
+                      "sha256":  "94320a9568119c4c5840922b6236d0cb20ab1d87ab6eedfb92a78a2e5648f76d",
+                      "path":  "server\\services\\media_resolution_coordinator.py"
+                  },
+                  {
+                      "sha256":  "e904f7f23402fd39c3185130a965025f8f2c76f35e6a87b6850aa0425c3b1c06",
+                      "path":  "server\\services\\media_shot_plan.py"
+                  },
+                  {
+                      "sha256":  "5afd2201991e2a1ab6adf6d5d12e19977f7bd69ffb36306cf03eea885b9dbe66",
+                      "path":  "server\\services\\media_type_contract.py"
+                  },
+                  {
+                      "sha256":  "91d0f7ee3259b48a27e7dcafc6014b65c0863fccedc04ede61b51ca1b8bfdee8",
+                      "path":  "server\\services\\media_visual_quality.py"
+                  },
+                  {
+                      "sha256":  "053bb2b4dd6f29251645d5e2682b2e6fcc0933d96beda55437e0e88881090dcf",
+                      "path":  "server\\services\\memory_bank.json"
+                  },
+                  {
+                      "sha256":  "fd8955fe1ab840fb9f9d5617846a4c34b60e10cfbf7c966dab303544a6dacd84",
+                      "path":  "server\\services\\mixed_media_planner.py"
+                  },
+                  {
+                      "sha256":  "e0146373ce793ee67ee7dc0220d784b4100a6a183cbdd85bf9621061c9e744c9",
+                      "path":  "server\\services\\model_catalog_policy.py"
+                  },
+                  {
+                      "sha256":  "d209526f0b5e02295621907863033ce8ce1250507cd510e85780c3b924d0ed15",
+                      "path":  "server\\services\\motion_templates.py"
+                  },
+                  {
+                      "sha256":  "5e3fa9ff4dddc5d7e03cf2a83be7db4f2e7a60e9937a8124717cd41220dbd766",
+                      "path":  "server\\services\\narration_quality.py"
+                  },
+                  {
+                      "sha256":  "cd001b52a64f1e556cb98297d528f6a05db6952bd318d5f29b2ceb65ea4033c3",
+                      "path":  "server\\services\\native_render_policy.py"
+                  },
+                  {
+                      "sha256":  "85961cd936d8c32e0085f2fa40428749438d43e9d3b62a66abcdebfb799320e5",
+                      "path":  "server\\services\\openrouter_llm.py"
+                  },
+                  {
+                      "sha256":  "12964ac858a4b5e5bc59b3bbd5506652f96678aa7afadb715748382288ea8b36",
+                      "path":  "server\\services\\openrouter_tts_service.py"
+                  },
+                  {
+                      "sha256":  "1215577e8863e920daf364c71c792a0840513b6d782a6ee7ec44dd31d9767708",
+                      "path":  "server\\services\\openrouter_usage.py"
+                  },
+                  {
+                      "sha256":  "013bfa58aee5b5ffe380b7ae092585e80c67e2d092657c4aca0abaf390266964",
+                      "path":  "server\\services\\parallel_director_pipeline.py"
+                  },
+                  {
+                      "sha256":  "a823013783227f718654f7e22d113576614afd86567cbf5b78d94fe723a7b666",
+                      "path":  "server\\services\\perceptual_media.py"
+                  },
+                  {
+                      "sha256":  "472e6f193cf7fc8e7559451d62fefefef313f63b8f9ec153e5bcb832e9b92783",
+                      "path":  "server\\services\\person_cutout_service.py"
+                  },
+                  {
+                      "sha256":  "e4111e106e8e2756a90d4c73afdaa99e814024eabfe13053dd24045f5d997cd9",
+                      "path":  "server\\services\\pipeline_budget.py"
+                  },
+                  {
+                      "sha256":  "9021f5cfdafa62a44da97be92610eb783fa640252be7f2fc905e203c2c971d83",
+                      "path":  "server\\services\\pipeline_contracts.py"
+                  },
+                  {
+                      "sha256":  "7c34bcfcbfb8686d82abaf580be619a43ae1a0ffcd1a98a56e2f9d67661fb79f",
+                      "path":  "server\\services\\pipeline_decision_auditor.py"
+                  },
+                  {
+                      "sha256":  "fb6e1820ffdf29a2b529907b5a7bd4763b4304b35fe1a27c344ad64d5fefa351",
+                      "path":  "server\\services\\pipeline_v2_media_adapter.py"
+                  },
+                  {
+                      "sha256":  "e980c36964571e580450bff4acd5b5cceeb34c428bab633d3007cc8fe5bff163",
+                      "path":  "server\\services\\pipeline_v2_runtime.py"
+                  },
+                  {
+                      "sha256":  "0246a937a22e5915b8c666f308ff4b3e0b9512fc28be98f849b23cfd92109e34",
+                      "path":  "server\\services\\power_guard.py"
+                  },
+                  {
+                      "sha256":  "7cc65543b5ffe33594d424c2250a815ebc21489256338a761da0aa75973859b3",
+                      "path":  "server\\services\\projects_service.py"
+                  },
+                  {
+                      "sha256":  "f80d65e700300a77367dda4bdc112b31b6623e6134f890c9d3a8b3cd5db08069",
+                      "path":  "server\\services\\provider_selection.py"
+                  },
+                  {
+                      "sha256":  "36f03af47b28cf88670e2fad85a1448c8961a98ef0a1850b090424ed7f002759",
+                      "path":  "server\\services\\queue_manager.py"
+                  },
+                  {
+                      "sha256":  "ad62b188f4961de53977d3bcb51f266c4cc10d96b371e1862913e9796c13f1d0",
+                      "path":  "server\\services\\real_media_service.py"
+                  },
+                  {
+                      "sha256":  "e769c31912ba3f627233297ac9eea5c12126979009b7fc7d4915d57a201a9dfc",
+                      "path":  "server\\services\\recovery_contract.py"
+                  },
+                  {
+                      "sha256":  "1f49fd67497af55d4716be8147aac5b7625b2832c8621eea37403b41e528dc5d",
+                      "path":  "server\\services\\remotion_renderer.py"
+                  },
+                  {
+                      "sha256":  "474b577060949baa0001e9c316eccf6b4ad67074e9408c4f6cc736c8f83b9fcf",
+                      "path":  "server\\services\\remotion_render_gate.py"
+                  },
+                  {
+                      "sha256":  "85a75092a5ff4efef22fdf655f408a1bf6fe10f74b7c0505d6c2e90173dfb114",
+                      "path":  "server\\services\\rendered_graphics_audit.py"
+                  },
+                  {
+                      "sha256":  "a1322842c8be925be497cd93d20a58326a823e69b9d635b4a5ebd756367f3d29",
+                      "path":  "server\\services\\render_media_timing.py"
+                  },
+                  {
+                      "sha256":  "9f54d1c8ff4ab7efa44bc5c09b6cbaadbcd8b85c35e661b05ee014d5ee66a6f6",
+                      "path":  "server\\services\\render_resource_manager.py"
+                  },
+                  {
+                      "sha256":  "c2e86b083fa960aa405c404bdebf5b38789d560d0a2335346f451b7063739857",
+                      "path":  "server\\services\\research_ledger.py"
+                  },
+                  {
+                      "sha256":  "fed9c5df15b126c38836fa6f90214504a6869101b2637f84c26c581b38182d4a",
+                      "path":  "server\\services\\research_search_worker.py"
+                  },
+                  {
+                      "sha256":  "1f435c3a7bf5d7c214e097ec4d2f6261cca31b7847332ff360dfe773f0e6b0cc",
+                      "path":  "server\\services\\retrieval_policy.py"
+                  },
+                  {
+                      "sha256":  "6ce283907567ad5524990f99435771317c2eb6275702c85eef38d79eb31df2e2",
+                      "path":  "server\\services\\satellite_map_service.py"
+                  },
+                  {
+                      "sha256":  "600dae7b0a88a9140a2ff5b1d9f692647db492f2a6029e675b495b3be539ba18",
+                      "path":  "server\\services\\scene_alignment.py"
+                  },
+                  {
+                      "sha256":  "f200db3d624ed71561b8da2481c2fcc33fa192a8a9c65bbccf36b691406c22d9",
+                      "path":  "server\\services\\scene_entities.py"
+                  },
+                  {
+                      "sha256":  "eab2046d294621654c1394b94aad9a91cddfa2b21fc7dfcdad97f67b01ff0134",
+                      "path":  "server\\services\\scene_query_brain.py"
+                  },
+                  {
+                      "sha256":  "ab29402cefeb386333a80686d6dc724b6ab78b847d7c5551dff9870c718ead5f",
+                      "path":  "server\\services\\scene_splitter.py"
+                  },
+                  {
+                      "sha256":  "ad4634a87884404991c1e0c318dfaf130c5f930f84c9226f41d70aca4874824c",
+                      "path":  "server\\services\\semantic_edit_engine.py"
+                  },
+                  {
+                      "sha256":  "01556608890e0fe4fe939ab0c8180faa10eb56467b7d9a34ca223f3d696783e4",
+                      "path":  "server\\services\\semantic_ffmpeg_renderer.py"
+                  },
+                  {
+                      "sha256":  "4f9efd5466fdeb08a1147c1dbed52f37f3434aa0bc4348e03d9a7b200d4e0dd9",
+                      "path":  "server\\services\\semantic_query_agent.py"
+                  },
+                  {
+                      "sha256":  "1c80d8246139827805a9f07f5c9645fcb2623daf1b91a4404d62897bb96d9ef4",
+                      "path":  "server\\services\\silence_remover.py"
+                  },
+                  {
+                      "sha256":  "1f27c91a7a15ad53183650fb98c76a670b3e61527a49fdf53eebdb4763acb1b3",
+                      "path":  "server\\services\\sound_library.py"
+                  },
+                  {
+                      "sha256":  "8ba10df7e845bc24d82a577316f02274ecbbffd48145fb908be789f55468ed74",
+                      "path":  "server\\services\\source_evidence.py"
+                  },
+                  {
+                      "sha256":  "69d8b07362990feec1393e218ae5cb7507d412e5cfff408f3bfe06128e1b3888",
+                      "path":  "server\\services\\speech_timing.py"
+                  },
+                  {
+                      "sha256":  "8db834116cd499bffb129326f1dc5bf04c970735f2e62c0b9a96d5b4b009fbec",
+                      "path":  "server\\services\\structured_response_cache.py"
+                  },
+                  {
+                      "sha256":  "23dd345333382e3b4d2f115244c2542eeb9ba314941a881c96273d8b80db49e7",
+                      "path":  "server\\services\\template_animation_cache.py"
+                  },
+                  {
+                      "sha256":  "d92313277c3de750281b8d76645d311b0932df386d7a39180decaee73ecf81d1",
+                      "path":  "server\\services\\template_library.py"
+                  },
+                  {
+                      "sha256":  "3153eb9aa72ef0bd10a922c7ea56dd02d27d7d4845d838fb32cdf67f87d4beb6",
+                      "path":  "server\\services\\template_preview.py"
+                  },
+                  {
+                      "sha256":  "9c5364db1895c916c6dbe5741181a1345bdfb3ea6a891e703767f5ae933956d7",
+                      "path":  "server\\services\\text_position_contract.py"
+                  },
+                  {
+                      "sha256":  "5caa4bfed6877dd4257b9ebc815f2d2f2967e7dd9809064bd1b04ad638537505",
+                      "path":  "server\\services\\transcription_service.py"
+                  },
+                  {
+                      "sha256":  "f792ccb9c87edd7f00207bda1eba80173471e73cd1acc557c8e29e2d224ed79e",
+                      "path":  "server\\services\\tts_service.py"
+                  },
+                  {
+                      "sha256":  "798a800da9f7dd431996fe0995aabe33546135c57df320ddeada8c317fb86a83",
+                      "path":  "server\\services\\universal_clip_classifier.py"
+                  },
+                  {
+                      "sha256":  "c1f3f107cae538da7f0f38174f0fe1fbdf54f6458dc49fef4d70f03ab4406c85",
+                      "path":  "server\\services\\video_service.py"
+                  },
+                  {
+                      "sha256":  "b5fa62642d8581d466599c73f570b42e57bf748e3b3af24cd287bbc799cf3033",
+                      "path":  "server\\services\\vidzeo_brain.py"
+                  },
+                  {
+                      "sha256":  "601886a717de2c762b3ec2b18a7c1f85ecbbf8f574a8bc8e2e3fb56d1a672972",
+                      "path":  "server\\services\\visual_requirement.py"
+                  },
+                  {
+                      "sha256":  "d061f83264246f3867e9d01d3a00a70d4947426d731013497f8286669cca18e0",
+                      "path":  "server\\services\\web_blacklist.json"
+                  },
+                  {
+                      "sha256":  "feda0a6bd52c6b2abc3b79ca6c6b69e398a530aa73dae83f9c70cd214063cf68",
+                      "path":  "server\\services\\web_image_service.py"
+                  },
+                  {
+                      "sha256":  "e96b7c429e77c3f377af08b2c510f65a729684d42a5a006c9722c02d475f5b59",
+                      "path":  "server\\services\\youtube_branch_worker.py"
+                  },
+                  {
+                      "sha256":  "713fb13ae38dce4a24c2d4d4269960aad1b5e234be8020c8547cc5777e66032f",
+                      "path":  "server\\services\\youtube_clips_service.py"
+                  },
+                  {
+                      "sha256":  "4f7e04ff2711f59c6ef1799a0601bd606fe10959fb8fdc2ed5fa194fc18da092",
+                      "path":  "server\\services\\youtube_clip_provenance.py"
+                  },
+                  {
+                      "sha256":  "fb65b87426d6401d66d0f685d970ad07b6ef335431cf7c2523203e57faf3b06d",
+                      "path":  "server\\services\\youtube_media_cache.py"
+                  },
+                  {
+                      "sha256":  "2126004016bb8c1e58ecfe3dc65ceab8d8303a134932b5a790ab2beb384c520c",
+                      "path":  "server\\services\\youtube_moment_matcher.py"
+                  },
+                  {
+                      "sha256":  "e323f2f422864ee11b463dee3f98f78e8ca8a8802184055e61112cb7dc9d9ae6",
+                      "path":  "server\\services\\youtube_overlay_policy.py"
+                  },
+                  {
+                      "sha256":  "b9eaeea28d7f612f4cceba9e1a76da57e8d206e16410e36ad32cd2d060f76201",
+                      "path":  "server\\services\\youtube_pipeline_v2.py"
+                  },
+                  {
+                      "sha256":  "970b87ca987cd3f7adadfbfa79304413530ab7e346f9ff1a12d4dd54b01682e1",
+                      "path":  "server\\services\\youtube_pool_renderer.py"
+                  },
+                  {
+                      "sha256":  "20ed71a4a53e1c4af7cbc1090180e34cb97bde73377e448688a1d513081c5a9c",
+                      "path":  "server\\services\\youtube_query_normalizer.py"
+                  },
+                  {
+                      "sha256":  "ab322ce098a1466d7a127c28987f3cc1b13806154ce99fc42011050a756586b2",
+                      "path":  "server\\services\\youtube_session.py"
+                  },
+                  {
+                      "sha256":  "505f86990d4a566feaef966fbc6085e7d6f302dbadcc418d04f9967870fcdef4",
+                      "path":  "server\\services\\youtube_source_chapters.py"
+                  },
+                  {
+                      "sha256":  "28782a8043d1bd4743fc5b514e1d2d927f4de5e883c7101f1942cf8485a72c75",
+                      "path":  "server\\services\\youtube_source_pool.py"
+                  },
+                  {
+                      "sha256":  "ae498de4e436c0c7306e7c6a8ea093beddaaa82e8ef962d1c9bbf42b0394caef",
+                      "path":  "server\\services\\youtube_stage_budget.py"
+                  },
+                  {
+                      "sha256":  "8b8ed605ba635dbf519f7c84992933f227ba7deea23e96f9f3b34cc24040da2d",
+                      "path":  "server\\services\\youtube_transcript_index.py"
+                  },
+                  {
+                      "sha256":  "ed440b7483465ead428dd77b13647948bb31da0126d1aad9ec068963e80c84fb",
+                      "path":  "server\\services\\youtube_worker_progress.py"
+                  },
+                  {
+                      "sha256":  "371c5abca3ec5d9e719e5bb9541dcf77509db9e8b851f0dd6d28f567f88e82ba",
+                      "path":  "server\\services\\yt_dlp_runtime.py"
+                  },
+                  {
+                      "sha256":  "dcf0d2457446f52953dda875240b93eda8879214b2f2a74d1ad9420b68628d67",
+                      "path":  "server\\services\\__init__.py"
+                  },
+                  {
+                      "sha256":  "c477cd37430da2482e70aa54254b67c0f57da5ae3a00dbcab9675134857d0272",
+                      "path":  "server\\services\\editorial_director\\ai_tweak.py"
+                  },
+                  {
+                      "sha256":  "38db5d361dac6bd74835f6b0cbee55b2c9b246daeb9a5ee863356c3e2943b517",
+                      "path":  "server\\services\\editorial_director\\audio_sync.py"
+                  },
+                  {
+                      "sha256":  "3774586fd50495588abac558ee012acd858f36828d827e293ab360b9368d1716",
+                      "path":  "server\\services\\editorial_director\\composition_layout.py"
+                  },
+                  {
+                      "sha256":  "d3c3ef7548ac8f3e1659aca8b3113ccf3d3fab84eaeb63cda02e91efffbbbe8e",
+                      "path":  "server\\services\\editorial_director\\contract.py"
+                  },
+                  {
+                      "sha256":  "521669d9eddefcd1a0e57336e26fe0d478a69a7cd31197054f18a8b36ae1e41a",
+                      "path":  "server\\services\\editorial_director\\creative_review_cache.py"
+                  },
+                  {
+                      "sha256":  "cbda99a4c675e262facddb3551b423de2698b65f4b65aa08314053b96ca2a79e",
+                      "path":  "server\\services\\editorial_director\\director.py"
+                  },
+                  {
+                      "sha256":  "44f046c991b177e841d1ddf4f809bb26073405961aa7b6477293e390a566ecf7",
+                      "path":  "server\\services\\editorial_director\\investigative_agents.py"
+                  },
+                  {
+                      "sha256":  "389d3edd6daa041546ee78c5c30a73adb390586b4e58507bfc212d4279f176a0",
+                      "path":  "server\\services\\editorial_director\\manager.py"
+                  },
+                  {
+                      "sha256":  "b75bcc621bcfbfcc412f7b141e996a338257b65ba04c6f569739dd89e56b911b",
+                      "path":  "server\\services\\editorial_director\\media_director.py"
+                  },
+                  {
+                      "sha256":  "6660fc163892c8dbfe7c42ffd93205a262980cb474fea4d1187510b90970f423",
+                      "path":  "server\\services\\editorial_director\\media_first.py"
+                  },
+                  {
+                      "sha256":  "64485305026d328ce429ad3c60779d75cbe4e60bdac60a86c13e9fc6a270ca56",
+                      "path":  "server\\services\\editorial_director\\media_repair.py"
+                  },
+                  {
+                      "sha256":  "83877a8d7a367fe0218d240735dccfa04820222c2e572d92efd902202e56f32b",
+                      "path":  "server\\services\\editorial_director\\pixel_revision.py"
+                  },
+                  {
+                      "sha256":  "3c3b9b837e448037b46efed8a86f24686ee22b538a8f25ee1c5e76b190a7b86b",
+                      "path":  "server\\services\\editorial_director\\production_contract.py"
+                  },
+                  {
+                      "sha256":  "9337419c3ec47076cffae51bfa243588a28aba31f8b9c20d94e4177c89a79461",
+                      "path":  "server\\services\\editorial_director\\release_review.py"
+                  },
+                  {
+                      "sha256":  "6d0dc32e9c9b13315e6ffb6ff74fde303c2e3177a5440638c0a03638edd4db1f",
+                      "path":  "server\\services\\editorial_director\\review_context.py"
+                  },
+                  {
+                      "sha256":  "62a736b3efcbccc0ef139c146f3b66b873cc8c4f78f4f8ce1789251292bba838",
+                      "path":  "server\\services\\editorial_director\\scene_grammar.py"
+                  },
+                  {
+                      "sha256":  "4a3a307b0d7802f7a182ab2e3846b172139a516276c240d8a3be96892e218032",
+                      "path":  "server\\services\\editorial_director\\script_analyzer.py"
+                  },
+                  {
+                      "sha256":  "005d690425fc80317959fed7e390afe2479dd3c2442f5d3febd231abd9c376a1",
+                      "path":  "server\\services\\editorial_director\\sequence_controller.py"
+                  },
+                  {
+                      "sha256":  "602f2b45a9c094225abe2dc1fc89abccf2aee33763db9ab4c784a47e65bbd226",
+                      "path":  "server\\services\\editorial_director\\similarity_detector.py"
+                  },
+                  {
+                      "sha256":  "8eda90f3b4dc8ca4291d34e0ed63094d412be3c88d58b967440e221cfd96280f",
+                      "path":  "server\\services\\editorial_director\\sound_director.py"
+                  },
+                  {
+                      "sha256":  "f961695184dfb2f30fbb04a940062870ea2843ffe268abc53effcaaca485b6cd",
+                      "path":  "server\\services\\editorial_director\\sound_events.py"
+                  },
+                  {
+                      "sha256":  "daa19c3242db26de0a98cf91aa83e42a1f83cdf36f3accc5987f833cddaed5cf",
+                      "path":  "server\\services\\editorial_director\\swarm.py"
+                  },
+                  {
+                      "sha256":  "ecaf63bcb724dee3cc88b5bf4cfcc8f48b428f14ff855de277748f256834367b",
+                      "path":  "server\\services\\editorial_director\\visual_critic.py"
+                  },
+                  {
+                      "sha256":  "00618833f05d8e9834049c2dc4bf872822fa0101c39cc4a9aa015c75995b0a60",
+                      "path":  "server\\services\\editorial_director\\visual_dna.py"
+                  },
+                  {
+                      "sha256":  "f2e4f91e967ed5718ca0bf2fa39ba72d62079ef38cb78f457e96dc77a91ede3d",
+                      "path":  "server\\services\\editorial_director\\__init__.py"
+                  },
+                  {
+                      "sha256":  "c214dfa8550e3f4d04488c10a8d891ea155c47e159c2aad90b9cf7517918e3ba",
+                      "path":  "server\\services\\native_engine\\component_manifest.py"
+                  },
+                  {
+                      "sha256":  "cac270b0a2cde4fdfd7abc7201494f473fb334c3d4b6d68bf98b4cc7fb223541",
+                      "path":  "server\\services\\native_engine\\profile_engine.py"
+                  },
+                  {
+                      "sha256":  "f868b938588cd779363272a6d3a5178f4e1b961818f729ed24725bd811885dd7",
+                      "path":  "server\\services\\native_engine\\pro_composer.py"
+                  },
+                  {
+                      "sha256":  "c2afc381646f9a0fc9b075b52498885e55b24439e50c47ca8006f112f69155cc",
+                      "path":  "server\\services\\native_engine\\renderer.py"
+                  },
+                  {
+                      "sha256":  "2e560a0912a9d7b2057544fbad8edd959ed3fe97492da15f7c19e99d16822d64",
+                      "path":  "server\\services\\native_engine\\smart_composer.py"
+                  },
+                  {
+                      "sha256":  "9abed99d58aa4b1b8b536506c58ec8a48977cfb58f252c7b193f2ad1f3676f00",
+                      "path":  "server\\services\\native_engine\\smart_router.py"
+                  },
+                  {
+                      "sha256":  "241e08b8ea934b401f577ea57f8510c79110682c9c083fd1a9ffaea7ef87df19",
+                      "path":  "server\\services\\native_engine\\timeline_compiler.py"
+                  },
+                  {
+                      "sha256":  "5cee5436ac3ba72a1492a4d0a5b5294c3e12624cc301d8dcbb7948d695c618d0",
+                      "path":  "server\\services\\native_engine\\vox_composer.py"
+                  },
+                  {
+                      "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                      "path":  "server\\services\\native_engine\\__init__.py"
+                  },
+                  {
+                      "sha256":  "dfbb5070558d295ac5a534bfd2bd6d247965469e853b95db255e9b38ba8b9013",
+                      "path":  "server\\services\\native_engine\\libraries\\image_treatments.py"
+                  },
+                  {
+                      "sha256":  "5a54b4bb215ae6c3f8bf27ce928ba9498883ff9e8fc8dbbfdb1c7182c839cda6",
+                      "path":  "server\\services\\native_engine\\libraries\\overlays.py"
+                  },
+                  {
+                      "sha256":  "9a661b657962b04ef0c34fcc900137163d7c53bcbd3a3d298f5b2bf6ee6ae62d",
+                      "path":  "server\\services\\native_engine\\libraries\\professional_templates.py"
+                  },
+                  {
+                      "sha256":  "fdd1823f0dd059f61b40f1a32eac474e872a86e70a7814a92f5f978cdf58a53d",
+                      "path":  "server\\services\\native_engine\\libraries\\sound_design.py"
+                  },
+                  {
+                      "sha256":  "cde0b5d2f629d9109a0074d4e9ae8daf25eee4e68d4396347307b5d20861b5c1",
+                      "path":  "server\\services\\native_engine\\libraries\\templates_pro.py"
+                  },
+                  {
+                      "sha256":  "67406724d9d59bd988b519604e14406ed98f48924c87d0a7716070e2b681f8ff",
+                      "path":  "server\\services\\native_engine\\libraries\\text_animations.py"
+                  },
+                  {
+                      "sha256":  "6e20f934fb878f72d3cca054264507a3609815d6b1b4747f844c0b206dc07f87",
+                      "path":  "server\\services\\native_engine\\libraries\\text_templates.py"
+                  },
+                  {
+                      "sha256":  "bdf6e0229b59047272c64211b12b4e2d8a429d385e6d61f90350b5550f8bc73c",
+                      "path":  "server\\services\\native_engine\\libraries\\transitions.py"
+                  },
+                  {
+                      "sha256":  "699347dea125305a2d36fda2bd3b0640e1da368ba4adb8352a2e9411d439eebf",
+                      "path":  "server\\services\\native_engine\\libraries\\visual_effects.py"
+                  },
+                  {
+                      "sha256":  "a58161a35f2f029556e9a1caec7bb2638271a257fc4e376a8ad0ce85cacfd213",
+                      "path":  "server\\services\\native_engine\\libraries\\vox_animations.py"
+                  },
+                  {
+                      "sha256":  "e3b8d1ba5ef870f44ce6e2b4d45bd4e8aad93b1d8883fd31528eeee35ff36411",
+                      "path":  "server\\services\\native_engine\\libraries\\vox_templates.py"
+                  },
+                  {
+                      "sha256":  "6f8bf1a9747056ef8e673f4837821c9866cbd6f95c0078fcd623d534e08f1de1",
+                      "path":  "server\\services\\scene_chain\\chain.py"
+                  },
+                  {
+                      "sha256":  "86b789e8ba65e0001393d4e571d6e0f0cf3f7bd9564baa1889b9af78953d15e5",
+                      "path":  "server\\services\\scene_chain\\inline_rank.py"
+                  },
+                  {
+                      "sha256":  "622e19a451032c80a52f3d28626abcb80560d79168f95ccdc84eefd131484cc9",
+                      "path":  "server\\services\\scene_chain\\__init__.py"
+                  },
+                  {
+                      "sha256":  "f5c1b68204091fa9851dec3359ec6a0e0d8d9fa7dd657f6d93515d3d68d1c273",
+                      "path":  "server\\services\\scene_understanding\\analyzers.py"
+                  },
+                  {
+                      "sha256":  "d4b367a77ab0734be334083dbaa71dabd5e5b4d05a032277548ce0ea83ee6bb8",
+                      "path":  "server\\services\\scene_understanding\\frame_overlay_blur.py"
+                  },
+                  {
+                      "sha256":  "8c2efdf14576201c3c3bf7127d2731801794d64c52df14eff9edebff30701e78",
+                      "path":  "server\\services\\scene_understanding\\models.py"
+                  },
+                  {
+                      "sha256":  "09f669a15c5ca708c148201d2887e1b038d31fe8e2ad6273fd37ab485d8392bd",
+                      "path":  "server\\services\\scene_understanding\\pipeline.py"
+                  },
+                  {
+                      "sha256":  "6d9f84c9ab03b78b4bba875fd5a95e4500e85293106091315fc82a7c8b906b06",
+                      "path":  "server\\services\\scene_understanding\\__init__.py"
+                  },
+                  {
+                      "sha256":  "8daa371b13c86efc19608b4145440952a708409603df9ad028bc245fd8095648",
+                      "path":  "server\\services\\sources\\base_source.py"
+                  },
+                  {
+                      "sha256":  "3b109cb47fabfa27de1f646e13ee41ec0df4e7c3b0a3151fec3f77a9db539f62",
+                      "path":  "server\\services\\sources\\brave_source.py"
+                  },
+                  {
+                      "sha256":  "7a0fa702250777177eaca5589828a224d78f8aa6a7f4a3cdd4559a865eaade97",
+                      "path":  "server\\services\\sources\\duckduckgo_source.py"
+                  },
+                  {
+                      "sha256":  "3ae8dd80885a4da67896ce8be81d2f6a2879956883da8895c965b31b8f27e0ed",
+                      "path":  "server\\services\\sources\\google_cse_source.py"
+                  },
+                  {
+                      "sha256":  "104158a7b4615be5f06401a6fb86ec19c933449ae4d077b6362ec044e299a2fa",
+                      "path":  "server\\services\\sources\\google_images_source.py"
+                  },
+                  {
+                      "sha256":  "b68ef3ca6da8f882cc048ee021395c0a37a916dc5553a630bfcde02f6da1db33",
+                      "path":  "server\\services\\sources\\loc_source.py"
+                  },
+                  {
+                      "sha256":  "c999d4a792bb8ac5a256d080c6e683e3d02b07f19f5912e6d10f8ab3bbdc894e",
+                      "path":  "server\\services\\sources\\openverse_source.py"
+                  },
+                  {
+                      "sha256":  "5e3a0db44e3194bcf8108e75c27381ebc87a664479290ef9128aba1bcdbf83a5",
+                      "path":  "server\\services\\sources\\pexels_source.py"
+                  },
+                  {
+                      "sha256":  "286b9b374a914069c3a682334fad347e5f14002964c0d069bb2abe515294b50b",
+                      "path":  "server\\services\\sources\\pixabay_source.py"
+                  },
+                  {
+                      "sha256":  "697c59ca7e1c82b007fcecaa103203a7bd2de8d8edf9ae9c93840a3690975de4",
+                      "path":  "server\\services\\sources\\reddit_source.py"
+                  },
+                  {
+                      "sha256":  "40150095f9d939032a20d71a42c7b608ec841a0c89cea38230a63ab18348e4dc",
+                      "path":  "server\\services\\sources\\searxng_source.py"
+                  },
+                  {
+                      "sha256":  "10c106ff6533210e58be057e5f88f3d8427da1d3cd163e084d3a4008e1a3de2e",
+                      "path":  "server\\services\\sources\\sources.yaml"
+                  },
+                  {
+                      "sha256":  "f8c318327b28b3d29382791f37479af98ac2d047e0f7d8da35c755c0589192e7",
+                      "path":  "server\\services\\sources\\wikimedia_source.py"
+                  },
+                  {
+                      "sha256":  "517b8b146f4d0d5a42d024793165ab02201cd33535118fc388f93e12855fdf7c",
+                      "path":  "server\\services\\sources\\yandex_browser_bridge.js"
+                  },
+                  {
+                      "sha256":  "0c400c79c88d0e6bd38d3ffe536cf9c31d86bbec9621532b15a87ed3cccf5b21",
+                      "path":  "server\\services\\sources\\yandex_source.py"
+                  },
+                  {
+                      "sha256":  "5d651b44eff71d52116d35bfdabe803291d89799dc8c669d92fd607b6125b8ab",
+                      "path":  "server\\services\\sources\\__init__.py"
+                  },
+                  {
+                      "sha256":  "d9d3234c5bdde5f61be216006c425ce0b82deb439b09d6c0fdf56f5ea45e8f68",
+                      "path":  "server\\services\\storyboard_v2\\alignment.py"
+                  },
+                  {
+                      "sha256":  "f6bffe730efbb795dc43a8a488aced6e9a0c5aa536b120f66abfeda45db7d9fb",
+                      "path":  "server\\services\\storyboard_v2\\compat.py"
+                  },
+                  {
+                      "sha256":  "d1b06c79484849444e4f78ed599d915cf8dde954019e80aa16cbe53ef5bc4c7e",
+                      "path":  "server\\services\\storyboard_v2\\models.py"
+                  },
+                  {
+                      "sha256":  "a94a952d64fd4d14196c22958cb8b9be6d8e24a2fa2d2a9c07c621efda6dffab",
+                      "path":  "server\\services\\storyboard_v2\\scene_builder.py"
+                  },
+                  {
+                      "sha256":  "a7412f97b977cad92dc7c098bc4d78dc7fa5dc7818d758e2bb749dc4e12a3b9c",
+                      "path":  "server\\services\\storyboard_v2\\script_parser.py"
+                  },
+                  {
+                      "sha256":  "5e577b3d9fe35702d38f8bf73e8ac69b31640a983b4427030962705b32bb0021",
+                      "path":  "server\\services\\storyboard_v2\\store.py"
+                  },
+                  {
+                      "sha256":  "e690f474111a13b0c3cc610f92594aa2d3be9d88bae39f658477052ca7a3b4be",
+                      "path":  "server\\services\\storyboard_v2\\text.py"
+                  },
+                  {
+                      "sha256":  "222a378accd06beb1067170c36a79bd1adcce9ae2bab2039e4d3872b68a6bbd3",
+                      "path":  "server\\services\\storyboard_v2\\__init__.py"
+                  },
+                  {
+                      "sha256":  "5d2e7bc4c8be22877d571af22c30c59fd9ffb8f192ef3eaf074e9ed7027c3d28",
+                      "path":  "server\\services\\visual_intelligence\\cache.py"
+                  },
+                  {
+                      "sha256":  "00c7a30528fcc90dcf534630f5afea802bd3b97074fe3ab76a9e90a6e80c9912",
+                      "path":  "server\\services\\visual_intelligence\\clip_pipeline.py"
+                  },
+                  {
+                      "sha256":  "ffaa0ba5a1a7d4bb2d46e9791fcdb9973093451b281d35b895cc1fcb4441e36c",
+                      "path":  "server\\services\\visual_intelligence\\context.py"
+                  },
+                  {
+                      "sha256":  "a5ab317e45fe2e536bf67b4394543c6753fa3fcfd5e31e134f52026a372037d4",
+                      "path":  "server\\services\\visual_intelligence\\database.py"
+                  },
+                  {
+                      "sha256":  "06a68a5698def641cdab48e46626cbae716be4018778aa826d239648adea7417",
+                      "path":  "server\\services\\visual_intelligence\\decision.py"
+                  },
+                  {
+                      "sha256":  "db206de25b6add72a8c7deec1e0d3542ae9cebf4e5fa1990828e7003d18fcd1e",
+                      "path":  "server\\services\\visual_intelligence\\frame_extractor.py"
+                  },
+                  {
+                      "sha256":  "f890b2f384320397b52bfb3fdde80cb623e1e98541ca6cbe88ad4b2b1f14eabb",
+                      "path":  "server\\services\\visual_intelligence\\image_pipeline.py"
+                  },
+                  {
+                      "sha256":  "adbe6c3fb14e0ad1ba6671a16e926cafeda6fea35bccbd35ebc924e80e2617e2",
+                      "path":  "server\\services\\visual_intelligence\\models.py"
+                  },
+                  {
+                      "sha256":  "a0b8521a602674afcdd35e2a241244f58353a9d0d255dea4fec822fc192faad8",
+                      "path":  "server\\services\\visual_intelligence\\orchestrator.py"
+                  },
+                  {
+                      "sha256":  "bbaa7593b31c36a367cb41c4f8c0e78e9dbb9f967e3953005d1a2271ede95646",
+                      "path":  "server\\services\\visual_intelligence\\orchestrator_v2.py"
+                  },
+                  {
+                      "sha256":  "348119996ad70a1959dc0a8a6acf361c9f9cbfb9f8473270bd425076cb4b1e73",
+                      "path":  "server\\services\\visual_intelligence\\prefilter.py"
+                  },
+                  {
+                      "sha256":  "bc6be78b353a37744d1083180c9c479f92d576c8c2c9b8b1a2879d5cdef997cf",
+                      "path":  "server\\services\\visual_intelligence\\prompts.py"
+                  },
+                  {
+                      "sha256":  "27c09eea4be339078a21c7978af46c136faf7feeb2b84f6b37588a24e4ff43ec",
+                      "path":  "server\\services\\visual_intelligence\\queue.py"
+                  },
+                  {
+                      "sha256":  "3f05b3ce7255ee16cd59bb7e726fb551355aaa5619cbe54774a9fec3d5f757f4",
+                      "path":  "server\\services\\visual_intelligence\\ranking.py"
+                  },
+                  {
+                      "sha256":  "98b65a9da3059e996e4a71858aaba6eec3cc804fa0f0f600b58e020d812f0d98",
+                      "path":  "server\\services\\visual_intelligence\\safety_override.py"
+                  },
+                  {
+                      "sha256":  "4bb25410e063a1ccab7f5c3706e10ace401dc2285ec8fba970e8b9338c9ca05c",
+                      "path":  "server\\services\\visual_intelligence\\semantic_guard.py"
+                  },
+                  {
+                      "sha256":  "5d9101c41676f78dbf8331ab276dd7fea2e48fc6f938dcc2571dddf9d379e760",
+                      "path":  "server\\services\\visual_intelligence\\vision_client.py"
+                  },
+                  {
+                      "sha256":  "c13921ce9adf6f2aa0a1b3badc7b601db8ad27f403d5d94accc7e45f7b954bdd",
+                      "path":  "server\\services\\visual_intelligence\\__init__.py"
+                  },
+                  {
+                      "sha256":  "4691e0a1034844019f4ac36028b874d53d490c994ae5245464e4780c60785012",
+                      "path":  "server\\services\\web_image\\constants.py"
+                  },
+                  {
+                      "sha256":  "ed47e6a788854b5c39f053df5a421655e5f3a42ac0e63b41d7d690ad1b0bfba4",
+                      "path":  "server\\services\\web_image\\flickr_api_source.py"
+                  },
+                  {
+                      "sha256":  "ee0afef960dcfa57c393eeb3c825aea0722fd89c43610c20fdcb32eff69e41c7",
+                      "path":  "server\\services\\web_image\\hybrid_search.py"
+                  },
+                  {
+                      "sha256":  "2b1f8a637d299347586806f783e3e9eb3b2bf881dc79c0aad4529d48795a60b5",
+                      "path":  "server\\services\\web_image\\ownership_mark.py"
+                  },
+                  {
+                      "sha256":  "25bcd64e9c9ad9ad58420843d452ddca9fdc44f6f19ddaf7e2ecc8bbcd940272",
+                      "path":  "server\\services\\web_image\\primary_archives.py"
+                  },
+                  {
+                      "sha256":  "5e057761d56454983bdb1c2fcd503dd40277f94da224fc0f02b50a2376332141",
+                      "path":  "server\\services\\web_image\\query.py"
+                  },
+                  {
+                      "sha256":  "c3074167ecbf550a8c5390d5f75b9902f635393dcd4d5e79ea802c7abb77d753",
+                      "path":  "server\\services\\web_image\\resolver.py"
+                  },
+                  {
+                      "sha256":  "2388a52d266578894e25d2c0e39aa16e9f9efcb027e31844bd9fe249f1fe7de4",
+                      "path":  "server\\services\\web_image\\runtime.py"
+                  },
+                  {
+                      "sha256":  "628111c3e50dc1e2a90e28c3f59e2593487df73ae8f6442aba35f67aa2076190",
+                      "path":  "server\\services\\web_image\\safety.py"
+                  },
+                  {
+                      "sha256":  "dc66c6bb36390a184d8e9b865ccf64d7d7883d1298f8c20959d72a07e8d2724f",
+                      "path":  "server\\services\\web_image\\source_broker.py"
+                  },
+                  {
+                      "sha256":  "1d7ec5645be6102e6e754848a7f9f6f0504920416c89bda59407bc81ffe0a1d9",
+                      "path":  "server\\services\\web_image\\universal_scraper.py"
+                  },
+                  {
+                      "sha256":  "b90922f8b727f5ea360c6af5f5180768004d2407f4e1006cdd45afff59ce9bb8",
+                      "path":  "server\\services\\web_image\\__init__.py"
+                  },
+                  {
+                      "sha256":  "2b5f11f2bf2ede8c71e17ebb28fd24e8df0e2326a6562fe4349568aee8aff286",
+                      "path":  "server\\web_pipeline\\gallery_search.py"
+                  },
+                  {
+                      "sha256":  "fefc62a1797d8fca3892d40ac471d6fb1fbb523f46affb4aa5d35444229b9b2c",
+                      "path":  "server\\web_pipeline\\__init__.py"
+                  },
+                  {
+                      "sha256":  "e2565d8a24cc347e049799d36cc6b56949ba054b685610290e3e00cbba7be35e",
+                      "path":  "src\\editor.css"
+                  },
+                  {
+                      "sha256":  "2b8b2c2ff7120f335665d11e2f80a9c9217f7ad855623c8a3daa93295e215f8e",
+                      "path":  "src\\editor.js"
+                  },
+                  {
+                      "sha256":  "94eb7ee63d76fcd72e1ed702cc322df9ac4f36c82490ef1c7973fe08dadc839d",
+                      "path":  "src\\fullstyle-editor.css"
+                  },
+                  {
+                      "sha256":  "6cc67b2371fffb048ae4eea3cb02aac91d8dac57d451ec9eedf07c7241f20d0a",
+                      "path":  "src\\fullstyle-editor.js"
+                  },
+                  {
+                      "sha256":  "809744c1bc653c11e7c11ad99ce9a7c7ebba867613038608782c3c98e8099ff3",
+                      "path":  "src\\index.css"
+                  },
+                  {
+                      "sha256":  "365671a1568e92cc488ce2e7dd69f7117f7affbb37d6c9cba7a4207350d03d7a",
+                      "path":  "src\\index.html"
+                  },
+                  {
+                      "sha256":  "08ce1a5dd107a995b2fbe673a666f38c03ce615c614531c2fc5f39425b56d937",
+                      "path":  "src\\landing.css"
+                  },
+                  {
+                      "sha256":  "a6a3b69f96f056133ad4ba418fa53ba9362fbb8f544877fabe0d895586ecc06f",
+                      "path":  "src\\landing.html"
+                  },
+                  {
+                      "sha256":  "0ecd1deb6344a19f047c2de77b781d5b6ea3f68b9fa8fe63edb06f8547ee9a27",
+                      "path":  "src\\landing.js"
+                  },
+                  {
+                      "sha256":  "44cabd684c9be591d560ef3b76758f3421ee951f73866de13acda6df5a801fda",
+                      "path":  "src\\production-timeline.js"
+                  },
+                  {
+                      "sha256":  "ad516e42806f4760b23d6e463e2de5a7a877e1f7b48fb174201833394ab77f89",
+                      "path":  "src\\remotion-player.js"
+                  },
+                  {
+                      "sha256":  "975fcf6243d64e93acab6db77aa6fa6ef8710689b16e0bbafdd37a11010c2503",
+                      "path":  "src\\renderer.js"
+                  },
+                  {
+                      "sha256":  "47cdcd650d886a803a4099fc938cfb17a1719df840dd77b49627024aafa298f2",
+                      "path":  "src\\assets\\app-icon.png"
+                  },
+                  {
+                      "sha256":  "47cdcd650d886a803a4099fc938cfb17a1719df840dd77b49627024aafa298f2",
+                      "path":  "src\\assets\\icon.png"
+                  },
+                  {
+                      "sha256":  "0c088ea84a69935dc98c703f96e3b94bb730d6343570059ed8c32209867b61e9",
+                      "path":  "src\\assets\\vidnets-brand-showcase.png"
+                  },
+                  {
+                      "sha256":  "47cdcd650d886a803a4099fc938cfb17a1719df840dd77b49627024aafa298f2",
+                      "path":  "src\\assets\\vidnets-icon-glow.png"
+                  },
+                  {
+                      "sha256":  "d09eda9011ea264946100988951d4405271b872510b22f1e3d889c557dff48eb",
+                      "path":  "src\\assets\\vidnets-logo-full.png"
+                  },
+                  {
+                      "sha256":  "05c0c598e0fa796bb44775764d5eb860df74f9cd6871080900e5d880ceb787d5",
+                      "path":  "src\\editing\\editing-assets.js"
+                  },
+                  {
+                      "sha256":  "d9006654cabdb011d0667f27972ee1150ef436ceb07628a820c6e338c435f88b",
+                      "path":  "src\\editing\\editing-settings.css"
+                  },
+                  {
+                      "sha256":  "e858b58ab127da62cde07b511adc0c2ce4b34414fe4390f5ab9d7eeab6e2b323",
+                      "path":  "src\\editing\\editing-studio.js"
+                  },
+                  {
+                      "sha256":  "87af589441bb6032b6b87d41432c7d36778b35dcc8ee9c198ce5e4b2b17956a3",
+                      "path":  "src\\remotion\\DocumentaryComposition.jsx"
+                  },
+                  {
+                      "sha256":  "a40a7945fefe320fc1c41a03c813b238dce2e0d40a98f24675eae0b7a2af3bf0",
+                      "path":  "src\\remotion\\fonts.jsx"
+                  },
+                  {
+                      "sha256":  "0509727c832cf8a391f286723b7e4fb9e24566f70235309b158e9a09f50202e9",
+                      "path":  "src\\remotion\\overlays.jsx"
+                  },
+                  {
+                      "sha256":  "89d999f624d3c4f6026d297b015ce7fad8fa36d16694112664a541eb15f602ae",
+                      "path":  "src\\remotion\\player-bootstrap.jsx"
+                  },
+                  {
+                      "sha256":  "077d0a6856398d4955e7a92f530a2edb4fb660548746edc217ea43537633f406",
+                      "path":  "src\\remotion\\templates-enhanced.jsx"
+                  },
+                  {
+                      "sha256":  "8cbe538fd58276fee11b4226684e25debc737d8bcb950c02913e49e79aa00a83",
+                      "path":  "src\\remotion\\templates.jsx"
+                  },
+                  {
+                      "sha256":  "6b893c4a8739754e0475a7011485a3f5e9ce9f1082be451940f18c7d39ea6978",
+                      "path":  "src\\remotion\\theme.js"
+                  },
+                  {
+                      "sha256":  "9f84020e04fff07b389b25efd4a29d5a72f7603aa74dac724d8aae93d4cc6f2e",
+                      "path":  "src\\remotion\\transitions.jsx"
+                  },
+                  {
+                      "sha256":  "ed8871d0a181f96923cb4fc0e38d3d67022fcfa0be6ada9f765e830379e7240a",
+                      "path":  "src\\remotion\\components\\AdaptiveChart.jsx"
+                  },
+                  {
+                      "sha256":  "8fb09d4bb7a571d6c46ee88828edf5ff6db7fe8e4e97a28fe2643ffbf5baa9ad",
+                      "path":  "src\\remotion\\components\\AdaptiveComparison.jsx"
+                  },
+                  {
+                      "sha256":  "7e16a34c500f5c88444ad4b3765d38bd66deb9574aaf768f16cd43911e54c312",
+                      "path":  "src\\remotion\\components\\AdaptiveMetricGrid.jsx"
+                  },
+                  {
+                      "sha256":  "916c18d39ab0030c2de211d3492bfa040576445d1ff99790c7bff0bcf39cba46",
+                      "path":  "src\\remotion\\components\\AdaptiveStat.jsx"
+                  },
+                  {
+                      "sha256":  "555fb40f40672493d965d0ab002926f8931e2647b3ca35b23661d448d297e492",
+                      "path":  "src\\remotion\\components\\AdaptiveTimeline.jsx"
+                  },
+                  {
+                      "sha256":  "d4266ffb511b31950ca4f1bdbb116373f08f2cd8b3118975b40167722638a303",
+                      "path":  "src\\remotion\\components\\AnimatedMap.jsx"
+                  },
+                  {
+                      "sha256":  "4678ebeeec16dd39b819d5518dd763471782aa2eeacb0ca10f860c107bb16c4c",
+                      "path":  "src\\remotion\\components\\ChapterTitle.jsx"
+                  },
+                  {
+                      "sha256":  "fc4a44aafb7a137f8ee8032ab83e1f28d982391f5c98444f3e27f0908fdae592",
+                      "path":  "src\\remotion\\components\\Chart.jsx"
+                  },
+                  {
+                      "sha256":  "4c8227c95fa59ee93e03d6fa85256c8fdfff3df53f4899d331e77720efcb2768",
+                      "path":  "src\\remotion\\components\\CinematicHighlight.jsx"
+                  },
+                  {
+                      "sha256":  "3289913520a6fc09b5253173e2da62fea3a1dd9968404adfa5af937057b2f723",
+                      "path":  "src\\remotion\\components\\Collage.jsx"
+                  },
+                  {
+                      "sha256":  "f683471c3a0e4cfb19d568f2700bc4ccb5a770ed024d32ad8b5edcf03c9bd086",
+                      "path":  "src\\remotion\\components\\Comparison.jsx"
+                  },
+                  {
+                      "sha256":  "faf10c7f715ea10b01c4ab646c87b84eb641afbe5732b3d304cfb668d402ee0c",
+                      "path":  "src\\remotion\\components\\DataCard.jsx"
+                  },
+                  {
+                      "sha256":  "2e6668ae461d38a53805d88efbec7c4979ca4bb3f000ab8f4daceb1106ff12cd",
+                      "path":  "src\\remotion\\components\\DeclarativeRecipe.jsx"
+                  },
+                  {
+                      "sha256":  "f2db205575d58bdea8543ca076afb2782eaf92ac2599795c96e9853b0f68a374",
+                      "path":  "src\\remotion\\components\\Diagram.jsx"
+                  },
+                  {
+                      "sha256":  "531b16c43ac0fd619ec73e0d48842b30a04d77d00abfd2aa3b2a74c355052254",
+                      "path":  "src\\remotion\\components\\DirectorMotionGraphics.jsx"
+                  },
+                  {
+                      "sha256":  "059ad1427568286771140888109c681c15a2adb8b06f0c7571a366b1a05d9619",
+                      "path":  "src\\remotion\\components\\DocumentHighlight.jsx"
+                  },
+                  {
+                      "sha256":  "8cbe668131561d19fc0de0fa62c3facb98df378f390a30a6fadc65e66ef49f8b",
+                      "path":  "src\\remotion\\components\\EditorialSceneCanvas.jsx"
+                  },
+                  {
+                      "sha256":  "bb8e2992172dd2f62299fcababef2217b38b280ebc274d681fe2fc6ea5677ce4",
+                      "path":  "src\\remotion\\components\\EditorialType.jsx"
+                  },
+                  {
+                      "sha256":  "b767b902c419520f56f077381932bc0a90100561b1828015906e603304e09003",
+                      "path":  "src\\remotion\\components\\ExplanatoryDiagram.jsx"
+                  },
+                  {
+                      "sha256":  "021726011e77fa632ece041b84d03d74cff47364839826b51de7c2961738c8d7",
+                      "path":  "src\\remotion\\components\\Globe3D.jsx"
+                  },
+                  {
+                      "sha256":  "9111e76d0e1857cbc77d92bf4b3b192b1d7fdc81df5b92c603ddbdd276accff7",
+                      "path":  "src\\remotion\\components\\Headline.jsx"
+                  },
+                  {
+                      "sha256":  "9c469f917f09706143bd49c8f994f7fadb4c81f0f1b157d35818ffa4e93877c8",
+                      "path":  "src\\remotion\\components\\index.js"
+                  },
+                  {
+                      "sha256":  "431e34eab7dff6a1b8b711e62f8f4b06b070f8a14ce42f0e6e11303466bc57a5",
+                      "path":  "src\\remotion\\components\\KineticText.jsx"
+                  },
+                  {
+                      "sha256":  "b343c38482ea392a52fdf179cea86c8e215a643778763de619dbc86a6f0ec8e7",
+                      "path":  "src\\remotion\\components\\MediaOverlayCanvas.jsx"
+                  },
+                  {
+                      "sha256":  "5fe562ccb3325c389c3517c4396a6a6b45591ec913773f41aaeee9dd81aa2576",
+                      "path":  "src\\remotion\\components\\MediaShotSequence.jsx"
+                  },
+                  {
+                      "sha256":  "06d0247267f659c2004f52a343439dbd694508241268da786945fe9847dfcf61",
+                      "path":  "src\\remotion\\components\\MissingSceneMotionGraphic.jsx"
+                  },
+                  {
+                      "sha256":  "69424c4b17a2fab0fa0a7dedd6645763d2f0c2e025a1f3faae953bfd903cec2b",
+                      "path":  "src\\remotion\\components\\PersonProfile.jsx"
+                  },
+                  {
+                      "sha256":  "955e90116a9a93fdc965681d46a4849c93c1e7f250b84472059a1ad7db070517",
+                      "path":  "src\\remotion\\components\\QuoteCard.jsx"
+                  },
+                  {
+                      "sha256":  "f83c0d13f5c81c293546000fe26fcf572967709a32770405f481ae18a0b26c92",
+                      "path":  "src\\remotion\\components\\RecoveryIllustration.jsx"
+                  },
+                  {
+                      "sha256":  "8693f5730cbeddc503695a6aa5278137832935630a8d7f02caf9e4a3a2fb4ab2",
+                      "path":  "src\\remotion\\components\\SatelliteMap.jsx"
+                  },
+                  {
+                      "sha256":  "6cdc08bde81d53a069ae38125fbd6e59911b3522fdcc55d6d26675a357f3a08a",
+                      "path":  "src\\remotion\\components\\SceneRenderBoundary.jsx"
+                  },
+                  {
+                      "sha256":  "6b8ea66cf6138ebd0e0c9d95955fb5a997f6d343c82b52c8c36d23ac0f619f4d",
+                      "path":  "src\\remotion\\components\\SignedBars.jsx"
+                  },
+                  {
+                      "sha256":  "79476ff3fb4320a5c804fb9b52e27a22b30434468b290ffd8b7902064e0734e3",
+                      "path":  "src\\remotion\\components\\SmartImage.jsx"
+                  },
+                  {
+                      "sha256":  "8b8b33f7811866652bddff81350e06786236bd8bd6e5f114be73870c53b69fe6",
+                      "path":  "src\\remotion\\components\\SmartVideo.jsx"
+                  },
+                  {
+                      "sha256":  "4fc13b1abeb9cb88b84bc859ef9e3c54e67929777ad08d4a0942db9d6bc01baf",
+                      "path":  "src\\remotion\\components\\SourceCredit.jsx"
+                  },
+                  {
+                      "sha256":  "c9803daa33ce67e3311ea335664ec0bdeaa72c3f1da5d6edd0de765fb33df3be",
+                      "path":  "src\\remotion\\components\\StatCard.jsx"
+                  },
+                  {
+                      "sha256":  "149e3b511b0514a3c58244ae67e2f1a6e4c8e4fe1e5fec5a1a365cbee239105a",
+                      "path":  "src\\remotion\\components\\TextCard.jsx"
+                  },
+                  {
+                      "sha256":  "d4a872a30f1b22fa60b55add06649810d64411b811227550bc6715f75f9bb11e",
+                      "path":  "src\\remotion\\components\\Timeline.jsx"
+                  },
+                  {
+                      "sha256":  "6a68e4c38525a60cf54b5d2a65a821f48f239f3c51de04dd8f1e6b3f8b916df6",
+                      "path":  "src\\remotion\\components\\WordHighlighter.jsx"
+                  },
+                  {
+                      "sha256":  "a1f930a16e15ac4c59fffa7617db067afe2c6cf5a9999a3b9fb877ca0a41bb6e",
+                      "path":  "src\\remotion\\effects\\index.jsx"
+                  },
+                  {
+                      "sha256":  "c8d2a41da04d148fe503455194ea74d5276cfb45899c9498a86d34f07e34091a",
+                      "path":  "src\\remotion\\engine\\ChartGeometry.js"
+                  },
+                  {
+                      "sha256":  "fe04d1300127bb63b00f4f0b4a29f497dad7f8ac8426a6461ebc0d67e0dd03d7",
+                      "path":  "src\\remotion\\engine\\ColorGrade.js"
+                  },
+                  {
+                      "sha256":  "fdc723b98b65c59775030f37926d5ecde2f5b1cc104ab5ecbc615f7e3dd86d09",
+                      "path":  "src\\remotion\\engine\\DirectorMotion.js"
+                  },
+                  {
+                      "sha256":  "ffd02026e44966b7859a6d70cc556d4cfe3d7cefd0168b872542fcffdec0f1ef",
+                      "path":  "src\\remotion\\engine\\DocumentaryLayoutAudit.jsx"
+                  },
+                  {
+                      "sha256":  "606cfa8397177fb66e0b682ba9310bf0e0c833dcaa9ed84e9fc1aec952d2f460",
+                      "path":  "src\\remotion\\engine\\DocumentaryTypography.js"
+                  },
+                  {
+                      "sha256":  "87a373f2d473509ee8c4e0e4d5a3865dc2681f62dc6cfde624823172fd8c0bd5",
+                      "path":  "src\\remotion\\engine\\FocalFrame.js"
+                  },
+                  {
+                      "sha256":  "ca8c3afa941844ad188f3415f74d9bc1020a099d04c293f0d8f5ff4cc62def6e",
+                      "path":  "src\\remotion\\engine\\LayoutEngine.js"
+                  },
+                  {
+                      "sha256":  "a736d4e897c9debdba9fa7d28d93e4f9060d9031324caccde5ad6e1a27ff0da9",
+                      "path":  "src\\remotion\\engine\\MediaKind.js"
+                  },
+                  {
+                      "sha256":  "c175e7dcbdecf05d418c23c99888b635d2896857c3aa7e9905568e3edf5d1203",
+                      "path":  "src\\remotion\\engine\\MediaProvenance.js"
+                  },
+                  {
+                      "sha256":  "1d8b2eae406a8c3c5504626d5045b908e288bf0a3c4ae8a695ee5a953e7c8d59",
+                      "path":  "src\\remotion\\engine\\MediaShotTiming.js"
+                  },
+                  {
+                      "sha256":  "d3bd2819179553d42e550bf8f8e1b798c372622a4bceb679767adfba254362b4",
+                      "path":  "src\\remotion\\engine\\MotionEngine.js"
+                  },
+                  {
+                      "sha256":  "13b0c7fe8ad0a31114c2d5bacbe7f309dd5071e9a3ea6e8b528c68c433322f2c",
+                      "path":  "src\\remotion\\engine\\MotionPrimitives.jsx"
+                  },
+                  {
+                      "sha256":  "49ae084a161cf4afd7a954280e63863796ed768534ee67f420dc2d20386194c2",
+                      "path":  "src\\remotion\\engine\\NumericEvidence.js"
+                  },
+                  {
+                      "sha256":  "ac6f64f3a2884b5ce6baad70733a110a640821d4c638d43ac7125bf616619ff4",
+                      "path":  "src\\remotion\\engine\\RecoveryContent.js"
+                  },
+                  {
+                      "sha256":  "79a04d6be603818cdb41d82014a775556b4a2104be5b04e8943eb4e92bf68494",
+                      "path":  "src\\remotion\\engine\\RecoveryMedia.js"
+                  },
+                  {
+                      "sha256":  "e09102b54c13a51ddba64a11dfa8f2d77a312dea7cc17215ad181774b14ca78a",
+                      "path":  "src\\remotion\\engine\\SceneRegistry.js"
+                  },
+                  {
+                      "sha256":  "113fdf42c3faeb70d45a9cf6ea53cab1b49f74acc5f42b4e54f6b5b4599c1474",
+                      "path":  "src\\remotion\\engine\\SceneSchedule.js"
+                  },
+                  {
+                      "sha256":  "ba755ce7938e8b0b12205e5b699610a466f9e44700d0089c553c756ee2892aaa",
+                      "path":  "src\\remotion\\engine\\StyleEngine.js"
+                  },
+                  {
+                      "sha256":  "fb91735f23aa9565eeff5d59c4a7e2b41d103821758879bb4a51f9d5db05f6fa",
+                      "path":  "src\\remotion\\engine\\TextSanitizer.js"
+                  },
+                  {
+                      "sha256":  "7892a4ccceaa03813924694688faa72f68a192925b7906a77d9fe6f03aa1f333",
+                      "path":  "src\\remotion\\maps\\ne_10m_admin_0_focus.json"
+                  },
+                  {
+                      "sha256":  "9ccc763299d9718fd8de47770bbfc0c80b0d3c8076fbcee8e6d8aa9020718d3c",
+                      "path":  "src\\remotion\\maps\\ne_10m_admin_1_focus.json"
+                  },
+                  {
+                      "sha256":  "6866c877d39cba9c357620878839b336d569f8c662d3cfab4cb1dbe2d39c977f",
+                      "path":  "src\\remotion\\maps\\ne_110m_admin_0_countries.json"
+                  },
+                  {
+                      "sha256":  "a86028b083182b68c7620fc6e1a8a47ee547cb9cd2fb62ccbb78bea786440899",
+                      "path":  "src\\remotion\\maps\\ne_110m_populated_places.json"
+                  },
+                  {
+                      "sha256":  "4d6c1437cf96e3d88a006a530defc99f118f8521f9f30750b02608d4b1d510be",
+                      "path":  "src\\remotion\\maps\\SOURCES.md"
+                  },
+                  {
+                      "sha256":  "78a37fa4e4a69126fb190c339ccc432c1b4c7f46d5b8f51264b2844aa6ed3096",
+                      "path":  "src\\remotion\\motion-graphics\\DateReveal.jsx"
+                  },
+                  {
+                      "sha256":  "4770feb4b6ba15ca7e674ec6c1ec3d852c89afe7f896d4ffc76ac56a12e33785",
+                      "path":  "src\\remotion\\motion-graphics\\index.jsx"
+                  },
+                  {
+                      "sha256":  "e3bb6bc5d5c5a295c3ba0d998ef49089616e70fc9b283a069d0e64b86576e0d5",
+                      "path":  "src\\remotion\\motion-graphics\\KineticType.jsx"
+                  },
+                  {
+                      "sha256":  "8a6881efec9e566b76eedb311d430202d4583c19caa1149be0efe939214f64dd",
+                      "path":  "src\\remotion\\motion-graphics\\MotionCard.jsx"
+                  },
+                  {
+                      "sha256":  "03fb87824ca6041feebf638252657cd438b7d7bab85c1f884d04afb9c8df2a5a",
+                      "path":  "src\\remotion\\motion-graphics\\NumberCounter.jsx"
+                  },
+                  {
+                      "sha256":  "7040282deb17aa63b283cde85811e0759c3e90e4547ee4b5a96715e842053561",
+                      "path":  "src\\remotion\\motion-graphics\\useMotion.jsx"
+                  },
+                  {
+                      "sha256":  "f40fda56b2d642c1764ad05bf9dd0b4f37ddc2ede3cfb89f2e13c32ca52371e8",
+                      "path":  "src\\remotion\\sfx\\catalog.json"
+                  },
+                  {
+                      "sha256":  "faf18db02b72670fc483337fa61dc78f99bf4f1dea349d38da68c846489614c1",
+                      "path":  "src\\remotion\\texts\\index.jsx"
+                  },
+                  {
+                      "sha256":  "488ff7669767a6bed36fdd49bc49da9bb241ff83123b1593cb97f73bd27c2eb9",
+                      "path":  "src\\remotion\\transitions\\motion.jsx"
+                  },
+                  {
+                      "sha256":  "834f32e769839706f354b862a6d67e575f14cd94b373672216cf3c1e6add5151",
+                      "path":  "remotion\\entry.jsx"
+                  },
+                  {
+                      "sha256":  "02245e5e54633a319ea297c56c8228b8c4c56c3832042f5409861c4e4f9bd13a",
+                      "path":  "remotion\\template-entry.jsx"
+                  },
+                  {
+                      "sha256":  "8ae7ad4501d0f827e2995543fffd133e7cbb731d48df46bcfff267b04191eeb4",
+                      "path":  "scripts\\admin-api-smoke.js"
+                  },
+                  {
+                      "sha256":  "9630eaaeb5e51ec844c736562a51158f390b4cf6e19be0ad53932b3d1db37f84",
+                      "path":  "scripts\\assemble-clean-release.ps1"
+                  },
+                  {
+                      "sha256":  "ed5651ecbbd9e6e8b2c5c106f6dfe20b5c492cf7c95cf81b6de5daed3da8cdb8",
+                      "path":  "scripts\\assess-cooper-documentary.py"
+                  },
+                  {
+                      "sha256":  "32b56b70096bb62dd20819a9334e074b67069d175fdedc6381a07910557e10b0",
+                      "path":  "scripts\\audit-entitlements.js"
+                  },
+                  {
+                      "sha256":  "8edc2131050ca9312a61451ca3eb51be877b7c0e659c4b6bad50dcf5b55b3d83",
+                      "path":  "scripts\\audit-live-director.py"
+                  },
+                  {
+                      "sha256":  "8e20f8cb9516e27839aa03c876f984ca23b1736e95416a2cb8bc93389535820f",
+                      "path":  "scripts\\audit-utils.js"
+                  },
+                  {
+                      "sha256":  "3d19901dacd74779cd2a9c367060636654d1098eebd4e5f996db6db516c444d2",
+                      "path":  "scripts\\audit-youtube-transport.py"
+                  },
+                  {
+                      "sha256":  "2398f98d459ac9d3563867c05e6d2c4b773c8afcecea6d7285b0366df2255906",
+                      "path":  "scripts\\audit_completed_video.py"
+                  },
+                  {
+                      "sha256":  "95980d8c5983e483dd681262244f4a0c92b08683c41bf50dabf6d3ecc86f1efa",
+                      "path":  "scripts\\audit_generation_live.py"
+                  },
+                  {
+                      "sha256":  "b4e56ecf796dedab7e808ab20082b74d553342092ec4e0c6e84e69e256e5c8c8",
+                      "path":  "scripts\\audit_semantic_manifest.py"
+                  },
+                  {
+                      "sha256":  "13be1aaa0ecdc97d31469b413f241d5cfbd66fdd3cff5ee45b06df39e72ebeea",
+                      "path":  "scripts\\bootstrap-runtime.ps1"
+                  },
+                  {
+                      "sha256":  "f60e206aad85c1dc41a5892c87de69cc29bdfc0b2e94262bd54f9fc6d79ab8c4",
+                      "path":  "scripts\\bootstrap-youtube-provider.ps1"
+                  },
+                  {
+                      "sha256":  "a5c654b973de7cd7a40632871ec23c6f081159ac08e82795a6ee15ddb7c7582d",
+                      "path":  "scripts\\build-full.js"
+                  },
+                  {
+                      "sha256":  "56ec753cacf9f5ed88c5e0bfaa86bc422991cbd2fa1f4b94675bf782d108c169",
+                      "path":  "scripts\\build-installer.js"
+                  },
+                  {
+                      "sha256":  "d57d3f0183c5092e946cd8ecdc7fe4a51c55eae6eacac64bee891964c648d714",
+                      "path":  "scripts\\build-niche-review-sheet.py"
+                  },
+                  {
+                      "sha256":  "b653161e5cb526ac1171810e342b7668256464798cda6e93ebb381dbf6e041eb",
+                      "path":  "scripts\\build-remotion-player.js"
+                  },
+                  {
+                      "sha256":  "aba29ec721440b265c1493006c3fcc8cac13402aa0892d17073c17ad345518f0",
+                      "path":  "scripts\\build_documentary_showcase.py"
+                  },
+                  {
+                      "sha256":  "9d8ce84629de701eb9def79925ab9686688c805e6b96ce078ff866c3d7ec8833",
+                      "path":  "scripts\\build_full_server_app.py"
+                  },
+                  {
+                      "sha256":  "e6b32f8c05d017b2e6809856802f45aac336cdc88b8b84eee4467cca9f51d7a6",
+                      "path":  "scripts\\build_map_chart_showcase.py"
+                  },
+                  {
+                      "sha256":  "30ab5a1462e453c67dbd2da57960a0bfd071b4a9699ac09d3e0f87c385347156",
+                      "path":  "scripts\\build_media_first_showcase.py"
+                  },
+                  {
+                      "sha256":  "53752d9f41ab35aad17e4d8a914ef42155d34033983b7907b5c0f28b9558d47d",
+                      "path":  "scripts\\build_reference_media_showcase.py"
+                  },
+                  {
+                      "sha256":  "2bd152c5dc7507cf52b3b3f7ff7b979f2b2ed23088443a4e6bf43767d9dd8304",
+                      "path":  "scripts\\build_royal_family_showcase.py"
+                  },
+                  {
+                      "sha256":  "2f6d11126d243ba9c1c5bb6881608f33351f886374da057dc9e892e9aa8112d9",
+                      "path":  "scripts\\capture-source-evidence.js"
+                  },
+                  {
+                      "sha256":  "5d373a796ffc79557568aac1b65463c06b776fdd9e133752d1534b20ccb6eb9a",
+                      "path":  "scripts\\check-editorial-review-loop.py"
+                  },
+                  {
+                      "sha256":  "17202f4f014486711df403cf02f93a7f00e4d031fa576275cf095478fb46d26d",
+                      "path":  "scripts\\check-live-niche-direction.py"
+                  },
+                  {
+                      "sha256":  "63b81adada6a4bfc3d257970be4392792426ea25c788edc0881b9b709ae00e02",
+                      "path":  "scripts\\check-niche-director-api.py"
+                  },
+                  {
+                      "sha256":  "30bc327da7b185f0dc4ca51143607e6e97211f8abd4ba0cb97c4fa264e19cddd",
+                      "path":  "scripts\\check-niche-generate-api.py"
+                  },
+                  {
+                      "sha256":  "f7fe1d96e1535abe3d3befa43ab9e63745f8c656cdb9cc6b2edb5ed9ff53044e",
+                      "path":  "scripts\\correct-news-source-media.py"
+                  },
+                  {
+                      "sha256":  "e75b9d9b4ce1e2d259ef3a0a90e8fb69781457c9f501fa2843ed32fd4eefcd39",
+                      "path":  "scripts\\create-clean-working-folder.ps1"
+                  },
+                  {
+                      "sha256":  "3d075f687ef3206eb3a2b895e409a72e8ea94fd14d7442512b64d5a4ef8c5b6f",
+                      "path":  "scripts\\create-cooper-documentary.py"
+                  },
+                  {
+                      "sha256":  "b32ed3bec4b12cd4187851508c9240b6fac201954961a1b0f919587e59039358",
+                      "path":  "scripts\\create-env-public.ps1"
+                  },
+                  {
+                      "sha256":  "0d8f24a6b6f7c37bad27a1b7c8fc22917eb44ce25394f96c33968d5a58ddfa38",
+                      "path":  "scripts\\create-github-source.py"
+                  },
+                  {
+                      "sha256":  "e80603e682f7bf7d9dff9a18f2495d6c7767bf13a4686589a5ed73da5cda6035",
+                      "path":  "scripts\\create-installer-build-config.js"
+                  },
+                  {
+                      "sha256":  "1aa06084b36a2b0bbbf63f05bfa5dfc5c259f03d409fb9f42e4b4d6415c35ca3",
+                      "path":  "scripts\\create-niche-visual-review.py"
+                  },
+                  {
+                      "sha256":  "97fd2d1d352a9f890826f8148e611ced44db88ad6b1705ee8edeb39212c51b56",
+                      "path":  "scripts\\create-original-working-folder.ps1"
+                  },
+                  {
+                      "sha256":  "d9baeea25d882f8473e23d8108eff101ec29c99c44adc8a277537e2c2f3ed990",
+                      "path":  "scripts\\create-portable-iexpress.sed"
+                  },
+                  {
+                      "sha256":  "c37832eab3e4ccc826a63633c7259c7f6c9b5f5fb8c1ea32d3d3a3a93e580a2f",
+                      "path":  "scripts\\create-pure-package.ps1"
+                  },
+                  {
+                      "sha256":  "9af9965d426cfaed09b99bd11a2921fb2600ee28401f12010638e4a2265ad6bc",
+                      "path":  "scripts\\create_10_niche_videos.py"
+                  },
+                  {
+                      "sha256":  "a44377322fe75e75ac8e289a49885c8dd663d21145b840d2b29af3152efc28ef",
+                      "path":  "scripts\\create_crime_doc_test.py"
+                  },
+                  {
+                      "sha256":  "2ca4847da5f743f2e466768067fb2a6b0568422ac88061fea5c66dc424fda60a",
+                      "path":  "scripts\\create_royal_family_1min_video.py"
+                  },
+                  {
+                      "sha256":  "fce766d96ca03e2b25ee45c6ee123469c16c80b42e0bfbe5f11471128189522d",
+                      "path":  "scripts\\debug_web_queries.py"
+                  },
+                  {
+                      "sha256":  "5397a80aa54fe62a70585b9712c1b73c9a3102b27a238facf4827eb4742435d9",
+                      "path":  "scripts\\docker-production-check.ps1"
+                  },
+                  {
+                      "sha256":  "08aab052fad70cb9c4eb4ff8dfe4195676b3c07cea7f5394dd5e88b3b322b97a",
+                      "path":  "scripts\\download_documentary_fonts.py"
+                  },
+                  {
+                      "sha256":  "de113a4906e10135a0275f211533e1bebef4e3026d7b1c8cbd93b7ccbfc4ca38",
+                      "path":  "scripts\\editor-ui-smoke.js"
+                  },
+                  {
+                      "sha256":  "f7c9c42c5d8b7ef9a7210a225bebe573dd8e9711dfc6ebe4c6f87e2ec404dbbe",
+                      "path":  "scripts\\finalize-verified-installer.js"
+                  },
+                  {
+                      "sha256":  "24a78509bfe7204b061f1a65391309406c0f2582d01874bc8a45df13f2831ec6",
+                      "path":  "scripts\\finish-cooper-documentary.py"
+                  },
+                  {
+                      "sha256":  "7d2ee1144ec82e395a53f386710a4240407e1ba5152b6fb98311b6618161d561",
+                      "path":  "scripts\\generate-procedural-sfx.py"
+                  },
+                  {
+                      "sha256":  "f82824ff07da6bedfb7506ad57a417971398979ff946ec5efb4cda28a8f9c8a6",
+                      "path":  "scripts\\generate_editorial_sfx.py"
+                  },
+                  {
+                      "sha256":  "67050c48ee6fb609f56b3ed6084e32e383405b6457492056f324d30db2d27aa6",
+                      "path":  "scripts\\inspect-news-export.py"
+                  },
+                  {
+                      "sha256":  "697a29d5323f42bdc65840b6a485af33907176509ea43e17ef56b232357b22ae",
+                      "path":  "scripts\\inspect-niche-generation.py"
+                  },
+                  {
+                      "sha256":  "5cc832c0c07a8974b230ca4102c6787d30a5480a62ba3e237d719f3642775e24",
+                      "path":  "scripts\\inspect_approved.py"
+                  },
+                  {
+                      "sha256":  "effb17abec9d25b2dfc19762bfe4d76765cf67b0305d2f53c5e38d086e38a330",
+                      "path":  "scripts\\openrouter_model_smoke.py"
+                  },
+                  {
+                      "sha256":  "903a2a477d442eb8f4ac373bd975f67929f67fc1111049f45cef02c25bea3517",
+                      "path":  "scripts\\package-scan.js"
+                  },
+                  {
+                      "sha256":  "ec1bdb1bc49674721daf98557e96b0b4405b6404452429b92571ec3ce2a7184b",
+                      "path":  "scripts\\patch_director_and_grammar.py"
+                  },
+                  {
+                      "sha256":  "24eaaa7011def757ab04f1386f8913ae832bf6b151c67aa4c08e93a0f5a8a3c6",
+                      "path":  "scripts\\prepare-release.js"
+                  },
+                  {
+                      "sha256":  "05de2f4d6166c54215ef1e1ee8197d125e64d66ab368640d6c34707191574766",
+                      "path":  "scripts\\prepare_pristine_royal_footage.py"
+                  },
+                  {
+                      "sha256":  "f58f9e0fd751eb5eb0d4db14297d386a22f9800bf5c8a197f8fb10a4cb3e88c2",
+                      "path":  "scripts\\prepare_royal_family_review_edit.py"
+                  },
+                  {
+                      "sha256":  "408b898d0be593c525abca766a7c07f2db6c51ef3e7eed06faa60c58f5c0a4f9",
+                      "path":  "scripts\\prepare_semantic_manifest_media.py"
+                  },
+                  {
+                      "sha256":  "fa6d686ae541db4ab16a9fd1493a0e6acd0b72e952222263c70765ebcf4bbacf",
+                      "path":  "scripts\\preview_all_assets.py"
+                  },
+                  {
+                      "sha256":  "0a24ae0c6370c3449233907313a256240e16c270cdf78eb3b3e2f3dc2356864e",
+                      "path":  "scripts\\preview_templates.py"
+                  },
+                  {
+                      "sha256":  "0b32943ee50ea1e7e75a6408dd538ceccdd3019e70f3db9cfe2a9a416ddeb2c9",
+                      "path":  "scripts\\preview_vox_templates.py"
+                  },
+                  {
+                      "sha256":  "d2c645aac8df26b8845127c4fe2613a8a322982d245cb9cf436a0cb434497a2e",
+                      "path":  "scripts\\produce_1min_documentary.py"
+                  },
+                  {
+                      "sha256":  "f8d7daa1802039218e5661b280ae603e093b75f89ce5d518ecd109d311f59a96",
+                      "path":  "scripts\\produce_1min_everything.py"
+                  },
+                  {
+                      "sha256":  "fd76e48ca7762a75f341e8ae5b982ef0d64b6bd96901fad2ce95cd87fad80d82",
+                      "path":  "scripts\\produce_1min_stock_demo.py"
+                  },
+                  {
+                      "sha256":  "40efc3e5bf208085dab65e68b36ea11657642b3c213b7c61ff6dbab49bc38eba",
+                      "path":  "scripts\\produce_berlin_airlift_history_whisper_sfx.py"
+                  },
+                  {
+                      "sha256":  "3477d698953a80f504280353ec3f5ec648058a35bd7033413a125388f7a53ea9",
+                      "path":  "scripts\\produce_corolla_ae101.py"
+                  },
+                  {
+                      "sha256":  "ef12e1259c78ccdb626274f04a0faa070598fba6045ced2edee8781658ac7d22",
+                      "path":  "scripts\\produce_crime_doc.py"
+                  },
+                  {
+                      "sha256":  "328b5db80dcdb11399956d2864bcca2e125efd063b268acdfa7281e871f8f800",
+                      "path":  "scripts\\produce_end_to_end.py"
+                  },
+                  {
+                      "sha256":  "8d14a14769ddfa490c22a964ced41ef9b4e6ad716dc770627b2ee124b209886e",
+                      "path":  "scripts\\produce_fixed.py"
+                  },
+                  {
+                      "sha256":  "4214c2cf954644559762ac27ea05d78ef24a07cd63d25e7ca22fbd5f98728f55",
+                      "path":  "scripts\\produce_native_1min.py"
+                  },
+                  {
+                      "sha256":  "31a3611e9f0bec1994ca9d268cbab85f0bc935447c30d2540f3b61cdb6d8ce4c",
+                      "path":  "scripts\\produce_panama_canal_whisper_sfx.py"
+                  },
+                  {
+                      "sha256":  "1dfc843d65f2c03d334405c4cee4bb462edd3cfc85694bb6cbd91287a9953b41",
+                      "path":  "scripts\\produce_pro_crime.py"
+                  },
+                  {
+                      "sha256":  "6fd56a48a2452a19353be990df116b43295cb9981654faa5755e22d8ed7984b5",
+                      "path":  "scripts\\produce_remotion_test.py"
+                  },
+                  {
+                      "sha256":  "3896fb83691e4de78d9ba69c1e4a3fe1127df64139412ec309a9b12ab438ede5",
+                      "path":  "scripts\\produce_smart_crime_doc.py"
+                  },
+                  {
+                      "sha256":  "6ddba2fa202a7e77600dfe573ae201345d4a4e6ae900b264638d38f46b721133",
+                      "path":  "scripts\\produce_suez_crisis_history_validation.py"
+                  },
+                  {
+                      "sha256":  "a0940bd6c4aa7a5569bab3ef217d182d3abc51b303f9cdc48f99809cc1e3f208",
+                      "path":  "scripts\\produce_titanic_1min.py"
+                  },
+                  {
+                      "sha256":  "8e3d8bf6a4c58f3c3502f909d60fac820e8ff874eeb1d6e20b49e1c602e53517",
+                      "path":  "scripts\\produce_toyota_corolla_1min.py"
+                  },
+                  {
+                      "sha256":  "42e20b96c51256cb5a38a36b4cd2f7b5b3c8a18e14be18bfb5906d009f55027f",
+                      "path":  "scripts\\produce_vox2.py"
+                  },
+                  {
+                      "sha256":  "6c0e0caec43c9fd0321140bb1dc45d0c3ad80673c944b27311ca29fa12ba6c04",
+                      "path":  "scripts\\produce_vox_crime.py"
+                  },
+                  {
+                      "sha256":  "aee721f5ffef0dc0ad088211e87d28fbd58b810515902fbc427444baa070607e",
+                      "path":  "scripts\\produce_vox_from_manifest.py"
+                  },
+                  {
+                      "sha256":  "5a30800409d5a45d4c3374b96a716de4a2ae21c1b0c068a039c20fafaee39d45",
+                      "path":  "scripts\\produce_yt_doc.py"
+                  },
+                  {
+                      "sha256":  "790d6e91c12f340aaaf630b19cc0398cfd70602b71cf3b597bb27eed7161da7c",
+                      "path":  "scripts\\prove_four_scenes.py"
+                  },
+                  {
+                      "sha256":  "96bac8654fcd0419c0674163d40674705fad2141f0dcb352bda0bccc7c3063ef",
+                      "path":  "scripts\\publish-prepared-release.py"
+                  },
+                  {
+                      "sha256":  "6c4d720cfc8d30eca1d7f54838247e93f2e8788caec6040c5725e60f76c77bdb",
+                      "path":  "scripts\\qa-audit.js"
+                  },
+                  {
+                      "sha256":  "e2a532544875346a235c8a401187565a80c7e7571f6d0768ecfba6d260fa1dde",
+                      "path":  "scripts\\recover_saved_documentary.py"
+                  },
+                  {
+                      "sha256":  "eb4317decaecae574b5faf9f4ce9eadc1a8f85ce9069505b74c2ce346d069ba6",
+                      "path":  "scripts\\refresh-release-shell.js"
+                  },
+                  {
+                      "sha256":  "372df99bbe7a2b082a923f4215fdba98a287620aab449cc8c25233fd8b9156b1",
+                      "path":  "scripts\\remotion-section-join.js"
+                  },
+                  {
+                      "sha256":  "ac7238ee1fc71711f67a74d2ba74600c18f3c05be15b9d126816d1a044106284",
+                      "path":  "scripts\\render-adaptive-documentary-smoke.js"
+                  },
+                  {
+                      "sha256":  "d22702bbb9035a0b5cd31533da5c13840035c5df884f63f1a20c2396b3f74e1f",
+                      "path":  "scripts\\render-cooper-documentary.py"
+                  },
+                  {
+                      "sha256":  "1306b8052b525295ef4e61e68c8272c2abb7bea4e4cadd876c003db3aead702c",
+                      "path":  "scripts\\render-editing-dna-smoke.py"
+                  },
+                  {
+                      "sha256":  "ac4f9104676a5c60da360329ef2f7732f6657867b4c38440a83c1f06d9407bfd",
+                      "path":  "scripts\\render-remotion-demo.js"
+                  },
+                  {
+                      "sha256":  "287b14b616033e5cc464f96256479f3ba406812f0d1e37ebc98ef423e423782f",
+                      "path":  "scripts\\render-remotion-manifest.js"
+                  },
+                  {
+                      "sha256":  "edea84b21e91fb86e3128b53e658493abb9b3c177ff34d190646b7998a130cf6",
+                      "path":  "scripts\\render-template-frames.js"
+                  },
+                  {
+                      "sha256":  "0a3521053ac5e1661dbd2356da479b3fc25526b787f772b1cf81afab357a3f0f",
+                      "path":  "scripts\\render_all_templates_showcase.js"
+                  },
+                  {
+                      "sha256":  "30dc6aacb343b2d555c978b14dc22aaae18acc7d8329ba9f335e4820d90e3e26",
+                      "path":  "scripts\\render_existing_400_motion_master.py"
+                  },
+                  {
+                      "sha256":  "1966e9cf0d340141beac5459264ffaabee0f3522983f76dfd1099f2da23923c8",
+                      "path":  "scripts\\render_motion_engine_smoke.py"
+                  },
+                  {
+                      "sha256":  "6514f0e58d422c40cc043b2470a68ca26d80a6690de2aa49b6221eefc4b61ee4",
+                      "path":  "scripts\\render_professional_showcase.py"
+                  },
+                  {
+                      "sha256":  "57c9460669d988bcbcd5a64dccfcdf9d236f6f56c16bc897f11dc9ad29b065ee",
+                      "path":  "scripts\\render_showcase_video.py"
+                  },
+                  {
+                      "sha256":  "ba49621353dbec337a0e158944e92fa9e6c1286b12a0effb7bbde99df2c2a7c2",
+                      "path":  "scripts\\render_template_library_showcase.py"
+                  },
+                  {
+                      "sha256":  "68ceaad0b8e0bdc31406487c16a81162436f1ea6a1465b5f90894a149451c78a",
+                      "path":  "scripts\\render_timeline_frames.js"
+                  },
+                  {
+                      "sha256":  "07c76c32a0ba71d822b1f407d3fbf5b288ccb4579142ffd6185dfb15d14c8c8f",
+                      "path":  "scripts\\repair-cooper-documentary.py"
+                  },
+                  {
+                      "sha256":  "0fe265e8f51ad45b4d96eac89862abf5f1a8eeed53bcf4c5934b5909148d1209",
+                      "path":  "scripts\\rerender_panama_with_grounded_map.py"
+                  },
+                  {
+                      "sha256":  "d512939906a8055f16be039e9169c4d5ce3306839524b73c8ec89133d985905d",
+                      "path":  "scripts\\rerender_saved_semantic_manifest.py"
+                  },
+                  {
+                      "sha256":  "98b52e5a20614aa0dd73d9d4f690fe7f01d8981eb9ed1a985ef6b02247ae8801",
+                      "path":  "scripts\\rerender_suez_history_with_grounded_nasser.py"
+                  },
+                  {
+                      "sha256":  "0773d1c911b97c48592d2eacb935d149dbb4e8758fa2a0dcf5a70298942f2c71",
+                      "path":  "scripts\\restart_nfl_test_backend.ps1"
+                  },
+                  {
+                      "sha256":  "ad148d88080ccb5d7ac2c4ba0967449488d8c032ea443e2358104ac5739fa3a5",
+                      "path":  "scripts\\resume_nfl_test_video_001_attempt_009.py"
+                  },
+                  {
+                      "sha256":  "75d5fb186fb2073268725eda3c6754b0917d435fa8e8432d44c1a3223dbb1307",
+                      "path":  "scripts\\resume_nfl_test_video_001_attempt_010.py"
+                  },
+                  {
+                      "sha256":  "4c96dbf6bfe9b5baf1dfb43e69e22688b10688f551064b596f39f489ca846322",
+                      "path":  "scripts\\resume_nfl_test_video_001_attempt_013.py"
+                  },
+                  {
+                      "sha256":  "16aeb9d6a47afdc941d078a4c55df740d27dcc97a80bad58fb3f7e75d9b1c98e",
+                      "path":  "scripts\\resume_nfl_test_video_001_attempt_014.py"
+                  },
+                  {
+                      "sha256":  "87644858a8a4f8ac1f4efdfecbb1695665c4db9bcad7baa680c8dbd4677fe16b",
+                      "path":  "scripts\\resume_nfl_test_video_001_attempt_015.py"
+                  },
+                  {
+                      "sha256":  "7198b20b806f9755f1fc36ba6b32b2e961537c5d29f77b1f91fa8156ebb3396b",
+                      "path":  "scripts\\resume_nfl_test_video_001_attempt_016.py"
+                  },
+                  {
+                      "sha256":  "5aba760f0292c31bd96fe1dc62100514d64b11046e79718f9a06d5274fb0c44f",
+                      "path":  "scripts\\retrieval-yield-live-check.py"
+                  },
+                  {
+                      "sha256":  "2d431d8f7ad3e9979187b28716c4653bc33504212703b3c0c2b2fbcfd0bfcbbd",
+                      "path":  "scripts\\retry-news-documentary.py"
+                  },
+                  {
+                      "sha256":  "4e403f1312ce3d9ea38b796d3d680db46187862a9159aa5f17a26a6a83a64653",
+                      "path":  "scripts\\retry_nfl_test_video_001.py"
+                  },
+                  {
+                      "sha256":  "2bdf2d76774e461e45277ed3c2a17c93e1de39fbafc2358d3d795ba3028c6250",
+                      "path":  "scripts\\review_documentary_direction.py"
+                  },
+                  {
+                      "sha256":  "e6a9b6356f3cf503be1690744abc7b2b939f57b412ab54e192c4cccc2ef8f8f6",
+                      "path":  "scripts\\review_rendered_frames.py"
+                  },
+                  {
+                      "sha256":  "8f9ae8755bab46e6c2147a2589621e9b74a755812b8a4b88a90743a1249afc42",
+                      "path":  "scripts\\run_ae_director_showcase.py"
+                  },
+                  {
+                      "sha256":  "d84a7aba5d9f16841c8dde3269d6ea9bca14d2b251c4af17725648a0b5b9fb01",
+                      "path":  "scripts\\run_director_showcase.py"
+                  },
+                  {
+                      "sha256":  "2c8aed5dea81ad6a1ce0bcccae8642ea94bc3373e728c84239b4254d45672a62",
+                      "path":  "scripts\\run_gta_vi_1min_parallel_production.py"
+                  },
+                  {
+                      "sha256":  "793f0cb7534b4e8d788bbf67bc604ea2311e57d61d95da1c46125113ce43d514",
+                      "path":  "scripts\\run_nfl_test_video_001.py"
+                  },
+                  {
+                      "sha256":  "72cfe8a9dfae9acb259f534eaa31184a16a401dfc493562ce4218f0cc82f5dcf",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_008.py"
+                  },
+                  {
+                      "sha256":  "22b2e7dea53554ff1e535050c9c979f0cf71d56b869e58e1d6a2af8a25c73b81",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_011.py"
+                  },
+                  {
+                      "sha256":  "ab20827a0fbb5e6cb8aa0b808a4fe1ae13f9fa74006ddd40fd64ae4645e157f3",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_012.py"
+                  },
+                  {
+                      "sha256":  "a0e9d6563515dd12fc0a4034011a42fe14cddbea17b74065f6bb376174120a81",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_017.py"
+                  },
+                  {
+                      "sha256":  "65bf5636fae0faaf543de81e4fe7c95a2277d01c3e3eff2fdc3a5a211a5604f5",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_018.py"
+                  },
+                  {
+                      "sha256":  "fae2bad030585b162b5cf19f94ad06b26f9d48ff5e5b7f2669fd10d80a081f1b",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_019.py"
+                  },
+                  {
+                      "sha256":  "3f7a10e0be463753d2badf4e96fe9e591e39556da58340a47d530ffb5f75b7c3",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_021.py"
+                  },
+                  {
+                      "sha256":  "e4f501e9e17d68c2fd25da3ccf48b5dc7512fadce932d0b0e27332462446e3fc",
+                      "path":  "scripts\\run_nfl_test_video_001_attempt_022.py"
+                  },
+                  {
+                      "sha256":  "bd275110f11f56f4f20fa1d63372d46a07487158f9c407c7ed6a29b18057da9f",
+                      "path":  "scripts\\run_royal_5min_main_test.py"
+                  },
+                  {
+                      "sha256":  "0d335ca7268929116b86196b8d4197ac5a48cdd32df6f8bae8147f3159256b45",
+                      "path":  "scripts\\run_royal_family_2min_video.py"
+                  },
+                  {
+                      "sha256":  "f71d82070738bb5fb1c43b805a2034f3f430362a4c85de346b16dcee347f4237",
+                      "path":  "scripts\\run_royal_family_reliability.py"
+                  },
+                  {
+                      "sha256":  "1354aa682eb85bd6256d54689a08db2b605234885bae68c92af47f39de265e0a",
+                      "path":  "scripts\\run_semantic_400_test.py"
+                  },
+                  {
+                      "sha256":  "43d88b393c772e1665b683a4a8b5d26a820a3ff30236c07ce9047558825c200f",
+                      "path":  "scripts\\run_test_video_1_nfl.py"
+                  },
+                  {
+                      "sha256":  "646fb37c6ce7db9a291c152715261a2a861edb43389012ebafbf8aa4f95c1aa8",
+                      "path":  "scripts\\security-scan.js"
+                  },
+                  {
+                      "sha256":  "89c656d20942d70e18815242329b21501e8934f56c91fe5437baae98c19d9deb",
+                      "path":  "scripts\\settings-browser-smoke.js"
+                  },
+                  {
+                      "sha256":  "005f921aadc24ca49176180b2b3497f209d073f9e34c32e659d4fe5e8f950dc4",
+                      "path":  "scripts\\settings-ui-smoke.js"
+                  },
+                  {
+                      "sha256":  "73ea2da587794dd2fff60135b0abc702b987abc50f765f41d8224c09d1783f21",
+                      "path":  "scripts\\supabase-auth-smoke.js"
+                  },
+                  {
+                      "sha256":  "3449393265e98515289ffa21113ee68ffe2f7eb5de775d04d34260e9c6324877",
+                      "path":  "scripts\\test_each_template.py"
+                  },
+                  {
+                      "sha256":  "4b7a0ae63a5b38742ceb56e3a5b9109145b45031d6be89f481aaef871294e3e5",
+                      "path":  "scripts\\test_flask_endpoints.py"
+                  },
+                  {
+                      "sha256":  "57f1f77833b3b3444822f80d8cdfebd86648cbffdfa7dd58f9113eca5a91ce2c",
+                      "path":  "scripts\\test_grammar_audit.py"
+                  },
+                  {
+                      "sha256":  "eaaa14eb2adf5f62546418eaa24ead35142a8d48777adc30ffec9a3798fc9f0d",
+                      "path":  "scripts\\test_gta6_director_plan.py"
+                  },
+                  {
+                      "sha256":  "94c6d22184937a57b72fe4547bd4d16a446450d15dac3d584a1cfbae1a6481c4",
+                      "path":  "scripts\\test_manifest_scenes.py"
+                  },
+                  {
+                      "sha256":  "044e50dce609a1e81a0fabb90909ea74eddf4dcc7a050b93429abbe6a9b77e55",
+                      "path":  "scripts\\test_native_drawtext.py"
+                  },
+                  {
+                      "sha256":  "340b910eee3ec1508922ebe3a473452b37c74cbb4b0125966218bb7d4febfc55",
+                      "path":  "scripts\\test_native_engine.py"
+                  },
+                  {
+                      "sha256":  "452def6a67ccdb9396da37f217ad260afee772ee8c7be567f9bfaa4809ef2fed",
+                      "path":  "scripts\\test_render_stills.js"
+                  },
+                  {
+                      "sha256":  "ead82ab6eee655e45e8a4b7e8ccba9b831122165858fed971d4508cd66a28b86",
+                      "path":  "scripts\\test_template_frames.js"
+                  },
+                  {
+                      "sha256":  "1f9dec40d559c6bc3bef1bed89848f22ed07bc56f2961637e53a02fc48add304",
+                      "path":  "scripts\\test_variety_documentary.py"
+                  },
+                  {
+                      "sha256":  "3cdf84d340596f61aa655610878523d89bd852f61205887dfeee875b9981cdba",
+                      "path":  "scripts\\validate-hardening-v8-documentary.py"
+                  },
+                  {
+                      "sha256":  "5313401277720bd9a725c65ce73afe0d2d4584acc46b020d8a7a5138a082e4c4",
+                      "path":  "scripts\\validate-news-documentary.py"
+                  },
+                  {
+                      "sha256":  "0f692962361234c79cabf5d0aa0d35162538d0e777aeeab539ecdf7e3ebecd66",
+                      "path":  "scripts\\validate_documentary_system.py"
+                  },
+                  {
+                      "sha256":  "7208934a09766060ec058e5c796db7d5359401a40aa92134e4d9d71e40c084f7",
+                      "path":  "scripts\\validate_hybrid_motion.py"
+                  },
+                  {
+                      "sha256":  "ad6aad2aa946922df83269f0f1b3c3695bb033314816904b7fce288ffb357615",
+                      "path":  "scripts\\verify-clean-release.py"
+                  },
+                  {
+                      "sha256":  "290d304895e1d5ac7f2549a965d41e77f341a035a55af7480de6c5038c3416ed",
+                      "path":  "scripts\\verify-delivered-api-replay.py"
+                  },
+                  {
+                      "sha256":  "a02abdbc45554dde80891146a1d05a9c03b0b287266a5ec8d11cdbc86e834832",
+                      "path":  "scripts\\verify-packaged-auth.py"
+                  },
+                  {
+                      "sha256":  "106d2570b7cd1b43ce980b52f5856efe2bd6d76e86d8064c44706de94db192b9",
+                      "path":  "scripts\\verify-production-editing.py"
+                  },
+                  {
+                      "sha256":  "e0fd39bec926533c9347038d278a04a8ca17b08b914e44d6e086757b794d5808",
+                      "path":  "scripts\\verify-release-generation.py"
+                  },
+                  {
+                      "sha256":  "4e9a17165870c1f5f73afd687f1e3fa00e87959f29156d82bce08dc43fbb3c76",
+                      "path":  "scripts\\verify-single-api-installer.js"
+                  },
+                  {
+                      "sha256":  "bcd05b7898e2b2736b1b55ccd7332b8f8d2401fa63065856097fa3a97ab45483",
+                      "path":  "scripts\\verify-single-call-generation.py"
+                  },
+                  {
+                      "sha256":  "be63bf173123eee3c3db145df4593d57cb54b628a7e84dfd2a3b80c8a0c73bed",
+                      "path":  "scripts\\verify_six_benchmark_scenarios.py"
+                  },
+                  {
+                      "sha256":  "dffa819f9d3f96d805355f2c8300930cdca513feddb7ebb4c749d7743530dcf0",
+                      "path":  "scripts\\verify_stock_apis.py"
+                  },
+                  {
+                      "sha256":  "04a910a5c7be145bc307113f05a8de11e161ff7e5a09199128e59d3deec96497",
+                      "path":  "scripts\\web-image-live-harness.py"
+                  },
+                  {
+                      "sha256":  "930333ee5fbc34c7877f2c67faa3860800a1320847220a0ad3ccddff26177445",
+                      "path":  "docs\\ADAPTIVE_DOCUMENTARY_REVISION_2026-10-05.md"
+                  },
+                  {
+                      "sha256":  "5bdb1efc6140feb027c04938dedda5a01c9f71e742e82a991f17e48bed7f21e9",
+                      "path":  "docs\\ADAPTIVE_RENDERING.md"
+                  },
+                  {
+                      "sha256":  "3208fe5bd394a3c4ab19056e1f6553b99a92015fea3b59147af27d1c370fb336",
+                      "path":  "docs\\ARCHITECTURE.md"
+                  },
+                  {
+                      "sha256":  "726cdd31271621c8191ab4c549f874891dd392cd635ac745a13ecd08bf5527a9",
+                      "path":  "docs\\AUDIT_HARDENING_2026-10-05.md"
+                  },
+                  {
+                      "sha256":  "0d52f9c145e48796652fdc97a191f73c8b759eb0f897dce70ebe9237190a186d",
+                      "path":  "docs\\chatgpt-provider-integration.md"
+                  },
+                  {
+                      "sha256":  "dfecda1199c2ac0637c0ad868c98b4728149099bc3dfffe7ea4cb2b8d8cc637d",
+                      "path":  "docs\\COST_OPTIMIZATION.md"
+                  },
+                  {
+                      "sha256":  "64e259c3034868b65a1546cec8f488017652798f7e790d4293f06d8611450f0f",
+                      "path":  "docs\\DOCUMENTARY_MOTION_RESEARCH.md"
+                  },
+                  {
+                      "sha256":  "acef1677b9dcf1e5b0e7a9861fc6af0057f7497a10ec610dd9a44eb819b3140d",
+                      "path":  "docs\\EDITORIAL_REVIEW_LOOP.md"
+                  },
+                  {
+                      "sha256":  "5e312b434744d9e3ae49be3a7d8109cde28278c407caacca789250d233414f00",
+                      "path":  "docs\\EDITOR_ARCHITECTURE.md"
+                  },
+                  {
+                      "sha256":  "c107797ded5c045d07977b25c70d77a30c14b65248324b3c4b10b03ea7ad1656",
+                      "path":  "docs\\FINAL_RELEASE_REVIEW.md"
+                  },
+                  {
+                      "sha256":  "886696462ffc07b33987f9f3b0e2a540ba2b5b94a010e2eebda34a10887da735",
+                      "path":  "docs\\FULL_SYSTEM_AUDIT_2026-10-05.md"
+                  },
+                  {
+                      "sha256":  "0ed3191561095ca538db347e6778a6d471f18dc40c1c0b64ab9081f3fda289ef",
+                      "path":  "docs\\GENERATION_API.md"
+                  },
+                  {
+                      "sha256":  "452b3453ed56a224be97a8ed437fe4cff1e1725830b10dcac33124158a9cfd5b",
+                      "path":  "docs\\GLOBAL_MEDIA_GUARANTEE.md"
+                  },
+                  {
+                      "sha256":  "07f64eba919c20e3988c4db6c8575107fffe8097ab525586adca8d687f07ed54",
+                      "path":  "docs\\LIFETIME_ACCESS_POLICY.md"
+                  },
+                  {
+                      "sha256":  "c0a0c04e629e417a842971697fd88074cf838b5818a86ec2c87187f02fd3a5ec",
+                      "path":  "docs\\LIFETIME_PRO_LAUNCH.md"
+                  },
+                  {
+                      "sha256":  "e14948ee61c37048e082c389069c2dd8d429a0f50c20b4f1e461d1f5bc3155f3",
+                      "path":  "docs\\MIXED_MEDIA_PRODUCTION_WORKFLOW.md"
+                  },
+                  {
+                      "sha256":  "a06cd978ac59b35083bcaf8c4cf1c602cd32ee0e9151e396261ce344fe8b35df",
+                      "path":  "docs\\PIPELINE_COVERAGE_INVENTORY.md"
+                  },
+                  {
+                      "sha256":  "ac7f38ff521c73f647022cf0a6c9dd16bcf61471ffdd0708109e45d24d0c77ab",
+                      "path":  "docs\\PIPELINE_REPAIR_1.0.7.md"
+                  },
+                  {
+                      "sha256":  "52c8d60933ee33ac5e11237b430093a2b2d7757cdaf92458a24eb480f8acec76",
+                      "path":  "docs\\REFERENCE_VIDEO_ANALYSIS_KUNWAR_NABEEL.md"
+                  },
+                  {
+                      "sha256":  "94e72464d5dd48a6efe92c64b3d74da39d55b9842fe5fa9168e708c3a4aeef53",
+                      "path":  "docs\\RELEASE_1.0.5.md"
+                  },
+                  {
+                      "sha256":  "0c9508e96eb9b1376591368610f13ca5db062c6bb2414af9679418e15253858e",
+                      "path":  "docs\\RELIABILITY_FIXES_1.0.4.md"
+                  },
+                  {
+                      "sha256":  "e4fb28b46d444406787616408a823cca466ae8dfe41168896fda91bbd8e3a080",
+                      "path":  "docs\\REMOTION_EDITING_SYSTEM_PLAN.md"
+                  },
+                  {
+                      "sha256":  "9b3640160b86176ee400342b6357bdd52006031a853d3c50f13a7ab37a805b0b",
+                      "path":  "docs\\REMOTION_IMPLEMENTATION_STATUS.md"
+                  },
+                  {
+                      "sha256":  "c6998f10bdc0a45f92c3f8932941d36084f917ea33c9a05cd943adac6f38ea94",
+                      "path":  "docs\\ROYAL_MEDIA_RELEASE_FIXES.md"
+                  },
+                  {
+                      "sha256":  "8c890695fe8c840d85bc4ec5b64f5a4c858ec6db2eed7b256366f88d1cc4df7a",
+                      "path":  "docs\\UNIFIED_VISUAL_PIPELINE.md"
+                  },
+                  {
+                      "sha256":  "3e8de86e88eb28d64b9db56aa8936b3ccb4ae50199cf00cf0044a0036a266069",
+                      "path":  "resources\\template-library\\builtin\\manifest.json"
+                  }
+              ],
+    "source":  "C:\\Users\\user\\Documents\\Side Projects\\Vidzeo Local\\Vidzeo App",
+    "createdAt":  "2026-10-26T14:04:02.4001003Z"
+}

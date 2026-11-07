@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing and cache
+.cache/
+cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+.nyc_output/
+coverage/
+
+# Production output & runs
+output/
+artifacts/
+temp/
+logs/
+*.log
+
+# Sensitive credentials & environment
+.env
+.env.local
+.env.*.local
+cookies.txt
+youtube-session-meta.json
+.vidzeo_*
+*.pem
+*.key
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

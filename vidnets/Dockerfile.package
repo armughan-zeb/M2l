@@ -1,0 +1,32 @@
+# escape=`
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+
+SHELL ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+ENV NODE_VERSION=20.11.1 `
+    PYTHON_VERSION=3.11.9 `
+    PYTHONIOENCODING=utf-8 `
+    VIDZEO_WEB_FAST_MODE=1 `
+    VIDZEO_FASTER_WHISPER_COMPUTE_TYPE=int8 `
+    VIDZEO_FORCE_BURN_SUBTITLES=0 `
+    VIDZEO_BURN_SUBTITLES_MAX_SECONDS=180 `
+    VIDZEO_YT_BATCH_SIZE=8 `
+    VIDZEO_YT_DOWNLOAD_CONCURRENCY=6 `
+    VIDZEO_YT_BATCH_DOWNLOAD_TIMEOUT=300 `
+    VIDZEO_MIXED_YT_DOWNLOAD_CANDIDATES=12 `
+    PATH="C:\\nodejs;C:\\Python311;C:\\Python311\\Scripts;${PATH}"
+
+RUN $ErrorActionPreference = 'Stop'; `
+    Invoke-WebRequest -Uri ('https://nodejs.org/dist/v{0}/node-v{0}-win-x64.zip' -f $env:NODE_VERSION) -OutFile C:\node.zip; `
+    Expand-Archive C:\node.zip -DestinationPath C:\; `
+    Rename-Item ('C:\node-v{0}-win-x64' -f $env:NODE_VERSION) C:\nodejs; `
+    Remove-Item C:\node.zip -Force; `
+    Invoke-WebRequest -Uri ('https://www.python.org/ftp/python/{0}/python-{0}-amd64.exe' -f $env:PYTHON_VERSION) -OutFile C:\python-installer.exe; `
+    Start-Process C:\python-installer.exe -ArgumentList '/quiet InstallAllUsers=1 TargetDir=C:\Python311 Include_pip=1 PrependPath=1' -Wait; `
+    Remove-Item C:\python-installer.exe -Force; `
+    node --version; npm --version; python --version
+
+WORKDIR C:/workspace
+COPY . .
+
+CMD ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/create-pure-package.ps1", "-Root", "C:\\workspace"]

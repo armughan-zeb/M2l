@@ -1,0 +1,23 @@
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on http://127.0.0.1:5000
+Press CTRL+C to quit
+127.0.0.1 - - [10/Sep/2026 15:32:06] "GET / HTTP/1.1" 304 -
+127.0.0.1 - - [10/Sep/2026 15:32:06] "GET /index.css HTTP/1.1" 304 -
+127.0.0.1 - - [10/Sep/2026 15:32:06] "GET /index.css HTTP/1.1" 304 -
+127.0.0.1 - - [10/Sep/2026 15:32:07] "GET /assets/vidnets-icon-glow.png HTTP/1.1" 304 -
+127.0.0.1 - - [10/Sep/2026 15:32:07] "GET /renderer.js HTTP/1.1" 304 -
+127.0.0.1 - - [10/Sep/2026 15:32:07] "GET /favicon.ico HTTP/1.1" 404 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/plans HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/voices HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/fonts HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/effects HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/animations HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/scene-modes HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/llm-providers HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/llm-models HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:09] "GET /api/youtube/session/status HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:10] "GET /api/tts-models HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:10] "GET /api/edge-tts-config HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:10] "GET /api/status HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:32:15] "GET /api/status HTTP/1.1" 200 -
+127.0.0.1 - - [10/Sep/2026 15:42:05] "GET /api/status HTTP/1.1" 200 -

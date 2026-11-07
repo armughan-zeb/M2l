@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "style": "vox-inspired-editorial",
+  "templates": [
+    {"id":"full-bleed","label":"Image-led scene","family":"image","component":"full-bleed","roles":["atmosphere","context","transition"],"status":"approved","default_panel":false},
+    {"id":"kinetic-statement","label":"Kinetic statement","family":"typography","component":"kinetic-statement","roles":["revelation","emphasis","chapter"],"status":"approved","default_panel":false},
+    {"id":"headline-center","label":"Centered headline","family":"typography","component":"kinetic-statement","roles":["revelation","emphasis","chapter"],"status":"approved","default_panel":false},
+    {"id":"keyword-reveal","label":"Keyword reveal","family":"typography","component":"keyword-reveal","roles":["revelation","emphasis","turn","climax"],"status":"approved","default_panel":false},
+    {"id":"chapter-opener","label":"Chapter opener","family":"typography","component":"chapter-opener","roles":["chapter"],"status":"approved","default_panel":false},
+    {"id":"timeline-trace","label":"Timeline trace","family":"timeline","component":"timeline-trace","roles":["chronology","sequence"],"status":"approved","default_panel":false},
+    {"id":"bar-chart","label":"Data comparison","family":"data","component":"bar-chart","roles":["comparison","scale","trend"],"status":"approved","default_panel":false},
+    {"id":"map-route","label":"Grounded map","family":"map","component":"animated-map","roles":["location","journey","territory"],"status":"approved","default_panel":false},
+    {"id":"source-highlight","label":"Source highlight","family":"evidence","component":"source-highlight","roles":["evidence","quotation","document"],"status":"approved","default_panel":false},
+    {"id":"quote-card","label":"Open quote","family":"typography","component":"quote-card","roles":["quotation"],"status":"approved","default_panel":false},
+    {"id":"split-screen","label":"Visual comparison","family":"comparison","component":"split-screen","roles":["before_after","comparison"],"status":"approved","default_panel":false},
+    {"id":"cause-effect","label":"Cause and effect","family":"diagram","component":"cause-effect","roles":["mechanism","cause_effect"],"status":"approved","default_panel":false},
+    {"id":"date-card","label":"Date / Chronology Card","family":"timeline","component":"date-card","roles":["chronology","date","milestone"],"status":"approved","default_panel":false},
+    {"id":"lower-third","label":"Lower Third Identification","family":"editorial","component":"lower-third","roles":["identity","caption","lower_third"],"status":"approved","default_panel":false},
+    {"id":"person-profile","label":"Person Profile","family":"profile","component":"person-profile","roles":["person","biography","figure"],"status":"approved","default_panel":false},
+    {"id":"stat-card","label":"Statistic Callout Card","family":"data","component":"stat-card","roles":["statistic","metric","number"],"status":"approved","default_panel":false},
+    {"id":"map-comparison","label":"Map Comparison","family":"map","component":"map-comparison","roles":["geography","territory","comparison"],"status":"approved","default_panel":false},
+    {"id":"metric-grid","label":"Metric Grid","family":"data","component":"metric-grid","roles":["metrics","stats","comparison"],"status":"approved","default_panel":false},
+    {"id":"dossier-card","label":"Dossier Profile Card","family":"profile","component":"dossier-card","roles":["investigation","person","dossier"],"status":"approved","default_panel":false},
+    {"id":"process-flow","label":"Process Flow Diagram","family":"diagram","component":"process-flow","roles":["mechanism","steps","process"],"status":"approved","default_panel":false},
+    {"id":"media-focus-card","label":"Media Focus Card","family":"evidence","component":"media-focus-card","roles":["evidence","focus","media"],"status":"approved","default_panel":false},
+    {"id":"generated-recipe","label":"Directed composition","family":"recipe","component":"generated-recipe","roles":["custom"],"status":"draft_only","default_panel":false}
+  ],
+  "rejected_for_auto_selection": ["evidence-callout", "case-file", "index-card", "terminal-log"]
+}

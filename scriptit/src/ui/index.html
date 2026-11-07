@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'none';" />
+  <title>ScriptIT — YouTube Script Generator</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">S</div>
+      <div class="brand-text">
+        <h1>ScriptIT</h1>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="keyBadge" class="badge badge-key">Key not set</span>
+    </div>
+  </header>
+
+  <main class="app-body">
+    <nav class="nav-sidebar">
+      <button class="nav-item active" data-page="home">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        Home
+      </button>
+      <button class="nav-item" data-page="generate">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+        Generate
+      </button>
+      <button class="nav-item" data-page="profile">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        Profile
+      </button>
+      <button class="nav-item" data-page="settings">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Settings
+      </button>
+      <div class="nav-spacer"></div>
+      <div class="nav-footer">
+        <span class="nav-version">v1.0.0</span>
+      </div>
+    </nav>
+
+    <!-- HOME -->
+    <section class="page active" id="page-home">
+      <div class="page-header">
+        <h2>Home</h2>
+        <p class="page-subtitle">Dashboard</p>
+      </div>
+      <div class="home-grid">
+        <div class="stat-card">
+          <div class="stat-value" id="statScripts">0</div>
+          <div class="stat-label">Scripts Generated</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statKey">—</div>
+          <div class="stat-label">API Key</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statModel">—</div>
+          <div class="stat-label">Default Model</div>
+        </div>
+      </div>
+      <div class="card home-quickstart">
+        <h3>Getting Started</h3>
+        <ol class="steps">
+          <li><strong>Set your API key</strong> — Go to Settings and paste your OpenRouter key.</li>
+          <li><strong>Choose a topic</strong> — ScriptIT researches it and selects a narrative strategy automatically.</li>
+          <li><strong>Generate</strong> — Review the evidence-backed script and its quality checks.</li>
+        </ol>
+        <button class="primary home-cta" data-page="generate">Generate a Script</button>
+      </div>
+    </section>
+
+    <!-- GENERATE -->
+    <section class="page" id="page-generate">
+      <div class="page-header">
+        <h2>Generate Script</h2>
+        <p class="page-subtitle">Research + write a YouTube script on any topic</p>
+      </div>
+      <div class="gen-layout">
+        <div class="gen-inputs">
+          <div class="field">
+            <label for="topic">Topic</label>
+            <textarea id="topic" rows="3" placeholder="e.g. 30 Greatest Football Players Ever, History of the World Cup, Why Brazil Stopped Winning..."></textarea>
+          </div>
+          <div class="ct-classify" id="ctClassify" hidden>
+            <div class="ct-row">
+              <span class="ct-label">Detected Type:</span>
+              <span class="ct-badge" id="ctBadge"></span>
+              <span class="ct-engine" id="ctEngine"></span>
+            </div>
+            <div class="field ct-override">
+              <label for="contentType">Override Type</label>
+              <select id="contentType">
+                <option value="auto">Auto-detect</option>
+                <option value="listicle">Listicle</option>
+                <option value="category">Category</option>
+                <option value="timeline">Timeline</option>
+                <option value="biography">Biography</option>
+                <option value="puzzle">Puzzle</option>
+                <option value="system">System</option>
+                <option value="comparison">Comparison</option>
+                <option value="collision">Collision</option>
+                <option value="era">Era</option>
+                <option value="investigation">Investigation</option>
+                <option value="documentary">Documentary</option>
+                <option value="explainer">Explainer</option>
+                <option value="tutorial">Tutorial</option>
+                <option value="review">Review</option>
+                <option value="news">News Analysis</option>
+                <option value="case-study">Case Study</option>
+                <option value="essay">Video Essay</option>
+                <option value="general">General Story</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="duration">Target Duration</label>
+            <select id="duration">
+              <option value="3min">3 min</option>
+              <option value="5min">5 min</option>
+              <option value="8min">8 min</option>
+              <option value="10min" selected>10 min</option>
+              <option value="15min">15 min</option>
+              <option value="20min">20 min</option>
+              <option value="30min">30 min</option>
+              <option value="45min">45 min</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="researchMode">Research Speed</label>
+            <select id="researchMode">
+              <option value="quick" selected>Quick — broad web search</option>
+              <option value="thorough">Thorough — deeper verification</option>
+            </select>
+            <div class="hint">Quick searches the web in parallel and writes immediately. Thorough adds a second evidence pass.</div>
+          </div>
+          <div class="field">
+            <label for="model">Model</label>
+            <select id="model"></select>
+          </div>
+          <div class="field">
+            <label for="voice">Narration Tone</label>
+            <select id="voice">
+              <option value="conversational">Conversational</option>
+              <option value="analytical">Analytical</option>
+              <option value="dramatic">Dramatic</option>
+              <option value="calm">Calm</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="narratorUrl">Reference YouTube video <span class="hint">optional — clone structure & outline</span></label>
+            <div class="narrator-row">
+              <input id="narratorUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." />
+              <select id="narratorModel" title="Model used to build the style or structure profile"></select>
+              <button id="narratorAnalyze" class="ghost" type="button" title="Analyze tone and voice">Analyze Voice</button>
+              <button id="structureCloneBtn" class="ghost" type="button" title="Extract sequence structure and outline">Clone Structure</button>
+            </div>
+            <div class="hint">
+              Paste a YouTube link and click <strong>Clone Structure</strong> to reverse-engineer its outline, hook formula, and sequence pacing. Enter a new topic to write a script in that exact structure.
+            </div>
+            <div id="narratorStatus" class="hint"></div>
+            <div id="narratorProfile" class="narrator-profile" hidden></div>
+            <div id="clonedStructurePreview" class="structure-preview" hidden></div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button id="generate" class="primary gen-btn" style="flex:1">
+              <span class="btn-label">Generate Script</span>
+              <span class="btn-spinner" hidden></span>
+            </button>
+            <button id="clearTopicBtn" class="ghost" type="button">Clear</button>
+          </div>
+          <div class="research-preview" id="researchPreview" hidden>
+            <div class="rp-title">Research pulled</div>
+            <div class="rp-row" id="rpStatus">Status: —</div>
+            <button id="retryResearchBtn" class="ghost small" type="button" hidden>Refresh sources</button>
+            <div class="rp-row" id="rpEngine">Engine: —</div>
+            <div class="rp-row" id="rpSources">0 sources</div>
+            <div class="rp-row" id="rpFacts">0 facts</div>
+            <div class="rp-row" id="rpCoverage">Question coverage: —</div>
+            <div class="rp-row" id="rpConflicts">Conflicts: —</div>
+            <div class="rp-row" id="rpFresh">Freshest data: —</div>
+            <div class="rp-row" id="rpCache">Cache: —</div>
+            <div class="rp-row" id="rpNarrator">Narrator: —</div>
+            <div class="rp-row" id="rpClonedStructure">Structure: —</div>
+          </div>
+        </div>
+        <div class="gen-output">
+          <div class="gen-output-tabs">
+            <button class="tab active" data-tab="script">Script</button>
+            <button class="tab" data-tab="raw">Raw</button>
+            <div class="gen-output-actions">
+              <button id="copyBtn" class="ghost" title="Copy script">Copy</button>
+              <button id="exportBtn" class="ghost" title="Export as .md">Export .md</button>
+            </div>
+          </div>
+          <div class="gen-output-body">
+            <div id="empty" class="empty">
+              <div class="empty-icon">✦</div>
+              <h2>Generate your first script</h2>
+              <p>Enter a topic and hit <strong>Generate Script</strong>. ScriptIT researches it, selects a fresh narrative strategy, and validates the result.</p>
+              <ul class="empty-steps">
+                <li>1. Set your OpenRouter key in <button class="link-btn" data-page="settings">Settings</button>.</li>
+                <li>2. Choose your topic, length, and narration tone.</li>
+              </ul>
+            </div>
+            <article id="scriptView" class="script" hidden></article>
+            <pre id="rawView" class="raw" hidden></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PROFILE -->
+    <section class="page" id="page-profile">
+      <div class="page-header">
+        <h2>Profile</h2>
+        <p class="page-subtitle">Your preferences and usage</p>
+      </div>
+      <div class="profile-layout">
+        <div class="card">
+          <h3>Preferences</h3>
+          <div class="profile-row">
+            <span class="profile-label">Preferred Model</span>
+            <span class="profile-value" id="profModel">—</span>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Account</h3>
+          <div class="profile-row">
+            <span class="profile-label">API Key</span>
+            <span class="profile-value" id="profKey">Not set</span>
+          </div>
+          <div class="profile-row">
+            <span class="profile-label">Storage</span>
+            <span class="profile-value">Encrypted locally (AES)</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="page" id="page-settings">
+      <div class="page-header">
+        <h2>Settings</h2>
+        <p class="page-subtitle">Configure ScriptIT</p>
+      </div>
+      <div class="settings-layout">
+        <div class="card">
+          <h3>API Key</h3>
+          <div class="field">
+            <label for="apiKey">OpenRouter API Key</label>
+            <input id="apiKey" type="password" placeholder="sk-or-v1-..." autocomplete="off" />
+            <div class="hint">
+              Stored locally with AES encryption via electron-store. Never leaves your machine except to call OpenRouter.
+              <a href="#" id="getKey">Get a key →</a>
+            </div>
+          </div>
+          <div class="field">
+            <label>Status</label>
+            <div id="keyStatus" class="hint">Unknown</div>
+          </div>
+          <div class="settings-actions">
+            <button id="saveKey" class="primary small">Save Key</button>
+            <button id="clearKey" class="ghost">Clear Key</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>About</h3>
+          <div class="profile-row">
+            <span class="profile-label">Version</span>
+            <span class="profile-value">1.0.0</span>
+          </div>
+          <div class="profile-row">
+            <span class="profile-label">Backend</span>
+            <span class="profile-value">OpenRouter BYOK</span>
+          </div>
+          <div class="profile-row">
+            <span class="profile-label">Research Sources</span>
+            <span class="profile-value">DuckDuckGo, RSS, Reddit</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="statusbar">
+    <span id="status">Ready.</span>
+    <span id="statusRight" class="muted"></span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

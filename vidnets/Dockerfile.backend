@@ -1,0 +1,52 @@
+FROM node:22-bookworm-slim AS javascript
+WORKDIR /opt/vidnets
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && node -e "require('@remotion/renderer').ensureBrowser().catch(e=>{console.error(e);process.exit(1)})"
+
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    VIDZEO_WEB_FAST_MODE=1 \
+    VIDZEO_FASTER_WHISPER_COMPUTE_TYPE=int8 \
+    VIDZEO_FORCE_BURN_SUBTITLES=0 \
+    VIDZEO_BURN_SUBTITLES_MAX_SECONDS=180 \
+    VIDZEO_YT_BATCH_SIZE=8 \
+    VIDZEO_YT_DOWNLOAD_CONCURRENCY=6 \
+    VIDZEO_YT_BATCH_DOWNLOAD_TIMEOUT=300 \
+    VIDZEO_MIXED_YT_DOWNLOAD_CANDIDATES=12 \
+    VIDZEO_BIND_HOST=0.0.0.0 VIDZEO_ROOT=/data VIDZEO_RESOURCE_ROOT=/opt/vidnets \
+    VIDZEO_OUTPUT_DIR=/data/output VIDZEO_TEMP_DIR=/data/temp HOME=/data
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg chromium curl ca-certificates fonts-dejavu-core libgomp1 tini \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/vidnets
+COPY server/requirements.txt server/requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r server/requirements.txt
+
+COPY --from=javascript /usr/local/bin/node /usr/local/bin/node
+COPY --from=javascript /opt/vidnets/node_modules ./node_modules
+# Only runtime application resources enter the image.
+COPY main.py package.json ./
+COPY server ./server
+COPY fonts ./fonts
+COPY public ./public
+COPY resources ./resources
+COPY src/remotion ./src/remotion
+COPY src/assets ./src/assets
+COPY src/editing ./src/editing
+COPY src/remotion-player.js ./src/
+COPY remotion ./remotion
+COPY scripts/render-remotion-manifest.js scripts/capture-source-evidence.js ./scripts/
+RUN useradd --uid 10001 --create-home --home-dir /data vidzeo \
+    && mkdir -p /data/output /data/temp /data/cache \
+    && chown -R 10001:10001 /data
+USER 10001:10001
+
+EXPOSE 5000
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "main.py"]

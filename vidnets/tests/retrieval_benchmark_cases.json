@@ -1,0 +1,58 @@
+[
+  {
+    "name": "cricket rejects football",
+    "script": "Virat Kohli batting in a cricket match for India.",
+    "scene": "Kohli plays a match-winning innings.",
+    "niche": "cricket",
+    "primary_subject": "Virat Kohli",
+    "bad_candidate": {
+      "title": "FIFA World Cup football goals",
+      "description": "Soccer match highlights",
+      "channel": "Football Clips",
+      "duration": 180
+    },
+    "expect_fatal": true
+  },
+  {
+    "name": "football rejects cricket",
+    "script": "Lionel Messi dribbles through defenders in a football match.",
+    "scene": "Messi creates a goal chance.",
+    "niche": "football",
+    "primary_subject": "Lionel Messi",
+    "bad_candidate": {
+      "title": "Cricket batting wickets and innings highlights",
+      "description": "ICC match highlights",
+      "channel": "Cricket Archive",
+      "duration": 180
+    },
+    "expect_fatal": true
+  },
+  {
+    "name": "edit pack blocked",
+    "script": "Virat Kohli cricket career explained.",
+    "scene": "Kohli batting footage.",
+    "niche": "cricket",
+    "primary_subject": "Virat Kohli",
+    "bad_candidate": {
+      "title": "Virat Kohli Topaz scenepack clips for editing no copyright",
+      "description": "status video edit pack",
+      "channel": "Random Edits",
+      "duration": 240
+    },
+    "expect_fatal": true
+  },
+  {
+    "name": "gaming rejects office stock",
+    "script": "Grand Theft Auto VI became one of the most anticipated games.",
+    "scene": "Rockstar Games reveals GTA VI.",
+    "niche": "gaming",
+    "primary_subject": "Grand Theft Auto",
+    "bad_candidate": {
+      "title": "Business team office meeting startup",
+      "description": "Corporate people in conference room",
+      "channel": "Stock Videos",
+      "duration": 90
+    },
+    "expect_fatal": true
+  }
+]

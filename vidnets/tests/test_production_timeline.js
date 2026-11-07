@@ -1,0 +1,56 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const Timeline = require('../src/production-timeline');
+const film = {fps:30,duration:8,duration_in_frames:240,captions:{enabled:true},audio:{voiceover:{src:'voice.wav'},music:{src:'music.wav'}},scenes:[{from:0,start:0,duration:4,duration_in_frames:120,narration:'One scene.',primary_visual:{type:'Chart'},editorial_contract:{approved:true,display_text:'One scene'},copy_window:{start_frame:15,duration_frames:60},media:{src:'image.jpg',shots:[{src:'first.jpg'}]},camera:{motion:'push'},sound_cues:[{sfx_id:'tick',time_local:1,duration:.8}]},{from:120,start:4,duration:4,duration_in_frames:120,narration:'Two.',primary_visual:{type:'SmartImage'}}]};
+const tracks = Timeline.importTracks(film);
+assert.equal(tracks.length,9);
+assert.deepEqual(tracks.map(t=>t.id),Timeline.definitions.map(d=>d[0]));
+assert.equal(tracks.find(t=>t.id==='copy').clips[0].trackOffset,.5);
+assert.equal(tracks.find(t=>t.id==='music').clips[0].end,8);
+tracks.find(t=>t.id==='copy').clips[0].trackOffset=1;
+tracks.find(t=>t.id==='graphics').visible=false;
+tracks.find(t=>t.id==='sfx').clips[0].trackOffset=2;
+const exported=Timeline.exportTracks(film,tracks);
+const at15=Timeline.sceneAtFrame(film.scenes[0],0,15,exported);
+assert.equal(at15.editor_track_visibility.copy,false);
+assert.equal(at15.editor_track_visibility.graphics,false);
+assert.equal(at15.sound_cues[0].time_local,2);
+assert.equal(at15.media.shots.length,1,'import must preserve per-beat media shot plans');
+const at40=Timeline.sceneAtFrame(film.scenes[0],0,40,exported);
+assert.equal(at40.editor_track_visibility.copy,true);
+assert.equal(at40.copy_window.start_frame,30);
+assert.equal(film.scenes[0].copy_window.start_frame,15,'exports must not mutate original');
+const roundtrip=Timeline.importTracks(exported);
+assert.equal(roundtrip.find(t=>t.id==='graphics').visible,false);
+assert.equal(roundtrip.find(t=>t.id==='copy').clips[0].trackOffset,1);
+const context={window:{VidzeoTimeline:Timeline,addEventListener(){}},document:{getElementById(){return null},querySelector(){return null},createElement(){return {}},body:{appendChild(){}}},console,setTimeout(){},requestAnimationFrame(){}};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync('src/editor.js','utf8')+'\nthis.editor=EditorController;',context);
+context.editor.loadManifest({name:'Synthetic',remotion_manifest:film});
+assert.equal(context.editor.project.tracks.length,9);
+assert.equal(context.editor.project.tracks.find(t=>t.id==='graphics').clips[0].name,'Chart');
+console.log('Nine production track import, timing edits, renderer gates, SFX, saved-project roundtrip, and controller handoff passed.');
+
+const mediaTrack=tracks.find(t=>t.id==='media');
+mediaTrack.clips[0].trackOffset=.5; mediaTrack.clips[0].start=1;mediaTrack.clips[0].end=3;
+tracks.find(t=>t.id==='camera').visible=false;
+const mediaEdited=Timeline.exportTracks(film,tracks);
+const shifted=Timeline.sceneAtFrame(film.scenes[0],0,45,mediaEdited);
+assert.equal(shifted.editor_media_window.start_frame,15);
+assert.equal(shifted.editor_media_window.source_start_frame,30);
+assert.equal(shifted.media.shots.length,1);
+assert.equal(shifted.camera.disabled,true);
+tracks.find(t=>t.id==='captions').clips[0].trackOffset=1;
+tracks.find(t=>t.id==='captions').clips[0].start=.5;
+const captionEdited=Timeline.exportTracks(film,tracks);
+assert.equal(Timeline.sceneAtFrame(film.scenes[0],0,45,captionEdited).editor_caption_source_seconds,1);
+console.log('Media source clocks, protected shot plans, camera muting, and caption source timing passed.');
+
+assert.equal(typeof context.editor.saveProject,'function');
+assert.equal(typeof context.editor.openProject,'function');
+
+assert.equal(typeof context.editor.addTrack,'function');
+assert.ok(!fs.readFileSync('src/index.html','utf8').includes('id="editorExportBtn" onclick='),'export must have one event handler');
+
+assert.ok(fs.readFileSync('src/editor.js','utf8').includes("fetch('/api/editor/media-info', {method:'POST'"),'media import must use the server POST contract');

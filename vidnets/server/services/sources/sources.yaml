@@ -1,0 +1,926 @@
+# Vidnets Studio — Niche-Specific Source Registry
+# Each niche defines a waterfall of tiers. Tiers are tried in order;
+# move to the next tier only if the current one returns < min_candidates
+# with score >= min_score.
+
+niches:
+  # ── Sports / Cricket ─────────────────────────────────────────────
+  cricket:
+    keywords: [cricket, batsman, bowler, IPL, "test match", ODI, T20, kohli, dhoni, rohit, pandya, wicket, century, sixer, "world cup"]
+    tier_0:
+      - type: reddit
+        subreddits: [Cricket, cricketshitposting, IndianCricketTeam]
+        sort: top
+        time: year
+        limit: 20
+      - type: wikimedia
+        category: Cricket
+        limit: 15
+      - type: wikimedia_category
+        limit: 30
+      - type: sportsdb
+        limit: 10
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: sports
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 15
+      - type: pexels
+        limit: 15
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Sports / Football ────────────────────────────────────────────
+  football:
+    keywords: [football, soccer, goal, striker, midfielder, "premier league", champions, fifa, "world cup", messi, ronaldo, neymar, mbappe]
+    tier_0:
+      - type: reddit
+        subreddits: [soccer, football, PremierLeague, ChampionsLeague]
+        sort: top
+        time: year
+        limit: 20
+      - type: wikimedia
+        category: "Association football"
+        limit: 15
+      - type: wikimedia_category
+        limit: 20
+      - type: sportsdb
+        limit: 10
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: sports
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 15
+      - type: pexels
+        limit: 15
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # Sports / Tennis
+  tennis:
+    keywords: [tennis, grand slam, wimbledon, us open, roland garros, australian open, atp, wta, nadal, federer, djokovic, serena, alcaraz, sinner]
+    tier_0:
+      - type: wikimedia
+        category: Tennis
+        limit: 20
+      - type: wikimedia_category
+        limit: 25
+      - type: reddit
+        subreddits: [tennis, sports]
+        sort: top
+        time: year
+        limit: 20
+    tier_1:
+      - type: rss
+        niche: tennis
+        limit: 15
+      - type: openverse
+        limit: 25
+      - type: bing
+        editorial_boost: true
+        limit: 25
+      - type: ddg
+        limit: 20
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 10
+      - type: pexels
+        limit: 10
+      - type: pixabay
+        limit: 10
+    tier_4:
+      - type: duckduckgo
+        limit: 25
+      - type: qwant
+        limit: 20
+    min_candidates: 4
+    min_score: 0.55
+
+  # ── Sports / General ─────────────────────────────────────────────
+  sports:
+    keywords: [sport, athlete, stadium, tournament, championship, medal, olympic, tennis, basketball, baseball, hockey, rugby, golf, boxing, MMA]
+    tier_0:
+      - type: reddit
+        subreddits: [sports, sport]
+        sort: top
+        time: year
+        limit: 15
+      - type: wikimedia
+        category: Sports
+        limit: 15
+      - type: wikimedia_category
+        limit: 20
+      - type: sportsdb
+        limit: 10
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: sports
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 15
+      - type: pexels
+        limit: 15
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Technology ───────────────────────────────────────────────────
+  tech:
+    keywords: [technology, tech, software, hardware, AI, artificial intelligence, machine learning, robot, gadget, smartphone, laptop, startup, silicon, chip, processor]
+    tier_0:
+      - type: reddit
+        subreddits: [technology, gadgets, hardware, tech]
+        sort: top
+        time: year
+        limit: 15
+      - type: wikimedia
+        category: Technology
+        limit: 10
+      - type: wikimedia_category
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: tech
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 20
+      - type: pexels
+        limit: 20
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── History ──────────────────────────────────────────────────────
+  history:
+    keywords: [history, historical, ancient, medieval, war, battle, empire, king, queen, dynasty, century, archaeological, artifact, civilization]
+    tier_0:
+      - type: wikimedia
+        category: History
+        limit: 20
+      - type: wikimedia_category
+        limit: 30
+      - type: reddit
+        subreddits: [HistoryPorn, OldSchoolCool, AskHistorians]
+        sort: top
+        time: all
+        limit: 15
+      - type: loc
+        limit: 10
+      - type: metmuseum
+        limit: 10
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: news
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 10
+      - type: pexels
+        limit: 10
+      - type: pixabay
+        limit: 10
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── True Crime ───────────────────────────────────────────────────
+  true_crime:
+    keywords: [crime, murder, detective, investigation, suspect, arrest, trial, verdict, forensic, evidence, criminal, case, unsolved]
+    tier_0:
+      - type: wikimedia
+        category: Crime
+        limit: 15
+      - type: wikimedia_category
+        limit: 20
+      - type: reddit
+        subreddits: [TrueCrime, crime, UnsolvedMysteries]
+        sort: top
+        time: year
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: news
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 10
+      - type: pexels
+        limit: 10
+      - type: pixabay
+        limit: 10
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Gaming ───────────────────────────────────────────────────────
+  gaming:
+    keywords: [gaming, game, video game, esports, console, PlayStation, Xbox, Nintendo, PC gaming, streamer, RPG, FPS, multiplayer]
+    tier_0:
+      - type: reddit
+        subreddits: [gaming, Games, pcgaming, Games]
+        sort: top
+        time: year
+        limit: 20
+      - type: wikimedia
+        category: Video games
+        limit: 10
+      - type: wikimedia_category
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: bing
+        editorial_boost: false
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 10
+      - type: pexels
+        limit: 10
+      - type: pixabay
+        limit: 10
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Celebrity / Pop Culture ──────────────────────────────────────
+  celebrity:
+    keywords: [celebrity, actor, actress, singer, musician, band, movie, film, hollywood, bollywood, award, oscars, grammy, red carpet, premiere]
+    tier_0:
+      - type: reddit
+        subreddits: [celebrities, movies, Entertainment]
+        sort: top
+        time: year
+        limit: 15
+      - type: wikimedia
+        category: Entertainment
+        limit: 10
+      - type: wikimedia_category
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: news
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 10
+      - type: pexels
+        limit: 10
+      - type: pixabay
+        limit: 10
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # Celebrity / Lifestyle
+  lifestyle:
+    keywords: [lifestyle, family, home, fashion, public appearance, wedding, socialite, philanthropist, celebrity, red carpet, candid, profile]
+    tier_0:
+      - type: wikimedia
+        category: People
+        limit: 15
+      - type: wikimedia_category
+        limit: 20
+      - type: reddit
+        subreddits: [celebrities, popculturechat, fashion, pics]
+        sort: top
+        time: year
+        limit: 15
+    tier_1:
+      - type: rss
+        niche: entertainment
+        limit: 15
+      - type: openverse
+        limit: 25
+      - type: bing
+        editorial_boost: true
+        limit: 30
+      - type: ddg
+        limit: 20
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 10
+      - type: pexels
+        limit: 10
+      - type: pixabay
+        limit: 10
+    tier_4:
+      - type: duckduckgo
+        limit: 25
+      - type: qwant
+        limit: 20
+    min_candidates: 4
+    min_score: 0.55
+
+  # ── Nature / Animals ─────────────────────────────────────────────
+  nature:
+    keywords: [nature, wildlife, animal, forest, ocean, mountain, river, desert, bird, mammal, plant, flower, landscape, ecosystem, conservation]
+    tier_0:
+      - type: wikimedia
+        category: Nature
+        limit: 15
+      - type: wikimedia_category
+        limit: 20
+      - type: reddit
+        subreddits: [NatureIsFuckingLit, wildlife, EarthPorn]
+        sort: top
+        time: year
+        limit: 15
+      - type: inaturalist
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: bing
+        editorial_boost: false
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 20
+      - type: pexels
+        limit: 20
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Business / Finance ───────────────────────────────────────────
+  business:
+    keywords: [business, finance, economy, market, stock, trading, investment, bank, corporate, startup, entrepreneur, CEO, revenue, profit, economy]
+    tier_0:
+      - type: wikimedia
+        category: Business
+        limit: 10
+      - type: wikimedia_category
+        limit: 15
+      - type: reddit
+        subreddits: [business, finance, economics]
+        sort: top
+        time: year
+        limit: 10
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: business
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 20
+      - type: pexels
+        limit: 20
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Science / Space ──────────────────────────────────────────────
+  science:
+    keywords: [science, research, laboratory, experiment, space, NASA, planet, star, galaxy, telescope, physics, chemistry, biology, discovery]
+    tier_0:
+      - type: wikimedia
+        category: Science
+        limit: 15
+      - type: wikimedia_category
+        limit: 20
+      - type: nasa
+        limit: 15
+      - type: reddit
+        subreddits: [space, science, astronomy]
+        sort: top
+        time: year
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: science
+        limit: 10
+      - type: bing
+        editorial_boost: true
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 15
+      - type: pexels
+        limit: 15
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Food / Cooking ───────────────────────────────────────────────
+  food:
+    keywords: [food, cooking, recipe, cuisine, restaurant, chef, dish, dessert, ingredient, meal, bake, grill, kitchen]
+    tier_0:
+      - type: reddit
+        subreddits: [food, Cooking, EatCheapAndHealthy, foodporn]
+        sort: top
+        time: year
+        limit: 15
+      - type: wikimedia
+        category: Food
+        limit: 10
+      - type: wikimedia_category
+        limit: 15
+      - type: themealdb
+        limit: 10
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: bing
+        editorial_boost: false
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 20
+      - type: pexels
+        limit: 20
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Travel ───────────────────────────────────────────────────────
+  travel:
+    keywords: [travel, destination, tourism, vacation, journey, adventure, backpack, passport, hotel, airport, landmark, city, country]
+    tier_0:
+      - type: wikimedia
+        category: Travel
+        limit: 15
+      - type: wikimedia_category
+        limit: 20
+      - type: reddit
+        subreddits: [travel, TravelPorn, solotravel]
+        sort: top
+        time: year
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: bing
+        editorial_boost: false
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 20
+      - type: pexels
+        limit: 20
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # ── Politics / News ──────────────────────────────────────────────
+  politics:
+    keywords: [politics, government, election, president, minister, parliament, congress, policy, law, protest, summit, diplomacy, campaign]
+    tier_0:
+      - type: wikimedia
+        category: Politics
+        limit: 10
+      - type: wikimedia_category
+        limit: 15
+      - type: reddit
+        subreddits: [politics, worldnews, news]
+        sort: top
+        time: year
+        limit: 15
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: news
+        limit: 15
+      - type: bing
+        editorial_boost: true
+        limit: 25
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 10
+      - type: pexels
+        limit: 10
+      - type: pixabay
+        limit: 10
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+  # Pakistan Politics / Public Figures
+  pakistan_politics:
+    keywords: [pakistan, pakistani, nawaz sharif, imran khan, benazir bhutto, zardari, shehbaz sharif, pmln, pti, parliament, election, lahore, islamabad]
+    tier_0:
+      - type: wikimedia
+        category: Politics of Pakistan
+        limit: 20
+      - type: wikimedia_category
+        limit: 25
+      - type: reddit
+        subreddits: [pakistan, PAK, worldnews, news]
+        sort: top
+        time: year
+        limit: 15
+    tier_1:
+      - type: rss
+        niche: pakistan_news
+        limit: 20
+      - type: openverse
+        limit: 25
+      - type: bing
+        editorial_boost: true
+        limit: 30
+      - type: ddg
+        limit: 20
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 8
+      - type: pexels
+        limit: 8
+      - type: pixabay
+        limit: 8
+    tier_4:
+      - type: duckduckgo
+        limit: 30
+      - type: qwant
+        limit: 20
+    min_candidates: 4
+    min_score: 0.6
+
+  # ── Default / Unknown ────────────────────────────────────────────
+  default:
+    keywords: []
+    tier_0:
+      - type: wikimedia
+        limit: 15
+      - type: wikimedia_category
+        limit: 15
+      - type: reddit
+        subreddits: [pics, interestingasfuck]
+        sort: top
+        time: year
+        limit: 10
+    tier_1:
+      - type: openverse
+        limit: 20
+      - type: rss
+        niche: news
+        limit: 10
+      - type: bing
+        editorial_boost: false
+        limit: 20
+      - type: ddg
+        limit: 15
+    tier_2:
+      - type: youtube_thumb
+        limit: 15
+      - type: ytdlp_frames
+        limit: 10
+    tier_3:
+      - type: unsplash
+        limit: 15
+      - type: pexels
+        limit: 15
+      - type: pixabay
+        limit: 15
+    tier_4:
+      - type: duckduckgo
+        limit: 20
+      - type: qwant
+        limit: 15
+    min_candidates: 3
+    min_score: 0.5
+
+
+# ── Source Trust Scores (used in final scoring) ────────────────────
+source_trust:
+  wikimedia: 1.0
+  wikimedia_category: 1.0
+  reddit: 0.85
+  openverse: 0.8
+  youtube_thumb: 0.6
+  ytdlp_frames: 0.65
+  sportsdb: 0.75
+  nasa: 1.0
+  loc: 1.0
+  metmuseum: 0.9
+  inaturalist: 0.8
+  themealdb: 0.7
+  unsplash: 0.75
+  pexels: 0.75
+  pixabay: 0.7
+  rss: 0.8
+  bing_editorial: 0.9
+  bing: 0.7
+  ddg: 0.65
+  qwant: 0.6
+  flickr: 0.8
+  duckduckgo: 0.5
+  archive: 0.9
+
+
+# ── Per-Niche Query Vocabulary (constrains query generation) ───────
+niche_vocab:
+  cricket:
+    actions: [batting, bowling, fielding, celebrating, century, six, wicket, diving catch]
+    settings: [stadium, pitch, crease, dressing room, pavilion]
+    modifiers: [test, ODI, T20, IPL, "world cup", international]
+    forbidden: [thinking, remembering, legacy, impact, strategy]
+
+  football:
+    actions: [scoring, celebrating, tackling, dribbling, saving, heading]
+    settings: [stadium, pitch, locker room, tunnel]
+    modifiers: ["premier league", champions, international, derby]
+    forbidden: [thinking, legacy, impact]
+
+  tech:
+    actions: [unboxing, demo, presentation, launch, coding, testing]
+    settings: ["keynote stage", lab, factory, office, server room]
+    modifiers: [prototype, retail, concept, flagship]
+    forbidden: [thinking, remembering, legacy]
+
+  history:
+    actions: [battle, portrait, ruins, artifact, ceremony, march]
+    settings: [battlefield, palace, museum, ruins, archive]
+    modifiers: [ancient, medieval, modern, archival, vintage]
+    forbidden: [modern, digital, futuristic]
+
+  nature:
+    actions: [hunting, flying, swimming, blooming, landscape, sunset]
+    settings: [forest, ocean, mountain, desert, savanna, reef]
+    modifiers: [wild, aerial, macro, panoramic, closeup]
+    forbidden: [artificial, synthetic, digital]
+
+  business:
+    actions: [meeting, presentation, handshake, working, analyzing]
+    settings: [office, boardroom, trading floor, conference]
+    modifiers: [corporate, professional, modern, team]
+    forbidden: [casual, party, festival]
+
+  science:
+    actions: [experiment, observation, launch, discovery, research]
+    settings: [laboratory, observatory, space, field site]
+    modifiers: [microscopic, telescopic, molecular, orbital]
+    forbidden: [fantasy, fictional, artistic]
+
+  food:
+    actions: [plating, cooking, pouring, slicing, garnishing]
+    settings: [kitchen, restaurant, table, market]
+    modifiers: [closeup, overhead, rustic, gourmet]
+    forbidden: [abstract, conceptual, digital]
+
+  travel:
+    actions: [exploring, arriving, photographing, hiking, sightseeing]
+    settings: [landmark, street, beach, mountain, cityscape]
+    modifiers: [panoramic, aerial, golden hour, tourist]
+    forbidden: [indoor, studio, artificial]
+
+  gaming:
+    actions: [playing, streaming, competing, celebrating, focused]
+    settings: [arena, setup, stage, convention]
+    modifiers: [esports, competitive, casual, retro]
+    forbidden: [realistic, documentary, news]
+
+  celebrity:
+    actions: [portrait, red carpet, performing, interview, candid]
+    settings: [stage, premiere, event, studio]
+    modifiers: [closeup, professional, candid, iconic]
+    forbidden: [anonymous, stock, generic]
+
+  politics:
+    actions: [speaking, campaigning, voting, protesting, signing]
+    settings: [podium, parliament, rally, office, summit]
+    modifiers: [official, formal, historic, breaking]
+    forbidden: [casual, entertainment, fictional]
+
+  default:
+    actions: [portrait, action, detail, overview, closeup]
+    settings: [indoor, outdoor, urban, natural]
+    modifiers: [professional, high quality, modern]
+    forbidden: []

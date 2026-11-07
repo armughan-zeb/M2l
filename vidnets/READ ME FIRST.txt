@@ -1,0 +1,24 @@
+﻿VIDNETS — ORIGINAL, EDITABLE WORKING APP
+
+Double-click Start Vidnets.cmd to run the original app through bundled Electron.
+No npm install is needed. Python, Node, FFmpeg, Electron, Remotion and its browser
+are included. Lifetime Pro purchase is required for public generation access.
+Private trials are granted only by the administrator. Sign in with your purchase
+account, then configure your provider API keys in Settings.
+Manual generation uses Qwen 3.5 Flash through OpenRouter. For an external agent,
+read AGENT_ACCESS.md and pair once in Settings, then use VIDNETS_AGENT.cmd.
+The agent service can run with the desktop closed; credentials are never bundled.
+
+The original main.js/preload.js, server Python, src UI, Remotion components,
+scripts, docs, tests and built-in template library are editable here.
+This is independent of the installed/portable app in the adjacent Vidnets folder.
+Private keys, auth sessions, cookies, past projects, logs and generated media
+are excluded. Original repository history remains in the development workspace.
+
+After changing Remotion player sources, use bundled Node to run:
+  tools\node\node.exe scripts\build-remotion-player.js
+Then start the app again. See docs\GENERATION_API.md for the single-call API.
+For rebuilding the installer use BUILD.bat (requires the build prerequisites
+described by that script). Installing/building is not necessary to run this copy.
+
+source-files.json contains hashes of the source files at delivery time.

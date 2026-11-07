@@ -1,0 +1,17 @@
+services:
+  package:
+    build:
+      context: .
+      dockerfile: Dockerfile.package
+    environment:
+      PYTHONIOENCODING: utf-8
+      VIDZEO_WEB_FAST_MODE: "1"
+      VIDZEO_FASTER_WHISPER_COMPUTE_TYPE: int8
+      VIDZEO_FORCE_BURN_SUBTITLES: "0"
+      VIDZEO_BURN_SUBTITLES_MAX_SECONDS: "180"
+      VIDZEO_YT_BATCH_SIZE: "8"
+      VIDZEO_YT_DOWNLOAD_CONCURRENCY: "6"
+      VIDZEO_YT_BATCH_DOWNLOAD_TIMEOUT: "300"
+      VIDZEO_MIXED_YT_DOWNLOAD_CANDIDATES: "12"
+    volumes:
+      - ./dist:C:/workspace/dist

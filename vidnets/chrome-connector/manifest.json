@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Vidzeo YouTube Connector",
+  "description": "Keeps Vidzeo linked to the current signed-in YouTube session in Chrome.",
+  "version": "1.0.0",
+  "minimum_chrome_version": "110",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxeUkOqtpI7VXnSKMMLfhRqiswdmLmLcyEhi91fNEgs5sqJINujcdi2/0n4DcJ6/ndg3AgeRh90quuiIc4zrivQhx0vmwh5lfC85PFJ7ojWht3Zwn14ww+6hfCcGzRPeX/+bZaJQb4xI5avjfelkURHB6G19tv4XoJSuUjUzslRnzS62u1u+kSQJJ6Xyf2GeNJGikygC0AgxXNhbizfhy5YmBTfm0lsk9DJO59eiyvT0o+6LJYcTTri5U4C7uIniM5zUS/pcwX9KANgnhApNINwFjJvX9GUaNp+ti7FrGAozHnzYvfvc3qz8NsOkvkoISTR4IQVkXccyFUVOZzjBGVQIDAQAB",
+  "permissions": [
+    "cookies",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://*.youtube.com/*",
+    "https://*.google.com/*",
+    "http://127.0.0.1:5000/*",
+    "http://localhost:5000/*",
+    "http://127.0.0.1:3210/*",
+    "http://localhost:3210/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://youtube.com/*",
+        "https://accounts.google.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "Sync Vidzeo YouTube session",
+    "default_popup": "popup.html"
+  }
+}

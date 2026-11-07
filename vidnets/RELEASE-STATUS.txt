@@ -1,0 +1,1 @@
+Vidnets Studio 1.0.5 published. Build: 0a39c855fd198822e627036b55ef6f5cb91b979e441fff44c23fb322fda67c57. Verified installer: 07d5306f53893539f2ff292c04016496d7c1bda9e592d9fba724621d28711ecc. See docs/RELEASE_1.0.5.md and https://vidnets.com/releases.html.

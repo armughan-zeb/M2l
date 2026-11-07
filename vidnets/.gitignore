@@ -1,0 +1,104 @@
+# -----------------------------------------------------------------------------
+# Secrets, credentials, and local identity
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials*.json
+service-account*.json
+auth-session*.json
+secret-settings*.json
+*.enc.json
+.vidzeo_session_secret
+
+# Private operator/control-plane tools (never publish or package)
+admin-panel/
+START_ADMIN_PANEL.bat
+scripts/admin-api-smoke.js
+
+# Supabase local state. Migrations remain publishable.
+supabase/.temp/
+supabase/.branches/
+supabase/.env*
+
+# Runtime databases, queues, and user state
+server/queue.json
+server/queue.json.bak
+server/queue.json.tmp
+queue.json
+queue.json.bak
+queue.json.tmp
+*.db
+*.sqlite
+*.sqlite3
+
+# Dependencies and bundled runtimes
+node_modules/
+venv/
+venv*/
+.venv/
+tools/python/
+tools/ffmpeg/
+
+# Generated media and runtime state
+output/
+temp/
+temp_test/
+tmp/
+cache/
+logs/
+scratch/
+voice_tests/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+*.pyo
+*.log
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.mkv
+*.webm
+
+# Build/package outputs
+dist/
+dist-build-cache/
+build/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.exe
+*.msi
+*.spec
+
+# Local editor, agent, and system state
+.vscode/
+.idea/
+.commandcode/
+.opencode/
+.vidzeo-production-export
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# One-off debug/package artifacts
+tmp_*
+debug_*
+patch*.py
+step_*_content.txt
+*.bak
+VidzeoLocal-Pure-Source.zip
+AudiogramTTS-Consumer/
+Youtube Scraper/
+**/chatgpt-accounts.dpapi
+**/chatgpt-accounts.lock

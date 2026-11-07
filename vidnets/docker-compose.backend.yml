@@ -1,0 +1,31 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "127.0.0.1:5000:5000"
+    env_file:
+      - .env
+    environment:
+      PYTHONIOENCODING: utf-8
+      VIDZEO_WEB_FAST_MODE: "1"
+      VIDZEO_FASTER_WHISPER_COMPUTE_TYPE: int8
+      VIDZEO_FORCE_BURN_SUBTITLES: "0"
+      VIDZEO_BURN_SUBTITLES_MAX_SECONDS: "180"
+      VIDZEO_YT_BATCH_SIZE: "8"
+      VIDZEO_YT_DOWNLOAD_CONCURRENCY: "6"
+      VIDZEO_YT_BATCH_DOWNLOAD_TIMEOUT: "300"
+      VIDZEO_MIXED_YT_DOWNLOAD_CANDIDATES: "12"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    shm_size: 1gb
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    volumes:
+      - vidnets-data:/data
+volumes:
+  vidnets-data:

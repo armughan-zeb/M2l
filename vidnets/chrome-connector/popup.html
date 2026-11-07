@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vidzeo YouTube Connector</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { width: 320px; margin: 0; padding: 16px; color: #f1f5f9; background: #0b1120; }
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    h1 { margin: 0; font-size: 15px; font-weight: 700; color: #fff; }
+    .badge { padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    .badge.verified { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+    .badge.signed-out { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .badge.offline { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
+    .badge.syncing { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); }
+    .card { background: #131d33; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+    .status-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 12px; color: #94a3b8; }
+    .status-row b { color: #f8fafc; }
+    .message { font-size: 12px; color: #cbd5e1; margin-top: 8px; line-height: 1.4; word-break: break-word; }
+    button { width: 100%; border: 0; border-radius: 6px; padding: 10px; color: #04101e; background: #38bdf8; font-weight: 700; font-size: 13px; cursor: pointer; transition: all 0.15s ease; }
+    button:hover:not(:disabled) { background: #7dd3fc; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .footer { margin-top: 10px; font-size: 11px; color: #64748b; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>YouTube Connector</h1>
+    <span id="badge" class="badge syncing">Checking</span>
+  </div>
+  <div class="card">
+    <div class="status-row"><span>Auth Cookies:</span><b id="auth-count">—</b></div>
+    <div class="status-row"><span>Total Cookies:</span><b id="total-count">—</b></div>
+    <div class="status-row"><span>Last Synced:</span><b id="synced-at">—</b></div>
+    <div id="message" class="message">Reading browser session…</div>
+  </div>
+  <button id="sync" type="button">Sync Session Now</button>
+  <div class="footer">
+    Cookies automatically sync to Vidzeo CMS (Port 3210/5000) for documentary YouTube clip searches.
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,728 @@
+/* =============================================================================
+   VIDZEO EDITING SETTINGS — Premium Sidebar Studio
+   Full sidebar + content layout inside the settings modal
+   ============================================================================= */
+
+/* ── Modal Header / Footer ──────────────────────────────────────────── */
+.video-settings-modal .video-settings-window { overflow: hidden; }
+
+.vs-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-dark);
+  flex-shrink: 0;
+}
+
+.vs-header .section-kicker { margin: 0; }
+.vs-header .section-heading { margin: 0; font-size: 16px; }
+
+.vs-header-actions {
+  display: flex; align-items: center; gap: 12px;
+}
+
+.vsm-header-badge {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 4px 12px;
+  background: var(--primary-glow); color: var(--primary);
+  border-radius: 20px;
+}
+
+.vs-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 24px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-dark);
+  flex-shrink: 0;
+}
+
+.vs-footer-right {
+  display: flex; align-items: center; gap: 12px;
+}
+
+.vs-footer-status {
+  font-size: 11px; color: var(--text-muted);
+}
+
+/* ── Layout Override ──────────────────────────────────────────────────── */
+.video-settings-modal .video-settings-window {
+  max-width: 1200px; width: 94vw; height: 88vh;
+  display: flex; flex-direction: column;
+  padding: 0; border-radius: 16px;
+  overflow: hidden;
+}
+
+.vsm-layout {
+  display: flex; flex: 1; overflow: hidden; min-height: 0;
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────── */
+.vsm-sidebar {
+  width: 220px; min-width: 220px;
+  background: var(--bg-dark);
+  border-right: 1px solid var(--border-subtle);
+  display: flex; flex-direction: column;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.vsm-sidebar-header {
+  padding: 20px 18px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.vsm-sidebar-header h3 {
+  font-size: 15px; font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.vsm-sidebar-header p {
+  font-size: 11px; color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.vsm-sidebar-nav {
+  flex: 1; padding: 8px 0;
+  display: flex; flex-direction: column; gap: 1px;
+}
+
+.vsm-tab-btn {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; padding: 10px 18px;
+  border: none; background: transparent;
+  color: var(--text-secondary); font-size: 12.5px;
+  font-family: inherit; font-weight: 500;
+  cursor: pointer; text-align: left;
+  transition: all 0.15s ease;
+  border-left: 3px solid transparent;
+  position: relative;
+}
+
+.vsm-tab-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255,255,255,0.03);
+}
+
+.vsm-tab-btn.active {
+  color: var(--primary);
+  background: var(--primary-glow);
+  border-left-color: var(--primary);
+  font-weight: 600;
+}
+
+.vsm-tab-icon {
+  font-size: 16px; width: 22px; text-align: center;
+  flex-shrink: 0;
+}
+
+.vsm-tab-label {
+  flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.vsm-tab-badge {
+  font-size: 9px; background: var(--primary); color: white;
+  padding: 1px 6px; border-radius: 8px; font-weight: 600;
+}
+
+.vsm-sidebar-footer {
+  padding: 14px 18px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* ── Main Content Area ────────────────────────────────────────────────── */
+.vsm-content {
+  flex: 1; overflow-y: auto; padding: 0;
+  background: var(--bg-card);
+  position: relative;
+}
+
+.vsm-page {
+  display: none; padding: 24px 28px;
+  animation: vsmFadeIn 0.2s ease;
+}
+
+.vsm-page.active { display: block; }
+
+@keyframes vsmFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.vsm-page-header {
+  margin-bottom: 20px;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  flex-wrap: wrap;
+}
+
+.vsm-page-header h2 {
+  font-size: 18px; font-weight: 700; color: var(--text-primary);
+  margin: 0;
+}
+
+.vsm-page-header p,
+.vsm-text-muted {
+  font-size: 12px; color: var(--text-muted); margin: 4px 0 0;
+}
+
+.vsm-section-title {
+  font-size: 13px; font-weight: 600; color: var(--text-secondary);
+  margin: 20px 0 12px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+
+/* ── Search Bar ───────────────────────────────────────────────────────── */
+.vsm-search-bar {
+  display: flex; align-items: center; gap: 10px;
+}
+
+.vsm-input {
+  background: var(--bg-input); border: 1px solid var(--border-default);
+  color: var(--text-primary); padding: 8px 14px;
+  border-radius: 8px; font-size: 13px; font-family: inherit;
+  outline: none; width: 100%; max-width: 260px;
+  transition: border-color 0.15s;
+}
+
+.vsm-input:focus { border-color: var(--primary); }
+.vsm-input::placeholder { color: var(--text-dim); }
+
+.vsm-search-bar .vsm-input { max-width: 200px; }
+
+/* ── Grid Layout ──────────────────────────────────────────────────────── */
+.vsm-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.vsm-grid-small {
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+/* ── Card ──────────────────────────────────────────────────────────────── */
+.vsm-card {
+  position: relative;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex; flex-direction: column;
+}
+
+.vsm-card:hover {
+  border-color: var(--border-active);
+  background: var(--bg-input-hover);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+}
+
+.vsm-card.vsm-selected {
+  border-color: var(--primary);
+  background: var(--primary-glow);
+  box-shadow: 0 0 0 1px var(--primary), 0 6px 24px rgba(99,102,241,0.15);
+}
+
+.vsm-card-preview {
+  height: 100px;
+  background: linear-gradient(145deg, #141424, #1a1a30);
+  display: flex; align-items: center; justify-content: center;
+  position: relative; overflow: hidden;
+  flex-shrink: 0;
+}
+
+.vsm-card-preview .vsm-template-mock {
+  width: 100%; height: 100%;
+  background: radial-gradient(ellipse at center, rgba(99,102,241,0.15) 0%, transparent 70%);
+}
+
+.vsm-card-preview .vsm-placeholder-icon {
+  font-size: 28px; color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.vsm-card-body {
+  padding: 10px 12px 12px;
+}
+
+.vsm-card-title {
+  font-size: 12.5px; font-weight: 600; color: var(--text-primary);
+  margin: 0 0 3px;
+}
+
+.vsm-card-desc {
+  font-size: 10.5px; color: var(--text-muted);
+  line-height: 1.4; margin: 0;
+}
+
+.vsm-check-icon {
+  position: absolute; top: 8px; right: 8px;
+  width: 20px; height: 20px;
+  background: var(--primary); color: white;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+  opacity: 0; transform: scale(0.8);
+  transition: all 0.2s ease;
+}
+
+.vsm-card.vsm-selected .vsm-check-icon {
+  opacity: 1; transform: scale(1);
+}
+
+/* ── Font Card ────────────────────────────────────────────────────────── */
+.vsm-card-font .vsm-card-preview {
+  height: 70px;
+  background: linear-gradient(145deg, #0e1020, #161830);
+}
+
+.vsm-card-font .vsm-font-preview-text {
+  font-size: 28px; font-weight: 700; color: white;
+  letter-spacing: 0.5px;
+}
+
+/* ── Template Card ────────────────────────────────────────────────────── */
+.vsm-preview-template {
+  background: linear-gradient(135deg, #0a0c1a, #1a1c30);
+}
+
+.vsm-template-swatch {
+  width: 100%; height: 100%;
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+
+.vsm-template-swatch-inner {
+  width: 60px; height: 40px; border-radius: 4px;
+  opacity: 0.7;
+}
+
+/* ── Transition Card ──────────────────────────────────────────────────── */
+.vsm-preview-transition {
+  background: #0d0f20;
+}
+
+.vsm-transition-icon {
+  position: relative; width: 48px; height: 32px;
+  overflow: hidden;
+}
+
+.vsm-transition-icon::before,
+.vsm-transition-icon::after {
+  content: ''; position: absolute;
+  width: 100%; height: 100%;
+  border-radius: 3px;
+  transition: transform 0.8s ease;
+}
+
+.vsm-transition-icon::before {
+  background: var(--primary); opacity: 0.3;
+  z-index: 1;
+}
+
+.vsm-transition-icon::after {
+  background: #7c3aed; opacity: 0.5;
+  z-index: 2;
+}
+
+/* Card-level hover animation for transitions */
+.vsm-card:hover .vsm-transition-icon::before { transform: translateX(-100%); }
+.vsm-card:hover .vsm-transition-icon::after { transform: translateX(0); }
+
+/* ── Effect Card ────────────────────────────────────────────────────────── */
+.vsm-preview-effect {
+  background: linear-gradient(135deg, var(--preview-color1, #1a1a30), var(--preview-color2, #0a0c1a));
+}
+
+.vsm-effect-swatch {
+  width: 100%; height: 100%;
+  position: absolute; inset: 0;
+  background: linear-gradient(var(--swatch-angle, 135deg),
+    var(--swatch-color1, rgba(99,102,241,0.2)),
+    var(--swatch-color2, rgba(139,92,246,0.3)));
+}
+
+/* ── Animation Card ──────────────────────────────────────────────────── */
+.vsm-preview-animation-container {
+  background: #0d0f20; height: 100px;
+  display: flex; align-items: center; justify-content: center;
+}
+
+.vsm-anim-text {
+  font-size: 20px; font-weight: 700; color: white;
+  display: inline-block;
+  animation-duration: 1.8s;
+  animation-iteration-count: infinite;
+  animation-timing-function: ease-in-out;
+}
+
+/* ── Overlay Card ─────────────────────────────────────────────────────── */
+.vsm-overlay-mock {
+  width: 100%; height: 100%;
+  display: flex; align-items: flex-end; padding: 8px;
+}
+
+.vsm-overlay-mock-bar {
+  height: 20px; width: 60%; background: rgba(99,102,241,0.5);
+  border-radius: 4px; display: flex; align-items: center;
+  padding: 0 8px; font-size: 8px; color: white; font-weight: 600;
+}
+
+/* ── Audio / SFX Card ──────────────────────────────────────────────────── */
+.vsm-card-sfx .vsm-card-body { padding: 12px; }
+
+.vsm-btn-icon {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 1px solid var(--border-default);
+  background: transparent; color: var(--text-secondary);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 12px; font-family: inherit;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.vsm-btn-icon:hover {
+  border-color: var(--primary); color: var(--primary);
+  background: var(--primary-glow);
+}
+
+.vsm-play-sfx { margin-left: auto; }
+
+/* ── Audio Controls ──────────────────────────────────────────────────── */
+.vsm-audio-controls {
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px; padding: 16px 20px;
+  display: grid; gap: 14px;
+}
+
+.vsm-control-group {
+  display: flex; flex-direction: column; gap: 6px;
+}
+
+.vsm-control-group label {
+  font-size: 12px; font-weight: 500; color: var(--text-secondary);
+}
+
+.vsm-slider-row {
+  display: flex; align-items: center; gap: 12px;
+}
+
+.vsm-slider {
+  flex: 1; height: 4px;
+  -webkit-appearance: none; appearance: none;
+  background: var(--border-default); border-radius: 2px;
+  outline: none;
+}
+
+.vsm-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 14px; height: 14px;
+  background: var(--primary); border-radius: 50%;
+  cursor: pointer;
+}
+
+.vsm-slider-val {
+  font-size: 12px; color: var(--text-muted); min-width: 36px; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.vsm-select {
+  background: var(--bg-input); border: 1px solid var(--border-default);
+  color: var(--text-primary); padding: 8px 12px;
+  border-radius: 8px; font-size: 12px; font-family: inherit;
+  outline: none; cursor: pointer;
+}
+
+.vsm-select:focus { border-color: var(--primary); }
+
+/* ── Canvas/Format ────────────────────────────────────────────────────── */
+.vsm-card-format .vsm-card-preview {
+  height: 70px;
+}
+
+.vsm-format-icon {
+  display: flex; align-items: center; justify-content: center;
+}
+
+.vsm-ratio-box {
+  border: 2px solid var(--text-muted);
+  border-radius: 3px;
+  background: rgba(255,255,255,0.05);
+}
+
+.vsm-ratio-box.w16\:h9 { width: 56px; height: 32px; }
+.vsm-ratio-box.w9\:h16 { width: 24px; height: 44px; }
+.vsm-ratio-box.w1\:h1 { width: 38px; height: 38px; }
+.vsm-ratio-box.w4\:h5 { width: 28px; height: 36px; }
+.vsm-ratio-box.w21\:h9 { width: 56px; height: 24px; }
+.vsm-ratio-box.w2\:h35 { width: 56px; height: 24px; }
+
+.vsm-color-controls {
+  display: grid; gap: 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px; padding: 16px 20px;
+}
+
+.vsm-color-picker-wrapper {
+  display: flex; align-items: center; gap: 10px;
+}
+
+.vsm-color-input {
+  width: 40px; height: 36px; border-radius: 6px;
+  border: 1px solid var(--border-default);
+  background: var(--bg-input); cursor: pointer;
+  padding: 2px;
+}
+
+.vsm-color-input::-webkit-color-swatch {
+  border-radius: 4px; border: none;
+}
+
+.vsm-input-small { width: 100px; }
+
+/* ── Assets / Documentary ─────────────────────────────────────────────── */
+.vsm-asset-toggles {
+  display: grid; gap: 10px;
+}
+
+.vsm-toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+}
+
+.vsm-toggle-info {
+  display: flex; align-items: center; gap: 12px;
+}
+
+.vsm-toggle-icon { font-size: 20px; }
+
+.vsm-toggle-info strong {
+  font-size: 13px; color: var(--text-primary); display: block;
+}
+
+.vsm-small { font-size: 11px; }
+
+.vsm-switch {
+  position: relative; width: 42px; height: 24px;
+  flex-shrink: 0;
+}
+
+.vsm-switch input { opacity: 0; width: 0; height: 0; }
+
+.vsm-slider-switch {
+  position: absolute; cursor: pointer;
+  inset: 0; background: var(--border-default);
+  border-radius: 24px;
+  transition: 0.3s;
+}
+
+.vsm-slider-switch::before {
+  content: ''; position: absolute;
+  width: 18px; height: 18px; left: 3px; bottom: 3px;
+  background: white; border-radius: 50%;
+  transition: 0.3s;
+}
+
+.vsm-switch input:checked + .vsm-slider-switch {
+  background: var(--primary);
+}
+
+.vsm-switch input:checked + .vsm-slider-switch::before {
+  transform: translateX(18px);
+}
+
+.vsm-upload-area {
+  border: 2px dashed var(--border-default);
+  border-radius: 12px; padding: 40px 20px;
+  text-align: center; cursor: pointer;
+  transition: all 0.2s;
+}
+
+.vsm-upload-area:hover {
+  border-color: var(--primary);
+  background: var(--primary-glow);
+}
+
+.vsm-upload-area.vsm-dragover {
+  border-color: var(--primary);
+  background: var(--primary-glow);
+}
+
+.vsm-upload-icon { font-size: 40px; margin-bottom: 10px; }
+.vsm-upload-area h3 { font-size: 16px; color: var(--text-primary); margin: 0 0 6px; }
+
+.vsm-mt { margin-top: 12px; }
+.vsm-divider { height: 1px; background: var(--border-subtle); margin: 20px 0; }
+
+/* ── General Settings Page ────────────────────────────────────────────── */
+.vsm-general-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.vsm-general-card {
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px; padding: 16px 18px;
+}
+
+.vsm-general-card h4 {
+  font-size: 13px; font-weight: 600; color: var(--text-primary);
+  margin: 0 0 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+
+.vsm-general-field {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 0;
+}
+
+.vsm-general-field label {
+  font-size: 12px; color: var(--text-secondary);
+}
+
+.vsm-general-field .vsm-select,
+.vsm-general-field select,
+.vsm-general-field input[type="number"],
+.vsm-general-field input[type="text"] {
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  padding: 6px 10px; border-radius: 6px;
+  font-size: 12px; font-family: inherit;
+  outline: none; max-width: 160px;
+}
+
+.vsm-general-field select:focus,
+.vsm-general-field input:focus { border-color: var(--primary); }
+
+.vsm-general-field input[type="range"] {
+  width: 100px; accent-color: var(--primary);
+}
+
+.vsm-toggle-group {
+  display: flex; align-items: center; gap: 8px;
+}
+
+/* ── Miscellaneous ────────────────────────────────────────────────────── */
+.vsm-empty-state {
+  text-align: center; padding: 40px 20px;
+  color: var(--text-muted); font-size: 13px;
+}
+
+.vsm-badge {
+  display: inline-block;
+  background: var(--primary-glow);
+  color: var(--primary);
+  font-size: 9px; font-weight: 700;
+  padding: 2px 8px; border-radius: 10px;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────── */
+.vsm-content::-webkit-scrollbar { width: 4px; }
+.vsm-content::-webkit-scrollbar-track { background: transparent; }
+.vsm-content::-webkit-scrollbar-thumb { background: var(--border-active); border-radius: 4px; }
+.vsm-sidebar::-webkit-scrollbar { width: 3px; }
+.vsm-sidebar::-webkit-scrollbar-track { background: transparent; }
+.vsm-sidebar::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 4px; }
+
+/* ── Animation Keyframes ──────────────────────────────────────────────── */
+@keyframes anim-typewriter-kf {
+  from { width: 0; }
+  to { width: 100%; }
+}
+@keyframes anim-fadein-kf {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes anim-fadeinup-kf {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes anim-fadeindown-kf {
+  from { opacity: 0; transform: translateY(-12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes anim-popin-kf {
+  0% { transform: scale(0.7); opacity: 0; }
+  60% { transform: scale(1.08); opacity: 1; }
+  100% { transform: scale(1); }
+}
+@keyframes anim-slideleft-kf {
+  from { transform: translateX(-30px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes anim-slideright-kf {
+  from { transform: translateX(30px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes anim-bounce-kf {
+  0%, 100% { transform: translateY(0); }
+  25% { transform: translateY(-12px); }
+  50% { transform: translateY(0); }
+  75% { transform: translateY(-6px); }
+}
+@keyframes anim-flash-kf {
+  0%, 100% { opacity: 1; }
+  25%, 75% { opacity: 0.2; }
+}
+@keyframes anim-wave-kf {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+@keyframes anim-shake-kf {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(6px); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(4px); }
+}
+@keyframes anim-flip-kf {
+  0% { transform: perspective(400px) rotateY(90deg); opacity: 0; }
+  100% { transform: perspective(400px) rotateY(0); opacity: 1; }
+}
+@keyframes anim-rotatein-kf {
+  from { transform: rotate(-180deg) scale(0.3); opacity: 0; }
+  to { transform: rotate(0) scale(1); opacity: 1; }
+}
+@keyframes anim-zoomin-kf {
+  from { transform: scale(0.3); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+@keyframes anim-blurin-kf {
+  from { filter: blur(6px); opacity: 0; }
+  to { filter: blur(0); opacity: 1; }
+}
+@keyframes anim-glitchin-kf {
+  0% { transform: translate(0); opacity: 0; filter: blur(4px); }
+  20% { transform: translate(-4px, 2px); opacity: 0.5; }
+  40% { transform: translate(4px, -2px); opacity: 0.8; }
+  60% { transform: translate(-2px, 1px); }
+  80% { transform: translate(2px, -1px); }
+  100% { transform: translate(0); opacity: 1; filter: blur(0); }
+}
+@keyframes anim-neonflicker-kf {
+  0%, 19%, 21%, 23%, 25%, 54%, 56%, 100% { opacity: 1; }
+  20%, 24%, 55% { opacity: 0.4; }
+}
+@keyframes anim-rainbow-kf {
+  0% { color: #ff0000; }
+  16% { color: #ffff00; }
+  33% { color: #00ff00; }
+  50% { color: #00ffff; }
+  66% { color: #0000ff; }
+  83% { color: #ff00ff; }
+  100% { color: #ff0000; }
+}
+@keyframes anim-spotlight-kf {
+  0% { clip-path: circle(0% at 50% 50%); }
+  100% { clip-path: circle(100% at 50% 50%); }
+}

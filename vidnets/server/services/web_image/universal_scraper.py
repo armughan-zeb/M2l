@@ -1,0 +1,740 @@
+"""Internal adapter for the parallel multi-engine scraper.
+
+This module is intentionally self contained.  It ports the useful discovery
+logic from ``Documents/xyz/Scrappers`` into Vidnets' existing resolver so the
+pipeline gets one result contract, one timeout budget, and one set of runtime
+logs.  Discovery is deliberately unauthenticated: no cookies, browser state,
+or account credentials are used.
+
+The manager fans out across engines at the same time and returns partial
+success when one engine is slow or challenged.  A bounded worker pool and
+per-engine timeout keep a bad endpoint from holding the media stage hostage.
+Pixel download, metadata safety, and vision verification remain the
+resolver's responsibility.
+"""
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+import logging
+import os
+import re
+import threading
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from ..job_context import JobThreadPoolExecutor as ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+
+import requests
+
+try:  # Optional fast Chrome-TLS transport used by the supplied scraper.
+    import primp  # type: ignore
+except Exception:  # pragma: no cover - optional in minimal deployments
+    primp = None
+
+try:  # Optional parser; regex fallback keeps the adapter lightweight.
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover - optional in minimal deployments
+    BeautifulSoup = None
+
+try:  # Optional DDG scraper dependency.
+    from ddgs import DDGS  # type: ignore
+except Exception:  # pragma: no cover - optional in minimal deployments
+    DDGS = None
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class UniversalImageResult:
+    """Normalized result copied from the standalone scraper's ImageResult."""
+
+    title: str
+    image_url: str
+    thumbnail_url: str = ""
+    source_url: str = ""
+    source_engine: str = ""
+    width: int = 0
+    height: int = 0
+    description: str = ""
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class UniversalEngineStat:
+    engine: str
+    count: int
+    duration_ms: int
+    success: bool
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class UniversalSearchResponse:
+    query: str
+    total: int
+    results: List[UniversalImageResult]
+    stats: List[UniversalEngineStat]
+
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_DIRECT_SCHEMES = ("http://", "https://")
+_BING_META_RE = re.compile(
+    r"<a[^>]+class=[\"'][^\"']*iusc[^\"']*[\"'][^>]+m=[\"']([^\"']+)[\"']",
+    re.IGNORECASE | re.DOTALL,
+)
+_BING_META_RE_REVERSE = re.compile(
+    r"<a[^>]+m=[\"']([^\"']+)[\"'][^>]+class=[\"'][^\"']*iusc[^\"']*[\"']",
+    re.IGNORECASE | re.DOTALL,
+)
+_Y_IMG_RE = re.compile(r'\\?"img_href\\?"\s*:\s*\\?"(https?://[^"\\]+)', re.I)
+_Y_THUMB_RE = re.compile(r'\\?"image\\?"\s*:\s*\\?"(//[^"\\]+|https?://[^"\\]+)', re.I)
+_Y_TITLE_RE = re.compile(r'\\?"(?:snippet"\s*:\s*\{[^{}]{0,600}?\\?"title|title)\\?"\s*:\s*\\?"([^"\\]+)', re.I)
+_URL_RE = re.compile(r"https?://[^\"'<>\\\s]+", re.I)
+
+
+def _title_is_query_echo(title: object, query: str) -> bool:
+    """Identify provider placeholders that repeat the retrieval query."""
+    raw_title = re.sub(r"\s+", " ", str(title or "")).strip()
+    raw_query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not raw_title or not raw_query:
+        return not raw_title
+    norm_title = re.sub(r"[^a-z0-9]+", " ", raw_title.casefold()).strip()
+    norm_query = re.sub(r"[^a-z0-9]+", " ", raw_query.casefold()).strip()
+    if norm_title == norm_query:
+        return True
+    if norm_title.startswith(norm_query + " "):
+        suffix = norm_title[len(norm_query):].strip()
+        # Yandex and a few SERP mirrors expose the page shell as every card's
+        # title (``<query>: browse and download images â€” Yandex``).  It is a
+        # provider label, never an image caption, so do not let it prove
+        # subject identity.
+        if any(
+            marker in suffix
+            for marker in ("browse", "download", "search", "image results", "yandex images", "bing images")
+        ):
+            return True
+    # Generic numbered labels are still query echoes, while meaningful
+    # captions (including years and event names) are retained as evidence.
+    stripped = re.sub(
+        r"\s+(?:result|image|photo|picture|thumbnail|item|card|match)\s*#?\s*\d+\s*$",
+        "",
+        norm_title,
+    ).strip()
+    return stripped == norm_query
+
+
+def _normalize_url(value: object) -> str:
+    value = html.unescape(str(value or "")).replace("\\/", "/").strip()
+    if value.startswith("//"):
+        value = "https:" + value
+    if not value.startswith(_DIRECT_SCHEMES):
+        return ""
+    parsed = urlparse(value)
+    if not parsed.netloc:
+        return ""
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    return value
+
+
+def _canonical_url(value: object) -> str:
+    url = _normalize_url(value)
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    # Query strings on CDN thumbnails frequently contain expiring signatures;
+    # retain them for download but dedupe on the stable path when possible.
+    return parsed._replace(fragment="").geturl().rstrip("/").casefold()
+
+
+def _int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _result(
+    engine: str,
+    query: str,
+    image_url: object,
+    *,
+    title: object = "",
+    thumbnail_url: object = "",
+    source_url: object = "",
+    width: object = 0,
+    height: object = 0,
+    description: object = "",
+    metadata: Optional[Dict[str, object]] = None,
+) -> Optional[UniversalImageResult]:
+    image = _normalize_url(image_url)
+    if not image:
+        return None
+    resolved_title = str(title or "").strip()
+    title_is_query = _title_is_query_echo(resolved_title, query)
+    return UniversalImageResult(
+        # Keep the query visible in raw scraper diagnostics, but mark it so
+        # the resolver never uses this placeholder as asset identity proof.
+        title=(resolved_title or query).strip()[:500],
+        image_url=image,
+        thumbnail_url=_normalize_url(thumbnail_url) or image,
+        source_url=_normalize_url(source_url) or image,
+        source_engine=engine,
+        width=_int(width),
+        height=_int(height),
+        description=str(description or "").strip()[:1000],
+        metadata={**dict(metadata or {}), "title_is_query": title_is_query},
+    )
+
+
+class _Engine:
+    name = "engine"
+
+    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+        raise NotImplementedError
+
+
+class _IsolatedNativeClient:
+    """Keep Chrome TLS behavior without a native initialization in the API."""
+    def get(self, url, *, headers, timeout):
+        from ..job_context import check_job_active, remaining_seconds
+        check_job_active()
+        budget = min(float(timeout), remaining_seconds(float(timeout)))
+        if budget <= 0:
+            raise TimeoutError('Search budget is exhausted')
+        process = subprocess.Popen(
+            [sys.executable, '-B', str(Path(__file__).resolve().parents[1] / 'research_search_worker.py')],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        try:
+            output, _ = process.communicate(json.dumps({'kind': 'http', 'url': url,
+                'headers': headers, 'timeout': budget}), timeout=budget)
+            check_job_active()
+            data = json.loads(output[:2200000])
+            return SimpleNamespace(status_code=data['status_code'], text=data['text'])
+        finally:
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.communicate(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+class YandexEngine(_Engine):
+    name = "yandex"
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _get_client(self):
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = _IsolatedNativeClient() if primp is not None else requests.Session()
+            self._local.client = client
+        return client
+
+    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+        encoded = urllib.parse.quote(query)
+        url = f"https://yandex.com/images/search?text={encoded}&p={max(0, page - 1)}"
+        if safe_search:
+            url += "&family=yes"
+        try:
+            response = self._get_client().get(url, headers=_HEADERS, timeout=6)
+        except Exception:
+            self._local.client = None
+            response = requests.get(url, headers=_HEADERS, timeout=6)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            raise RuntimeError(f"Yandex returned HTTP status {status}")
+        raw = html.unescape(str(getattr(response, "text", "") or ""))
+        # The source project's unescaped SERP parser is retained here.  The
+        # newer state parser often exposes ``img_href`` before card metadata.
+        images = [_normalize_url(v) for v in _Y_IMG_RE.findall(raw)]
+        thumbs = [_normalize_url(v) for v in _Y_THUMB_RE.findall(raw)]
+        titles = [html.unescape(v).replace("\\u002F", "/") for v in _Y_TITLE_RE.findall(raw)]
+        out: List[UniversalImageResult] = []
+        seen = set()
+        for idx, image in enumerate(images):
+            key = _canonical_url(image)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            row = _result(
+                "Yandex", query, image,
+                title=titles[idx] if idx < len(titles) else f"{query} result {idx + 1}",
+                thumbnail_url=thumbs[idx] if idx < len(thumbs) else image,
+                source_url=image,
+                description="Yandex visual search index",
+                metadata={"retrieval_method": "unescaped_serp", "title_is_query": not (idx < len(titles) and titles[idx])},
+            )
+            if row:
+                out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
+
+class BingEngine(_Engine):
+    name = "bing"
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _get_client(self):
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = _IsolatedNativeClient() if primp is not None else requests.Session()
+            self._local.client = client
+        return client
+
+    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+        first = max(0, (page - 1) * limit)
+        safe = "strict" if safe_search else "off"
+        url = (
+            "https://www.bing.com/images/async?"
+            f"q={urllib.parse.quote(query)}&first={first}&count={limit}&mmasync=1&adlt={safe}"
+        )
+        try:
+            response = self._get_client().get(url, headers=_HEADERS, timeout=6)
+        except Exception:
+            self._local.client = None
+            response = requests.get(url, headers=_HEADERS, timeout=6)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            raise RuntimeError(f"Bing returned HTTP status {status}")
+        markup = str(getattr(response, "text", "") or "")
+        elements: Iterable[object]
+        if BeautifulSoup is not None:
+            elements = BeautifulSoup(markup, "html.parser").find_all("a", class_="iusc")
+        else:
+            elements = _BING_META_RE.findall(markup) + _BING_META_RE_REVERSE.findall(markup)
+        out: List[UniversalImageResult] = []
+        for element in elements:
+            if isinstance(element, str):
+                raw_meta = element
+                anchor_title = query
+            else:
+                raw_meta = element.get("m")  # type: ignore[union-attr]
+                anchor_title = element.get("aria-label") or query  # type: ignore[union-attr]
+            try:
+                data = json.loads(html.unescape(str(raw_meta or "")))
+            except Exception:
+                continue
+            row = _result(
+                "Bing", query, data.get("murl"),
+                title=data.get("t") or anchor_title,
+                thumbnail_url=data.get("turl"),
+                source_url=data.get("purl"),
+                width=data.get("w") or data.get("mw"),
+                height=data.get("h") or data.get("mh"),
+                description=data.get("desc"),
+                metadata={"retrieval_method": "bing_async_media", "title_is_query": not bool(data.get("t") or anchor_title != query)},
+            )
+            if row:
+                out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
+
+class DuckDuckGoEngine(_Engine):
+    name = "duckduckgo"
+
+    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+        if DDGS is None:
+            raise RuntimeError("optional dependency 'ddgs' is not installed")
+        start = max(0, (page - 1) * limit)
+        out: List[UniversalImageResult] = []
+        process = None
+        try:
+            from ..job_context import check_job_active, remaining_seconds
+            check_job_active()
+            budget = min(4.0, remaining_seconds(4.0))
+            if budget <= 0:
+                return out
+            process = subprocess.Popen(
+                [sys.executable, '-B', str(Path(__file__).resolve().parents[1] / 'research_search_worker.py')],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            output, _ = process.communicate(json.dumps({'kind': 'images', 'query': query,
+                'timeout': budget, 'safe_search': safe_search, 'limit': start + limit}), timeout=budget)
+            check_job_active()
+            raw_items = json.loads(output[:1000000])
+            for idx, item in enumerate(raw_items or []):
+                if idx < start:
+                    continue
+                row = _result(
+                    "DuckDuckGo", query, item.get("image"),
+                    title=item.get("title"), thumbnail_url=item.get("thumbnail"),
+                    source_url=item.get("url"), width=item.get("width"),
+                    height=item.get("height"),
+                    description=f"Source: {item.get('source', '')}",
+                    metadata={"retrieval_method": "ddgs_image_index"},
+                )
+                if row:
+                    out.append(row)
+                if len(out) >= limit:
+                    break
+        except Exception as exc:
+            LOGGER.debug("DuckDuckGo search error: %s", exc)
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                try:
+                    process.communicate(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        return out
+
+
+class BaiduEngine(_Engine):
+    name = "baidu"
+
+    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+        del safe_search
+        start = max(0, (page - 1) * limit)
+        encoded = urllib.parse.quote(query)
+        url = (
+            "https://image.baidu.com/search/acjson?tn=resultjson_com&ipn=rj&ct=201326592"
+            f"&fp=result&queryWord={encoded}&word={encoded}&cl=2&lm=-1&ie=utf-8&oe=utf-8"
+            f"&pn={start}&rn={limit}"
+        )
+        response = requests.get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=5)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            raise RuntimeError(f"Baidu returned HTTP status {status}")
+        raw = re.sub(r"\\(?![/\\\"bfnrtu])", r"\\\\", str(response.text or ""))
+        try:
+            data = json.loads(raw, strict=False)
+        except Exception as exc:
+            raise RuntimeError(f"Baidu JSON parse failed: {exc}")
+        out: List[UniversalImageResult] = []
+        for item in data.get("data", []) if isinstance(data, dict) else []:
+            replacements = item.get("replaceUrl") if isinstance(item, dict) else None
+            original = ""
+            if isinstance(replacements, list) and replacements:
+                original = replacements[0].get("ObjUrl") or ""
+            row = _result(
+                "Baidu", query, original or item.get("thumbURL") or item.get("middleURL"),
+                title=item.get("fromPageTitleEnc"), thumbnail_url=item.get("thumbURL"),
+                source_url=item.get("fromURL"), width=item.get("width"), height=item.get("height"),
+                description=f"Host: {item.get('bdImgLoc', '') or 'Baidu Images'}",
+                metadata={"retrieval_method": "baidu_acjson"},
+            )
+            if row:
+                out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
+
+class OpenverseEngine(_Engine):
+    name = "openverse"
+
+    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+        del safe_search
+        url = (
+            f"https://api.openverse.org/v1/images/?q={urllib.parse.quote(query)}"
+            f"&page={max(1, page)}&page_size={min(limit, 50)}"
+        )
+        response = requests.get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=6)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            raise RuntimeError(f"Openverse returned HTTP status {status}")
+        data = response.json()
+        out: List[UniversalImageResult] = []
+        for item in data.get("results", []) if isinstance(data, dict) else []:
+            license_code = str(item.get("license") or "").upper()
+            description = f"Creator: {item.get('creator') or 'Unknown'}"
+            if license_code:
+                description += f" â€¢ License: {license_code}"
+            row = _result(
+                "Openverse", query, item.get("url"), title=item.get("title"),
+                thumbnail_url=item.get("thumbnail"), source_url=item.get("foreign_landing_url"),
+                width=item.get("width"), height=item.get("height"), description=description,
+                metadata={
+                    "retrieval_method": "openverse_api",
+                    "license": license_code,
+                    "rights_status": "friendly" if license_code else "unknown",
+                    "foreign_url": item.get("foreign_landing_url") or "",
+                },
+            )
+            if row:
+                out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
+
+class FlickrEngine(_Engine):
+    name = "flickr"
+
+    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+        del safe_search
+        tags = urllib.parse.quote(query.replace(" ", ","))
+        url = f"https://www.flickr.com/services/feeds/photos_public.gne?tags={tags}&format=json&nojsoncallback=1"
+        response = requests.get(url, headers=_HEADERS, timeout=5)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            raise RuntimeError(f"Flickr returned HTTP status {status}")
+        data = response.json()
+        out: List[UniversalImageResult] = []
+        for item in data.get("items", []) if isinstance(data, dict) else []:
+            media = item.get("media") or {}
+            thumb = media.get("m") or ""
+            high = thumb.replace("_m.jpg", "_b.jpg")
+            row = _result(
+                "Flickr", query, high or thumb, title=str(item.get("title") or query).strip(),
+                thumbnail_url=thumb, source_url=item.get("link"),
+                description=f"Author: {str(item.get('author') or '').strip()}",
+                metadata={"retrieval_method": "flickr_public_feed", "tags": item.get("tags") or ""},
+            )
+            if row:
+                out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
+
+class UniversalScraperManager:
+    """Run the supplied six-engine search strategy as a resolver lane."""
+
+    DEFAULT_ENGINES = ("yandex", "bing", "duckduckgo", "baidu", "openverse", "flickr")
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = 6,
+        engine_timeout_seconds: float = 10.0,
+        log_fn: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.max_workers = max(1, min(12, int(max_workers)))
+        self.engine_timeout_seconds = max(1.0, min(20.0, float(engine_timeout_seconds)))
+        self._log_fn = log_fn
+        self._engines: Dict[str, _Engine] = {
+            "yandex": YandexEngine(),
+            "bing": BingEngine(),
+            "duckduckgo": DuckDuckGoEngine(),
+            "baidu": BaiduEngine(),
+            "openverse": OpenverseEngine(),
+            "flickr": FlickrEngine(),
+        }
+        # Reuse one bounded pool for the manager lifetime. Creating a new
+        # executor for every query and shutting it down without waiting can
+        # leave timed-out HTTP workers running after the resolver has moved
+        # on; repeated scenes then accumulate detached workers and late
+        # errors. A single ``max_workers`` pool is correct for one search but
+        # starves concurrent listicle scene searches: each scene submits six
+        # engine tasks and the queued waves cannot start before the scene
+        # deadline. Reserve a small number of parallel batches while keeping
+        # a hard process-wide cap so this remains safe on slow machines.
+        try:
+            batch_multiplier = max(
+                1,
+                min(6, int(os.environ.get("VIDZEO_UNIVERSAL_BATCH_MULTIPLIER", "3") or 3)),
+            )
+        except (TypeError, ValueError):
+            batch_multiplier = 3
+        transport_workers = min(36, max(self.max_workers, self.max_workers * batch_multiplier))
+        self._executor = ThreadPoolExecutor(
+            max_workers=transport_workers,
+            thread_name_prefix="universal-scraper",
+        )
+        self._lock = threading.Lock()
+        self._last_response: Optional[UniversalSearchResponse] = None
+
+    @property
+    def engines(self) -> Tuple[str, ...]:
+        return tuple(self._engines.keys())
+
+    def _log(self, message: str) -> None:
+        try:
+            if self._log_fn:
+                self._log_fn(message)
+            else:
+                LOGGER.info(message)
+        except Exception:
+            pass
+
+    def search(
+        self,
+        query: str,
+        *,
+        engine_ids: Optional[Sequence[str]] = None,
+        limit_per_engine: int = 20,
+        page: int = 1,
+        safe_search: bool = True,
+        timeout_seconds: Optional[float] = None,
+        wait_until_complete: bool = False,
+    ) -> UniversalSearchResponse:
+        clean = re.sub(r"\s+", " ", str(query or "")).strip()
+        selected = [str(e).strip().lower() for e in (engine_ids or self.DEFAULT_ENGINES)]
+        selected = list(dict.fromkeys(e for e in selected if e in self._engines))
+        limit = max(1, min(50, int(limit_per_engine or 20)))
+        if not clean or not selected:
+            return UniversalSearchResponse(clean, 0, [], [])
+        engine_timeout = max(
+            0.5,
+            min(20.0, float(timeout_seconds or self.engine_timeout_seconds or 6.0))
+        )
+        if wait_until_complete:
+            # wait_until_complete waits for all parallel engines rather than
+            # returning on first completion, but still bounds the wait so stalled
+            # engines (e.g. Baidu, DDG) cannot hang the pipeline.
+            engine_timeout = min(engine_timeout, 6.0)
+        timeout_label = f"{engine_timeout:.1f}s"
+        self._log(
+            f"[universal] batch start query='{clean[:72]}' engines={','.join(selected)} "
+            f"parallel={len(selected)} timeout={timeout_label}"
+        )
+        batch_finished = threading.Event()
+
+        def run(engine_name: str) -> Tuple[str, List[UniversalImageResult], UniversalEngineStat]:
+            started = time.perf_counter()
+            try:
+                rows = self._engines[engine_name].search(clean, limit, max(1, int(page)), bool(safe_search))
+                duration = int((time.perf_counter() - started) * 1000)
+                stat = UniversalEngineStat(engine_name, len(rows), duration, True)
+                if batch_finished.is_set():
+                    self._log(
+                        f"[universal] {engine_name}: late result ignored after batch deadline "
+                        f"({len(rows)} result(s), {duration}ms)"
+                    )
+                else:
+                    self._log(f"[universal] {engine_name}: {len(rows)} result(s) in {duration}ms")
+                return engine_name, rows, stat
+            except Exception as exc:
+                duration = int((time.perf_counter() - started) * 1000)
+                error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                if batch_finished.is_set():
+                    self._log(
+                        f"[universal] {engine_name}: late failure ignored after batch deadline "
+                        f"({duration}ms, {error})"
+                    )
+                else:
+                    self._log(f"[universal] {engine_name}: failed in {duration}ms ({error})")
+                return engine_name, [], UniversalEngineStat(engine_name, 0, duration, False, error)
+
+        buckets: Dict[str, List[UniversalImageResult]] = {e: [] for e in selected}
+        stats_by_engine: Dict[str, UniversalEngineStat] = {}
+        # ``requests`` and the optional clients enforce their own socket
+        # timeouts.  The manager timeout is a wall-clock guard around each
+        # future so one stalled engine cannot delay the batch indefinitely.
+        futures = {self._executor.submit(run, engine): engine for engine in selected}
+        try:
+            for future in as_completed(
+                futures,
+                timeout=engine_timeout,
+            ):
+                engine, rows, stat = future.result()
+                buckets[engine] = rows
+                stats_by_engine[engine] = stat
+        except (TimeoutError, FuturesTimeoutError):
+            for future, engine in futures.items():
+                if not future.done():
+                    future.cancel()
+                    stats_by_engine[engine] = UniversalEngineStat(
+                        engine, 0, int(engine_timeout * 1000), False, "engine timeout"
+                    )
+                    self._log(f"[universal] {engine}: timed out after {engine_timeout:.1f}s")
+        finally:
+            # Do not shut down the shared pool after each batch. Running HTTP
+            # calls cannot be force-cancelled by Future.cancel(); closing the
+            # executor here created late work that raced interpreter/test
+            # teardown. Unfinished calls remain bounded by this manager's
+            # fixed worker count and their own socket timeouts.
+            batch_finished.set()
+
+        # Preserve engine diversity by round-robin interleaving, then remove
+        # only exact canonical URL duplicates.
+        merged: List[UniversalImageResult] = []
+        seen = set()
+        max_len = max((len(rows) for rows in buckets.values()), default=0)
+        for index in range(max_len):
+            for engine in selected:
+                rows = buckets.get(engine) or []
+                if index >= len(rows):
+                    continue
+                row = rows[index]
+                key = _canonical_url(row.image_url)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(row)
+        stats = [stats_by_engine.get(e, UniversalEngineStat(e, 0, 0, False, "engine timeout")) for e in selected]
+        response = UniversalSearchResponse(clean, len(merged), merged, stats)
+        with self._lock:
+            self._last_response = response
+        successes = sum(1 for stat in stats if stat.success)
+        self._log(
+            f"[universal] batch complete results={response.total} "
+            f"engines={successes}/{len(selected)}"
+        )
+        return response
+
+    async def search_async(self, query: str, **kwargs) -> UniversalSearchResponse:
+        return await asyncio.to_thread(self.search, query, **kwargs)
+
+
+def universal_result_to_candidate(row: UniversalImageResult, query: str = "") -> Dict[str, object]:
+    """Map the standalone scraper result into Vidnets' resolver row contract."""
+    engine = row.source_engine.casefold().replace(" ", "_") or "universal"
+    title_is_query = bool(
+        row.metadata.get("title_is_query")
+        or _title_is_query_echo(row.title, query)
+    )
+    return {
+        "url": row.image_url,
+        "image_url": row.image_url,
+        "preview_url": row.thumbnail_url or row.image_url,
+        "thumbnail_url": row.thumbnail_url or row.image_url,
+        "source_url": row.source_url or row.image_url,
+        "page_url": row.source_url or row.image_url,
+        "title": row.title,
+        "description": row.description,
+        "tags": str(row.metadata.get("tags") or ""),
+        "source": "universal_scraper",
+        "provider": f"universal_{engine}",
+        "query": query,
+        "domain": (urlparse(row.source_url or row.image_url).netloc or "").lower(),
+        "width": row.width,
+        "height": row.height,
+        "metadata_pending": True,
+        "title_is_query": title_is_query,
+        "query_echo": title_is_query,
+        "discovery_method": "universal_parallel_scraper",
+        "universal_engine": row.source_engine,
+        "license": str(row.metadata.get("license") or ""),
+        "license_url": str(row.metadata.get("foreign_url") or ""),
+        "rights_status": str(row.metadata.get("rights_status") or "unknown"),
+    }
+
+
+__all__ = [
+    "UniversalImageResult",
+    "UniversalEngineStat",
+    "UniversalSearchResponse",
+    "UniversalScraperManager",
+    "universal_result_to_candidate",
+]

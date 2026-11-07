@@ -1,0 +1,18 @@
+{
+  "version": "5",
+  "redirects": {
+    "https://esm.sh/@supabase/supabase-js@2": "https://esm.sh/@supabase/supabase-js@2.112.4"
+  },
+  "remote": {
+    "https://esm.sh/@supabase/supabase-js@2.112.4": "cfaa762b66cf8717f1b32db2699c4277aa673b39417cb9be9c0b19d9c7786bd7"
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:electron-builder@^25.1.8",
+        "npm:electron@30",
+        "npm:playwright-core@^1.55.0"
+      ]
+    }
+  }
+}

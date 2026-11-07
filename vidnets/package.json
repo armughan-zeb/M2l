@@ -1,0 +1,309 @@
+{
+  "name": "vidnets-studio-v1",
+  "version": "1.0.7",
+  "description": "Vidnets Studio v1 - AI Video Generation Desktop App",
+  "main": "main.js",
+  "author": "Vidnets",
+  "scripts": {
+    "start": "electron .",
+    "prestart": "node scripts/build-remotion-player.js",
+    "build": "electron-builder --win nsis --x64",
+    "prebuild": "node scripts/build-remotion-player.js",
+    "build:dir": "electron-builder --win --x64 --dir",
+    "prebuild:dir": "node scripts/build-remotion-player.js",
+    "create:product": "python create_product_folder.py",
+    "create:product:source": "python create_product_folder.py --source-only",
+    "release:prepare": "node scripts/prepare-release.js",
+    "security:scan": "node scripts/security-scan.js",
+    "auth:smoke": "node scripts/supabase-auth-smoke.js",
+    "audit:entitlements": "node scripts/audit-entitlements.js",
+    "audit:package": "node scripts/package-scan.js",
+    "qa:audit": "node scripts/qa-audit.js"
+  },
+  "build": {
+    "appId": "com.vidzeo.studio.v1",
+    "productName": "Vidnets Studio v1",
+    "copyright": "Copyright (c) 2026 Vidnets",
+    "compression": "maximum",
+    "electronLanguages": [
+      "en-US"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "protocols": [
+      {
+        "name": "Vidnets Studio",
+        "schemes": [
+          "vidnets"
+        ]
+      }
+    ],
+    "asar": true,
+    "asarUnpack": [],
+    "extraFiles": [
+      {
+        "from": "VIDNETS_AGENT.cmd",
+        "to": "VIDNETS_AGENT.cmd"
+      },
+      {
+        "from": "AGENT_ACCESS.md",
+        "to": "AGENT_ACCESS.md"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "public/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "artifactName": "Vidnets v1.${ext}",
+      "oneClick": false,
+      "differentialPackage": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
+      "perMachine": false,
+      "allowElevation": false
+    },
+    "extraResources": [
+      {
+        "from": "resources/template-library/",
+        "to": "resources/template-library/",
+        "filter": [
+          "builtin/**/*"
+        ]
+      },
+      {
+        "from": "src/",
+        "to": "src/",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**"
+        ]
+      },
+      {
+        "from": "admin-panel/",
+        "to": "admin-panel/",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/dist/**",
+          "!**/build/**",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/*.log"
+        ]
+      },
+      {
+        "from": "server/",
+        "to": "server/",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/*.pyo",
+          "!**/*.log",
+          "!**/queue.json",
+          "!**/queue.json.bak",
+          "!**/.env",
+          "!**/.env.*",
+          "!**/tests/**",
+          "!**/test_*",
+          "!**/.pytest_cache/**",
+          "!**/groq*.py",
+          "!cache/**",
+          "!temp/**",
+          "!harness_*.txt",
+          "!debug_*.py",
+          "!run_*.py",
+          "!inspect_*.py",
+          "!tmp_*.py"
+        ]
+      },
+      {
+        "from": "fonts/",
+        "to": "fonts/"
+      },
+      {
+        "from": "public/",
+        "to": "public/",
+        "filter": [
+          "map-assets/**/*",
+          "font-library/**/*",
+          "sound-effects/**/*",
+          "icon.ico",
+          "icon.png",
+          "update-build.json"
+        ]
+      },
+      {
+        "from": "chrome-connector/",
+        "to": "chrome-connector/",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "tools/python/",
+        "to": "tools/python/",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/.pytest_cache/**",
+          "!**/tests/**",
+          "!**/*-tests/**",
+          "!**/*.log",
+          "!**/*.tmp"
+        ]
+      },
+      {
+        "from": "tools/ffmpeg/",
+        "to": "tools/ffmpeg/",
+        "filter": [
+          "ffmpeg.exe",
+          "ffprobe.exe"
+        ]
+      },
+      {
+        "from": "tools/models/",
+        "to": "tools/models/",
+        "filter": [
+          "**/*",
+          "!**/.cache/**"
+        ]
+      },
+      {
+        "from": "tools/.runtime-ready",
+        "to": "tools/.runtime-ready"
+      },
+      {
+        "from": "tools/node/",
+        "to": "tools/node/",
+        "filter": [
+          "node.exe",
+          "LICENSE"
+        ]
+      },
+      {
+        "from": "node_modules/",
+        "to": "node_modules/",
+        "filter": [
+          "**/*",
+          "!**/.cache/**",
+          "!**/app-builder-bin/**",
+          "!**/electron-builder/**",
+          "!**/7zip-bin/**",
+          "!.remotion/**",
+          "!electron/**"
+        ]
+      },
+      {
+        "from": "node_modules/.remotion/",
+        "to": "node_modules/.remotion/",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "remotion/",
+        "to": "remotion/",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "scripts/render-remotion-manifest.js",
+        "to": "scripts/render-remotion-manifest.js"
+      },
+      {
+        "from": "scripts/remotion-section-join.js",
+        "to": "scripts/remotion-section-join.js"
+      },
+      {
+        "from": "scripts/capture-source-evidence.js",
+        "to": "scripts/capture-source-evidence.js"
+      },
+      {
+        "from": "scripts/bootstrap-runtime.ps1",
+        "to": "scripts/bootstrap-runtime.ps1"
+      },
+      {
+        "from": "main.py",
+        "to": "main.py"
+      },
+      {
+        "from": "gallery-dl.conf",
+        "to": "gallery-dl.conf"
+      },
+      {
+        "from": ".env.defaults",
+        "to": ".env.defaults"
+      },
+      {
+        "from": ".env.example",
+        "to": ".env.example"
+      },
+      {
+        "from": ".env.public",
+        "to": ".env.public"
+      },
+      {
+        "from": "public/icon.ico",
+        "to": "public/icon.ico"
+      },
+      {
+        "from": "public/icon.png",
+        "to": "public/icon.png"
+      }
+    ],
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "remotion/**/*",
+      "scripts/render-remotion-manifest.js",
+      "scripts/remotion-section-join.js",
+      "!.env",
+      "!.env.*",
+      "!node_modules/**",
+      "!tools/**",
+      "!venv*/**",
+      "!output/**",
+      "!temp/**",
+      "!cache/**",
+      "!logs/**",
+      "!tmp/**",
+      "!tests/**",
+      "!dist/**",
+      "!*.bat",
+      "!*.spec",
+      "!*.md",
+      "!*.zip",
+      "!.git/**",
+      "!.vscode/**"
+    ]
+  },
+  "devDependencies": {
+    "electron": "45.0.0",
+    "electron-builder": "26.15.3",
+    "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "@remotion/bundler": "^4.0.526",
+    "@remotion/player": "^4.0.526",
+    "@remotion/renderer": "^4.0.526",
+    "playwright-core": "^1.55.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "remotion": "^4.0.526"
+  }
+}

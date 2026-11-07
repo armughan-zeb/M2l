@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.cache/
+*.log
+.DS_Store
+Thumbs.db
+build/output/
+package-lock.json.bak
