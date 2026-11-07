@@ -70,8 +70,10 @@ function heartbeatInfo(currentJobId = '') {
 
 function requireClient() {
   const saved = config.loadConfig();
-  const token = config.requireToken(saved);
-  return { saved, token, baseUrl: config.cmsUrl(saved), client: createClient({ baseUrl: config.cmsUrl(saved), token }) };
+  const envToken = String(process.env.MUSE_TOKEN || process.env.MUSE_AGENT_KEY || '').trim();
+  const token = envToken || config.requireToken(saved);
+  const cmsUrl = config.normalizeBaseUrl(process.env.MUSE_CMS_URL || config.cmsUrl(saved));
+  return { saved, token, baseUrl: cmsUrl, client: createClient({ baseUrl: cmsUrl, token }) };
 }
 
 function loadJobPayload(jobId) {
@@ -90,14 +92,51 @@ function loadJobPayload(jobId) {
 
 async function pairCommand(args) {
   const baseUrl = config.normalizeBaseUrl(args.cms || process.env.MUSE_CMS_URL || 'http://127.0.0.1:3210');
+  const staticToken = String(args.token || process.env.MUSE_TOKEN || process.env.MUSE_AGENT_KEY || '').trim();
   const code = String(args.code || '').trim();
-  if (!code) throw new Error('Pass the one-time pairing code from Muse agents: --code MUSE-XXXX-XXXX');
   const deviceId = config.deviceId();
+  const agentName = String(args.name || '').trim().slice(0, 80) || 'Muse Worker';
+
+  if (staticToken) {
+    if (!staticToken.startsWith('muse_')) throw new Error('Static worker token must start with "muse_"');
+    config.saveConfig({
+      cmsUrl: baseUrl,
+      token: staticToken,
+      agentId: '',
+      agentName,
+      pairedAt: new Date().toISOString(),
+      version: VERSION
+    });
+    const client = createClient({ baseUrl, token: staticToken });
+    const heartbeat = await client.heartbeat(heartbeatInfo(''));
+    if (heartbeat.agentId) {
+      config.saveConfig({ agentId: heartbeat.agentId, agentName: heartbeat.agentName || agentName });
+    }
+    log.info(`Paired with static token as "${agentName}" at ${baseUrl}`);
+    console.log(JSON.stringify({
+      ok: true,
+      cms: baseUrl,
+      mode: 'static_token',
+      agent: {
+        id: heartbeat.agentId || 'configured',
+        name: heartbeat.agentName || agentName,
+        deviceId,
+        active: heartbeat.active === true
+      },
+      credentialStored: path.basename(config.CONFIG_FILE),
+      next: heartbeat.active
+        ? 'node muse-agent.js start'
+        : 'Select this worker as Active Worker in Muse agents, then run: node muse-agent.js start'
+    }, null, 2));
+    return;
+  }
+
+  if (!code) throw new Error('Pass pairing code (--code MUSE-XXXX-XXXX) or static worker token (--token muse_...)');
   const claimed = await jsonRequest(baseUrl, '/api/muse/pair/claim', {
     method: 'POST',
     body: {
       code,
-      name: String(args.name || '').trim().slice(0, 80),
+      name: agentName,
       deviceId,
       platform: platform(),
       version: VERSION,
