@@ -6,6 +6,7 @@
   "type": "commonjs",
   "main": "muse-agent.js",
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "pair": "node muse-agent.js pair",
     "start": "node muse-agent.js start",
     "status": "node muse-agent.js status",

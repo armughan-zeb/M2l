@@ -212,6 +212,21 @@ async function statusCommand() {
   console.log(JSON.stringify(result, null, 2));
 }
 
+function configureCommand(args) {
+  const saved = config.loadConfig();
+  if (!saved.token) throw new Error('This worker is not paired. Pair it before changing its CMS address.');
+  const cmsUrl = config.normalizeBaseUrl(args.cms || '');
+  config.saveConfig({ cmsUrl });
+  console.log(JSON.stringify({
+    ok: true,
+    cms: cmsUrl,
+    paired: true,
+    agentName: saved.agentName || '',
+    credentialStored: path.basename(config.CONFIG_FILE),
+    next: 'Run "node muse-agent.js status" to verify the connection.'
+  }, null, 2));
+}
+
 async function doctorCommand() {
   const checks = [];
   const add = (name, level, detail) => checks.push({ name, level, detail });
@@ -418,6 +433,10 @@ function acquireLock() {
 }
 
 async function startCommand(args) {
+  const blockers = require('./lib/runtimePolicy').automatedRuntimeBlockers();
+  if (blockers.length) {
+    throw new Error('Automated Muse worker was not started, so it cannot claim and fail production jobs. ' + blockers.join(' '));
+  }
   const { saved, client } = requireClient();
   const releaseLock = acquireLock();
   const abort = new AbortController();
@@ -562,6 +581,7 @@ function usage() {
 
 Usage:
   node muse-agent.js pair --cms <url> --code <MUSE-XXXX-XXXX> [--name "Studio GPU"]
+  node muse-agent.js configure --cms <url>
   node muse-agent.js start [--once]
   node muse-agent.js claim [--wait 60]
   node muse-agent.js deliver [--job <id>] [--script <file>] [--video <file>] [--thumbnail <file>]
@@ -587,6 +607,7 @@ async function main() {
 
   switch (command) {
     case 'pair': await pairCommand(args); break;
+    case 'configure': configureCommand(args); break;
     case 'start': await startCommand(args); break;
     case 'status': await statusCommand(); break;
     case 'doctor': await doctorCommand(); break;

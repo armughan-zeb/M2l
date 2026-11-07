@@ -50,7 +50,24 @@ node muse-agent.js start
 
 `start` registers a heartbeat, resumes a saved job after a crash, claims jobs,
 reports progress and uploads each finished job. Use `--once` to process at most
-one job and exit.
+one job and exit. Before it heartbeats or claims anything, the automated loop
+checks that its script and render/inference adapters are configured. This keeps
+an incomplete worker from taking CMS jobs and immediately failing them.
+
+The automated loop requires `MUSE_SCRIPT_COMMAND` plus either
+`MUSE_RENDER_COMMAND`, or the built-in Vidnets path with
+`MUSE_INFERENCE_COMMAND` / `MUSE_INFERENCE_URL`. If the Muse agent itself writes
+the narration and renders in its own environment, use the agent-driven
+`claim` → write/render into the returned work folder → `deliver` flow instead
+of `start`.
+
+If the CMS address changes, update the saved endpoint without replacing the
+worker credential:
+
+```bat
+node muse-agent.js configure --cms https://your-current-cms-address
+node muse-agent.js status
+```
 
 ## Two production workflows
 
