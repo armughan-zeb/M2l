@@ -24,4 +24,7 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+# Default to autonomous auto-looping without manual intervention
+export MUSE_AUTO_LOOP="${MUSE_AUTO_LOOP:-1}"
+
 exec node "$ROOT/muse-agent.js" start "$@"

@@ -24,3 +24,8 @@ test('built-in Vidnets requires an explicit Muse inference bridge', () => {
     MUSE_INFERENCE_URL: 'http://127.0.0.1:9000/inference'
   }), []);
 });
+
+test('MUSE_AUTO_LOOP=1 activates auto-looping without manual intervention', () => {
+  assert.deepEqual(automatedRuntimeBlockers({ MUSE_AUTO_LOOP: '1' }), []);
+  assert.deepEqual(automatedRuntimeBlockers({ MUSE_AUTONOMOUS: '1' }), []);
+});

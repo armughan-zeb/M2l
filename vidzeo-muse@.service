@@ -13,6 +13,7 @@ KillMode=mixed
 TimeoutStopSec=30
 Environment=NODE_ENV=production
 Environment=MUSE_LOG_LEVEL=info
+Environment=MUSE_AUTO_LOOP=1
 
 [Install]
 WantedBy=multi-user.target

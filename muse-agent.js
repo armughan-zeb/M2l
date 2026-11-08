@@ -449,6 +449,9 @@ function acquireLock() {
 }
 
 async function startCommand(args) {
+  if (args.auto === true || args.autonomous === true || args['auto-loop'] === true) {
+    process.env.MUSE_AUTO_LOOP = '1';
+  }
   const blockers = require('./lib/runtimePolicy').automatedRuntimeBlockers();
   if (blockers.length) {
     throw new Error('Automated Muse worker was not started, so it cannot claim and fail production jobs. ' + blockers.join(' '));
