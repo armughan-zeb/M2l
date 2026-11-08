@@ -39153,10 +39153,17 @@ Check that all your Remotion packages are on the same version. If your dependenc
     x: (geo.lon - bounds.west) / (bounds.east - bounds.west) * width,
     y: (bounds.north - geo.lat) / (bounds.north - bounds.south) * height
   });
+  var KNOWN_SATELLITE_MAPS = new Set([
+    "map-assets/nasa-blue-marble-topography-mercator.jpg",
+    "map-assets/nasa-blue-marble-july-5400.jpg",
+    "map-assets/panama-canal-satellite-eox-2016.jpg"
+  ]);
   var imageSrc = (source) => {
     const value = String(source || "").trim();
     if (/^(?:https?:|data:|blob:)/i.test(value)) return value;
-    return staticFile(value.replace(/^\/+/, ""));
+    const clean = value.replace(/^\/+/, "");
+    const verified = KNOWN_SATELLITE_MAPS.has(clean) ? clean : "map-assets/panama-canal-satellite-eox-2016.jpg";
+    return staticFile(verified);
   };
   var routePosition = (points, progress) => {
     if (points.length < 2) return points[0] || { x: 0, y: 0, angle: 0 };
@@ -39256,9 +39263,17 @@ Check that all your Remotion packages are on the same version. If your dependenc
     const lat = Number(Array.isArray(value) ? value[1] : value?.lat);
     return Number.isFinite(lon) && Number.isFinite(lat) ? { lon, lat } : null;
   };
+  var KNOWN_GLOBE_MAPS = new Set([
+    "map-assets/nasa-blue-marble-topography-mercator.jpg",
+    "map-assets/nasa-blue-marble-july-5400.jpg",
+    "map-assets/panama-canal-satellite-eox-2016.jpg"
+  ]);
   var srcFor = (source) => {
     const value = String(source || "").trim();
-    return /^(?:https?:|data:|blob:)/i.test(value) ? value : staticFile(value.replace(/^\/+/, ""));
+    if (/^(?:https?:|data:|blob:)/i.test(value)) return value;
+    const clean = value.replace(/^\/+/, "");
+    const verified = KNOWN_GLOBE_MAPS.has(clean) ? clean : "map-assets/nasa-blue-marble-july-5400.jpg";
+    return staticFile(verified);
   };
   var unitVector = ({ lon, lat }) => {
     const phi = radians(lat);
@@ -39745,7 +39760,9 @@ Check that all your Remotion packages are on the same version. If your dependenc
     const displayFont = visualDNA.typography?.display || "Plus Jakarta Sans";
     const mapStyle = String(props.map_style || visualDNA.map_style || "dark_desaturated").toLowerCase();
     const requestedMapRaster = typeof (props.map_background_src || scene.map_background_src) === "string" ? String(props.map_background_src || scene.map_background_src).trim() : "";
-    const mapRasterSrc = /^(?:https?:|data:|blob:)/i.test(requestedMapRaster) ? requestedMapRaster : staticFile(requestedMapRaster || "map-assets/nasa-blue-marble-topography-mercator.jpg");
+    const cleanMapRaster = requestedMapRaster.replace(/^\/+/, "");
+    const verifiedMapRaster = ["map-assets/nasa-blue-marble-topography-mercator.jpg", "map-assets/nasa-blue-marble-july-5400.jpg", "map-assets/panama-canal-satellite-eox-2016.jpg"].includes(cleanMapRaster) ? cleanMapRaster : "map-assets/nasa-blue-marble-topography-mercator.jpg";
+    const mapRasterSrc = /^(?:https?:|data:|blob:)/i.test(requestedMapRaster) ? requestedMapRaster : staticFile(verifiedMapRaster);
     const vectorOnlyMap = ["minimal_monochrome", "blueprint_slate"].includes(mapStyle);
     const mapBackground = mapStyle === "minimal_monochrome" ? "#171B1D" : mapStyle === "blueprint_slate" ? "#0C1B2B" : palette.background || "#080C12";
     const mapLand = mapStyle === "minimal_monochrome" ? "#697277" : mapStyle === "blueprint_slate" ? "#17334A" : palette.surface || "#161B22";
@@ -46946,12 +46963,15 @@ Check that all your Remotion packages are on the same version. If your dependenc
     if (typeof cue === "string") {
       return resolveSfxPath(cue);
     }
-    const candidate = cue.sfx_id
+    const candidate = cue.sfx
+      || cue.sfx_id
       || cue.sound_id
       || cue.asset_id
       || cue.token
       || cue.file
       || cue.sound
+      || cue.effect
+      || cue.effect_id
       || (cue.kind && cue.kind !== "transition" && cue.kind !== "feature" ? cue.kind : null)
       || (cue.type && cue.type !== "transition" && cue.type !== "feature" ? cue.type : null)
       || cue.asset
@@ -47032,8 +47052,14 @@ Check that all your Remotion packages are on the same version. If your dependenc
     if (normalized.includes("music/") && (normalized.endsWith(".mp3") || normalized.endsWith(".wav"))) {
       return null;
     }
-    if (normalized.includes("map-assets/")) {
-      const mapRel = normalized.slice(normalized.indexOf("map-assets/"));
+    const isAudioFile = /\.(?:wav|mp3|ogg|aac|m4a|flac)(?:[?#]|$)/i.test(trimmed);
+    if (isAudioFile) {
+      return null;
+    }
+    if (normalized.includes("map-assets/") || normalized.includes("blue-marble") || normalized.includes("panama-canal") || normalized.includes("satellite-eox")) {
+      const mapRel = normalized.includes("map-assets/")
+        ? normalized.slice(normalized.indexOf("map-assets/"))
+        : `map-assets/${normalized.split("/").pop()}`;
       const verifiedMap = KNOWN_MAP_FILES.has(mapRel) ? mapRel : "map-assets/nasa-blue-marble-topography-mercator.jpg";
       return staticFile(verifiedMap);
     }
@@ -47533,18 +47559,25 @@ Check that all your Remotion packages are on the same version. If your dependenc
     }), /* @__PURE__ */ import_react180.default.createElement(TimedCaptionTrack, { scene, fps, theme }), cues.map((soundCue, index) => {
       const sfxSrc = resolveSfxSource(soundCue);
       if (!sfxSrc || typeof sfxSrc !== "string" || !sfxSrc.trim()) return null;
-      const localTime = soundCue.time_local !== void 0 && soundCue.time_local !== null
+      const rawLocalTime = soundCue.time_local !== void 0 && soundCue.time_local !== null
         ? Number(soundCue.time_local)
         : (soundCue.start_offset_seconds !== void 0 && soundCue.start_offset_seconds !== null)
           ? Math.max(0, Number(soundCue.start_offset_seconds))
           : Math.max(0, Number(soundCue.start || 0) - Number(scene.start || 0));
+      const localTime = Number.isFinite(rawLocalTime) ? Math.max(0, rawLocalTime) : 0;
       const soundFrom = Math.max(0, Math.round(localTime * fps));
-      const soundDuration = Math.max(1, Math.round(Number(soundCue.duration || 0.6) * fps));
+      const rawDuration = Number(soundCue.duration);
+      const safeDuration = Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : 0.6;
+      const soundDuration = Math.max(1, Math.round(safeDuration * fps));
       const rawSoundVolume = Number(soundCue.volume ?? 0.28);
       const soundVol = Math.min(1, Math.max(0, Number.isFinite(rawSoundVolume) ? rawSoundVolume : 0.28));
-      const fadeIn = Math.max(1, Math.round(Number(soundCue.fade_in || 0.012) * fps));
-      const fadeOut = Math.max(1, Math.round(Number(soundCue.fade_out || 0.08) * fps));
-      return /* @__PURE__ */ import_react180.default.createElement(Sequence, { key: `${soundCue.kind || soundCue.sfx_id || "sfx"}-${index}`, from: soundFrom, durationInFrames: soundDuration, name: `sfx-${soundCue.kind || soundCue.sfx_id || index}` }, /* @__PURE__ */ import_react180.default.createElement(Audio, { src: sfxSrc, startFrom: Math.max(0, Math.round(Number(soundCue.trim_start_seconds || 0) * fps)), volume: (frame2) => soundVol * Math.min(1, Math.max(0, frame2 / fadeIn), Math.max(0, (soundDuration - frame2) / fadeOut)), onError: (error2) => console.warn(`[Remotion] Scene ${scene.scene_index ?? "unknown"} sound effect skipped after load error.`, error2?.message || error2) }));
+      const rawFadeIn = Number(soundCue.fade_in);
+      const fadeIn = Math.max(1, Math.round((Number.isFinite(rawFadeIn) && rawFadeIn > 0 ? rawFadeIn : 0.012) * fps));
+      const rawFadeOut = Number(soundCue.fade_out);
+      const fadeOut = Math.max(1, Math.round((Number.isFinite(rawFadeOut) && rawFadeOut > 0 ? rawFadeOut : 0.08) * fps));
+      const rawTrim = Number(soundCue.trim_start_seconds || 0);
+      const startFromFrames = Math.max(0, Math.round((Number.isFinite(rawTrim) && rawTrim > 0 ? rawTrim : 0) * fps));
+      return /* @__PURE__ */ import_react180.default.createElement(Sequence, { key: `${soundCue.kind || soundCue.sfx_id || "sfx"}-${index}`, from: soundFrom, durationInFrames: soundDuration, name: `sfx-${soundCue.kind || soundCue.sfx_id || index}` }, /* @__PURE__ */ import_react180.default.createElement(Audio, { src: sfxSrc, startFrom: startFromFrames, volume: (frame2) => soundVol * Math.min(1, Math.max(0, frame2 / fadeIn), Math.max(0, (soundDuration - frame2) / fadeOut)), onError: (error2) => console.warn(`[Remotion] Scene ${scene.scene_index ?? "unknown"} sound effect skipped after load error.`, error2?.message || error2) }));
     }))));
   }
   function DocumentaryComposition({ manifest = {} }) {
@@ -47583,7 +47616,11 @@ Check that all your Remotion packages are on the same version. If your dependenc
       return track.clips.map((clip, index) => {
         const clipSrc = clip.asset ? resolveStaticAsset(clip.asset) : src;
         if (!clipSrc || typeof clipSrc !== "string" || !clipSrc.trim()) return null;
-        return /* @__PURE__ */ import_react180.default.createElement(Sequence, { key: `${id}-${index}`, from: clip.start_frame, durationInFrames: clip.duration_frames }, /* @__PURE__ */ import_react180.default.createElement(Audio, { src: clipSrc, startFrom: id === "narration" ? Number(scenes[clip.scene_index]?.from || 0) + Number(clip.source_start_frame || 0) : Number(clip.source_start_frame || 0), volume, onError: onTrackError }));
+        const clipFrom = Math.max(0, Number.isFinite(Number(clip.start_frame)) ? Math.round(Number(clip.start_frame)) : 0);
+        const clipDuration = Math.max(1, Number.isFinite(Number(clip.duration_frames)) ? Math.round(Number(clip.duration_frames)) : 30);
+        const rawOffset = id === "narration" ? Number(scenes[clip.scene_index]?.from || 0) + Number(clip.source_start_frame || 0) : Number(clip.source_start_frame || 0);
+        const startFromFrames = Math.max(0, Number.isFinite(rawOffset) ? Math.round(rawOffset) : 0);
+        return /* @__PURE__ */ import_react180.default.createElement(Sequence, { key: `${id}-${index}`, from: clipFrom, durationInFrames: clipDuration }, /* @__PURE__ */ import_react180.default.createElement(Audio, { src: clipSrc, startFrom: startFromFrames, volume, onError: onTrackError }));
       });
     }));
   }

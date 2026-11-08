@@ -288,6 +288,24 @@ test('Unbreakable sound-effects/ path resolution and fuzzy fallback prevent 404s
   const fallbackManifest = buildSemanticManifest({}, '', { fps: 30 });
   assert.ok(fallbackManifest.scenes.length >= 1, 'Fallback manifest must contain at least 1 scene');
   assert.ok(fallbackManifest.scenes[0].sound_cues.length >= 2, 'Fallback scene must have sound cues');
+
+  // 7. Unresolvable audio files MUST return null from resolveStaticAsset (never bare /filename that causes 404)
+  assert.equal(sfx.resolveStaticAsset('nonexistent_sound.wav'), null, 'Missing .wav must return null');
+  assert.equal(sfx.resolveStaticAsset('missing_bgm.mp3'), null, 'Missing .mp3 must return null');
+  assert.equal(sfx.resolveStaticAsset('missing.aac'), null, 'Missing .aac must return null');
+  assert.equal(sfx.resolveStaticAsset('missing.flac'), null, 'Missing .flac must return null');
+  assert.equal(sfx.resolveStaticAsset('missing.ogg'), null, 'Missing .ogg must return null');
+  assert.equal(sfx.resolveStaticAsset('missing.m4a'), null, 'Missing .m4a must return null');
+
+  // 8. SFX candidate properties: cue.sfx, cue.effect, cue.effect_id
+  assert.ok(sfx.resolveSfxSource({ sfx: 'whoosh' })?.includes('edit_whoosh_light.wav'));
+  assert.ok(sfx.resolveSfxSource({ effect: 'whoosh' })?.includes('edit_whoosh_light.wav'));
+  assert.ok(sfx.resolveSfxSource({ sfx: 'map_pulse' })?.includes('map_pulse.wav'));
+  assert.ok(sfx.resolveSfxSource({ effect_id: 'stamp_hit' })?.includes('stamp_hit.wav'));
+
+  // 9. Bare map asset name resolution
+  assert.ok(sfx.resolveStaticAsset('nasa-blue-marble-topography-mercator.jpg')?.includes('map-assets/nasa-blue-marble-topography-mercator.jpg'));
+  assert.ok(sfx.resolveStaticAsset('panama-canal-satellite-eox-2016.jpg')?.includes('map-assets/panama-canal-satellite-eox-2016.jpg'));
 });
 
 

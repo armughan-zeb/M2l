@@ -854,12 +854,15 @@ function resolveSfxSource(cue) {
   }
 
   // 1. Explicit candidate properties
-  const candidate = cue.sfx_id
+  const candidate = cue.sfx
+    || cue.sfx_id
     || cue.sound_id
     || cue.asset_id
     || cue.token
     || cue.file
     || cue.sound
+    || cue.effect
+    || cue.effect_id
     || (cue.kind && cue.kind !== 'transition' && cue.kind !== 'feature' ? cue.kind : null)
     || (cue.type && cue.type !== 'transition' && cue.type !== 'feature' ? cue.type : null)
     || cue.asset
@@ -963,9 +966,18 @@ function resolveStaticAsset(value) {
     return null;
   }
 
+  // Any audio file that cannot be resolved in SFX or Music registry MUST return null.
+  // Never allow Remotion to request a non-existent audio file from the webpack server (prevents fatal 404).
+  const isAudioFile = /\.(?:wav|mp3|ogg|aac|m4a|flac)(?:[?#]|$)/i.test(trimmed);
+  if (isAudioFile) {
+    return null;
+  }
+
   // 3. Map assets
-  if (normalized.includes('map-assets/')) {
-    const mapRel = normalized.slice(normalized.indexOf('map-assets/'));
+  if (normalized.includes('map-assets/') || normalized.includes('blue-marble') || normalized.includes('panama-canal') || normalized.includes('satellite-eox')) {
+    const mapRel = normalized.includes('map-assets/')
+      ? normalized.slice(normalized.indexOf('map-assets/'))
+      : `map-assets/${normalized.split('/').pop()}`;
     const verifiedMap = KNOWN_MAP_FILES.has(mapRel) ? mapRel : 'map-assets/nasa-blue-marble-topography-mercator.jpg';
     return staticFile(verifiedMap);
   }
@@ -1781,21 +1793,28 @@ function Scene({ scene: rawScene, theme, visualDNA: compositionDNA = {}, fps = 3
       {cues.map((soundCue, index) => {
         const sfxSrc = resolveSfxSource(soundCue);
         if (!sfxSrc || typeof sfxSrc !== 'string' || !sfxSrc.trim()) return null;
-        const localTime = (soundCue.time_local !== undefined && soundCue.time_local !== null)
+        const rawLocalTime = (soundCue.time_local !== undefined && soundCue.time_local !== null)
           ? Number(soundCue.time_local)
           : (soundCue.start_offset_seconds !== undefined && soundCue.start_offset_seconds !== null)
             ? Math.max(0, Number(soundCue.start_offset_seconds))
             : Math.max(0, Number(soundCue.start || 0) - Number(scene.start || 0));
+        const localTime = Number.isFinite(rawLocalTime) ? Math.max(0, rawLocalTime) : 0;
         const soundFrom = Math.max(0, Math.round(localTime * fps));
-        const soundDuration = Math.max(1, Math.round(Number(soundCue.duration || .6) * fps));
+        const rawDuration = Number(soundCue.duration);
+        const safeDuration = Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : 0.6;
+        const soundDuration = Math.max(1, Math.round(safeDuration * fps));
         // The soundtrack planner already measures/levels each asset; preserve
         // its gain and editor mutes instead of attenuating quiet ticks again.
         const rawSoundVolume = Number(soundCue.volume ?? 0.28);
-        const soundVol = Math.min(1, Math.max(0, Number.isFinite(rawSoundVolume) ? rawSoundVolume : .28));
-        const fadeIn = Math.max(1, Math.round(Number(soundCue.fade_in || .012) * fps));
-        const fadeOut = Math.max(1, Math.round(Number(soundCue.fade_out || .08) * fps));
+        const soundVol = Math.min(1, Math.max(0, Number.isFinite(rawSoundVolume) ? rawSoundVolume : 0.28));
+        const rawFadeIn = Number(soundCue.fade_in);
+        const fadeIn = Math.max(1, Math.round((Number.isFinite(rawFadeIn) && rawFadeIn > 0 ? rawFadeIn : 0.012) * fps));
+        const rawFadeOut = Number(soundCue.fade_out);
+        const fadeOut = Math.max(1, Math.round((Number.isFinite(rawFadeOut) && rawFadeOut > 0 ? rawFadeOut : 0.08) * fps));
+        const rawTrim = Number(soundCue.trim_start_seconds || 0);
+        const startFromFrames = Math.max(0, Math.round((Number.isFinite(rawTrim) && rawTrim > 0 ? rawTrim : 0) * fps));
         return <Sequence key={`${soundCue.kind || soundCue.sfx_id || 'sfx'}-${index}`} from={soundFrom} durationInFrames={soundDuration} name={`sfx-${soundCue.kind || soundCue.sfx_id || index}`}>
-          <Audio src={sfxSrc} startFrom={Math.max(0, Math.round(Number(soundCue.trim_start_seconds || 0) * fps))} volume={(frame) => soundVol * Math.min(1, Math.max(0, frame / fadeIn), Math.max(0, (soundDuration - frame) / fadeOut))} onError={(error) => console.warn(`[Remotion] Scene ${scene.scene_index ?? 'unknown'} sound effect skipped after load error.`, error?.message || error)} />
+          <Audio src={sfxSrc} startFrom={startFromFrames} volume={(frame) => soundVol * Math.min(1, Math.max(0, frame / fadeIn), Math.max(0, (soundDuration - frame) / fadeOut))} onError={(error) => console.warn(`[Remotion] Scene ${scene.scene_index ?? 'unknown'} sound effect skipped after load error.`, error?.message || error)} />
         </Sequence>;
       })}
     </AbsoluteFill>
@@ -1848,7 +1867,11 @@ export function DocumentaryComposition({ manifest = {} }) {
       return track.clips.map((clip,index) => {
         const clipSrc = clip.asset ? resolveStaticAsset(clip.asset) : src;
         if (!clipSrc || typeof clipSrc !== 'string' || !clipSrc.trim()) return null;
-        return <Sequence key={`${id}-${index}`} from={clip.start_frame} durationInFrames={clip.duration_frames}><Audio src={clipSrc} startFrom={id === 'narration' ? Number(scenes[clip.scene_index]?.from || 0)+Number(clip.source_start_frame || 0) : Number(clip.source_start_frame || 0)} volume={volume} onError={onTrackError} /></Sequence>;
+        const clipFrom = Math.max(0, Number.isFinite(Number(clip.start_frame)) ? Math.round(Number(clip.start_frame)) : 0);
+        const clipDuration = Math.max(1, Number.isFinite(Number(clip.duration_frames)) ? Math.round(Number(clip.duration_frames)) : 30);
+        const rawOffset = id === 'narration' ? Number(scenes[clip.scene_index]?.from || 0) + Number(clip.source_start_frame || 0) : Number(clip.source_start_frame || 0);
+        const startFromFrames = Math.max(0, Number.isFinite(rawOffset) ? Math.round(rawOffset) : 0);
+        return <Sequence key={`${id}-${index}`} from={clipFrom} durationInFrames={clipDuration}><Audio src={clipSrc} startFrom={startFromFrames} volume={volume} onError={onTrackError} /></Sequence>;
       });
     })}
   </AbsoluteFill>;

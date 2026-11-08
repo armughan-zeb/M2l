@@ -11,6 +11,15 @@ const safeNumber = (value, fallback = 0) => Number.isFinite(Number(value)) ? Num
 const shotSource = (shot) => String(shot?.src || shot?.path || shot?.asset_path || '');
 const videoAsset = /\.(?:mp4|webm|mov|mkv|avi|m4v)(?:[?#]|$)/i;
 
+function safeStaticAsset(assetId) {
+  if (!assetId || typeof assetId !== 'string') return '';
+  const trimmed = assetId.trim();
+  if (!trimmed || trimmed.includes('..') || /^(?:https?:|data:|blob:|file:)/i.test(trimmed)) return trimmed;
+  if (!trimmed.includes('/') && !trimmed.includes('\\') && !trimmed.includes('.')) return '';
+  if (/\.(?:wav|mp3|ogg|aac|m4a|flac)(?:[?#]|$)/i.test(trimmed)) return '';
+  return staticFile(trimmed.replace(/^\/+/, ''));
+}
+
 function progressAt(frame, start, duration) {
   const local = frame - start;
   const reveal = Math.min(Math.max(1, duration), 18);
@@ -197,7 +206,7 @@ function RecipeLayer({ layer, scene, theme, children, canvasWidth, canvasHeight 
       ? shotSource(imageShots[Number(layer.image_index)]) : '';
     const source = layer.image_index !== undefined && layer.image_index !== null ? selectedImage
       : assetId && !assetId.split('/').includes('..') && !assetId.includes('://')
-      ? staticFile(assetId)
+      ? safeStaticAsset(assetId)
       : (!videoAsset.test(primarySource) ? primarySource : '') || shotSource(imageShots[0]);
     if (source) {
       content = <Img src={source} style={{ width: '100%', height: '100%', objectFit: 'cover', objectPosition: `${safePercent(layer.focal_x, 50)}% ${safePercent(layer.focal_y, 50)}%`, ...shapeStyle(layer.shape) }} />;
