@@ -31,10 +31,17 @@ const mapPoint = (geo, bounds, width, height) => ({
   x: (geo.lon - bounds.west) / (bounds.east - bounds.west) * width,
   y: (bounds.north - geo.lat) / (bounds.north - bounds.south) * height,
 });
+const KNOWN_SATELLITE_MAPS = new Set([
+  'map-assets/nasa-blue-marble-topography-mercator.jpg',
+  'map-assets/nasa-blue-marble-july-5400.jpg',
+  'map-assets/panama-canal-satellite-eox-2016.jpg'
+]);
 const imageSrc = (source) => {
   const value = String(source || '').trim();
   if (/^(?:https?:|data:|blob:)/i.test(value)) return value;
-  return staticFile(value.replace(/^\/+/, ''));
+  const clean = value.replace(/^\/+/, '');
+  const verified = KNOWN_SATELLITE_MAPS.has(clean) ? clean : 'map-assets/panama-canal-satellite-eox-2016.jpg';
+  return staticFile(verified);
 };
 const routePosition = (points, progress) => {
   if (points.length < 2) return points[0] || { x: 0, y: 0, angle: 0 };

@@ -504,9 +504,17 @@ export function AnimatedMap({ scene = {}, visualDNA = {}, props = {} }) {
   const requestedMapRaster = typeof (props.map_background_src || scene.map_background_src) === 'string'
     ? String(props.map_background_src || scene.map_background_src).trim()
     : '';
+  const knownMaps = new Set([
+    'map-assets/nasa-blue-marble-topography-mercator.jpg',
+    'map-assets/nasa-blue-marble-july-5400.jpg',
+    'map-assets/panama-canal-satellite-eox-2016.jpg'
+  ]);
+  const cleanRaster = requestedMapRaster.replace(/^\/+/, '');
+  const verifiedRaster = knownMaps.has(cleanRaster) ? cleanRaster : 'map-assets/nasa-blue-marble-topography-mercator.jpg';
   const mapRasterSrc = /^(?:https?:|data:|blob:)/i.test(requestedMapRaster)
     ? requestedMapRaster
-    : staticFile(requestedMapRaster || 'map-assets/nasa-blue-marble-topography-mercator.jpg');
+    : staticFile(verifiedRaster);
+
   const vectorOnlyMap = ['minimal_monochrome', 'blueprint_slate'].includes(mapStyle);
   const mapBackground = mapStyle === 'minimal_monochrome'
     ? '#171B1D'

@@ -186,6 +186,32 @@ Every component of the suspension had to withstand fifty straight hours of conti
       assert.ok(fs.existsSync(diskPath), `Sound cue file must exist on disk: ${diskPath}`);
     }
   }
+
+  // Inject messy cues to verify renderer resilience against bare names, paths, and unknowns
+  const testCues = [
+    { cue: { type: 'transition', file: 'whoosh' }, expectFile: 'edit_whoosh_light.wav' },
+    { cue: { type: 'transition', file: 'sound-effects/whoosh' }, expectFile: 'edit_whoosh_light.wav' },
+    { cue: { type: 'transition', file: 'sound-effects/edit/whoosh.wav' }, expectFile: 'edit_whoosh_light.wav' },
+    { cue: { type: 'feature', file: 'map_pulse' }, expectFile: 'map_pulse.wav' },
+    { cue: { type: 'feature', file: 'sound-effects/map_pulse.wav' }, expectFile: 'map_pulse.wav' },
+    { cue: { type: 'feature', file: 'stamp_hit' }, expectFile: 'stamp_hit.wav' },
+    { cue: { type: 'feature', file: 'typewriter' }, expectFile: 'typewriter.wav' },
+    { cue: { sound: 'clock_tick' }, expectFile: 'clock_tick.wav' },
+    { cue: { kind: 'transition' }, expectFile: 'edit_whoosh_light.wav' },
+    { cue: { file: 'whoosh_fast' }, expectFile: 'edit_whoosh_light.wav' },
+    { cue: { file: 'sound-effects/totally_unknown_sound.wav' }, expectNull: true }
+  ];
+
+  for (const { cue, expectFile, expectNull } of testCues) {
+    const src = sfx.resolveSfxSource(cue);
+    if (expectNull) {
+      assert.equal(src, null, `Unknown cue ${JSON.stringify(cue)} must return null`);
+    } else {
+      assert.ok(src && src.includes(expectFile), `Cue ${JSON.stringify(cue)} must resolve to include ${expectFile}, got: ${src}`);
+      const rel = src.replace(/^\/+/, '');
+      assert.ok(fs.existsSync(path.join(publicDir, rel)), `Resolved asset must exist on disk: ${rel}`);
+    }
+  }
 });
 
 test('Catalog.json has valid aliases section and all aliased files exist', () => {
@@ -219,4 +245,49 @@ test('Remotion bundle versioning and fingerprinting detect source changes and su
   // Verify clearBundleCache runs without throwing
   remotionRenderer.clearBundleCache();
 });
+
+test('Unbreakable sound-effects/ path resolution and fuzzy fallback prevent 404s', () => {
+  const root = path.resolve(__dirname, '..');
+  const publicDir = path.join(root, 'public');
+
+  // 1. Invalid or non-existent sound-effects/ paths must be mapped or return null, NEVER a broken path
+  assert.equal(sfx.resolveSfxRelativePath('sound-effects/whoosh'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('sound-effects/whoosh.wav'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('sound-effects/edit/whoosh.wav'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('sound-effects/map_pulse.wav'), 'sound-effects/vidzeo/map_pulse.wav');
+  assert.equal(sfx.resolveSfxRelativePath('sound-effects/stamp_hit.wav'), 'sound-effects/vidzeo/stamp_hit.wav');
+  assert.equal(sfx.resolveSfxRelativePath('sound-effects/typewriter.wav'), 'sound-effects/vidzeo/typewriter.wav');
+  assert.equal(sfx.resolveSfxRelativePath('sound-effects/totally_unknown_garbage_xyz.wav'), null, 'Missing sound must return null, NEVER 404 path');
+
+  // 2. resolveStaticAsset must never return a non-existent sound-effects/ path
+  assert.equal(sfx.resolveStaticAsset('sound-effects/totally_unknown_garbage_xyz.wav'), null);
+  assert.ok(sfx.resolveStaticAsset('sound-effects/whoosh')?.includes('edit_whoosh_light.wav'));
+
+  // 3. Whoosh variant and prefix/suffix fallback
+  assert.equal(sfx.resolveSfxRelativePath('whoosh_fast'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('trans_whoosh'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('whoosh_deep'), 'sound-effects/edit/edit_whoosh_deep.wav');
+  assert.equal(sfx.resolveSfxRelativePath('whoosh_snap'), 'sound-effects/vidzeo/whoosh_snap.wav');
+  assert.equal(sfx.resolveSfxRelativePath('unknown_feature_xyz'), null, 'Unknown non-whoosh sound must return null');
+
+  // 4. Bare transition cue fallback
+  assert.ok(sfx.resolveSfxSource({ kind: 'transition' })?.includes('edit_whoosh_light.wav'));
+  assert.ok(sfx.resolveSfxSource({ type: 'transition' })?.includes('edit_whoosh_light.wav'));
+  assert.ok(sfx.resolveSfxSource({ id: 'sfx-3-trans' })?.includes('edit_whoosh_light.wav'));
+
+  // 5. Channel music track resolution
+  const musicTracks = ['train-crew', 'classic-wheels', 'nostalgic-brit', 'royal-celeb', 'crown-royal', 'crown-zone', 'after-death', 'documentary'];
+  for (const track of musicTracks) {
+    const rel = sfx.resolveMusicRelativePath(track);
+    assert.ok(rel, `Music track "${track}" must be resolvable`);
+    assert.ok(fs.existsSync(path.join(publicDir, rel)), `Music file must exist on disk: ${rel}`);
+    assert.ok(sfx.resolveStaticAsset(track)?.includes(rel));
+  }
+
+  // 6. buildSemanticManifest resilience: handles null/empty script without throwing
+  const fallbackManifest = buildSemanticManifest({}, '', { fps: 30 });
+  assert.ok(fallbackManifest.scenes.length >= 1, 'Fallback manifest must contain at least 1 scene');
+  assert.ok(fallbackManifest.scenes[0].sound_cues.length >= 2, 'Fallback scene must have sound cues');
+});
+
 

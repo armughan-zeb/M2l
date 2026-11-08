@@ -12,9 +12,17 @@ const coordinates = (value) => {
   const lat = Number(Array.isArray(value) ? value[1] : value?.lat);
   return Number.isFinite(lon) && Number.isFinite(lat) ? { lon, lat } : null;
 };
+const KNOWN_GLOBE_MAPS = new Set([
+  'map-assets/nasa-blue-marble-topography-mercator.jpg',
+  'map-assets/nasa-blue-marble-july-5400.jpg',
+  'map-assets/panama-canal-satellite-eox-2016.jpg'
+]);
 const srcFor = (source) => {
   const value = String(source || '').trim();
-  return /^(?:https?:|data:|blob:)/i.test(value) ? value : staticFile(value.replace(/^\/+/, ''));
+  if (/^(?:https?:|data:|blob:)/i.test(value)) return value;
+  const clean = value.replace(/^\/+/, '');
+  const verified = KNOWN_GLOBE_MAPS.has(clean) ? clean : 'map-assets/nasa-blue-marble-july-5400.jpg';
+  return staticFile(verified);
 };
 const unitVector = ({ lon, lat }) => {
   const phi = radians(lat);

@@ -691,68 +691,160 @@ const SFX_REGISTRY_MAP = {
   'water_pulse': 'sound-effects/vidzeo/water_pulse.wav'
 };
 
-function resolveSfxPath(raw) {
+const KNOWN_MUSIC_FILES = new Set([
+  'music/after-death.mp3',
+  'music/ambient_dark.mp3',
+  'music/british_orchestral.mp3',
+  'music/cinematic.mp3',
+  'music/classic-wheels.mp3',
+  'music/crown-royal.mp3',
+  'music/crown-zone.mp3',
+  'music/documentary.mp3',
+  'music/industrial_acoustic.mp3',
+  'music/investigative_tension.mp3',
+  'music/modern_cinematic.mp3',
+  'music/nostalgic-brit.mp3',
+  'music/retro_groove.mp3',
+  'music/royal-celeb.mp3',
+  'music/royal_orchestral.mp3',
+  'music/suspense.mp3',
+  'music/train-crew.mp3'
+]);
+
+const KNOWN_MAP_FILES = new Set([
+  'map-assets/nasa-blue-marble-topography-mercator.jpg',
+  'map-assets/nasa-blue-marble-july-5400.jpg',
+  'map-assets/panama-canal-satellite-eox-2016.jpg'
+]);
+
+const MUSIC_REGISTRY_MAP = {
+  'classic-wheels': 'music/classic-wheels.mp3',
+  'classic_wheels': 'music/classic-wheels.mp3',
+  'nostalgic-brit': 'music/nostalgic-brit.mp3',
+  'nostalgic_brit': 'music/nostalgic-brit.mp3',
+  'royal-celeb': 'music/royal-celeb.mp3',
+  'royal_celeb': 'music/royal-celeb.mp3',
+  'crown-royal': 'music/crown-royal.mp3',
+  'crown_royal': 'music/crown-royal.mp3',
+  'crown-zone': 'music/crown-zone.mp3',
+  'crown_zone': 'music/crown-zone.mp3',
+  'after-death': 'music/after-death.mp3',
+  'after_death': 'music/after-death.mp3',
+  'train-crew': 'music/train-crew.mp3',
+  'train_crew': 'music/train-crew.mp3',
+  'documentary': 'music/documentary.mp3',
+  'cinematic': 'music/cinematic.mp3',
+  'ambient_dark': 'music/ambient_dark.mp3',
+  'ambient-dark': 'music/ambient_dark.mp3',
+  'investigative_tension': 'music/investigative_tension.mp3',
+  'investigative-tension': 'music/investigative_tension.mp3',
+  'british_orchestral': 'music/british_orchestral.mp3',
+  'british-orchestral': 'music/british_orchestral.mp3',
+  'royal_orchestral': 'music/royal_orchestral.mp3',
+  'royal-orchestral': 'music/royal_orchestral.mp3',
+  'industrial_acoustic': 'music/industrial_acoustic.mp3',
+  'industrial-acoustic': 'music/industrial_acoustic.mp3',
+  'modern_cinematic': 'music/modern_cinematic.mp3',
+  'modern-cinematic': 'music/modern_cinematic.mp3',
+  'retro_groove': 'music/retro_groove.mp3',
+  'retro-groove': 'music/retro_groove.mp3',
+  'suspense': 'music/suspense.mp3'
+};
+
+function resolveSfxRelativePath(raw) {
   if (!raw || typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed === 'none' || trimmed === 'null' || trimmed === 'undefined') return null;
 
-  // External URLs or data URIs: return directly
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:')) {
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('file://')) {
     return trimmed;
   }
 
-  // Normalize path separators and remove leading slashes
   const normalized = trimmed.replace(/\\/g, '/').replace(/^\/+/, '');
 
-  // Direct path containing sound-effects/
+  // 1. Exact path containing sound-effects/ that matches verified existing file
   const sfxIdx = normalized.indexOf('sound-effects/');
   if (sfxIdx !== -1) {
     const sfxRel = normalized.slice(sfxIdx);
-    return staticFile(sfxRel);
+    if (KNOWN_SFX_FILES.has(sfxRel)) {
+      return sfxRel;
+    }
   }
 
-  // Clean candidate for registry lookup (strip .wav / .mp3 and parent folders)
+  // 2. Extract base identifier
   let baseId = normalized;
-  if (baseId.endsWith('.wav') || baseId.endsWith('.mp3')) {
+  if (baseId.includes('?')) {
+    baseId = baseId.split('?')[0];
+  }
+  if (baseId.endsWith('.wav') || baseId.endsWith('.mp3') || baseId.endsWith('.ogg') || baseId.endsWith('.aac') || baseId.endsWith('.m4a')) {
     baseId = baseId.slice(0, baseId.lastIndexOf('.'));
   }
   if (baseId.includes('/')) {
     baseId = baseId.split('/').pop();
   }
 
-  const cleanId = baseId.toLowerCase();
+  const cleanId = baseId.toLowerCase().trim();
+  if (!cleanId) return null;
+
   const dotId = cleanId.replace(/_/g, '.');
   const underscoreId = cleanId.replace(/\./g, '_');
 
-  // Registry lookup with priority: cleanId, dotId, underscoreId
-  const mapped = SFX_REGISTRY_MAP[cleanId] || SFX_REGISTRY_MAP[dotId] || SFX_REGISTRY_MAP[underscoreId];
-  if (mapped) {
-    return staticFile(mapped);
+  // 3. Registry map lookup
+  const mapped = SFX_REGISTRY_MAP[cleanId]
+    || SFX_REGISTRY_MAP[dotId]
+    || SFX_REGISTRY_MAP[underscoreId]
+    || SFX_REGISTRY_MAP['edit_' + underscoreId];
+  if (mapped && KNOWN_SFX_FILES.has(mapped)) {
+    return mapped;
   }
 
-  // Edit folder prefix check
+  // 4. Edit folder prefix check (edit_*.wav)
   if (cleanId.startsWith('edit_')) {
     const editCandidate = `sound-effects/edit/${cleanId}.wav`;
     if (KNOWN_SFX_FILES.has(editCandidate)) {
-      return staticFile(editCandidate);
+      return editCandidate;
     }
   }
 
-  // Vidzeo folder fallback check
+  // 5. Vidzeo folder direct check
   const vidzeoCandidate = `sound-effects/vidzeo/${underscoreId}.wav`;
   if (KNOWN_SFX_FILES.has(vidzeoCandidate)) {
-    return staticFile(vidzeoCandidate);
+    return vidzeoCandidate;
   }
 
-  // Edit folder fallback check (without edit_ prefix)
+  // 6. Edit folder fallback check (edit_<name>.wav)
   const editFallback = `sound-effects/edit/edit_${underscoreId}.wav`;
   if (KNOWN_SFX_FILES.has(editFallback)) {
-    return staticFile(editFallback);
+    return editFallback;
   }
 
-  // Unresolvable: Never return a bare string or unknown relative path that will trigger a 404!
-  console.warn(`[Remotion] Sound cue "${raw}" could not be resolved to an existing sound effect file; safely bypassing.`);
+  // 7. Edit folder fallback without edit_ prefix
+  const editDirect = `sound-effects/edit/${underscoreId}.wav`;
+  if (KNOWN_SFX_FILES.has(editDirect)) {
+    return editDirect;
+  }
+
+  // 8. Whoosh & Transition family fallback (bare whoosh, variants, trans_whoosh, etc.)
+  if (cleanId === 'whoosh' || cleanId.startsWith('whoosh') || cleanId.endsWith('whoosh') || cleanId === 'transition' || cleanId.startsWith('trans_whoosh') || cleanId.startsWith('edit_whoosh')) {
+    if (cleanId.includes('deep')) return 'sound-effects/edit/edit_whoosh_deep.wav';
+    if (cleanId.includes('air')) return 'sound-effects/edit/edit_whoosh_air.wav';
+    if (cleanId.includes('soft')) return 'sound-effects/vidzeo/whoosh_soft.wav';
+    if (cleanId.includes('snap')) return 'sound-effects/vidzeo/whoosh_snap.wav';
+    if (cleanId.includes('dark')) return 'sound-effects/vidzeo/whoosh_dark.wav';
+    return 'sound-effects/edit/edit_whoosh_light.wav';
+  }
+
   return null;
+}
+
+
+function resolveSfxPath(raw) {
+  const relPath = resolveSfxRelativePath(raw);
+  if (!relPath) return null;
+  if (relPath.startsWith('http://') || relPath.startsWith('https://') || relPath.startsWith('data:') || relPath.startsWith('blob:') || relPath.startsWith('file://')) {
+    return relPath;
+  }
+  return staticFile(relPath);
 }
 
 function resolveSfxSource(cue) {
@@ -761,9 +853,13 @@ function resolveSfxSource(cue) {
     return resolveSfxPath(cue);
   }
 
-  // Prioritize sound name/alias identifiers over generic URLs/paths
+  // 1. Explicit candidate properties
   const candidate = cue.sfx_id
+    || cue.sound_id
+    || cue.asset_id
+    || cue.token
     || cue.file
+    || cue.sound
     || (cue.kind && cue.kind !== 'transition' && cue.kind !== 'feature' ? cue.kind : null)
     || (cue.type && cue.type !== 'transition' && cue.type !== 'feature' ? cue.type : null)
     || cue.asset
@@ -772,42 +868,128 @@ function resolveSfxSource(cue) {
     || (cue.id && !String(cue.id).startsWith('sfx-') ? cue.id : null)
     || cue.name;
 
-  if (!candidate || typeof candidate !== 'string') return null;
-  return resolveSfxPath(candidate);
+  if (candidate && typeof candidate === 'string') {
+    const resolved = resolveSfxPath(candidate);
+    if (resolved) return resolved;
+  }
+
+  // 2. Default transition sound fallback
+  if (cue.kind === 'transition' || cue.type === 'transition' || String(cue.id || '').includes('trans')) {
+    return staticFile('sound-effects/edit/edit_whoosh_light.wav');
+  }
+
+  return null;
+}
+
+function resolveMusicRelativePath(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === 'none' || trimmed === 'null' || trimmed === 'undefined') return null;
+
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('file://')) {
+    return trimmed;
+  }
+
+  const normalized = trimmed.replace(/\\/g, '/').replace(/^\/+/, '');
+
+  const musicIdx = normalized.indexOf('music/');
+  if (musicIdx !== -1) {
+    const musicRel = normalized.slice(musicIdx);
+    if (KNOWN_MUSIC_FILES.has(musicRel)) return musicRel;
+  }
+
+  let baseId = normalized;
+  if (baseId.endsWith('.mp3') || baseId.endsWith('.wav')) {
+    baseId = baseId.slice(0, baseId.lastIndexOf('.'));
+  }
+  if (baseId.includes('/')) {
+    baseId = baseId.split('/').pop();
+  }
+
+  const cleanId = baseId.toLowerCase().trim();
+  const hyphenId = cleanId.replace(/_/g, '-');
+  const underscoreId = cleanId.replace(/-/g, '_');
+
+  const mapped = MUSIC_REGISTRY_MAP[cleanId] || MUSIC_REGISTRY_MAP[hyphenId] || MUSIC_REGISTRY_MAP[underscoreId];
+  if (mapped && KNOWN_MUSIC_FILES.has(mapped)) return mapped;
+
+  const candidateHyphen = `music/${hyphenId}.mp3`;
+  if (KNOWN_MUSIC_FILES.has(candidateHyphen)) return candidateHyphen;
+
+  const candidateUnderscore = `music/${underscoreId}.mp3`;
+  if (KNOWN_MUSIC_FILES.has(candidateUnderscore)) return candidateUnderscore;
+
+  if (cleanId.includes('doc') || cleanId.includes('track') || cleanId.includes('soundtrack')) {
+    return 'music/documentary.mp3';
+  }
+
+  return null;
+}
+
+function resolveMusicPath(raw) {
+  const relPath = resolveMusicRelativePath(raw);
+  if (!relPath) return null;
+  if (relPath.startsWith('http://') || relPath.startsWith('https://') || relPath.startsWith('data:') || relPath.startsWith('blob:') || relPath.startsWith('file://')) {
+    return relPath;
+  }
+  return staticFile(relPath);
 }
 
 function resolveStaticAsset(value) {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   if (!trimmed || trimmed === 'none' || trimmed === 'null' || trimmed === 'undefined') return null;
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:')) {
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('file://')) {
     return trimmed;
   }
   const normalized = trimmed.replace(/\\/g, '/');
-  const sfxIdx = normalized.indexOf('sound-effects/');
-  if (sfxIdx !== -1) {
-    return staticFile(normalized.slice(sfxIdx));
+
+  // 1. Check SFX registry
+  const sfxResolved = resolveSfxPath(trimmed);
+  if (sfxResolved) {
+    return sfxResolved;
   }
+  // If it was explicitly a sound-effects/ path but could not be resolved, do not request it (prevent 404)
+  if (normalized.includes('sound-effects/')) {
+    return null;
+  }
+
+  // 2. Check Music registry
+  const musicResolved = resolveMusicPath(trimmed);
+  if (musicResolved) {
+    return musicResolved;
+  }
+  if (normalized.includes('music/') && (normalized.endsWith('.mp3') || normalized.endsWith('.wav'))) {
+    return null;
+  }
+
+  // 3. Map assets
+  if (normalized.includes('map-assets/')) {
+    const mapRel = normalized.slice(normalized.indexOf('map-assets/'));
+    const verifiedMap = KNOWN_MAP_FILES.has(mapRel) ? mapRel : 'map-assets/nasa-blue-marble-topography-mercator.jpg';
+    return staticFile(verifiedMap);
+  }
+
+  // 4. Remotion assets
   const remotionIdx = normalized.indexOf('remotion-');
   if (remotionIdx !== -1) {
     return staticFile(normalized.slice(remotionIdx));
   }
 
-  // Check if it resolves through SFX registry
-  const sfxResolved = resolveSfxPath(trimmed);
-  if (sfxResolved) {
-    return sfxResolved;
+  // 5. Font library
+  if (normalized.includes('font-library/')) {
+    return staticFile(normalized.slice(normalized.indexOf('font-library/')));
   }
 
-  // If it's a bare name (no slashes, no dots/extension), DO NOT return bare string to prevent 404
+  // 6. Bare identifier without path or extension: return null to prevent 404
   if (!trimmed.includes('/') && !trimmed.includes('\\') && !trimmed.includes('.')) {
-    console.warn(`[Remotion] Unresolved bare asset name "${trimmed}" bypassed to prevent 404 render crash.`);
     return null;
   }
 
-  // Otherwise, if it has a path or extension, treat as relative static file
+  // Otherwise, treat as relative static file
   return staticFile(trimmed.replace(/^\/+/, ''));
 }
+
 
 function TimedCaptionTrack({ scene, fps, theme }) {
   const frame = useCurrentFrame();
@@ -1769,10 +1951,16 @@ export function getCompositionConfig(manifest = {}) {
 }
 
 export {
+  resolveSfxRelativePath,
   resolveSfxPath,
   resolveSfxSource,
+  resolveMusicRelativePath,
+  resolveMusicPath,
   resolveStaticAsset,
   SFX_REGISTRY_MAP,
-  KNOWN_SFX_FILES
+  MUSIC_REGISTRY_MAP,
+  KNOWN_SFX_FILES,
+  KNOWN_MUSIC_FILES
 };
+
 
