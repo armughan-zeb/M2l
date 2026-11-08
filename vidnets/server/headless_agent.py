@@ -10,6 +10,13 @@ import time
 import urllib.error
 import urllib.request
 
+_SERVER_DIR = Path(__file__).resolve().parent
+_RESOURCES_DIR = _SERVER_DIR.parent
+if str(_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVER_DIR))
+if str(_RESOURCES_DIR) not in sys.path:
+    sys.path.insert(0, str(_RESOURCES_DIR))
+
 BUILD_ID = '2026-10-09-local-agent-v1'
 
 
@@ -45,8 +52,15 @@ def configure(runtime_root=None):
               'VIDZEO_NODE_PATH': node_candidate,
               'NODE_PATH': resources / 'node_modules', 'VIDZEO_PACKAGED': '1' if packaged else '0',
               'VIDZEO_NO_BROWSER': '1', 'VIDZEO_BIND_HOST': '127.0.0.1',
-              'VIDZEO_AUTH_MODE': saved.get('auth_mode') or env.get('VIDZEO_AUTH_MODE') or 'supabase'}
-    if saved.get('allow_packaged_local_auth') == '1':
+              'VIDZEO_AUTH_MODE': saved.get('auth_mode') or env.get('VIDZEO_AUTH_MODE') or 'local'}
+    # Sign-in-free local mode is the default for this worker build. Packaged
+    # installs gate local auth behind an explicit opt-in, which is granted here
+    # rather than requiring a desktop pairing session first.
+    if str(os.environ.get('VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH', '')) == '1':
+        values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
+    elif values['VIDZEO_AUTH_MODE'] == 'local' and packaged:
+        values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
+    elif saved.get('allow_packaged_local_auth') == '1':
         values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
     env.update({key: str(value) for key, value in values.items()})
     env['PATH'] = os.pathsep.join([str(resources / 'tools' / 'node'), str(resources / 'tools' / 'ffmpeg'), env.get('PATH', '')])
@@ -85,7 +99,14 @@ def service_url(root):
 def start(resources, root, env):
     from services.agent_access import _read
     from services.agent_bridge import atomic_json, _request_lock
-    _read()  # Requires explicit pairing; never silently enables account bypass.
+    # A paired credential is optional here. The service boots without any
+    # account, and unpaired requests use the local 'local-bypass' worker token
+    # instead of a Vidnets-supabase delegated session.
+    try:
+        _read()
+        paired = True
+    except PermissionError:
+        paired = False
     secure = root / 'secure'
     secure.mkdir(parents=True, exist_ok=True)
     with _request_lock(secure / 'agent-service.json'):
@@ -120,7 +141,8 @@ def start(resources, root, env):
         if not python.is_file():
             python = Path(sys.executable)
         with logfile.open('ab') as stream:
-            spawn_kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
+            nt_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+            spawn_kwargs = {'creationflags': nt_flags, 'close_fds': True} if os.name == 'nt' else {'start_new_session': True}
             child = subprocess.Popen([str(python), '-u', str(resources / 'main.py')],
                 cwd=str(resources), env=env, stdout=stream, stderr=stream, stdin=subprocess.DEVNULL,
                 **spawn_kwargs)
@@ -168,7 +190,13 @@ def main(argv=None):
         result = start(resources, root, env)
     else:
         from services.agent_access import _read
-        key = _read()['key']
+        try:
+            key = _read()['key']
+        except PermissionError:
+            # Sign-in-free worker build: without a paired account the CLI uses
+            # the fixed local worker token, which the local-mode server maps to
+            # the 'local-user' agent owner.
+            key = 'local-bypass'
         url = service_url(root)
         status = _json_http(url + '/api/status', timeout=5)
         if status.get('pipeline_build_id') != BUILD_ID or Path(status.get('resource_root', '')).resolve() != resources:

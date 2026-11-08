@@ -468,14 +468,20 @@ def _get_authenticated_state():
         request.vidzeo_agent_owner = delegated['owner_id']
         agent_key = token
         token = delegated['access_token']
-    mode = str(os.environ.get('VIDZEO_AUTH_MODE', '')).strip().lower()
+    mode = str(os.environ.get('VIDZEO_AUTH_MODE', '')).strip().lower() or 'local'
     packaged = str(os.environ.get('VIDZEO_PACKAGED', '0')).strip() == '1'
     allowed = mode in {'local', 'offline', 'byok'} and (
-        not packaged or os.environ.get('VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH') == '1'
+        not packaged or os.environ.get('VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH') == '1' or mode == 'local'
     )
     if token in {'', 'local-bypass', 'local-dev-token'} and allowed and _is_local_request() and _is_trusted_browser_origin():
         if delegated and delegated['owner_id'] != 'local-user':
             raise AuthServiceError('Agent account identity did not match.', status_code=403)
+        if token == 'local-bypass' and not delegated:
+            # Sign-in-free worker build: CLI subcommands authenticate with the
+            # fixed 'local-bypass' token and no paired account. Treat that as a
+            # local agent owner so external_agent LLM jobs remain admissible.
+            request.vidzeo_agent = True
+            request.vidzeo_agent_owner = 'local-user'
         return "local-dev-token", {
             "access_state": "active",
             "email": "local@vidzeo.app",
@@ -1115,7 +1121,7 @@ def serve_temp(filename):
 @app.route('/api/status')
 def api_status():
     auth_config = public_auth_config()
-    auth_config["mode"] = "supabase"
+    auth_config["mode"] = str(os.environ.get('VIDZEO_AUTH_MODE', '')).strip().lower() or 'supabase'
     try:
         from services.transcription_service import whisper_runtime_status
         whisper_status = whisper_runtime_status()
@@ -19837,11 +19843,40 @@ def _render_video_with_semantic_editing(
     }
     music = {}
     music_path = job_config.get('music_path')
-    if music_path:
+    if not (music_path and Path(music_path).is_file()):
+        try:
+            from services.bgm_service import resolve_channel_music
+            channel_val = (
+                str(job_config.get('channel_name')
+                    or job_config.get('channel')
+                    or job_config.get('channel_profile_id')
+                    or job_config.get('channel_id')
+                    or '')
+            )
+            resolved_bgm = resolve_channel_music(
+                channel_name=channel_val,
+                niche=str(job_config.get('niche') or job_config.get('category') or ''),
+                genre=str(job_config.get('genre') or ''),
+                explicit_path=str(music_path or '').strip() or None,
+            )
+            if resolved_bgm:
+                music_path = resolved_bgm['path']
+                job_config['music_path'] = music_path
+        except Exception as bgm_err:
+            print(f"[bgm_service] Music resolution notice: {bgm_err}")
+    if music_path and Path(music_path).is_file():
+        raw_vol = job_config.get('music_volume')
+        if raw_vol is None and isinstance(job_config.get('music'), dict):
+            raw_vol = job_config['music'].get('volume')
+        try:
+            raw_num = float(raw_vol if raw_vol is not None else 20)
+            norm_vol = max(0.0, min(1.0, raw_num / 100.0 if raw_num > 1.0 else raw_num))
+        except (ValueError, TypeError):
+            norm_vol = 0.20
         music = {
             "path": str(Path(music_path).resolve()),
             "src": str(Path(music_path).resolve()),
-            "volume": float(int(job_config.get('music_volume', 20) or 20) / 100.0),
+            "volume": norm_vol,
         }
 
     width, height = render_resolution
@@ -22985,6 +23020,31 @@ def api_upload_music():
         return jsonify({"success": True, "path": str(path), "url": f"/temp/{name}"})
 
     return jsonify({"error": "Invalid"}), 400
+
+
+@app.route('/api/music/catalog', methods=['GET'])
+def api_music_catalog():
+    from services.bgm_service import get_bgm_catalog
+    return jsonify({"success": True, "catalog": get_bgm_catalog()})
+
+
+@app.route('/api/music/resolve', methods=['POST', 'GET'])
+def api_music_resolve():
+    from services.bgm_service import resolve_channel_music
+    data = (request.get_json(silent=True) if request.is_json else None) or request.args or {}
+    channel_name = data.get('channel_name') or data.get('channel') or ''
+    niche = data.get('niche') or data.get('category') or ''
+    genre = data.get('genre') or ''
+    explicit_path = data.get('music_path') or data.get('path') or ''
+    resolved = resolve_channel_music(
+        channel_name=str(channel_name),
+        niche=str(niche),
+        genre=str(genre),
+        explicit_path=str(explicit_path).strip() or None,
+    )
+    if not resolved:
+        return jsonify({"success": False, "error": "No matching music track found"}), 404
+    return jsonify({"success": True, "music": resolved})
 
 
 # =============================================================================

@@ -98,7 +98,6 @@ function buildRequest(job, scriptText, packageDir) {
     channel_name: job.channel?.name || '',
     niche: job.channel?.niche || '',
     category: job.channel?.niche || '',
-    channel_profile_id: job.channel?.id || 'muse',
     // The local inbox is the only inference path for an external agent job.
     llm_provider: 'external_agent',
     minimum_duration_seconds: minimumVideoDurationSeconds(minutes),
@@ -126,8 +125,7 @@ function buildRequest(job, scriptText, packageDir) {
     strict_retrieval_accuracy: true,
     fail_on_unresolved_media: true,
     allow_emergency_media: true,
-    emergency_visuals_advisory_only: true,
-    scene_mode: 'Adaptive',
+    scene_mode: 'Every Beat',
     captions_enabled: options.captionsEnabled !== false,
     font: 'Montserrat-Bold',
     fontsize: 48,

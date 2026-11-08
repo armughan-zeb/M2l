@@ -485,7 +485,7 @@ def detect_browser_profiles() -> List[BrowserProfile]:
             ("vivaldi", local / "Vivaldi" / "User Data"),
             ("opera", roaming / "Opera Software" / "Opera Stable"),
         ]
-        firefox_root = roaming / "Mozilla" / "Firefox" / "Profiles"
+        firefox_roots = [roaming / "Mozilla" / "Firefox" / "Profiles"]
     else:
         home = Path.home()
         config_dir = home / ".config"

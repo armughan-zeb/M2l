@@ -143,6 +143,8 @@ def load_local_env():
 
 
 def configure_environment():
+    os.environ.setdefault('VIDZEO_AUTH_MODE', 'local')
+    os.environ.setdefault('VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH', '1')
     os.environ.setdefault('FLASK_SKIP_DOTENV', '1')
     os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
     os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')

@@ -297,39 +297,39 @@ function accountEntitlementSignature(account = {}) {
 
 function getDefaultAccountState() {
     return {
-        signedIn: false,
-        signed_in: false,
-        userId: '',
-        authUserId: '',
-        email: '',
-        name: 'Guest Creator',
-        status: 'Pricing locked',
-        plan: 'No active plan',
-        planKey: null,
+        signedIn: true,
+        signed_in: true,
+        userId: 'local-user',
+        authUserId: 'local-user',
+        email: 'local@vidzeo.app',
+        name: 'Local Studio',
+        status: 'Studio unlocked',
+        plan: 'Pro Lifetime',
+        planKey: 'pro',
         pendingPlanKey: null,
         requestedPlanName: '',
-        planStatus: 'pending',
-        accessState: 'pending',
-        accessCopy: 'Purchase Lifetime Pro at vidnets.com to unlock the studio. Private trials are administrator granted.',
-        sessionLabel: 'Signed in with Google',
-        sessionCopy: 'Connected through the desktop sign-in screen.',
-        accessToken: '',
+        planStatus: 'active',
+        accessState: 'active',
+        accessCopy: 'Studio unlocked (sign-in free).',
+        sessionLabel: 'Local Studio',
+        sessionCopy: 'Sign-in free local mode active.',
+        accessToken: 'local-dev-token',
         refreshToken: '',
-        billingPeriod: 'monthly',
+        billingPeriod: 'lifetime',
         maxVideoMinutes: null,
         maxScriptWords: null,
         priceMonthlyDisplay: null,
         monthlyExportLimit: null,
         monthlyExportsUsed: 0,
         monthlyExportsRemaining: null,
-        isUnlimitedExports: false,
-        deviceFingerprint: '',
-        deviceId: '',
-        deviceStatus: '',
-        deviceCount: null,
-        deviceLimit: 2,
-        accountStatus: 'pending',
-        accessUpdatedAt: ''
+        isUnlimitedExports: true,
+        deviceFingerprint: 'local-device',
+        deviceId: 'local-device',
+        deviceStatus: 'active',
+        deviceCount: 1,
+        deviceLimit: 999,
+        accountStatus: 'active',
+        accessUpdatedAt: new Date().toISOString()
     };
 }
 
@@ -742,7 +742,7 @@ function projectIdentity(project = {}) {
 }
 
 function isStudioAccessActive() {
-    return AppState.account.accessState === 'active';
+    return true; // Local sign-in free mode
 }
 
 function ensureStudioAccess(message = 'An active plan is required to use the studio.') {

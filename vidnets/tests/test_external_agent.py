@@ -2,8 +2,10 @@
 import ast
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 import tempfile
@@ -42,15 +44,19 @@ class AgentTests(unittest.TestCase):
             time.sleep(.01)
         self.fail('No agent inference request was published.')
 
-    def test_manual_all_models_and_fallbacks_are_qwen_even_custom(self):
+    def test_manual_rejects_uncatalogued_models_and_pins_saved_selection(self):
         for profile in ('efficient', 'custom'):
-            cfg = normalize_provider_config(apply_generation_cost_policy({'cost_profile': profile,
-                'llm_model': 'expensive', 'qwen_vision_model': 'expensive',
-                'scene_brain_fallback_models': ['expensive']}))
-            for name in ('llm_model', 'director_model', 'scene_brain_model', 'query_llm_model',
-                         'vision_model', 'qwen_vision_model', 'research_model', 'composition_model'):
-                self.assertEqual(cfg[name], OPENROUTER_MODEL)
-            self.assertEqual(cfg['scene_brain_fallback_models'], [OPENROUTER_MODEL])
+            with self.assertRaises(ValueError):
+                normalize_provider_config(apply_generation_cost_policy({'cost_profile': profile,
+                    'llm_model': 'expensive', 'qwen_vision_model': 'expensive',
+                    'scene_brain_fallback_models': ['expensive']}))
+        # The saved catalog selection is admitted unchanged and pinned to every role.
+        cfg = normalize_provider_config(apply_generation_cost_policy({'cost_profile': 'custom',
+            'llm_model': OPENROUTER_MODEL, 'qwen_vision_model': OPENROUTER_MODEL}))
+        for name in ('llm_model', 'director_model', 'scene_brain_model', 'query_llm_model',
+                     'vision_model', 'qwen_vision_model', 'research_model', 'composition_model'):
+            self.assertEqual(cfg[name], OPENROUTER_MODEL)
+        self.assertEqual(cfg['scene_brain_fallback_models'], [OPENROUTER_MODEL])
 
     def test_external_normalization_removes_paid_and_subscription_credentials(self):
         cfg = normalize_provider_config({'llm_provider': 'external_agent', 'agent_owner_id': 'alice',
@@ -146,8 +152,13 @@ class AgentTests(unittest.TestCase):
         response._content = b'{"choices":[]}'
         network = Mock(return_value=response)
         with job_scope({'llm_provider': 'openrouter', 'cost_profile': 'custom'}):
+            with self.assertRaises(ValueError):
+                provider_post(network, 'https://openrouter.ai/api/v1/chat/completions', headers={},
+                    json={'model': 'expensive', 'models': ['expensive-2']}, timeout=1)
+            network.assert_not_called()
+            # An omitted model is admitted only as the saved catalog selection.
             provider_post(network, 'https://openrouter.ai/api/v1/chat/completions', headers={},
-                json={'model': 'expensive', 'models': ['expensive-2']}, timeout=1)
+                json={}, timeout=1)
             self.assertEqual(network.call_args.kwargs['json']['model'], OPENROUTER_MODEL)
             self.assertNotIn('models', network.call_args.kwargs['json'])
             with self.assertRaises(ValueError):
@@ -217,7 +228,8 @@ class EndpointTests(AgentTests):
         from config import normalize_generation_config
         wanted = {'_json_error', '_extract_bearer_token', '_extract_device_context', '_get_authenticated_state',
             '_is_local_request', '_is_trusted_browser_origin', 'require_authenticated_user', 'require_active_access',
-            'api_agent_access', 'api_agent_bridge', 'api_generate', '_apply_env_api_key_defaults'}
+            'api_agent_access', 'api_agent_bridge', 'api_generate', '_apply_env_api_key_defaults',
+            '_parse_duration_to_seconds', '_estimate_script_duration_seconds'}
         tree = ast.parse((ROOT / 'server/app.py').read_text(encoding='utf-8'))
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
         app = Flask(__name__)
@@ -228,6 +240,8 @@ class EndpointTests(AgentTests):
         namespace = {'app': app, 'request': request, 'jsonify': jsonify, 'os': os, 'json': json,
             'urllib': __import__('urllib'), 'wraps': wraps, 'AuthServiceError': AuthServiceError,
             'sync_authenticated_user': self.sync, 'secrets': secrets, 'Path': Path,
+            're': re, 'math': math,
+            'OpenRouterScenePlanningError': type('OpenRouterScenePlanningError', (Exception,), {}),
             'TEMP_DIR': self.root, 'OUTPUT_DIR': self.root, 'normalize_generation_config': normalize_generation_config,
             '_attach_plan_constraints': lambda data, user: data, '_coerce_media_source_from_weights': lambda data: data,
             '_enforce_generation_plan_limits': lambda data, user: data, '_validate_media_request_config': lambda data: None,
@@ -239,28 +253,30 @@ class EndpointTests(AgentTests):
         return app.test_client()
 
     def test_agent_generate_pins_owner_and_routes_to_same_queue_api(self):
+        from services import export_entitlements
         key = self.seed_access()
         client = self.make_api()
-        response = client.post('/api/generate', json={'script': 'Grounded script', 'agent_owner_id': 'spoofed',
-            'llm_model': 'expensive', 'openrouter_api_key': 'paid-secret'}, headers={'Authorization': 'Bearer ' + key})
-        self.assertEqual(response.status_code, 202, response.get_json())
-        cfg = self.enqueue.call_args.args[0]
-        self.assertEqual(cfg['agent_owner_id'], 'alice')
-        self.assertEqual(cfg['llm_provider'], 'external_agent')
-        self.assertEqual(cfg['openrouter_api_key'], 'external-agent:alice')
-        self.assertEqual(cfg['tts_model'], 'audiogram')
-        self.assertEqual(self.sync.call_args.kwargs['device_fingerprint'], 'paired-device')
-        denied = client.post('/api/generate', json={'script': 'script', 'llm_provider': 'openrouter'}, headers={'Authorization': 'Bearer ' + key})
-        self.assertEqual(denied.status_code, 400)
+        with patch.object(export_entitlements, 'reserve_generation_export', lambda *args, **kwargs: {'allowed': True}), \
+                patch.object(export_entitlements, 'finish_generation_export', lambda *args, **kwargs: None):
+            response = client.post('/api/generate', json={'script': 'Grounded script', 'agent_owner_id': 'spoofed',
+                'llm_model': 'expensive', 'openrouter_api_key': 'paid-secret'}, headers={'Authorization': 'Bearer ' + key})
+            self.assertEqual(response.status_code, 202, response.get_json())
+            cfg = self.enqueue.call_args.args[0]
+            self.assertEqual(cfg['agent_owner_id'], 'alice')
+            self.assertEqual(cfg['llm_provider'], 'external_agent')
+            self.assertEqual(cfg['openrouter_api_key'], 'external-agent:alice')
+            self.assertEqual(cfg['tts_model'], 'audiogram')
+            self.assertEqual(self.sync.call_args.kwargs['device_fingerprint'], 'paired-device')
+            denied = client.post('/api/generate', json={'script': 'script', 'llm_provider': 'openrouter'}, headers={'Authorization': 'Bearer ' + key})
+            self.assertEqual(denied.status_code, 400)
 
-    def test_manual_cannot_spoof_agent_and_uses_qwen(self):
+    def test_manual_cannot_spoof_agent_or_paid_models(self):
         client = self.make_api()
         headers = {'Authorization': 'Bearer user-session'}
         denied = client.post('/api/generate', json={'llm_provider': 'external_agent', 'agent_owner_id': 'alice'}, headers=headers)
         self.assertEqual(denied.status_code, 400)
-        success = client.post('/api/generate', json={'script': 'script', 'llm_model': 'expensive', 'cost_profile': 'custom'}, headers=headers)
-        self.assertEqual(success.status_code, 200, success.get_json())
-        self.assertEqual(success.get_json()['model'], OPENROUTER_MODEL)
+        uncatalogued = client.post('/api/generate', json={'script': 'script', 'llm_model': 'expensive', 'cost_profile': 'custom'}, headers=headers)
+        self.assertEqual(uncatalogued.status_code, 400, uncatalogued.get_json())
 
     def test_key_remote_bad_origin_inactive_and_wrong_identity_are_rejected(self):
         key = self.seed_access()

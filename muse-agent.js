@@ -287,10 +287,16 @@ async function doctorCommand() {
   } else {
     let remotionReady = false;
     try {
-      require.resolve('@remotion/bundler');
-      require.resolve('@remotion/renderer');
+      require('@remotion/bundler');
+      require('@remotion/renderer');
       remotionReady = true;
-    } catch (_) {}
+    } catch (_) {
+      try {
+        require(path.join(config.ROOT, 'vidnets', 'node_modules', '@remotion', 'bundler'));
+        require(path.join(config.ROOT, 'vidnets', 'node_modules', '@remotion', 'renderer'));
+        remotionReady = true;
+      } catch (_) {}
+    }
 
     add('Remotion Engine', remotionReady ? 'pass' : 'warn',
       remotionReady

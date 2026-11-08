@@ -133,7 +133,7 @@ def test_scene_brain_defaults_to_nemotron_free_without_premium_fallbacks(monkeyp
     monkeypatch.delenv("VIDZEO_SCENE_BRAIN_FALLBACK_MODELS", raising=False)
     monkeypatch.delenv("VIDZEO_SCENE_BRAIN_FALLBACK_CHAIN", raising=False)
     config = normalize_generation_config({})
-    assert config["scene_brain_model"] == DEFAULT_SCENE_BRAIN_MODEL
+    assert config["scene_brain_model"] == "nvidia/nemotron-3.5-super-vl:free"
     assert config["scene_brain_fallback_models"] == [
         "nvidia/nemotron-3.5-super-vl:free",
     ]

@@ -9,9 +9,20 @@ from unittest.mock import Mock
 import pytest
 
 
+def _find_bridge():
+    candidates = [
+        Path(__file__).resolve().parents[4] / 'Management' / 'YT CMS' / 'harness' / 'vidzeo-bridge.py',
+        Path(__file__).resolve().parents[3] / 'Management' / 'YT CMS' / 'harness' / 'vidzeo-bridge.py',
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return candidates[0]
+
+
 @pytest.mark.parametrize('unlink_fails', [False, True])
 def test_normal_generation_import_is_independent_of_request_cleanup(tmp_path, monkeypatch, capsys, unlink_fails):
-    bridge = Path(__file__).resolve().parents[3] / 'Management' / 'YT CMS' / 'harness' / 'vidzeo-bridge.py'
+    bridge = _find_bridge()
     job = tmp_path / 'request.json'
     job.write_text(json.dumps({'_output_package_dir': str(tmp_path), '_cms_bridge_attempt_id': 'fixture'}))
     expected = {'success': True, 'duration': 600, 'component_manifest': {'fixture': True}}
@@ -37,7 +48,7 @@ def test_normal_generation_import_is_independent_of_request_cleanup(tmp_path, mo
 
 
 def test_generation_error_preserves_attempt_receipt_after_request_consumption(tmp_path, monkeypatch, capsys):
-    bridge = Path(__file__).resolve().parents[3] / 'Management' / 'YT CMS' / 'harness' / 'vidzeo-bridge.py'
+    bridge = _find_bridge()
     job = tmp_path / 'request.json'
     job.write_text(json.dumps({'_output_package_dir': str(tmp_path), '_cms_bridge_attempt_id': 'failed-fixture'}))
     fake = types.ModuleType('server.app')

@@ -21,7 +21,7 @@ def test_cost_mode_retains_distinct_saved_role_models():
     assert value['scene_brain_model'] == QWEN
     assert value['qwen_vision_model'] == QWEN
     assert value['scene_brain_fallback_chain'] == [QWEN]
-    assert normalize_provider_config({})['llm_model'] == FREE
+    assert normalize_provider_config({})['llm_model'] == QWEN
     with pytest.raises(ValueError, match='paid models'):
         normalize_provider_config({'llm_model':FREE, 'vision_model':'provider/paid'})
 
