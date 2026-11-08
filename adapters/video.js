@@ -102,15 +102,38 @@ async function renderWithFfmpeg(job, scriptText, workDir, options = {}) {
     outputPath
   ];
 
+  const { stopTree } = require('../lib/command');
   await new Promise((resolve, reject) => {
-    const child = spawn(ffmpegBinary, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let settled = false;
+    const child = spawn(ffmpegBinary, args, {
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      detached: process.platform !== 'win32'
+    });
     let stderr = '';
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener?.('abort', onAbort);
+      if (err) reject(err);
+      else resolve();
+    };
+    const onAbort = () => {
+      stopTree(child);
+      finish(new Error('FFmpeg render was cancelled'));
+    };
+    if (options.signal?.aborted) {
+      stopTree(child);
+      finish(new Error('FFmpeg render was cancelled'));
+      return;
+    }
+    options.signal?.addEventListener?.('abort', onAbort, { once: true });
     child.stderr.on('data', chunk => { stderr += chunk.toString(); });
     child.on('close', code => {
-      if (code === 0) resolve();
-      else reject(new Error('FFmpeg render failed: ' + stderr.slice(-400)));
+      if (code === 0) finish();
+      else finish(new Error('FFmpeg render failed: ' + stderr.slice(-400)));
     });
-    child.on('error', reject);
+    child.on('error', finish);
   });
 
   options.onProgress?.(95, '1080p master encoded; verifying master');

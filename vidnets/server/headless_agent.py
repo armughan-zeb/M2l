@@ -21,6 +21,13 @@ def configure(runtime_root=None):
     root = Path(runtime_root or saved.get('runtime_root') or resources).resolve()
     packaged = bool(saved.get('packaged', (resources / 'app.asar').is_file()))
     env = dict(os.environ)
+    node_name = 'node.exe' if os.name == 'nt' else 'node'
+    node_candidate = resources / 'tools' / 'node' / node_name
+    if not node_candidate.is_file():
+        import shutil
+        sys_node = shutil.which('node')
+        node_candidate = Path(sys_node) if sys_node else node_candidate
+
     values = {'VIDZEO_ROOT': root, 'VIDZEO_RESOURCE_ROOT': resources,
               'VIDZEO_SECURE_DATA_DIR': root / 'secure', 'VIDZEO_SESSION_SECRET_FILE': root / '.vidzeo_session_secret',
               'VIDZEO_OUTPUT_DIR': root / 'output', 'VIDZEO_TEMP_DIR': root / 'temp',
@@ -29,7 +36,7 @@ def configure(runtime_root=None):
               'VIDZEO_FONTS_DIR': resources / 'fonts', 'VIDZEO_PUBLIC_DIR': resources / 'public',
               'VIDZEO_TEMPLATE_LIBRARY_DIR': resources / 'resources' / 'template-library',
               'VIDZEO_TEMPLATE_CUSTOM_DIR': root / 'template-library' / 'custom',
-              'VIDZEO_NODE_PATH': resources / 'tools' / 'node' / 'node.exe',
+              'VIDZEO_NODE_PATH': node_candidate,
               'NODE_PATH': resources / 'node_modules', 'VIDZEO_PACKAGED': '1' if packaged else '0',
               'VIDZEO_NO_BROWSER': '1', 'VIDZEO_BIND_HOST': '127.0.0.1',
               'VIDZEO_AUTH_MODE': saved.get('auth_mode') or env.get('VIDZEO_AUTH_MODE') or 'supabase'}
@@ -60,7 +67,8 @@ def _json_http(url, *, key='', body=None, timeout=20):
 def service_url(root):
     descriptor = root / 'secure' / 'agent-service.json'
     if not descriptor.is_file():
-        raise RuntimeError('Start the service first: VIDNETS_AGENT.cmd start')
+        launcher_name = 'VIDNETS_AGENT.cmd' if os.name == 'nt' else './VIDNETS_AGENT.sh'
+        raise RuntimeError(f'Start the service first: {launcher_name} start')
     state = json.loads(descriptor.read_text(encoding='utf-8'))
     port = int(state['port'])
     if port < 1 or port > 65535 or state.get('build_id') != BUILD_ID:
@@ -88,6 +96,8 @@ def start(resources, root, env):
                 try:
                     if os.name == 'nt':
                         probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    else:
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     probe.bind(('127.0.0.1', candidate))
                     port = candidate
                     break
@@ -99,7 +109,8 @@ def start(resources, root, env):
         logs = root / 'logs'
         logs.mkdir(parents=True, exist_ok=True)
         logfile = logs / 'agent-service.log'
-        python = resources / 'tools' / 'python' / 'python.exe'
+        py_name = 'python.exe' if os.name == 'nt' else 'python'
+        python = resources / 'tools' / 'python' / py_name
         if not python.is_file():
             python = Path(sys.executable)
         with logfile.open('ab') as stream:

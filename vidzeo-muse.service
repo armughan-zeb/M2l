@@ -1,0 +1,18 @@
+[Unit]
+Description=Vidzeo Muse Production Worker Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=%I
+WorkingDirectory=/opt/vidzeo/muse-tools
+ExecStart=/usr/bin/node /opt/vidzeo/muse-tools/muse-agent.js start
+Restart=always
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=30
+Environment=NODE_ENV=production
+Environment=MUSE_LOG_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target

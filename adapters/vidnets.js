@@ -21,15 +21,41 @@ const MINUTE = 60 * 1000;
 function agentCommand() {
   const explicit = String(process.env.MUSE_VIDNETS_COMMAND || '').trim();
   if (explicit) return explicit;
-  const bundled = path.join(config.ROOT, 'vidnets', 'VIDNETS_AGENT.cmd');
-  if (fs.existsSync(bundled)) return quoteArg(bundled);
-  const external = String(process.env.MUSE_VIDNETS_ROOT || '').trim();
-  if (external) {
-    const launcher = path.join(external, 'VIDNETS_AGENT.cmd');
-    if (fs.existsSync(launcher)) return quoteArg(launcher);
+
+  const vidnetsRoots = [
+    path.join(config.ROOT, 'vidnets'),
+    String(process.env.MUSE_VIDNETS_ROOT || '').trim()
+  ].filter(Boolean);
+
+  for (const root of vidnetsRoots) {
+    if (process.platform !== 'win32') {
+      const shLauncher = path.join(root, 'VIDNETS_AGENT.sh');
+      if (fs.existsSync(shLauncher)) {
+        try { fs.chmodSync(shLauncher, 0o755); } catch {}
+        return `bash ${quoteArg(shLauncher)}`;
+      }
+    } else {
+      const cmdLauncher = path.join(root, 'VIDNETS_AGENT.cmd');
+      if (fs.existsSync(cmdLauncher)) return quoteArg(cmdLauncher);
+    }
+    // Direct python execution fallback for headless agent
+    const headlessPy = path.join(root, 'server', 'headless_agent.py');
+    const resourcesHeadlessPy = path.join(root, 'resources', 'server', 'headless_agent.py');
+    const targetScript = fs.existsSync(headlessPy) ? headlessPy : (fs.existsSync(resourcesHeadlessPy) ? resourcesHeadlessPy : null);
+    if (targetScript) {
+      let pythonBin = process.env.VIDNETS_PYTHON || process.env.PYTHON;
+      if (!pythonBin) {
+        pythonBin = process.platform === 'win32'
+          ? (fs.existsSync(path.join(root, 'tools', 'python', 'python.exe')) ? path.join(root, 'tools', 'python', 'python.exe') : 'python')
+          : 'python3';
+      }
+      return `${quoteArg(pythonBin)} ${quoteArg(targetScript)}`;
+    }
   }
+
+  const expectedLauncher = process.platform === 'win32' ? 'VIDNETS_AGENT.cmd' : 'VIDNETS_AGENT.sh';
   throw new Error(
-    'The Vidnets launcher was not found. Set MUSE_VIDNETS_COMMAND (for example to a complete Vidnets VIDNETS_AGENT.cmd), ' +
+    `The Vidnets launcher was not found. Set MUSE_VIDNETS_COMMAND (for example to a complete Vidnets ${expectedLauncher}), ` +
     'or set MUSE_RENDER_COMMAND to your own renderer.'
   );
 }

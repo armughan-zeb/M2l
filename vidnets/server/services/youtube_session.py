@@ -122,6 +122,10 @@ def _secure_store_candidates() -> List[Path]:
             candidates.append(local / "Vidzeo Studio" / "secure" / "youtube-session.dpapi")
             candidates.append(local / "vidnets-studio-v1" / "VidzeoData" / "secure" / "youtube-session.dpapi")
             candidates.append(local / "Vidzeo CoSystems" / "secure" / "youtube-session.dpapi")
+    else:
+        home = Path.home()
+        candidates.append(home / ".local" / "share" / "vidnets" / "secure" / "youtube-session.dpapi")
+        candidates.append(home / ".config" / "vidnets" / "secure" / "youtube-session.dpapi")
     candidates.append(Path(os.environ.get("VIDZEO_TEMP_DIR") or Path.cwd() / "temp") / ".secure" / "youtube-session.dpapi")
     return candidates
 
@@ -135,6 +139,8 @@ def _secure_store_path() -> Path:
             return candidate
     if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         return Path(os.environ["LOCALAPPDATA"]) / "Vidnets Studio" / "secure" / "youtube-session.dpapi"
+    if os.name != "nt":
+        return Path.home() / ".local" / "share" / "vidnets" / "secure" / "youtube-session.dpapi"
     return Path(os.environ.get("VIDZEO_TEMP_DIR") or Path.cwd() / "temp") / ".secure" / "youtube-session.dpapi"
 
 
@@ -270,9 +276,69 @@ def _data_blob(data: bytes) -> Tuple[_DataBlob, Any]:
     return blob, buffer
 
 
+def _linux_derive_key(salt: bytes) -> bytes:
+    uid = str(os.getuid() if hasattr(os, 'getuid') else 1000).encode()
+    node = os.uname().nodename.encode() if hasattr(os, 'uname') else b'linux'
+    seed = [uid, node]
+    for p in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+        if os.path.isfile(p):
+            try:
+                seed.append(Path(p).read_bytes().strip())
+                break
+            except Exception:
+                pass
+    secret_file = Path.home() / '.vidzeo_session_secret'
+    if not secret_file.is_file():
+        try:
+            secret_file.parent.mkdir(parents=True, exist_ok=True)
+            secret_file.write_bytes(secrets.token_bytes(32))
+            os.chmod(secret_file, 0o600)
+        except Exception:
+            pass
+    if secret_file.is_file():
+        try:
+            seed.append(secret_file.read_bytes())
+        except Exception:
+            pass
+    return hashlib.pbkdf2_hmac('sha256', b''.join(seed), salt, 10000)
+
+
+def _linux_protect(data: bytes) -> bytes:
+    salt = secrets.token_bytes(16)
+    key = _linux_derive_key(salt)
+    nonce = secrets.token_bytes(16)
+    keystream_blocks = (len(data) + 31) // 32
+    keystream = bytearray()
+    for block_num in range(keystream_blocks):
+        counter = block_num.to_bytes(4, 'big')
+        keystream.extend(hashlib.sha256(key + nonce + counter).digest())
+    ciphertext = bytes(b ^ k for b, k in zip(data, keystream[:len(data)]))
+    tag = hashlib.sha256(key + b'mac' + ciphertext).digest()[:16]
+    return b'LNX1' + salt + nonce + tag + ciphertext
+
+
+def _linux_unprotect(data: bytes) -> bytes:
+    if not data.startswith(b'LNX1') or len(data) < 4 + 16 + 16 + 16:
+        raise ValueError('Invalid Linux credential blob format')
+    salt = data[4:20]
+    nonce = data[20:36]
+    tag = data[36:52]
+    ciphertext = data[52:]
+    key = _linux_derive_key(salt)
+    expected_tag = hashlib.sha256(key + b'mac' + ciphertext).digest()[:16]
+    if not secrets.compare_digest(tag, expected_tag):
+        raise ValueError('Credential authentication check failed')
+    keystream_blocks = (len(ciphertext) + 31) // 32
+    keystream = bytearray()
+    for block_num in range(keystream_blocks):
+        counter = block_num.to_bytes(4, 'big')
+        keystream.extend(hashlib.sha256(key + nonce + counter).digest())
+    return bytes(b ^ k for b, k in zip(ciphertext, keystream[:len(ciphertext)]))
+
+
 def _protect(data: bytes) -> bytes:
     if os.name != "nt":
-        raise OSError("OS credential encryption is unavailable on this platform")
+        return _linux_protect(data)
     source, source_buffer = _data_blob(data)
     output = _DataBlob()
     crypt32 = ctypes.windll.crypt32
@@ -290,8 +356,8 @@ def _protect(data: bytes) -> bytes:
 
 
 def _unprotect(data: bytes) -> bytes:
-    if os.name != "nt":
-        raise OSError("OS credential encryption is unavailable on this platform")
+    if os.name != "nt" or data.startswith(b"LNX1"):
+        return _linux_unprotect(data)
     source, source_buffer = _data_blob(data)
     output = _DataBlob()
     crypt32 = ctypes.windll.crypt32
@@ -399,23 +465,37 @@ def _chromium_profiles(browser: str, root: Path) -> List[BrowserProfile]:
 
 def detect_browser_profiles() -> List[BrowserProfile]:
     """Return installed browser profiles ordered by most recent local activity."""
-    local = Path(os.environ.get("LOCALAPPDATA") or "")
-    roaming = Path(os.environ.get("APPDATA") or "")
     candidates: List[BrowserProfile] = []
-    roots = [
-        ("chrome", local / "Google" / "Chrome" / "User Data"),
-        ("edge", local / "Microsoft" / "Edge" / "User Data"),
-        ("brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
-        ("chromium", local / "Chromium" / "User Data"),
-        ("vivaldi", local / "Vivaldi" / "User Data"),
-        ("opera", roaming / "Opera Software" / "Opera Stable"),
-    ]
+    if os.name == "nt":
+        local = Path(os.environ.get("LOCALAPPDATA") or "")
+        roaming = Path(os.environ.get("APPDATA") or "")
+        roots = [
+            ("chrome", local / "Google" / "Chrome" / "User Data"),
+            ("edge", local / "Microsoft" / "Edge" / "User Data"),
+            ("brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
+            ("chromium", local / "Chromium" / "User Data"),
+            ("vivaldi", local / "Vivaldi" / "User Data"),
+            ("opera", roaming / "Opera Software" / "Opera Stable"),
+        ]
+        firefox_root = roaming / "Mozilla" / "Firefox" / "Profiles"
+    else:
+        home = Path.home()
+        config_dir = home / ".config"
+        roots = [
+            ("chrome", config_dir / "google-chrome"),
+            ("chromium", config_dir / "chromium"),
+            ("brave", config_dir / "BraveSoftware" / "Brave-Browser"),
+            ("edge", config_dir / "microsoft-edge"),
+            ("vivaldi", config_dir / "vivaldi"),
+            ("opera", config_dir / "opera"),
+        ]
+        firefox_root = home / ".mozilla" / "firefox"
+
     for browser, root in roots:
         try:
             candidates.extend(_chromium_profiles(browser, root))
         except OSError:
             pass
-    firefox_root = roaming / "Mozilla" / "Firefox" / "Profiles"
     if firefox_root.is_dir():
         try:
             for profile in firefox_root.iterdir():

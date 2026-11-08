@@ -20,7 +20,22 @@ const { chatCompletion } = require('../providers/openrouter');
 const cache = require('../cache/cache');
 
 const NARRATOR_MODEL = require('../providers/modelPolicy').MODEL;
-const PYTHON = process.env.SCRIPTIT_PYTHON || process.env.PYTHON || 'python';
+function getPythonCommand() {
+  if (process.env.SCRIPTIT_PYTHON) return process.env.SCRIPTIT_PYTHON;
+  if (process.env.PYTHON) return process.env.PYTHON;
+  if (process.platform !== 'win32') {
+    for (const bin of ['python3', '/usr/bin/python3', '/usr/local/bin/python3', 'python']) {
+      try {
+        const { spawnSync } = require('child_process');
+        const res = spawnSync(bin, ['--version'], { stdio: 'ignore' });
+        if (res.status === 0) return bin;
+      } catch {}
+    }
+    return 'python3';
+  }
+  return 'python';
+}
+const PYTHON = getPythonCommand();
 const HELPER = path.join(__dirname, '..', '..', 'scripts', 'yt_transcript.py');
 
 const PROFILE_KEYS = [

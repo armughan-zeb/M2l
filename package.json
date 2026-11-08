@@ -4,7 +4,10 @@
   "private": true,
   "description": "Pairing, heartbeat and job transport for a Vidzeo Muse rendering worker",
   "type": "commonjs",
-  "main": "muse-agent.js",
+  "bin": {
+    "vidzeo-muse": "./muse-agent.js",
+    "muse-agent": "./muse-agent.js"
+  },
   "scripts": {
     "test": "node --test tests/*.test.js",
     "pair": "node muse-agent.js pair",
@@ -12,7 +15,8 @@
     "status": "node muse-agent.js status",
     "doctor": "node muse-agent.js doctor",
     "claim": "node muse-agent.js claim",
-    "deliver": "node muse-agent.js deliver"
+    "deliver": "node muse-agent.js deliver",
+    "setup:linux": "bash setup-linux.sh"
   },
   "engines": {
     "node": ">=18.17"

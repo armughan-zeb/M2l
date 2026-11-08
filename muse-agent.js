@@ -27,6 +27,7 @@ const { jsonRequest } = require('./lib/httpClient');
 const jobRunner = require('./lib/jobRunner');
 const { sleep } = require('./lib/sleep');
 const ffmpeg = require('./lib/ffmpeg');
+const python = require('./lib/python');
 const vidnets = require('./adapters/vidnets');
 
 const VERSION = require('./package.json').version;
@@ -271,6 +272,10 @@ async function doctorCommand() {
   const media = await ffmpeg.availability();
   add('FFprobe', media.ffprobe ? 'pass' : 'fail', media.ffprobe || 'Not found. Set FFPROBE_PATH or MUSE_FFMPEG_DIR.');
   add('FFmpeg', media.ffmpeg ? 'pass' : 'fail', media.ffmpeg || 'Not found. Set FFMPEG_PATH or MUSE_FFMPEG_DIR.');
+
+  const py = await python.availability();
+  add('Python 3', py.ok ? 'pass' : 'warn',
+    py.ok ? `${py.binary}${py.version ? ' (v' + py.version + ')' : ''}` : 'Not found. Install python3 (e.g. sudo apt install python3) or set VIDNETS_PYTHON.');
 
   add('Script adapter', String(process.env.MUSE_SCRIPT_COMMAND || '').trim() ? 'pass' : 'warn',
     String(process.env.MUSE_SCRIPT_COMMAND || '').trim() || 'Automated mode needs MUSE_SCRIPT_COMMAND. Agent-driven mode writes script.txt and uses "deliver".');
