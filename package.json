@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "private": true,
   "description": "Pairing, heartbeat and Remotion documentary video rendering worker for Vidzeo Muse",
-  "type": "commonjs",
   "bin": {
     "vidzeo-muse": "./muse-agent.js",
     "muse-agent": "./muse-agent.js"
