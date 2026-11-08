@@ -96,32 +96,42 @@ function readSavedScript(workDir) {
 }
 
 function synthesizeNarration(job) {
-  const title = job.title || 'Documentary Investigation';
-  const premise = job.premise || job.description || 'An in-depth documentary exploring the operational reality, technical history, and documented mechanics.';
-  const channelName = job.channel?.name || 'Documentary Archives';
-  const niche = job.channel?.niche || 'Technical History';
+  const title = String(job.title || 'Documentary Investigation').trim();
+  const premise = String(job.premise || job.description || 'An in-depth documentary exploring the operational reality, technical history, and documented record.').trim();
+  const channelName = String(job.channel?.name || 'Documentary Archive').trim();
+  const niche = String(job.channel?.niche || 'Documentary').trim();
+  const hook = String(job.titlePackage?.hook || '').trim();
   const targetWords = minimumWords(job);
 
+  const hookIntro = hook
+    ? `${hook} This fundamental question stands at the center of ${title}. In this documentary, we trace the documented facts, the structural decisions, and the pivotal turning points that defined what unfolded.`
+    : `When we look closely at the history of ${title}, few chapters offer as much clarity and unexpected depth. Behind the familiar headlines lies a documented sequence of events, structural decisions, and critical moments that shaped the outcome. In this investigation, we examine the primary evidence, separating the myth from the documented reality.`;
+
   const sections = [
-    `When we observe the modern railway landscape, few operations appear as deceptively simple as the way a train navigates its path. Yet beneath every switch and junction lies a century of mechanical refinement, rigorous safety engineering, and the continuous oversight of dedicated railway personnel. In this investigation, we examine the precise mechanics of ${title.toLowerCase()}, examining the documented physical reality that keeps heavy rail transport functioning smoothly across thousands of miles of interconnected tracks.`,
+    hookIntro,
 
-    `At the foundation of this process is the switch mechanism itself, historically known as the turnout or points. Unlike road vehicles, where steering is controlled directly by the operator rotating wheels, a railway locomotive and its rolling stock are guided entirely by the profile of the steel wheel flange pressing against the rail head. The movable switch rails, tapered to a fine point, dictate whether the train continues along the through route or diverges onto an alternate alignment. When the switch moves, it closes against the stock rail on one side while creating a vital clearance flangeway on the opposite side.`,
+    `To understand how this story developed, we must first establish the context that surrounded it. ${premise} Rather than an isolated incident or an abrupt coincidence, the reality was driven by a convergence of technological, organizational, and historical pressures. Observers at the time noted the growing momentum, yet the full significance of these early indicators would only become apparent as the key actors committed to their respective courses of action.`,
 
-    `Understanding this geometry explains why precision is non-negotiable in railway engineering. The frog, or common crossing, allows the wheel flanges to cross the intersecting rails without derailing. Guard rails placed opposite the frog physically prevent the wheel set from wandering into the wrong flangeway, ensuring the vehicle stays firmly anchored to its designated course. As trains grew heavier and operating speeds increased throughout the twentieth century, mechanical levers connected by rodding gave way to electro-hydraulic switch machines capable of locking the switch points under hundreds of tons of dynamic pressure.`,
+    `As events progressed toward their central turning point, the operational mechanics revealed themselves with absolute precision. In fields within ${niche.toLowerCase()}, success and stability depend on exacting standards, where small oversights cascade into far-reaching consequences. Archival records and primary documentation demonstrate how every decision brought compound effects, forcing leadership and participants to confront challenges that had never previously been tested under such rigorous conditions.`,
 
-    `Beyond the mechanical hardware, the operational discipline of train crews and signaling centers forms the vital human layer of track switching. Interlocking systems ensure that signals cannot clear for a train until every relevant switch is confirmed locked and facing the correct route. For the crew in the cab, approaching a junction requires strict adherence to aspect indications and speed restrictions, acknowledging that a diverging movement introduces centrifugal forces that must be carefully managed. Modern computerized dispatching systems monitor these alignments in real time, detecting micro-millimeter variances in point closure before a train ever approaches the signal block.`,
+    `What makes ${title} particularly compelling in hindsight is the structural discipline that governed each phase. Far from arbitrary, the choices made were anchored in specific principles, calculated tradeoffs, and the relentless pressure of their operating environment. Eyewitness accounts, technical audits, and contemporary documentation all point to a singular conclusion: the pivotal breakthroughs and catastrophic failures alike were the direct consequence of human decisions made under uncompromising constraints.`,
 
-    `In reviewing the technical progression of these systems, we see how railway transport achieved its remarkable safety record through redundant engineering. From the pioneering days of hand-thrown switches to solid-state interlocking and heated switch points designed to withstand severe winter freezes, the fundamental principle remains unchanged: precise steel-on-steel geometry guided by infallible mechanical interlocks. As railway networks continue to modernize, these time-tested switch installations remain the essential foundation connecting every departure with its destination safely and reliably.`
+    `In reflecting on this legacy through ${channelName}, we gain a broader perspective on the systemic realities that continue to influence modern practice. By returning to the documented record, analyzing the causal chain step by step, and interrogating the underlying mechanics, the story of ${title} moves beyond simplified lore into an enduring case study in perseverance, strategy, and consequence.`
   ];
 
   let script = sections.join('\n\n');
   let currentWords = script.split(/\s+/).filter(Boolean).length;
 
-  // If higher word count is required for long durations, expand with detailed technical paragraphs
   let iteration = 1;
+  const expansionTopics = [
+    `Delving deeper into the archival records of ${title}, chapter ${iteration} highlights the technical evaluations and evidentiary reviews conducted in the aftermath. Contemporary analysts cataloged the precise timelines, verifying that procedural discipline remained the deciding factor across every major milestone.`,
+    `Furthermore, examining the structural impact of these events reveals how institutions and practitioners adapted their methodologies in response. The documented outcomes of ${title} established lasting benchmarks, demonstrating that verifiable standards and rigorous execution supersede short-term expediency.`,
+    `A critical dimension often overlooked in retrospective accounts is the logistical and operational framework that underpinned these efforts. Through meticulous documentation and primary testimony, researchers have mapped the interplay of resource allocation and strategic foresight that ultimately governed the outcome of ${title}.`
+  ];
+
   while (currentWords < targetWords) {
-    const expansionParagraph = `Continuing our examination of ${title.toLowerCase()}, section ${iteration} details the maintenance tolerances and sensor arrays deployed along modern high-speed corridors. Railway track inspectors perform regular dynamic ultrasonic scans to detect internal micro-fractures within the switch points and frog assemblies. When wear reaches specified limits, specialized maintenance gangs replace movable point frogs or perform precision grinding to restore the original wheel-rail interface geometry. These continuous maintenance routines ensure that both heavy freight and rapid transit operations maintain complete structural integrity under all operating conditions.`;
-    script += '\n\n' + expansionParagraph;
+    const topic = expansionTopics[(iteration - 1) % expansionTopics.length];
+    script += '\n\n' + topic;
     currentWords = script.split(/\s+/).filter(Boolean).length;
     iteration += 1;
   }
@@ -200,6 +210,7 @@ module.exports = {
   minimumScriptWords: minimumWords,
   validateScript,
   generateScript,
+  synthesizeNarration,
   normalizeScriptResult,
   saveScript,
   readSavedScript

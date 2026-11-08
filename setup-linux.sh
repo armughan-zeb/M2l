@@ -64,7 +64,19 @@ else
     fi
 fi
 
-# 4. Check Python 3
+# 4. Install Chromium libraries for Remotion Headless Rendering
+echo "[Info] Ensuring Chrome / Chromium sandbox libraries for Remotion..."
+if command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get update -y && $SUDO apt-get install -y \
+        ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+        libc6 libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 \
+        libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
+        libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 \
+        libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+        libxss1 libxtst6 lsb-release wget xdg-utils chromium-browser 2>/dev/null || true
+fi
+
+# 5. Check Python 3
 if command -v python3 >/dev/null 2>&1; then
     echo "[PASS] Python 3 installed: $(python3 --version 2>&1)"
 elif [ -x /opt/conda/bin/python3 ]; then

@@ -51,9 +51,9 @@ function platform() {
 }
 
 function capabilities() {
-  const list = ['script', 'render', 'thumbnail', 'heartbeat'];
-  list.push(String(process.env.MUSE_SCRIPT_COMMAND || '').trim() ? 'script-command' : 'agent-written-script');
-  list.push(String(process.env.MUSE_RENDER_COMMAND || '').trim() ? 'render-command' : 'vidnets');
+  const list = ['script', 'render', 'thumbnail', 'heartbeat', 'remotion-documentary'];
+  list.push(String(process.env.MUSE_SCRIPT_COMMAND || '').trim() ? 'script-command' : 'autonomous-narration-synthesizer');
+  list.push(String(process.env.MUSE_RENDER_COMMAND || '').trim() ? 'render-command' : 'remotion-native');
   list.push(String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() ? 'thumbnail-command' : 'video-frame-thumbnail');
   if (String(process.env.MUSE_INFERENCE_COMMAND || process.env.MUSE_INFERENCE_URL || '').trim()) list.push('agent-inference');
   return list;
@@ -344,22 +344,27 @@ async function claimCommand(args) {
   const workDir = jobRunner.prepareWorkDir(job, digest);
   config.writeActiveJob({ jobId: job.jobId, payload: job, attempt: claim.attempt || 1, digest, startedAt: new Date().toISOString() });
   log.info(`Claimed Muse job ${job.jobId}: ${job.title}`);
+  const summary = jobRunner.jobSummary(job);
+  const scriptPath = path.join(workDir, 'script.txt');
+  const videoPath = path.join(workDir, 'video.mp4');
+  const thumbnailPath = path.join(workDir, 'thumbnail.jpg');
+
   console.log(JSON.stringify({
     ok: true,
     job: {
-      ...jobRunner.jobSummary(job),
+      ...summary,
       attempt: claim.attempt || 1,
       workDir,
-      scriptPath: path.join(workDir, 'script.txt'),
-      videoPath: path.join(workDir, 'video.mp4'),
-      thumbnailPath: path.join(workDir, 'thumbnail.jpg'),
+      scriptPath,
+      videoPath,
+      thumbnailPath,
       inferenceDir: path.join(workDir, 'inference')
     },
     instructions: [
-      'Research and write the complete narration to scriptPath (plain text).',
-      'Render a 1080p master with audio to videoPath, or pass --video to deliver an existing file.',
-      'Create a 16:9 thumbnail, or omit it to extract a frame from the finished master.',
-      `Then run: node muse-agent.js deliver --job ${job.jobId}`
+      `1. SCRIPT: Write complete source-grounded narration matching channel style to scriptPath (${scriptPath}). Target: ~${summary.targetWordCount} words (at least ${summary.minimumWords} words required for ${summary.targetDurationMinutes}min duration).`,
+      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`,
+      `3. THUMBNAIL: Create a high-CTR 16:9 thumbnail styled after the reference (${summary.thumbnailStyle.referenceImageUrl || summary.thumbnailStyle.referenceUrl || 'see concept'}) executing concept "${summary.thumbnailStyle.concept}" to thumbnailPath (${thumbnailPath}).`,
+      `4. DELIVER: Once all files exist in workDir, run: node muse-agent.js deliver --job ${job.jobId}`
     ]
   }, null, 2));
 }

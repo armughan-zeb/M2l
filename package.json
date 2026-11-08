@@ -2,7 +2,7 @@
   "name": "vidzeo-muse-worker",
   "version": "1.0.0",
   "private": true,
-  "description": "Pairing, heartbeat and job transport for a Vidzeo Muse rendering worker",
+  "description": "Pairing, heartbeat and Remotion documentary video rendering worker for Vidzeo Muse",
   "type": "commonjs",
   "bin": {
     "vidzeo-muse": "./muse-agent.js",
@@ -16,9 +16,18 @@
     "doctor": "node muse-agent.js doctor",
     "claim": "node muse-agent.js claim",
     "deliver": "node muse-agent.js deliver",
+    "render": "node lib/remotionRenderer.js",
     "setup:linux": "bash setup-linux.sh"
   },
   "engines": {
     "node": ">=18.17"
+  },
+  "dependencies": {
+    "@remotion/bundler": "^4.0.526",
+    "@remotion/player": "^4.0.526",
+    "@remotion/renderer": "^4.0.526",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "remotion": "^4.0.526"
   }
 }

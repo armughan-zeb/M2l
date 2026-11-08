@@ -37,7 +37,38 @@ function copyThumbnail(source, workDir) {
   return destination;
 }
 
+async function downloadReferenceThumbnail(job, workDir) {
+  const thumbReq = job.requirements?.thumbnail || {};
+  const candidates = [
+    thumbReq.referenceImageUrl,
+    job.titlePackage?.refThumbImageUrl,
+    job.thumbnailReferences?.[0]?.imageUrl,
+    job.thumbnailReferences?.[0]?.fallbackImageUrl
+  ].filter(Boolean);
+
+  if (!candidates.length) return null;
+  const target = path.join(workDir, 'reference-thumbnail.jpg');
+  try {
+    if (fs.existsSync(target) && fs.statSync(target).size > 1024) return target;
+  } catch { /* proceed */ }
+
+  for (const url of candidates) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (!response.ok) continue;
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > 1024) {
+        fs.writeFileSync(target, buffer);
+        log.info(`Downloaded reference thumbnail (${Math.round(buffer.length / 1024)} KB) to ${target}`);
+        return target;
+      }
+    } catch { /* try next candidate */ }
+  }
+  return null;
+}
+
 async function fromCommand(command, job, scriptText, videoPath, workDir, { signal } = {}) {
+  const refImage = await downloadReferenceThumbnail(job, workDir);
   const result = await runCommand(command, {
     input: JSON.stringify({
       type: 'thumbnail',
@@ -46,7 +77,11 @@ async function fromCommand(command, job, scriptText, videoPath, workDir, { signa
       scriptPath: path.join(workDir, 'script.txt'),
       videoPath,
       workDir,
-      aspect: '16:9'
+      aspect: job.requirements?.thumbnail?.aspect || '16:9',
+      concept: job.thumbnailIdea || job.titlePackage?.thumbnailIdea || '',
+      referenceUrl: job.requirements?.thumbnail?.referenceUrl || job.titlePackage?.refThumb || '',
+      referenceImageUrl: job.requirements?.thumbnail?.referenceImageUrl || job.titlePackage?.refThumbImageUrl || '',
+      referenceThumbnailPath: refImage || ''
     }),
     cwd: workDir,
     signal,
@@ -56,7 +91,9 @@ async function fromCommand(command, job, scriptText, videoPath, workDir, { signa
       MUSE_JOB_ID: job.jobId,
       MUSE_WORK_DIR: workDir,
       MUSE_STAGE: 'thumbnail',
-      MUSE_VIDEO_PATH: videoPath
+      MUSE_VIDEO_PATH: videoPath,
+      MUSE_THUMBNAIL_CONCEPT: job.thumbnailIdea || job.titlePackage?.thumbnailIdea || '',
+      MUSE_THUMBNAIL_REFERENCE: refImage || ''
     }
   });
   const { parseJsonOutput } = require('../lib/command');
@@ -75,6 +112,7 @@ async function generate(job, scriptText, videoPath, workDir, { signal } = {}) {
     return { thumbnailPath: saved, resumed: true };
   }
 
+  const refImage = await downloadReferenceThumbnail(job, workDir);
   const command = String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim();
   let thumbnailPath;
   if (command) {
@@ -83,6 +121,9 @@ async function generate(job, scriptText, videoPath, workDir, { signal } = {}) {
     const output = path.join(workDir, 'thumbnail.jpg');
     await ffmpeg.extractFrame(videoPath, output, { atSeconds: Number(process.env.MUSE_THUMBNAIL_AT_SECONDS) || undefined });
     thumbnailPath = output;
+    if (refImage) {
+      log.warn(`No MUSE_THUMBNAIL_COMMAND configured; extracted fallback frame from video. Reference thumbnail saved at ${refImage} (Concept: "${job.thumbnailIdea || 'none'}")`);
+    }
   }
 
   const check = await ffmpeg.validateThumbnail(thumbnailPath, '16:9');
