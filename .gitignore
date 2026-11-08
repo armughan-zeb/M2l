@@ -20,6 +20,10 @@ temp/
 logs/
 *.log
 
+# Linux Remotion render project (built artefacts; source is committed)
+remotion-linux/node_modules/
+remotion-linux/out/
+
 # Muse worker state (never commit: contains the worker bearer token)
 .muse-agent.json
 .muse-agent.json.*

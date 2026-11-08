@@ -5,6 +5,7 @@ if (typeof dns.setDefaultResultOrder === 'function') {
 const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 const { MODEL, normalizeModel, lockPayload } = require('./modelPolicy');
 const { isAgentHandle, agentChat } = require('./agentInference');
+const { isBridgeHandle, agentBridgeChat } = require('./agentBridge');
 const { providerError, waitForRetry } = require('./errorPolicy');
 
 const FALLBACK_MODELS = [];
@@ -12,6 +13,13 @@ const FALLBACK_MODELS = [];
 async function singleChatAttempt({ apiKey, model, messages, temperature, maxTokens, stream, onChunk, signal, timeoutMs, reasoning, responseFormat, _noRequireParams }) {
   if (isAgentHandle(apiKey)) {
     const result = await agentChat({ apiKey, messages, responseFormat, maxTokens, signal, timeoutMs, operation: 'scriptit.completion', kind: 'text' });
+    if (stream && onChunk && result.content) onChunk(result.content, result.content);
+    return result;
+  }
+  if (isBridgeHandle(apiKey)) {
+    // File-based agent bridge (Vidnets inbox): no model provider, no :3210
+    // server. The operator answers request.json files under the bridge root.
+    const result = await agentBridgeChat({ apiKey, messages, responseFormat, maxTokens, signal, timeoutMs, operation: 'scriptit.completion', kind: 'text' });
     if (stream && onChunk && result.content) onChunk(result.content, result.content);
     return result;
   }
@@ -144,6 +152,13 @@ async function chatCompletion({
   responseFormat,
 }) {
   if (!apiKey) throw new Error('Missing OpenRouter API key');
+  if (isBridgeHandle(apiKey)) {
+    if (!Array.isArray(messages) || !messages.length) throw new Error('Missing messages');
+    const result = await singleChatAttempt({ apiKey, messages, responseFormat, maxTokens, stream, onChunk, signal,
+      timeoutMs: Math.max(1000, Math.min(Number(totalTimeoutMs) || timeoutMs, Number(perAttemptTimeoutMs) || timeoutMs)) });
+    if (!result?.content) throw new Error('External agent returned an empty completion');
+    return { ...result, modelUsed: 'agent-bridge', truncated: result.raw?.choices?.[0]?.finish_reason === 'length' };
+  }
   if (isAgentHandle(apiKey)) {
     if (!Array.isArray(messages) || !messages.length) throw new Error('Missing messages');
     const result = await singleChatAttempt({ apiKey, messages, responseFormat, maxTokens, stream, onChunk, signal,

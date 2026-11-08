@@ -191,7 +191,13 @@ Once your worker daemon is running, it watches the CMS queue. Here is the exact 
        |
        v
 [ Step 1: Script Writing ] (Status: 15%)
-  • Synthesizes complete documentary narration (150 words/minute).
+  • ScriptIT headless CLI researches the title and writes the narration
+    (150 words/minute) through an editorial gate: hook, pacing, topic fit,
+    evidence support, and concrete-entity specificity. See scriptit/CLI.md.
+  • Publishable only with a passing gate and at least one external evidence
+    claim; a failed draft fails the job honestly instead of shipping
+    generic narration. No OpenRouter key needed — Muse answers the CLI's
+    inference requests through the Vidnets agent-bridge inbox.
   • Follows channel style, tone, and factual grounding rules.
        |
        v

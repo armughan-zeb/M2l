@@ -62,6 +62,12 @@ def configure(runtime_root=None):
         values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
     elif saved.get('allow_packaged_local_auth') == '1':
         values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
+    if os.name != 'nt':
+        # Node's os.tmpdir() (Remotion bundle cache, staged assets, and the
+        # render's disk-space check) defaults to the system temp dir, which
+        # on hosts with a small tmpfs /tmp (e.g. 512 MB) fails mid-render.
+        # Point it at the runtime temp dir on the data disk instead.
+        values.setdefault('TMPDIR', root / 'temp')
     env.update({key: str(value) for key, value in values.items()})
     env['PATH'] = os.pathsep.join([str(resources / 'tools' / 'node'), str(resources / 'tools' / 'ffmpeg'), env.get('PATH', '')])
     os.environ.update({key: env[key] for key in values})
@@ -141,8 +147,11 @@ def start(resources, root, env):
         if not python.is_file():
             python = Path(sys.executable)
         with logfile.open('ab') as stream:
-            nt_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
-            spawn_kwargs = {'creationflags': nt_flags, 'close_fds': True} if os.name == 'nt' else {'start_new_session': True}
+            if os.name == 'nt':
+                nt_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+                spawn_kwargs = {'creationflags': nt_flags, 'close_fds': True}
+            else:
+                spawn_kwargs = {'start_new_session': True}
             child = subprocess.Popen([str(python), '-u', str(resources / 'main.py')],
                 cwd=str(resources), env=env, stdout=stream, stderr=stream, stdin=subprocess.DEVNULL,
                 **spawn_kwargs)

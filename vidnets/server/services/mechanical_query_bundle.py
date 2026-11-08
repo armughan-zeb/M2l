@@ -14,6 +14,33 @@ def _clean_query(value: Any, fallback: str = "") -> str:
     return " ".join(text.split()[:14]).strip()
 
 
+# Filler words that carry no search value in a title anchor. A title such as
+# "Amtrak's Long Run Through the Crew's Day" is a made-up phrase: used
+# verbatim it produces queries no search engine can match ("Amtrak Long Run
+# Through documentary crew history photograph"). Stripping the filler leaves
+# the searchable subject ("Amtrak Crew").
+_COMPACT_SUBJECT_FILLER = {
+    "a", "an", "the", "of", "and", "in", "on", "to", "for", "with", "from",
+    "into", "over", "under", "after", "before", "during", "through", "across",
+    "between", "about", "than", "then", "there", "here", "while", "since",
+    "until", "per", "via", "at", "by", "as", "or", "but", "not", "no", "is",
+    "are", "was", "were", "be", "been", "how", "what", "when", "where", "why",
+    "who", "which", "that", "this", "these", "those", "very", "just", "also",
+    "still", "yet", "more", "most", "other", "another", "first", "second",
+    "new", "old", "great", "big", "small", "real", "true", "full", "complete",
+    "entire", "long", "run", "runs", "day", "days", "history", "story",
+    "stories", "look", "looks", "closely", "behind", "familiar", "primary",
+}
+
+
+def _compact_search_subject(anchor: str) -> str:
+    """Shorten a title anchor to its searchable content words (max 4)."""
+    text = re.sub(r"'s\b", "", str(anchor or ""))
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", text)
+    kept = [word for word in words if word.casefold() not in _COMPACT_SUBJECT_FILLER]
+    return " ".join(kept[:4]).strip()
+
+
 def _variants(*values: str) -> List[str]:
     return list(dict.fromkeys(value for value in values if value))
 
@@ -214,6 +241,10 @@ def build_mechanical_query_bundle(
         " ".join(scene_texts),
         global_anchor,
     )
+    # The scene plans also take the title as their topic; give them the
+    # compact subject too, so YouTube/stock queries don't repeat the full
+    # made-up title phrase before the scene words.
+    plan_topic = _compact_search_subject(global_anchor) or global_anchor
     bundle: Dict[str, List[Dict[str, Any]]] = {"web": [], "yt": [], "stock": []}
 
     for idx, scene_text in enumerate(scene_texts):
@@ -221,14 +252,18 @@ def build_mechanical_query_bundle(
         subject = str(section_subjects[idx] if idx < len(section_subjects) else "").strip()
         if section.get("is_intro") or str(section.get("container_id") or "").lower() == "outro":
             subject = ""
-        active = subject or global_anchor
+        # When no section subject exists, the raw title anchor is usually a
+        # made-up phrase, not a searchable subject. Compact it to its content
+        # words ("Amtrak's Long Run Through the Crew's Day" -> "Amtrak Crew")
+        # so every lane's queries can actually match real media.
+        active = subject or _compact_search_subject(global_anchor) or global_anchor
         context = _fallback_retrieval_context(active, scene_text, global_anchor)
         domain_category = context.get("domain_category") or "other"
         if domain_category == "other":
             domain_category = global_context.get("domain_category") or "other"
         facet = _scene_visual_facet(scene_text, active, domain_category)
         entity_kind = _entity_visual_kind(active, scene_text, domain_category, section)
-        plan = _mechanical_scene_plan(scene_text, idx + 1, section_subject=subject, topic=global_anchor)
+        plan = _mechanical_scene_plan(scene_text, idx + 1, section_subject=subject, topic=plan_topic)
         container_id = str(
             section.get("container_id")
             or plan.get("section_label")

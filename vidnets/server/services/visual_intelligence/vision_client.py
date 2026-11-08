@@ -850,6 +850,19 @@ class QwenVisionClient:
         if _thinking not in {"1", "true", "yes", "on"}:
             payload["reasoning"] = {"enabled": False}
 
+        # The external agent (Muse's own vision) answers through the local
+        # inbox; a missed deadline raises AgentBridgeError. Import it lazily
+        # (same pattern as the AGENT_HANDLE import below) so a missing inbox
+        # never breaks module import.
+        try:
+            from ..agent_bridge import AgentBridgeError as _AgentBridgeError
+        except Exception:
+            # Never raised: keeps the `except _AgentBridgeError` clause below
+            # valid (an `except None` would raise TypeError) while matching
+            # nothing when the bridge is unavailable.
+            class _AgentBridgeError(Exception):
+                pass
+
         last_error = ""
         structured_fallback_used = False
         attempts = min(self.max_attempts, 2) if current_job().get('cost_profile') == 'efficient' else self.max_attempts
@@ -952,6 +965,14 @@ class QwenVisionClient:
                 return str(content_out)
             except VisionClientError:
                 raise
+            except _AgentBridgeError as exc:
+                # The external agent did not answer this inbox request in
+                # time. Retry once with a fresh inbox request instead of
+                # failing the candidate closed: the agent may simply have
+                # been busy answering another request.
+                last_error = str(exc)
+                if attempt + 1 < attempts:
+                    time.sleep(min(2.0, max(0.0, verdict_deadline - time.monotonic())))
             except requests.RequestException as exc:
                 last_error = str(exc)
                 if attempt + 1 < self.max_attempts:

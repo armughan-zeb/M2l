@@ -50,6 +50,13 @@ def _youtube_host_dns_failure(error) -> bool:
 
 def _youtube_js_runtime_options() -> Dict[str, Any]:
     """Enable yt-dlp's supported JS challenge runtime and EJS scripts."""
+    options: Dict[str, Any] = {}
+    # Linux hosts behind a TLS-intercepting egress proxy (a sandbox proxy
+    # with its own CA) break yt-dlp's default certifi bundle, which does
+    # not include the proxy CA. 'no-certifi' makes yt-dlp use the system
+    # SSL context instead, which honours SSL_CERT_FILE and the OS trust
+    # store. Safe on Windows/macOS too (their system stores are used).
+    options["compat_opts"] = {"no-certifi"}
     root = Path(__file__).resolve().parents[2]
     runtime_candidates = [
         os.environ.get("VIDZEO_NODE_PATH"),

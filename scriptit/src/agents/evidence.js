@@ -108,6 +108,10 @@ function isTrustedPublisher(item) {
 }
 
 function sourceTier(item) {
+  // Model-written dossier/anchor claims carry fabricated archive URLs and
+  // must never pass as reference-grade evidence. They are synthetic context
+  // only: the writer may qualify them, the gate may never count them.
+  if (item && (item.synthetic === true || cleanText(item.source).toLowerCase() === 'encyclopedic historical archive')) return 'synthetic';
   const source = cleanText(item.source).toLowerCase();
   const host = hostname(item.url || '');
   if (isOfficial(item)) return 'primary';
@@ -128,6 +132,7 @@ function authorityTier(tier) {
     reference: 'P2',
     community: 'P3',
     discovery: 'P4',
+    synthetic: 'P4',
   })[tier] || 'P4';
 }
 
@@ -187,6 +192,7 @@ function hasBody(item) {
 
 function claimConfidence(item) {
   const tier = sourceTier(item);
+  if (tier === 'synthetic') return 'low';
   // Search/academic index metadata is a pointer, not a claim-bearing source.
   // Treating a long generated snippet as medium confidence let unrelated
   // Crossref/OpenAlex records satisfy the minimum evidence gate.
@@ -377,6 +383,7 @@ function buildEvidenceLedger(research) {
       retrievedAt: research.gatheredAt,
       confidence,
       official,
+      synthetic: item.synthetic === true,
       sourceTier: tier,
       authorityTier: authorityTier(tier),
       sourceTierCode: authorityTier(tier),

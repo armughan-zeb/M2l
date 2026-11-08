@@ -18,6 +18,19 @@ const BANNED_PATTERNS = [
   /\bunwavering (?:dedication|commitment)\b/gi,
   /\bunparalleled (?:skill|success|ability|impact)\b/gi,
   /\bin conclusion\b/gi,
+  // The old worker template synthesizer's signature phrasing. A ScriptIT
+  // script must never read like the generic narration it replaces.
+  /\bdocumented sequence of events\b/gi,
+  /\bfew chapters offer as much clarity\b/gi,
+  /\bbehind the familiar headlines\b/gi,
+  /\bseparating the myth from the documented reality\b/gi,
+  /\bconvergence of .* pressures\b/gi,
+  /\bstructural discipline that governed\b/gi,
+  /\bmoves beyond simplified lore\b/gi,
+  /\benduring case study in perseverance\b/gi,
+  /\bfar from arbitrary\b/gi,
+  /\bin reflecting on this legacy\b/gi,
+  /\bthrough meticulous documentation and primary testimony\b/gi,
 ];
 
 const META_PATTERNS = [
@@ -177,6 +190,26 @@ function repeatedStarts(text) {
   return [...counts.entries()].filter(([, count]) => count >= 3).map(([start]) => start);
 }
 
+/**
+ * Distinct concrete entities: years, quantified numbers, and multi-word
+ * proper nouns. A script with almost none of these is generic by
+ * construction, however fluent it reads.
+ */
+function concreteEntities(text) {
+  const found = new Set();
+  for (const match of String(text || '').match(/\b(?:19|20)\d{2}\b/g) || []) found.add(match);
+  for (const match of String(text || '').match(/\b\d+(?:\.\d+)?\s*(?:%|percent|million|billion|thousand|km|miles?|hours?|minutes?|seconds?|years?|months?|days?|feet|tons?|mph)\b/gi) || []) {
+    found.add(match.toLowerCase().replace(/\s+/g, ' '));
+  }
+  for (const match of String(text || '').match(/\b[A-Z][a-z]{2,}(?:\s+(?:[A-Z][a-z]{2,}|of|the|and)){1,3}\b/g) || []) {
+    const cleaned = match.replace(/\s+(of|the|and)$/i, '').trim();
+    if (cleaned.split(/\s+/).length >= 2) found.add(cleaned);
+  }
+  // Named missions and vehicles: "Apollo 11", "Saturn V", "Voyager 2".
+  for (const match of String(text || '').match(/\b[A-Z][a-z]{2,}\s+(?:[A-Z]|\d{1,2})\b/g) || []) found.add(match);
+  return [...found];
+}
+
 function formatPlainNarration(text) {
   return String(text || '')
     .replace(/```[\s\S]*?```/g, '')
@@ -212,10 +245,21 @@ function assessScript({ script, topic = '', wordTarget, previousScripts = [], co
   const repeatedSentenceStarts = repeatedStarts(cleaned);
   const hook = openingHasHook(cleaned);
   const topicQuality = topicFit(cleaned, topic);
+  const entities = concreteEntities(cleaned);
+  const entitiesPer100Words = words ? Math.round((entities.length / words) * 100 * 10) / 10 : 0;
+  const specificityRequired = words >= 180 ? 4 : 2;
+  const specificity = {
+    entities,
+    count: entities.length,
+    per100Words: entitiesPer100Words,
+    required: specificityRequired,
+    passes: words === 0 || entities.length >= specificityRequired,
+  };
   const issues = [];
   const warnings = [];
 
   if (!cleaned) issues.push('The model returned no narration.');
+  if (!specificity.passes) issues.push(`The draft names almost no concrete dates, numbers, or people (${entities.length} distinct, need ${specificityRequired}) — it reads as generic.`);
   if (genericMatches.length > 1) issues.push('The draft uses repeated or generic AI phrasing.');
   if (metaMatches.length) issues.push('The draft contains process commentary instead of narration.');
   if (inferenceMatches.length) issues.push('The draft makes unsupported inferences instead of staying with sourced facts.');
@@ -235,7 +279,7 @@ function assessScript({ script, topic = '', wordTarget, previousScripts = [], co
   const wordDeficit = wordTarget && words < wordTarget ? Math.max(0, wordTarget - words) : 0;
   const wordPenalty = wordDeficit > 0 ? Math.min(25, Math.round((wordDeficit / (wordTarget || 1500)) * 50)) : 0;
   const penalties = (genericMatches.length * 8) + (metaMatches.length * 20) + (inferenceMatches.length * 22)
-    + (hook ? 0 : 12) + (repeatedSentenceStarts.length * 6) + wordPenalty;
+    + (hook ? 0 : 12) + (specificity.passes ? 0 : 10) + (repeatedSentenceStarts.length * 6) + wordPenalty;
   const score = Math.max(0, Math.min(100, 100 - penalties));
   return {
     script: cleaned,
@@ -244,6 +288,7 @@ function assessScript({ script, topic = '', wordTarget, previousScripts = [], co
     sentences: sentences.length,
     score,
     hook,
+    specificity,
     genericMatches,
     metaMatches,
     inferenceMatches,
@@ -257,4 +302,4 @@ function assessScript({ script, topic = '', wordTarget, previousScripts = [], co
   };
 }
 
-module.exports = { assessScript, formatPlainNarration, similarity, openingHasHook, topicAnchors, topicFit };
+module.exports = { assessScript, formatPlainNarration, similarity, openingHasHook, topicAnchors, topicFit, concreteEntities };

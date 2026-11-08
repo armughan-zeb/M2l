@@ -133,10 +133,23 @@ Use this when the Muse environment exposes commands. Configure the adapters in
 
 | Adapter | Variable | Contract |
 | --- | --- | --- |
-| Narration | `MUSE_SCRIPT_COMMAND` | Job JSON on stdin; print narration text or `{"scriptText":"..."}` |
+| Narration | `MUSE_SCRIPT_COMMAND` (optional — defaults to ScriptIT) | Job JSON on stdin; print narration text or `{"scriptText":"..."}` |
 | Renderer | `MUSE_RENDER_COMMAND` | JSON on stdin (`job`, `scriptText`, `scriptPath`, `workDir`, `outputPath`); print `{"videoPath":"...","thumbnailPath":"..."}` |
 | Thumbnail | `MUSE_THUMBNAIL_COMMAND` | JSON on stdin (`job`, `scriptText`, `videoPath`, `workDir`); print `{"thumbnailPath":"..."}` |
 | Vidnets inference | `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` | One Vidnets request JSON on stdin (or POSTed); return the exact text/JSON answer |
+
+**Narration defaults to ScriptIT** (`scriptit/cli/generate.js`, see
+`scriptit/CLI.md`): it researches the title, writes narration through an
+editorial gate (hook, pacing, topic fit, evidence support, concrete-entity
+specificity), and scores opening-hook variants. It needs no OpenRouter key —
+Muse answers its inference requests through the Vidnets agent-bridge inbox
+(the `vidnets-inbox-watch` hook wakes an operator for each request). A script
+is publishable only if the gate passes and at least one external evidence
+claim supports it; a failed draft is left in `script-draft.json` and the job
+fails honestly instead of shipping generic narration. Set
+`MUSE_SCRIPT_COMMAND` to use a different writer, or
+`MUSE_SCRIPT_ALLOW_TEMPLATE_FALLBACK=1` to bring back the old template
+synthesizer (opt-in only, labelled generic).
 
 Without a render command, the worker uses **Vidnets**:
 - Vidnets is started through `VIDNETS_AGENT.sh` (Linux) or `VIDNETS_AGENT.cmd` (Windows) and runs with

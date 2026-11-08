@@ -572,6 +572,9 @@ def _extract_profile(profile: BrowserProfile) -> http.cookiejar.CookieJar:
         "skip_download": True,
         "cookiesfrombrowser": specification,
         "logger": _CookieExtractionLogger(),
+        # Prefer the system SSL context over certifi so a host behind a
+        # TLS-intercepting proxy (custom CA via SSL_CERT_FILE) still works.
+        "compat_opts": {"no-certifi"},
     }) as ydl:
         return _filtered_jar(ydl.cookiejar)
 

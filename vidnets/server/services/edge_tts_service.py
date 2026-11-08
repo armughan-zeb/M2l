@@ -16,6 +16,15 @@ from pathlib import Path
 try:
     import edge_tts
     _EDGE_TTS_AVAILABLE = True
+    # edge-tts pins its websocket TLS to certifi's CA bundle, which does
+    # not include a TLS-intercepting proxy's CA, so synthesis fails
+    # certificate verification on a host behind such a proxy. Point the
+    # library's module-global context at the system one instead: it
+    # honours SSL_CERT_FILE and the OS trust store, and on Windows/macOS
+    # it loads the native store, so this is safe there too.
+    import ssl as _ssl
+
+    edge_tts.communicate._SSL_CTX = _ssl.create_default_context()
 except Exception:
     edge_tts = None
     _EDGE_TTS_AVAILABLE = False
@@ -47,6 +56,22 @@ _EDGE_TTS_TARGET_CHUNK_CHARS = max(220, int(os.environ.get("VIDZEO_EDGE_TTS_TARG
 _EDGE_TTS_MAX_RETRIES = max(3, int(os.environ.get("VIDZEO_EDGE_TTS_MAX_RETRIES", "6") or 6))
 _EDGE_TTS_BACKOFF_BASE = float(os.environ.get("VIDZEO_EDGE_TTS_BACKOFF_BASE", "2.0") or 2.0)
 _EDGE_TTS_FALLBACK_ENABLED = str(os.environ.get("VIDZEO_EDGE_TTS_FALLBACK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _edge_tts_proxy() -> str:
+    """Proxy for the Edge TTS websocket, if the host needs one.
+
+    Sandboxed / proxied Linux hosts have no direct internet: edge-tts
+    connects straight to wss://speech.platform.bing.com unless a proxy is
+    passed, and the connection just times out. Read the standard proxy
+    env vars (explicit VIDZEO_EDGE_TTS_PROXY wins) so the same code also
+    works on an unproxied machine (no vars -> direct, as before).
+    """
+    for name in ('VIDZEO_EDGE_TTS_PROXY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'):
+        value = str(os.environ.get(name, '') or '').strip()
+        if value:
+            return value
+    return ''
 
 
 def is_available() -> bool:
@@ -161,7 +186,8 @@ def _refresh_voice_catalog():
         return list(fallback_catalog)
 
     try:
-        raw_voices = _run_async(asyncio.wait_for(edge_tts.list_voices(), timeout=15))
+        proxy = _edge_tts_proxy() or None
+        raw_voices = _run_async(asyncio.wait_for(edge_tts.list_voices(proxy=proxy), timeout=15))
         # Keep strictly English voices (en-* locale) and remove other languages
         en_raw_voices = [
             raw_voice for raw_voice in (raw_voices or [])
@@ -268,6 +294,7 @@ async def _generate_edge_tts(text: str, voice_id: str, output_path: str, edge_op
         volume=speak_options['volume'],
         pitch=speak_options['pitch'],
         boundary='WordBoundary',
+        proxy=_edge_tts_proxy() or None,
     )
     words = []
     with open(output_path, 'wb') as audio:
@@ -461,8 +488,65 @@ def _concat_edge_chunks(chunk_paths: list[str], batch_start: float) -> tuple[str
         raise RuntimeError(f"Edge TTS chunk concatenation failed: {exc}") from exc
 
 
+def _generate_linux_tts_audio(text: str, output_path: str) -> tuple | None:
+    """Linux offline fallback: shell out to a configured TTS command.
+
+    Edge TTS needs a websocket, which sandboxed/proxied Linux hosts often
+    block, and the SAPI fallback is Windows-only. When the operator sets
+    VIDZEO_LINUX_TTS_COMMAND, run it instead. The command is a template
+    with {text_file}, {output}, {voice} and {speed} placeholders; the
+    script text is also piped on stdin. Example for this VM's Shortwave
+    CLI (set in vidnets-runtime/.env):
+        VIDZEO_LINUX_TTS_COMMAND=/opt/hatch/bin/tts speak --text-stdin --voice {voice} --speed {speed} --format mp3 --output {output}
+        VIDZEO_LINUX_TTS_VOICE=avocado_v2:MAI_03
+        VIDZEO_LINUX_TTS_SPEED=100
+    Returns None when no command is configured, so callers keep the
+    previous behaviour (SAPI on Windows, clear platform error elsewhere).
+    """
+    import shlex
+
+    template = str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip()
+    if not template:
+        return None
+    voice = str(os.environ.get('VIDZEO_LINUX_TTS_VOICE', '') or '').strip()
+    speed = str(os.environ.get('VIDZEO_LINUX_TTS_SPEED', '100') or '100').strip()
+    text_file = Path(str(output_path) + '.txt')
+    try:
+        text_file.write_text(text, encoding='utf-8')
+        argv = [
+            part.format(text_file=str(text_file), output=str(output_path), voice=voice, speed=speed)
+            for part in shlex.split(template)
+        ]
+        timeout = float(os.environ.get('VIDZEO_LINUX_TTS_TIMEOUT_SECONDS', '300') or 300)
+        result = subprocess.run(
+            argv, input=text.encode('utf-8'),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f'Linux TTS command failed ({result.returncode}): '
+                f'{result.stderr.decode("utf-8", "replace").strip()[-400:]}'
+            )
+        if not Path(output_path).is_file() or Path(output_path).stat().st_size < 128:
+            raise RuntimeError('Linux TTS command produced no audio file.')
+        duration = _get_audio_duration(output_path)
+        if duration <= 0:
+            raise RuntimeError('Linux TTS command produced unreadable audio.')
+        print(f"   [TTS] Generated Linux offline spoken narration ({duration:.1f}s)")
+        return str(output_path), duration
+    finally:
+        try:
+            text_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _generate_sapi_audio(text: str, output_path: str) -> tuple:
     """Recover real speech without requiring pywin32 or an online service."""
+    if sys.platform != 'win32':
+        linux = _generate_linux_tts_audio(text, output_path)
+        if linux is not None:
+            return linux
     from .local_speech_service import generate_audio as generate_local_speech
     path, duration = generate_local_speech(text, output_path)
     print(f"   [TTS] Generated offline spoken narration ({duration:.1f}s)")
@@ -497,6 +581,22 @@ def generate_audio(script: str, voice: str = 'Brian (Male US)',
     hash_seed = f"{script}{voice_id}{speak_options}{time.time()}"
     hash_str = hashlib.sha256(hash_seed.encode()).hexdigest()[:12]
     output_path = str(TEMP_DIR / f"edge_tts_{hash_str}.mp3")
+
+    # On a Linux host where the operator configured an offline TTS command
+    # (e.g. Edge TTS websockets are blocked by the egress proxy), prefer
+    # it over Edge TTS instead of burning minutes on websocket timeouts
+    # first. If the command fails, fall through to Edge TTS as usual.
+    if sys.platform != 'win32':
+        try:
+            linux = _generate_linux_tts_audio(script, output_path)
+        except Exception as exc:
+            print(f"   Linux TTS command failed, trying Edge TTS: {exc}")
+            linux = None
+        if linux is not None:
+            linux_path, linux_duration = linux
+            from .narration_quality import validate_narration_audio
+            validate_narration_audio(linux_path)
+            return linux_path, linux_duration
 
     print(
         f"   Edge TTS: voice={voice_id}, rate={speak_options['rate']}, "
@@ -564,6 +664,12 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
             return _generate_sapi_audio(script, output_path)
         raise ValueError("Edge TTS package is not installed. Run `pip install -r requirements.txt`.")
     del speed, api_key
+
+    # A configured Linux offline TTS command handles the whole script at
+    # once; skip the chunked Edge TTS path (whose websocket attempts would
+    # just time out on a host where websockets are blocked).
+    if sys.platform != 'win32' and str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip():
+        return generate_audio(script, voice, edge_options=edge_options)
 
     if len(script) < _EDGE_TTS_CHUNK_TRIGGER_CHARS:
         return generate_audio(script, voice, edge_options=edge_options)

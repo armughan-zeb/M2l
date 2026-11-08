@@ -578,9 +578,9 @@ class VisualDecisionContext:
             ),
         )
         if str(config.get('llm_provider') or '') == 'external_agent' or str(key).startswith('external-agent:'):
-            max_concurrent = min(2, max_concurrent)
+            max_concurrent = min(4, max_concurrent)
             call_timeout_seconds = 300.0
-            call_max_attempts = 1
+            call_max_attempts = 2
         fast_mode = _as_bool(config.get("visual_fast_mode"))
         context = cls(
             enabled=enabled,

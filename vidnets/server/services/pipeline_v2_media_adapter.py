@@ -1872,8 +1872,12 @@ def build_qwen_verifier(
     else:
         context_config["visual_concurrency"] = min(4, max(1, int(context_config.get("visual_concurrency") or 4)))
     if external_agent:
-        context_config['visual_concurrency'] = 2
-        visual_timeout, visual_attempts = 300.0, 1
+        # Muse's own vision answers through the local inbox: allow 4 calls
+        # in flight (the inbox holds multiple pending rows) and 2 attempts
+        # per call, so one missed inbox deadline retries with a fresh
+        # request instead of failing the candidate closed.
+        context_config['visual_concurrency'] = 4
+        visual_timeout, visual_attempts = 300.0, 2
     context_config["visual_call_timeout_seconds"] = visual_timeout
     context_config["visual_call_max_attempts"] = visual_attempts
     context_config["visual_fail_closed"] = True

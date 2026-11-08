@@ -1984,7 +1984,10 @@ def _extract_script_asset_variants(script: str, title: str, subject: str, limit:
             and not any(part in reject_terms for part in cleaned_lower.split())
         ):
             variants.append(f"{cleaned} photo")
-            variants.append(f"{cleaned} documentary")
+            # NOTE: the "{cleaned} documentary" variant used to be appended
+            # here too. It produced nonsense queries from sentence-start words
+            # ("Behind documentary", "Amtrak Long Run Through documentary")
+            # that no image engine can match, so it was removed.
 
     visual_terms = _extract_visual_keywords(text, max_kws=16) if "_extract_visual_keywords" in globals() else []
     if subject:

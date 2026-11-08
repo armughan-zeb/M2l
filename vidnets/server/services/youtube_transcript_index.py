@@ -526,6 +526,9 @@ class YouTubeTranscriptIndex:
                         "noplaylist": True,
                         "socket_timeout": timeout,
                         "retries": 0,
+                        # Prefer the system SSL context over certifi so a host
+                        # behind a TLS-intercepting proxy still works.
+                        "compat_opts": {"no-certifi"},
                         "extractor_args": {"youtube": {"player_client": [client]}},
                     }
                     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -625,6 +628,9 @@ class YouTubeTranscriptIndex:
                             "noplaylist": True,
                             "socket_timeout": client_timeout,
                             "retries": 0,
+                            # Prefer the system SSL context over certifi so a
+                            # host behind a TLS-intercepting proxy still works.
+                            "compat_opts": {"no-certifi"},
                             "extractor_args": {"youtube": {"player_client": [client]}},
                         }) as ydl:
                             info = ydl.extract_info(video_id, download=False)

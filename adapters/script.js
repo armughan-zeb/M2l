@@ -11,7 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const { minimumScriptWords } = require('../lib/mediaRules');
-const { runCommand, parseJsonOutput } = require('../lib/command');
+const { runCommand, parseJsonOutput, quoteArg } = require('../lib/command');
 
 function minimumWords(job) {
   return minimumScriptWords(job.targetDurationMinutes || 8);
@@ -46,7 +46,7 @@ function validateScript(text, job) {
   return { ok: true, words, minimumWords: requiredWords, warnings };
 }
 
-async function runScriptCommand(command, job, workDir, { signal, onDetail, expansion } = {}) {
+async function runScriptCommand(command, job, workDir, { signal, onDetail, expansion, timeoutMs } = {}) {
   const payload = {
     type: 'script',
     job,
@@ -59,7 +59,7 @@ async function runScriptCommand(command, job, workDir, { signal, onDetail, expan
     input: JSON.stringify(payload),
     cwd: workDir,
     signal,
-    timeoutMs: Number(process.env.MUSE_SCRIPT_TIMEOUT_MS) || 10 * 60 * 1000,
+    timeoutMs: Number(timeoutMs) || Number(process.env.MUSE_SCRIPT_TIMEOUT_MS) || 10 * 60 * 1000,
     label: 'Muse script command',
     env: {
       MUSE_JOB_ID: job.jobId,
@@ -151,20 +151,35 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
     }
   }
 
-  if (!command) {
-    onProgress?.(15, 'Synthesizing narration from channel research context and competitor references');
+  // Template fallback is opt-in only. The old synthesizer pads generic
+  // paragraphs to a word count; it is not a researched script and must never
+  // be the silent default.
+  if (!command && process.env.MUSE_SCRIPT_ALLOW_TEMPLATE_FALLBACK === '1') {
+    onProgress?.(15, 'Template fallback enabled: synthesizing generic narration (not a researched script)');
     const synthesized = synthesizeNarration(job);
     const check = validateScript(synthesized, job);
     if (!check.ok) {
       throw new Error(`Synthesized narration failed validation: ${check.error}`);
     }
-    saveScript(workDir, synthesized, { engine: 'synthesizer', words: check.words });
-    onDetail?.(`Narration ready (${check.words} words)`);
-    return { scriptText: synthesized, words: check.words, resumed: false, meta: { engine: 'synthesizer' } };
+    saveScript(workDir, synthesized, { engine: 'template-synthesizer-generic', words: check.words });
+    onDetail?.(`Generic template narration ready (${check.words} words)`);
+    return { scriptText: synthesized, words: check.words, resumed: false, meta: { engine: 'template-synthesizer-generic' } };
   }
 
-  onProgress?.(10, 'Generating narration with the Muse agent');
-  let result = await runScriptCommand(command, job, workDir, { signal, onDetail });
+  // Default engine: the ScriptIT headless CLI. In agent-bridge mode it needs
+  // no OpenRouter key — Muse answers its inference requests through the
+  // Vidnets inbox. A custom MUSE_SCRIPT_COMMAND still wins when set.
+  const scriptitCli = path.join(__dirname, '..', 'scriptit', 'cli', 'generate.js');
+  const isDefault = !command;
+  const effectiveCommand = command || `node ${quoteArg(scriptitCli)}`;
+  // Agent-bridge round-trips are human-speed (inbox + operator); give the
+  // default engine a 45-minute budget. A custom command keeps the 10-minute
+  // default unless MUSE_SCRIPT_TIMEOUT_MS overrides it.
+  const timeoutMs = Number(process.env.MUSE_SCRIPT_TIMEOUT_MS)
+    || (isDefault ? 45 * 60 * 1000 : 10 * 60 * 1000);
+
+  onProgress?.(10, isDefault ? 'Generating narration with ScriptIT (agent-bridge mode)' : 'Generating narration with the Muse agent');
+  let result = await runScriptCommand(effectiveCommand, job, workDir, { signal, onDetail, timeoutMs });
   let check = validateScript(result.scriptText, job);
 
   // One bounded expansion. The CMS allows a slightly shorter narration only
@@ -174,9 +189,10 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
     onDetail?.(`Narration returned ${check.words} of ${check.minimumWords} words; requesting one bounded expansion`);
     onProgress?.(45, 'Narration is short; requesting one bounded expansion');
     try {
-      const expanded = await runScriptCommand(command, job, workDir, {
+      const expanded = await runScriptCommand(effectiveCommand, job, workDir, {
         signal,
         onDetail,
+        timeoutMs,
         expansion: {
           requiredWords: check.minimumWords,
           previousWords: check.words,
@@ -202,8 +218,8 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
     );
   }
 
-  saveScript(workDir, result.scriptText, { engine: 'command', meta: result.meta || {}, words: check.words });
-  return { ...result, words: check.words, resumed: false };
+  saveScript(workDir, result.scriptText, { engine: isDefault ? 'scriptit' : 'command', meta: result.meta || {}, words: check.words });
+  return { ...result, meta: { ...(result.meta || {}), engine: isDefault ? 'scriptit' : 'command' }, words: check.words, resumed: false };
 }
 
 module.exports = {

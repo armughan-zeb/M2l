@@ -240,6 +240,12 @@ function startLocalAssetServer() {
         const rawPath = decodeURIComponent(pathname.replace(/^\/+/, ''));
         let resolved = path.resolve(rawPath);
         if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+          // POSIX absolute paths (e.g. /home/.../narration.mp3) lose their
+          // leading slash in the URL; try it back before the project roots.
+          // On Windows this is a no-op (path.resolve('/C:/...') == C:\...).
+          resolved = path.resolve('/' + rawPath);
+        }
+        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
           resolved = path.resolve(path.join(root, rawPath));
         }
         if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
@@ -347,7 +353,10 @@ function asLocalUrl(value, baseUrl) {
       const parsed = new URL(raw);
       const loopback = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname.toLowerCase());
       if (!loopback) return raw;
-      raw = decodeURIComponent(parsed.pathname.replace(/^\/+/, ''));
+      // Keep the pathname as-is: on POSIX it is an absolute path
+      // (/home/...), and stripping its leading slashes would make it
+      // unresolvable. Candidates below handle the relative joins.
+      raw = decodeURIComponent(parsed.pathname);
     } catch {
       return raw;
     }
@@ -368,7 +377,9 @@ function asLocalUrl(value, baseUrl) {
       const resolved = path.resolve(candidate);
       if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
         const normalized = resolved.replace(/\\/g, '/');
-        return `${baseUrl}/${encodeURI(normalized)}`;
+        // Strip a POSIX leading slash: `${baseUrl}//home/...` would parse
+        // as a protocol-relative URL (host "home") instead of a path.
+        return `${baseUrl}/${encodeURI(normalized.replace(/^\/+/, ''))}`;
       }
     } catch {
       // Ignore invalid candidate paths

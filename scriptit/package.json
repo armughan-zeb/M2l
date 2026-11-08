@@ -4,7 +4,7 @@
   "description": "YouTube Script Generator Pro - BYOK desktop app powered by OpenRouter",
   "main": "electron/main.js",
   "scripts": {
-    "test": "node test/model-policy.js && node test/core.js && node test/narrator.js && node test/editorial.js && node tests/production-safety.js && node tests/workflow-recovery.js && node tests/prompt-led.js && node tests/external-agent.js && node test/universal-engine.js && node test/structure-cloner.js",
+    "test": "node test/model-policy.js && node test/core.js && node test/narrator.js && node test/editorial.js && node tests/production-safety.js && node tests/workflow-recovery.js && node tests/prompt-led.js && node tests/external-agent.js && node test/universal-engine.js && node test/structure-cloner.js && node tests/agent-bridge.js && node tests/cli-generate.js",
     "start": "electron .",
     "electron": "electron .",
     "dev": "electron . --dev",
