@@ -26,7 +26,13 @@ def configure(runtime_root=None):
     if not node_candidate.is_file():
         import shutil
         sys_node = shutil.which('node')
-        node_candidate = Path(sys_node) if sys_node else node_candidate
+        if sys_node:
+            node_candidate = Path(sys_node)
+        elif os.name != 'nt':
+            for candidate_node in ('/usr/bin/node', '/usr/local/bin/node', '/snap/bin/node', '/opt/node/bin/node'):
+                if Path(candidate_node).is_file():
+                    node_candidate = Path(candidate_node)
+                    break
 
     values = {'VIDZEO_ROOT': root, 'VIDZEO_RESOURCE_ROOT': resources,
               'VIDZEO_SECURE_DATA_DIR': root / 'secure', 'VIDZEO_SESSION_SECRET_FILE': root / '.vidzeo_session_secret',
@@ -114,9 +120,10 @@ def start(resources, root, env):
         if not python.is_file():
             python = Path(sys.executable)
         with logfile.open('ab') as stream:
+            spawn_kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
             child = subprocess.Popen([str(python), '-u', str(resources / 'main.py')],
                 cwd=str(resources), env=env, stdout=stream, stderr=stream, stdin=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                **spawn_kwargs)
         url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -132,7 +139,13 @@ def start(resources, root, env):
                 pass
             time.sleep(.25)
         # Only stop the process this invocation created, never another app.
-        child.terminate()
+        if os.name == 'nt':
+            child.terminate()
+        else:
+            try:
+                os.killpg(child.pid, 15)  # SIGTERM
+            except Exception:
+                child.terminate()
         raise RuntimeError(f'Service startup exceeded 45 seconds. Inspect {logfile}')
 
 

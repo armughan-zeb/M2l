@@ -287,7 +287,15 @@ def _linux_derive_key(salt: bytes) -> bytes:
                 break
             except Exception:
                 pass
-    secret_file = Path.home() / '.vidzeo_session_secret'
+    env_secret = os.environ.get('VIDZEO_SESSION_SECRET_FILE')
+    if env_secret:
+        secret_file = Path(env_secret)
+    else:
+        try:
+            secret_file = Path.home() / '.vidzeo_session_secret'
+        except Exception:
+            import tempfile
+            secret_file = Path(tempfile.gettempdir()) / f'.vidzeo_session_secret_{uid.decode()}'
     if not secret_file.is_file():
         try:
             secret_file.parent.mkdir(parents=True, exist_ok=True)
@@ -481,29 +489,40 @@ def detect_browser_profiles() -> List[BrowserProfile]:
     else:
         home = Path.home()
         config_dir = home / ".config"
+        snap_dir = home / "snap"
+        var_app = home / ".var" / "app"
         roots = [
             ("chrome", config_dir / "google-chrome"),
             ("chromium", config_dir / "chromium"),
+            ("chromium", snap_dir / "chromium" / "common" / "chromium"),
+            ("chromium", snap_dir / "chromium" / "current" / ".config" / "chromium"),
+            ("chrome", var_app / "com.google.Chrome" / "config" / "google-chrome"),
+            ("chromium", var_app / "org.chromium.Chromium" / "config" / "chromium"),
             ("brave", config_dir / "BraveSoftware" / "Brave-Browser"),
             ("edge", config_dir / "microsoft-edge"),
             ("vivaldi", config_dir / "vivaldi"),
             ("opera", config_dir / "opera"),
         ]
-        firefox_root = home / ".mozilla" / "firefox"
+        firefox_roots = [
+            home / ".mozilla" / "firefox",
+            snap_dir / "firefox" / "common" / ".mozilla" / "firefox",
+            var_app / "org.mozilla.firefox" / ".mozilla" / "firefox",
+        ]
 
     for browser, root in roots:
         try:
             candidates.extend(_chromium_profiles(browser, root))
         except OSError:
             pass
-    if firefox_root.is_dir():
-        try:
-            for profile in firefox_root.iterdir():
-                activity = _profile_activity(profile, ("cookies.sqlite", "places.sqlite"))
-                if activity:
-                    candidates.append(BrowserProfile("firefox", str(profile), profile.name, activity))
-        except OSError:
-            pass
+    for f_root in firefox_roots:
+        if f_root.is_dir():
+            try:
+                for profile in f_root.iterdir():
+                    activity = _profile_activity(profile, ("cookies.sqlite", "places.sqlite"))
+                    if activity:
+                        candidates.append(BrowserProfile("firefox", str(profile), profile.name, activity))
+            except OSError:
+                pass
 
     hint = _preferred_browser()
     candidates.sort(key=lambda item: (item.browser == hint, item.activity), reverse=True)

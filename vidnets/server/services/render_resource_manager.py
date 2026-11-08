@@ -81,7 +81,12 @@ def _trim_current_process_working_set() -> bool:
             psapi.EmptyWorkingSet.restype = ctypes.c_int
             return bool(psapi.EmptyWorkingSet(kernel32.GetCurrentProcess()))
         if sys.platform.startswith("linux"):
-            libc = ctypes.CDLL("libc.so.6")
+            import ctypes.util
+            libc_name = ctypes.util.find_library("c") or "libc.so.6"
+            try:
+                libc = ctypes.CDLL(libc_name)
+            except OSError:
+                libc = ctypes.CDLL(None)
             malloc_trim = getattr(libc, "malloc_trim", None)
             if malloc_trim is not None:
                 malloc_trim.argtypes = [ctypes.c_size_t]

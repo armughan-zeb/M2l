@@ -21,6 +21,27 @@ if [ ! -d "node_modules" ]; then
     npm install
 fi
 
+# 1. Explicit bridge / headless mode
+if [ "$1" = "bridge" ] || [ "$1" = "--bridge" ] || [ "$1" = "headless" ] || [ "$1" = "--headless" ]; then
+    echo "Starting ScriptIT Bridge server (pure Node headless mode)..."
+    echo ""
+    exec node bridge/server.js
+fi
+
+# 2. Check for display environment
+if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+    if command -v xvfb-run >/dev/null 2>&1; then
+        echo "No display detected. Launching under virtual framebuffer (xvfb-run)..."
+        echo ""
+        exec xvfb-run -a npm run electron
+    else
+        echo "No graphical display detected ($DISPLAY) and xvfb-run not installed."
+        echo "Starting ScriptIT in headless Bridge API mode on port 3211..."
+        echo ""
+        exec node bridge/server.js
+    fi
+fi
+
 echo "Starting ScriptIT..."
 echo ""
-npm run electron
+exec npm run electron

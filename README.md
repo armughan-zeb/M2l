@@ -178,25 +178,29 @@ node muse-agent.js unpair
 
 To run the Muse worker as a background service on Ubuntu / Boost:
 
+**Option A — Standard Service:**
+
 1. Copy `vidzeo-muse.service` to `/etc/systemd/system/`:
 
 ```bash
 sudo cp vidzeo-muse.service /etc/systemd/system/vidzeo-muse.service
-```
-
-2. Edit the service file to set your user and installation directory:
-
-```bash
-sudo nano /etc/systemd/system/vidzeo-muse.service
-```
-
-3. Enable and start the service:
-
-```bash
 sudo systemctl daemon-reload
 sudo systemctl enable vidzeo-muse
 sudo systemctl start vidzeo-muse
 sudo systemctl status vidzeo-muse
+```
+
+**Option B — Templated Per-User Service (`vidzeo-muse@<user>`):**
+
+1. Copy `vidzeo-muse@.service` to `/etc/systemd/system/`:
+
+```bash
+sudo cp vidzeo-muse@.service /etc/systemd/system/vidzeo-muse@.service
+sudo systemctl daemon-reload
+# Run as your specific Ubuntu / Boost user (e.g. ubuntu):
+sudo systemctl enable vidzeo-muse@ubuntu
+sudo systemctl start vidzeo-muse@ubuntu
+sudo systemctl status vidzeo-muse@ubuntu
 ```
 
 ---
