@@ -46550,24 +46550,99 @@ Check that all your Remotion packages are on the same version. If your dependenc
     const window2 = scene.editor_media_window;
     return /* @__PURE__ */ import_react180.default.createElement(Sequence, { from: window2?.start_frame || 0, durationInFrames: window2?.duration_frames || scene.duration_in_frames }, /* @__PURE__ */ import_react180.default.createElement(MediaShotSequence, { scene, media: media || {} }, ({ scene: shotScene, media: shotMedia }) => /* @__PURE__ */ import_react180.default.createElement(MediaLayer, { media: shotMedia, theme, scene: shotScene, visualDNA, isBlurred })));
   }
-  function resolveStaticAsset(value) {
-    if (typeof value !== "string") return value;
-    if (value.startsWith("http://") || value.startsWith("https://") || value.startsWith("data:")) {
-      return value;
-    }
-    const normalized = value.replace(/\\/g, "/");
-    const sfxIdx = normalized.indexOf("sound-effects/");
-    if (sfxIdx !== -1) {
-      return staticFile(normalized.slice(sfxIdx));
-    }
-    const remotionIdx = normalized.indexOf("remotion-");
-    if (remotionIdx !== -1) {
-      return staticFile(normalized.slice(remotionIdx));
-    }
-    return value;
-  }
+  var KNOWN_SFX_FILES = new Set([
+    "sound-effects/edit/edit_book_close.wav",
+    "sound-effects/edit/edit_check_tick.wav",
+    "sound-effects/edit/edit_cursor_blink.wav",
+    "sound-effects/edit/edit_flash_bulb.wav",
+    "sound-effects/edit/edit_hit_boomed.wav",
+    "sound-effects/edit/edit_hit_dry.wav",
+    "sound-effects/edit/edit_hit_tight.wav",
+    "sound-effects/edit/edit_marker_underline.wav",
+    "sound-effects/edit/edit_paper_shuffle.wav",
+    "sound-effects/edit/edit_paper_tear_subtle.wav",
+    "sound-effects/edit/edit_reveal_chime.wav",
+    "sound-effects/edit/edit_reveal_soft.wav",
+    "sound-effects/edit/edit_room_shift.wav",
+    "sound-effects/edit/edit_shutter_snap.wav",
+    "sound-effects/edit/edit_slider_move.wav",
+    "sound-effects/edit/edit_staple.wav",
+    "sound-effects/edit/edit_sting_major.wav",
+    "sound-effects/edit/edit_sting_minor.wav",
+    "sound-effects/edit/edit_tape_stop.wav",
+    "sound-effects/edit/edit_type_burst_short.wav",
+    "sound-effects/edit/edit_type_click.wav",
+    "sound-effects/edit/edit_vinyl_pop.wav",
+    "sound-effects/edit/edit_whoosh_air.wav",
+    "sound-effects/edit/edit_whoosh_deep.wav",
+    "sound-effects/edit/edit_whoosh_light.wav",
+    "sound-effects/edit/edit_whoosh_sucked.wav",
+    "sound-effects/edit/edit_zoom_whirr.wav",
+    "sound-effects/vidzeo/archive_drone.wav",
+    "sound-effects/vidzeo/bass_drop.wav",
+    "sound-effects/vidzeo/calendar_flip.wav",
+    "sound-effects/vidzeo/camera_shutter.wav",
+    "sound-effects/vidzeo/camera_wind.wav",
+    "sound-effects/vidzeo/cash_counter.wav",
+    "sound-effects/vidzeo/clock_tick.wav",
+    "sound-effects/vidzeo/coin_tick.wav",
+    "sound-effects/vidzeo/crowd_murmur.wav",
+    "sound-effects/vidzeo/data_tick.wav",
+    "sound-effects/vidzeo/decision_tick.wav",
+    "sound-effects/vidzeo/film_splice.wav",
+    "sound-effects/vidzeo/heartbeat.wav",
+    "sound-effects/vidzeo/impact.wav",
+    "sound-effects/vidzeo/impact_glass.wav",
+    "sound-effects/vidzeo/impact_metal.wav",
+    "sound-effects/vidzeo/impact_soft.wav",
+    "sound-effects/vidzeo/impact_wood.wav",
+    "sound-effects/vidzeo/keyboard_single.wav",
+    "sound-effects/vidzeo/lens_click.wav",
+    "sound-effects/vidzeo/low_rumble.wav",
+    "sound-effects/vidzeo/map_draw.wav",
+    "sound-effects/vidzeo/map_pulse.wav",
+    "sound-effects/vidzeo/marker_scratch.wav",
+    "sound-effects/vidzeo/mouse_click.wav",
+    "sound-effects/vidzeo/news_sting.wav",
+    "sound-effects/vidzeo/notification_down.wav",
+    "sound-effects/vidzeo/notification_up.wav",
+    "sound-effects/vidzeo/page_stack.wav",
+    "sound-effects/vidzeo/paper_flip.wav",
+    "sound-effects/vidzeo/paper_rustle.wav",
+    "sound-effects/vidzeo/paper_tear.wav",
+    "sound-effects/vidzeo/pencil_mark.wav",
+    "sound-effects/vidzeo/photo_slide.wav",
+    "sound-effects/vidzeo/projector.wav",
+    "sound-effects/vidzeo/radio_static.wav",
+    "sound-effects/vidzeo/reveal_chime.wav",
+    "sound-effects/vidzeo/reverse_swell.wav",
+    "sound-effects/vidzeo/riser.wav",
+    "sound-effects/vidzeo/room_tone.wav",
+    "sound-effects/vidzeo/route_ping.wav",
+    "sound-effects/vidzeo/signal_ping.wav",
+    "sound-effects/vidzeo/sonar.wav",
+    "sound-effects/vidzeo/stamp_hit.wav",
+    "sound-effects/vidzeo/sub_boom.wav",
+    "sound-effects/vidzeo/suspense_pulse.wav",
+    "sound-effects/vidzeo/technical_tick.wav",
+    "sound-effects/vidzeo/telegraph.wav",
+    "sound-effects/vidzeo/tension_string.wav",
+    "sound-effects/vidzeo/transition_suck.wav",
+    "sound-effects/vidzeo/typewriter.wav",
+    "sound-effects/vidzeo/typing_burst.wav",
+    "sound-effects/vidzeo/ui_tick.wav",
+    "sound-effects/vidzeo/vinyl_crackle.wav",
+    "sound-effects/vidzeo/water_pulse.wav",
+    "sound-effects/vidzeo/whoosh.wav",
+    "sound-effects/vidzeo/whoosh_air.wav",
+    "sound-effects/vidzeo/whoosh_dark.wav",
+    "sound-effects/vidzeo/whoosh_snap.wav",
+    "sound-effects/vidzeo/whoosh_soft.wav",
+    "sound-effects/vidzeo/wind_room.wav"
+  ]);
   var SFX_REGISTRY_MAP = {
-    // Whooshes & transitions
+    // Whooshes & transitions \u2014 bare 'whoosh' maps to edit_whoosh_light.wav
+    "whoosh": "sound-effects/edit/edit_whoosh_light.wav",
     "whoosh.light": "sound-effects/edit/edit_whoosh_light.wav",
     "whoosh_light": "sound-effects/edit/edit_whoosh_light.wav",
     "edit_whoosh_light": "sound-effects/edit/edit_whoosh_light.wav",
@@ -46579,10 +46654,12 @@ Check that all your Remotion packages are on the same version. If your dependenc
     "edit_whoosh_air": "sound-effects/edit/edit_whoosh_air.wav",
     "whoosh.soft": "sound-effects/vidzeo/whoosh_soft.wav",
     "whoosh_soft": "sound-effects/vidzeo/whoosh_soft.wav",
-    "whoosh": "sound-effects/vidzeo/whoosh.wav",
     "whoosh.snap": "sound-effects/vidzeo/whoosh_snap.wav",
     "whoosh_snap": "sound-effects/vidzeo/whoosh_snap.wav",
+    "whoosh.dark": "sound-effects/vidzeo/whoosh_dark.wav",
     "whoosh_dark": "sound-effects/vidzeo/whoosh_dark.wav",
+    "whoosh.vidzeo": "sound-effects/vidzeo/whoosh.wav",
+    "whoosh_vidzeo": "sound-effects/vidzeo/whoosh.wav",
     "transition.suck": "sound-effects/vidzeo/transition_suck.wav",
     "transition_suck": "sound-effects/vidzeo/transition_suck.wav",
     "edit.whoosh.sucked": "sound-effects/edit/edit_whoosh_sucked.wav",
@@ -46592,6 +46669,7 @@ Check that all your Remotion packages are on the same version. If your dependenc
     "edit.zoom.whirr": "sound-effects/edit/edit_zoom_whirr.wav",
     "edit_zoom_whirr": "sound-effects/edit/edit_zoom_whirr.wav",
     "edit.hit.tight": "sound-effects/edit/edit_hit_tight.wav",
+
     // Paper & documents
     "paper.shuffle": "sound-effects/edit/edit_paper_shuffle.wav",
     "paper_shuffle": "sound-effects/edit/edit_paper_shuffle.wav",
@@ -46605,16 +46683,19 @@ Check that all your Remotion packages are on the same version. If your dependenc
     "paper_rustle": "sound-effects/vidzeo/paper_rustle.wav",
     "marker.scratch": "sound-effects/vidzeo/marker_scratch.wav",
     "marker_scratch": "sound-effects/vidzeo/marker_scratch.wav",
+    "pencil.mark": "sound-effects/vidzeo/pencil_mark.wav",
     "pencil_mark": "sound-effects/vidzeo/pencil_mark.wav",
     "stamp.hit": "sound-effects/vidzeo/stamp_hit.wav",
     "stamp_hit": "sound-effects/vidzeo/stamp_hit.wav",
     "pin.click": "sound-effects/edit/edit_staple.wav",
     "pin_click": "sound-effects/edit/edit_staple.wav",
+    "staple": "sound-effects/edit/edit_staple.wav",
     "marker.underline": "sound-effects/edit/edit_marker_underline.wav",
     "marker_underline": "sound-effects/edit/edit_marker_underline.wav",
     "edit_staple": "sound-effects/edit/edit_staple.wav",
     "page.stack": "sound-effects/vidzeo/page_stack.wav",
     "page_stack": "sound-effects/vidzeo/page_stack.wav",
+
     // Impacts, stings & risers
     "impact.soft": "sound-effects/vidzeo/impact_soft.wav",
     "impact_soft": "sound-effects/vidzeo/impact_soft.wav",
@@ -46628,18 +46709,23 @@ Check that all your Remotion packages are on the same version. If your dependenc
     "hit_dry": "sound-effects/edit/edit_hit_dry.wav",
     "edit_hit_dry": "sound-effects/edit/edit_hit_dry.wav",
     "edit_hit_tight": "sound-effects/edit/edit_hit_tight.wav",
+    "sting.major": "sound-effects/edit/edit_sting_major.wav",
+    "sting_major": "sound-effects/edit/edit_sting_major.wav",
     "sting.minor": "sound-effects/edit/edit_sting_minor.wav",
+    "sting_minor": "sound-effects/edit/edit_sting_minor.wav",
     "edit_sting_minor": "sound-effects/edit/edit_sting_minor.wav",
     "riser.tension": "sound-effects/vidzeo/riser.wav",
     "riser": "sound-effects/vidzeo/riser.wav",
     "reveal.chime": "sound-effects/vidzeo/reveal_chime.wav",
     "reveal_chime": "sound-effects/vidzeo/reveal_chime.wav",
     "reveal.soft": "sound-effects/edit/edit_reveal_soft.wav",
+    "reveal_soft": "sound-effects/edit/edit_reveal_soft.wav",
     "edit_reveal_soft": "sound-effects/edit/edit_reveal_soft.wav",
     "reverse.swell": "sound-effects/vidzeo/reverse_swell.wav",
     "reverse_swell": "sound-effects/vidzeo/reverse_swell.wav",
     "news.sting": "sound-effects/vidzeo/news_sting.wav",
     "news_sting": "sound-effects/vidzeo/news_sting.wav",
+
     // Telemetry & metrics
     "data.tick": "sound-effects/vidzeo/data_tick.wav",
     "data_tick": "sound-effects/vidzeo/data_tick.wav",
@@ -46652,16 +46738,24 @@ Check that all your Remotion packages are on the same version. If your dependenc
     "clock.tick": "sound-effects/vidzeo/clock_tick.wav",
     "clock_tick": "sound-effects/vidzeo/clock_tick.wav",
     "ui_tick": "sound-effects/vidzeo/ui_tick.wav",
+    "ui.tick": "sound-effects/vidzeo/ui_tick.wav",
     "decision_tick": "sound-effects/vidzeo/decision_tick.wav",
+    "decision.tick": "sound-effects/vidzeo/decision_tick.wav",
+
     // Maps & radar
-    "map.ping": "sound-effects/vidzeo/map_pulse.wav",
+    "map.pulse": "sound-effects/vidzeo/map_pulse.wav",
     "map_pulse": "sound-effects/vidzeo/map_pulse.wav",
+    "map.ping": "sound-effects/vidzeo/map_pulse.wav",
+    "map_ping": "sound-effects/vidzeo/map_pulse.wav",
     "map.draw": "sound-effects/vidzeo/map_draw.wav",
     "map_draw": "sound-effects/vidzeo/map_draw.wav",
     "sonar.ping": "sound-effects/vidzeo/sonar.wav",
     "sonar": "sound-effects/vidzeo/sonar.wav",
     "route.ping": "sound-effects/vidzeo/route_ping.wav",
     "route_ping": "sound-effects/vidzeo/route_ping.wav",
+    "signal.ping": "sound-effects/vidzeo/signal_ping.wav",
+    "signal_ping": "sound-effects/vidzeo/signal_ping.wav",
+
     // Camera & profile
     "camera.shutter": "sound-effects/vidzeo/camera_shutter.wav",
     "camera_shutter": "sound-effects/vidzeo/camera_shutter.wav",
@@ -46669,6 +46763,7 @@ Check that all your Remotion packages are on the same version. If your dependenc
     "camera_wind": "sound-effects/vidzeo/camera_wind.wav",
     "photo.slide": "sound-effects/vidzeo/photo_slide.wav",
     "photo_slide": "sound-effects/vidzeo/photo_slide.wav",
+
     // Typing & text
     "type.click": "sound-effects/vidzeo/typewriter.wav",
     "typewriter": "sound-effects/vidzeo/typewriter.wav",
@@ -46676,35 +46771,103 @@ Check that all your Remotion packages are on the same version. If your dependenc
     "typing_burst": "sound-effects/vidzeo/typing_burst.wav",
     "edit_type_click": "sound-effects/edit/edit_type_click.wav",
     "edit_type_burst_short": "sound-effects/edit/edit_type_burst_short.wav",
+
     // Ambient & background
     "room_tone": "sound-effects/vidzeo/room_tone.wav",
     "low_rumble": "sound-effects/vidzeo/low_rumble.wav",
     "suspense_pulse": "sound-effects/vidzeo/suspense_pulse.wav",
     "archive_drone": "sound-effects/vidzeo/archive_drone.wav",
     "wind_room": "sound-effects/vidzeo/wind_room.wav",
-    "vinyl_crackle": "sound-effects/vidzeo/vinyl_crackle.wav"
+    "vinyl_crackle": "sound-effects/vidzeo/vinyl_crackle.wav",
+    "heartbeat": "sound-effects/vidzeo/heartbeat.wav",
+    "water_pulse": "sound-effects/vidzeo/water_pulse.wav"
   };
-  function resolveSfxSource(cue) {
-    if (!cue) return null;
-    if (cue.asset) return resolveStaticAsset(cue.asset);
-    if (cue.src) return resolveStaticAsset(cue.src);
-    if (cue.path) return resolveStaticAsset(cue.path);
-    if (cue.file) return resolveStaticAsset(cue.file);
-    const id = cue.sfx_id || cue.kind || cue.id;
-    if (!id) return null;
-    const cleanId = String(id).trim();
-    if (cleanId.includes("/") || cleanId.includes("\\") || cleanId.endsWith(".wav") || cleanId.endsWith(".mp3")) {
-      return resolveStaticAsset(cleanId);
+  function resolveSfxPath(raw) {
+    if (!raw || typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed === "none" || trimmed === "null" || trimmed === "undefined") return null;
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("data:")) {
+      return trimmed;
     }
+    const normalized = trimmed.replace(/\\/g, "/").replace(/^\/+/, "");
+    const sfxIdx = normalized.indexOf("sound-effects/");
+    if (sfxIdx !== -1) {
+      const sfxRel = normalized.slice(sfxIdx);
+      return staticFile(sfxRel);
+    }
+    let baseId = normalized;
+    if (baseId.endsWith(".wav") || baseId.endsWith(".mp3")) {
+      baseId = baseId.slice(0, baseId.lastIndexOf("."));
+    }
+    if (baseId.includes("/")) {
+      baseId = baseId.split("/").pop();
+    }
+    const cleanId = baseId.toLowerCase();
     const dotId = cleanId.replace(/_/g, ".");
     const underscoreId = cleanId.replace(/\./g, "_");
-    if (SFX_REGISTRY_MAP[cleanId]) return staticFile(SFX_REGISTRY_MAP[cleanId]);
-    if (SFX_REGISTRY_MAP[dotId]) return staticFile(SFX_REGISTRY_MAP[dotId]);
-    if (SFX_REGISTRY_MAP[underscoreId]) return staticFile(SFX_REGISTRY_MAP[underscoreId]);
-    if (cleanId.startsWith("edit_")) {
-      return staticFile(`sound-effects/edit/${cleanId}.wav`);
+    const mapped = SFX_REGISTRY_MAP[cleanId] || SFX_REGISTRY_MAP[dotId] || SFX_REGISTRY_MAP[underscoreId];
+    if (mapped) {
+      return staticFile(mapped);
     }
-    return staticFile(`sound-effects/vidzeo/${underscoreId}.wav`);
+    if (cleanId.startsWith("edit_")) {
+      const editCandidate = `sound-effects/edit/${cleanId}.wav`;
+      if (KNOWN_SFX_FILES.has(editCandidate)) {
+        return staticFile(editCandidate);
+      }
+    }
+    const vidzeoCandidate = `sound-effects/vidzeo/${underscoreId}.wav`;
+    if (KNOWN_SFX_FILES.has(vidzeoCandidate)) {
+      return staticFile(vidzeoCandidate);
+    }
+    const editFallback = `sound-effects/edit/edit_${underscoreId}.wav`;
+    if (KNOWN_SFX_FILES.has(editFallback)) {
+      return staticFile(editFallback);
+    }
+    console.warn(`[Remotion] Sound cue "${raw}" could not be resolved to an existing sound effect file; safely bypassing.`);
+    return null;
+  }
+  function resolveSfxSource(cue) {
+    if (!cue) return null;
+    if (typeof cue === "string") {
+      return resolveSfxPath(cue);
+    }
+    const candidate = cue.sfx_id
+      || cue.file
+      || (cue.kind && cue.kind !== "transition" && cue.kind !== "feature" ? cue.kind : null)
+      || (cue.type && cue.type !== "transition" && cue.type !== "feature" ? cue.type : null)
+      || cue.asset
+      || cue.src
+      || cue.path
+      || (cue.id && !String(cue.id).startsWith("sfx-") ? cue.id : null)
+      || cue.name;
+    if (!candidate || typeof candidate !== "string") return null;
+    return resolveSfxPath(candidate);
+  }
+  function resolveStaticAsset(value) {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === "none" || trimmed === "null" || trimmed === "undefined") return null;
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("data:")) {
+      return trimmed;
+    }
+    const normalized = trimmed.replace(/\\/g, "/");
+    const sfxIdx = normalized.indexOf("sound-effects/");
+    if (sfxIdx !== -1) {
+      return staticFile(normalized.slice(sfxIdx));
+    }
+    const remotionIdx = normalized.indexOf("remotion-");
+    if (remotionIdx !== -1) {
+      return staticFile(normalized.slice(remotionIdx));
+    }
+    const sfxResolved = resolveSfxPath(trimmed);
+    if (sfxResolved) {
+      return sfxResolved;
+    }
+    if (!trimmed.includes("/") && !trimmed.includes("\\") && !trimmed.includes(".")) {
+      console.warn(`[Remotion] Unresolved bare asset name "${trimmed}" bypassed to prevent 404 render crash.`);
+      return null;
+    }
+    return staticFile(trimmed.replace(/^\/+/, ""));
   }
   function TimedCaptionTrack({ scene, fps, theme }) {
     const frame = useCurrentFrame();
@@ -47189,8 +47352,12 @@ Check that all your Remotion packages are on the same version. If your dependenc
       return /* @__PURE__ */ import_react180.default.createElement(Sequence, { key: `${templateId2}-${index}`, from: timing.from, durationInFrames: timing.duration, name: `overlay-${scene.scene_index || 0}-${index}` }, mediaHasSource ? renderMediaSafeOverlay(scene, overlay, visualDNA, theme) : /* @__PURE__ */ import_react180.default.createElement(GraphicTemplate, { id: templateId2, props: sanitizeDocumentaryProps(overlay.props || {}, scene), theme }));
     }), /* @__PURE__ */ import_react180.default.createElement(TimedCaptionTrack, { scene, fps, theme }), cues.map((soundCue, index) => {
       const sfxSrc = resolveSfxSource(soundCue);
-      if (!sfxSrc) return null;
-      const localTime = soundCue.time_local !== void 0 && soundCue.time_local !== null ? Number(soundCue.time_local) : Math.max(0, Number(soundCue.start || 0) - Number(scene.start || 0));
+      if (!sfxSrc || typeof sfxSrc !== "string" || !sfxSrc.trim()) return null;
+      const localTime = soundCue.time_local !== void 0 && soundCue.time_local !== null
+        ? Number(soundCue.time_local)
+        : (soundCue.start_offset_seconds !== void 0 && soundCue.start_offset_seconds !== null)
+          ? Math.max(0, Number(soundCue.start_offset_seconds))
+          : Math.max(0, Number(soundCue.start || 0) - Number(scene.start || 0));
       const soundFrom = Math.max(0, Math.round(localTime * fps));
       const soundDuration = Math.max(1, Math.round(Number(soundCue.duration || 0.6) * fps));
       const rawSoundVolume = Number(soundCue.volume ?? 0.28);
@@ -47229,8 +47396,15 @@ Check that all your Remotion packages are on the same version. If your dependenc
       if (track?.enabled === false || !src && !track?.clips?.some((clip) => clip.asset)) return null;
       const volume = id === "narration" ? 1 : Number(music.volume ?? 0.08);
       const onTrackError = (error2) => console.warn(`[Remotion] ${id} audio track skipped after load error; the video render continues.`, error2?.message || error2);
-      if (!track) return /* @__PURE__ */ import_react180.default.createElement(Audio, { key: id, src, volume, onError: onTrackError });
-      return track.clips.map((clip, index) => /* @__PURE__ */ import_react180.default.createElement(Sequence, { key: `${id}-${index}`, from: clip.start_frame, durationInFrames: clip.duration_frames }, /* @__PURE__ */ import_react180.default.createElement(Audio, { src: clip.asset ? resolveStaticAsset(clip.asset) : src, startFrom: id === "narration" ? Number(scenes[clip.scene_index]?.from || 0) + Number(clip.source_start_frame || 0) : Number(clip.source_start_frame || 0), volume, onError: onTrackError })));
+      if (!track) {
+        if (!src || typeof src !== "string" || !src.trim()) return null;
+        return /* @__PURE__ */ import_react180.default.createElement(Audio, { key: id, src, volume, onError: onTrackError });
+      }
+      return track.clips.map((clip, index) => {
+        const clipSrc = clip.asset ? resolveStaticAsset(clip.asset) : src;
+        if (!clipSrc || typeof clipSrc !== "string" || !clipSrc.trim()) return null;
+        return /* @__PURE__ */ import_react180.default.createElement(Sequence, { key: `${id}-${index}`, from: clip.start_frame, durationInFrames: clip.duration_frames }, /* @__PURE__ */ import_react180.default.createElement(Audio, { src: clipSrc, startFrom: id === "narration" ? Number(scenes[clip.scene_index]?.from || 0) + Number(clip.source_start_frame || 0) : Number(clip.source_start_frame || 0), volume, onError: onTrackError }));
+      });
     }));
   }
   function buildRenderableScenes(manifest = {}, fps = 30) {

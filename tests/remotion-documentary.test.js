@@ -90,3 +90,133 @@ test('Remotion entry files, templates, and map assets exist in repository struct
   assert.ok(fs.existsSync(sfxCatalogPath), 'sfx/catalog.json must exist');
   assert.ok(fs.existsSync(publicDir), 'public/ directory must exist');
 });
+
+const sfx = require('../lib/sfxRegistry');
+const remotionRenderer = require('../lib/remotionRenderer');
+
+test('SFX registry maps aliases and bare whoosh to whoosh.light (edit_whoosh_light.wav)', () => {
+  const root = path.resolve(__dirname, '..');
+  const publicDir = path.join(root, 'public');
+
+  // 1. Bare whoosh MUST map to edit_whoosh_light.wav
+  const whooshRel = sfx.resolveSfxRelativePath('whoosh');
+  assert.equal(whooshRel, 'sound-effects/edit/edit_whoosh_light.wav', 'Bare whoosh must map to edit_whoosh_light.wav');
+  assert.ok(fs.existsSync(path.join(publicDir, whooshRel)), `File must exist on disk: ${whooshRel}`);
+
+  // 2. Whoosh variants
+  assert.equal(sfx.resolveSfxRelativePath('whoosh.light'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('whoosh_light'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('edit_whoosh_light'), 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(sfx.resolveSfxRelativePath('edit_whoosh_light.wav'), 'sound-effects/edit/edit_whoosh_light.wav');
+
+  // 3. Key documentary SFX aliases
+  const expectedMappings = {
+    'map_pulse': 'sound-effects/vidzeo/map_pulse.wav',
+    'map.pulse': 'sound-effects/vidzeo/map_pulse.wav',
+    'stamp_hit': 'sound-effects/vidzeo/stamp_hit.wav',
+    'stamp.hit': 'sound-effects/vidzeo/stamp_hit.wav',
+    'typewriter': 'sound-effects/vidzeo/typewriter.wav',
+    'type.click': 'sound-effects/vidzeo/typewriter.wav',
+    'sub_boom': 'sound-effects/vidzeo/sub_boom.wav',
+    'sub.boom': 'sound-effects/vidzeo/sub_boom.wav',
+    'marker_scratch': 'sound-effects/vidzeo/marker_scratch.wav',
+    'marker.scratch': 'sound-effects/vidzeo/marker_scratch.wav',
+    'clock_tick': 'sound-effects/vidzeo/clock_tick.wav',
+    'clock.tick': 'sound-effects/vidzeo/clock_tick.wav'
+  };
+
+  for (const [alias, expected] of Object.entries(expectedMappings)) {
+    const resolved = sfx.resolveSfxRelativePath(alias);
+    assert.equal(resolved, expected, `Alias "${alias}" must resolve to ${expected}`);
+    assert.ok(fs.existsSync(path.join(publicDir, resolved)), `Mapped file must exist: ${resolved}`);
+  }
+});
+
+test('Unbreakable SFX resolution: unresolvable cues and bare strings return null and never throw or crash', () => {
+  // Cue objects with missing / non-existent sounds must return null (silent bypass)
+  assert.equal(sfx.resolveSfxSource({ file: 'completely_unknown_sound_12345' }), null);
+  assert.equal(sfx.resolveSfxSource({ sfx_id: 'nonexistent_ping_xyz' }), null);
+  assert.equal(sfx.resolveSfxSource({ kind: 'imaginary_boom' }), null);
+  assert.equal(sfx.resolveSfxSource(null), null);
+  assert.equal(sfx.resolveSfxSource({}), null);
+  assert.equal(sfx.resolveSfxSource(''), null);
+  assert.equal(sfx.resolveSfxSource('   '), null);
+
+  // resolveStaticAsset must resolve bare whoosh, but return null for unresolved bare names
+  assert.ok(sfx.resolveStaticAsset('whoosh')?.includes('edit_whoosh_light.wav'));
+  assert.equal(sfx.resolveStaticAsset('unknown_bare_sound_name'), null, 'Unresolved bare name must return null, never bare string');
+  assert.equal(sfx.resolveStaticAsset(''), null);
+  assert.equal(sfx.resolveStaticAsset(null), null);
+
+  // Valid cue objects must resolve correctly even when specified as file, sfx_id, or kind
+  const mockCueTrans = { id: 'sfx-0-trans', type: 'transition', file: 'whoosh' };
+  const mockCueFeat = { id: 'sfx-0-feat', type: 'feature', file: 'map_pulse' };
+  assert.ok(sfx.resolveSfxSource(mockCueTrans)?.includes('edit_whoosh_light.wav'));
+  assert.ok(sfx.resolveSfxSource(mockCueFeat)?.includes('map_pulse.wav'));
+});
+
+test('All sound cues produced by buildSemanticManifest resolve to existing audio files on disk', () => {
+  const root = path.resolve(__dirname, '..');
+  const publicDir = path.join(root, 'public');
+
+  const job = {
+    jobId: 'test-job-indian-pacific-01',
+    title: 'The Indian Pacific: 4,352km Across the Desert',
+    channel: { name: 'Train Crew' },
+    targetDurationMinutes: 10
+  };
+
+  const scriptText = `The Indian Pacific spans four thousand three hundred and fifty two kilometers across Australia.
+Departing Sydney Central, the transcontinental run crosses the Blue Mountains toward Broken Hill.
+The official railway log REC-8400 documented severe rail stresses on the Nullarbor straight.
+Operating at one hundred and fifteen kilometers per hour, diesel-electric locomotives face extreme heat.
+The engineering schematic DWG-1920 specified heavy-duty continuously welded rail to endure the crossing.
+In 1970, the first unbroken standard-gauge service connected the Pacific and Indian oceans.
+Every component of the suspension had to withstand fifty straight hours of continuous pounding.`;
+
+  const manifest = buildSemanticManifest(job, scriptText, { fps: 30 });
+  assert.ok(manifest.scenes.length >= 6);
+
+  for (const scene of manifest.scenes) {
+    assert.ok(Array.isArray(scene.sound_cues) && scene.sound_cues.length >= 2, `Scene ${scene.id} must have sound cues`);
+    for (const cue of scene.sound_cues) {
+      const relPath = sfx.resolveSfxRelativePath(cue.file || cue.sfx_id);
+      assert.ok(relPath, `Sound cue ${JSON.stringify(cue)} must be resolvable`);
+      const diskPath = path.join(publicDir, relPath);
+      assert.ok(fs.existsSync(diskPath), `Sound cue file must exist on disk: ${diskPath}`);
+    }
+  }
+});
+
+test('Catalog.json has valid aliases section and all aliased files exist', () => {
+  const root = path.resolve(__dirname, '..');
+  const catalogPath = path.join(root, 'src', 'remotion', 'sfx', 'catalog.json');
+  const publicDir = path.join(root, 'public');
+  const catalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
+
+  assert.ok(catalog.aliases, 'catalog.json must have aliases object');
+  assert.equal(catalog.aliases.whoosh, 'sound-effects/edit/edit_whoosh_light.wav');
+  assert.equal(catalog.aliases.map_pulse, 'sound-effects/vidzeo/map_pulse.wav');
+  assert.equal(catalog.aliases.stamp_hit, 'sound-effects/vidzeo/stamp_hit.wav');
+  assert.equal(catalog.aliases.typewriter, 'sound-effects/vidzeo/typewriter.wav');
+  assert.equal(catalog.aliases.sub_boom, 'sound-effects/vidzeo/sub_boom.wav');
+  assert.equal(catalog.aliases.marker_scratch, 'sound-effects/vidzeo/marker_scratch.wav');
+  assert.equal(catalog.aliases.clock_tick, 'sound-effects/vidzeo/clock_tick.wav');
+
+  for (const [name, relPath] of Object.entries(catalog.aliases)) {
+    assert.ok(fs.existsSync(path.join(publicDir, relPath)), `Alias ${name} target ${relPath} must exist on disk`);
+  }
+});
+
+test('Remotion bundle versioning and fingerprinting detect source changes and support cache clearing', () => {
+  assert.ok(typeof remotionRenderer.BUNDLE_VERSION === 'string' && remotionRenderer.BUNDLE_VERSION.length > 0);
+  const fp1 = remotionRenderer.computeCompositionFingerprint();
+  assert.ok(typeof fp1 === 'string' && fp1.length === 64, 'Fingerprint must be a 64-char sha256 hex');
+
+  const fp2 = remotionRenderer.computeCompositionFingerprint();
+  assert.equal(fp1, fp2, 'Fingerprint must be deterministic when source files are unchanged');
+
+  // Verify clearBundleCache runs without throwing
+  remotionRenderer.clearBundleCache();
+});
+

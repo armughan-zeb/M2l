@@ -1,7 +1,26 @@
 {
   "basePath": "/sound-effects/vidzeo",
+  "aliases": {
+    "whoosh": "sound-effects/edit/edit_whoosh_light.wav",
+    "whoosh.light": "sound-effects/edit/edit_whoosh_light.wav",
+    "whoosh_light": "sound-effects/edit/edit_whoosh_light.wav",
+    "edit_whoosh_light": "sound-effects/edit/edit_whoosh_light.wav",
+    "map_pulse": "sound-effects/vidzeo/map_pulse.wav",
+    "map.pulse": "sound-effects/vidzeo/map_pulse.wav",
+    "map.ping": "sound-effects/vidzeo/map_pulse.wav",
+    "stamp_hit": "sound-effects/vidzeo/stamp_hit.wav",
+    "stamp.hit": "sound-effects/vidzeo/stamp_hit.wav",
+    "typewriter": "sound-effects/vidzeo/typewriter.wav",
+    "type.click": "sound-effects/vidzeo/typewriter.wav",
+    "sub_boom": "sound-effects/vidzeo/sub_boom.wav",
+    "sub.boom": "sound-effects/vidzeo/sub_boom.wav",
+    "marker_scratch": "sound-effects/vidzeo/marker_scratch.wav",
+    "marker.scratch": "sound-effects/vidzeo/marker_scratch.wav",
+    "clock_tick": "sound-effects/vidzeo/clock_tick.wav",
+    "clock.tick": "sound-effects/vidzeo/clock_tick.wav"
+  },
   "catalog": {
-    "transition": ["whoosh", "whoosh_soft", "whoosh_air", "whoosh_snap", "reverse_swell", "transition_suck"],
+    "transition": ["whoosh", "whoosh_light", "whoosh_soft", "whoosh_air", "whoosh_snap", "reverse_swell", "transition_suck"],
     "impact": ["impact", "bass_drop", "sub_boom", "impact_soft", "impact_metal", "impact_glass", "impact_wood"],
     "chapter": ["riser", "whoosh_dark", "reveal_chime"],
     "evidence": ["paper_flip", "stamp_hit", "paper_rustle", "pencil_mark", "marker_scratch"],
