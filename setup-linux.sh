@@ -89,7 +89,7 @@ else
     fi
 fi
 
-# 5. Make all scripts and CLI executable
+# 6. Make all scripts and CLI executable
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 chmod +x "$DIR/muse-agent.js" 2>/dev/null || true
 find "$DIR" -type f -name "*.sh" -exec chmod +x {} + 2>/dev/null || true
@@ -98,7 +98,11 @@ if [ -f "$DIR/scriptit/scripts/yt_transcript.py" ]; then
 fi
 echo "[PASS] Set executable permissions on all shell scripts and binaries"
 
-# 6. Run doctor
+# 7. Install Node dependencies (Remotion documentary engine and React)
+echo "[Info] Installing npm dependencies for Remotion documentary engine..."
+(cd "$DIR" && npm install --no-audit --no-fund) || true
+
+# 8. Run doctor
 echo ""
 echo "=== Running Muse Doctor ==="
 node "$DIR/muse-agent.js" doctor || true

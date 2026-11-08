@@ -281,39 +281,45 @@ async function doctorCommand() {
     String(process.env.MUSE_SCRIPT_COMMAND || '').trim() || 'Automated mode needs MUSE_SCRIPT_COMMAND. Agent-driven mode writes script.txt and uses "deliver".');
 
   const renderCommand = String(process.env.MUSE_RENDER_COMMAND || '').trim();
-  add('Render adapter', renderCommand ? 'pass' : 'warn', renderCommand || 'No MUSE_RENDER_COMMAND; the built-in Vidnets path will be used.');
-  let vidnetsOk = false;
-  if (!renderCommand) {
-    try {
-      const command = vidnets.agentCommand();
-      add('Vidnets launcher', 'pass', command);
-      try {
-        const ready = await vidnets.ensureReady();
-        vidnetsOk = true;
-        add('Vidnets service', 'pass', ready.url || 'ready');
-      } catch (error) {
-        add('Vidnets service', 'fail', error.message);
-      }
-    } catch (error) {
-      add('Vidnets launcher', 'fail', error.message);
-    }
-    add('Muse inference', String(process.env.MUSE_INFERENCE_COMMAND || process.env.MUSE_INFERENCE_URL || '').trim() ? 'pass' : 'fail',
-      String(process.env.MUSE_INFERENCE_COMMAND || process.env.MUSE_INFERENCE_URL || '').trim()
-        ? 'Vidnets requests will use the Muse agent'
-        : 'Vidnets stalls without MUSE_INFERENCE_COMMAND or MUSE_INFERENCE_URL');
-  } else {
+  if (renderCommand) {
+    add('Render adapter', 'pass', renderCommand);
     add('Muse inference', 'pass', 'Handled by the render command');
+  } else {
+    let remotionReady = false;
+    try {
+      require.resolve('@remotion/bundler');
+      require.resolve('@remotion/renderer');
+      remotionReady = true;
+    } catch (_) {}
+
+    add('Remotion Engine', remotionReady ? 'pass' : 'warn',
+      remotionReady
+        ? 'Native Remotion documentary engine active (Maps, Word Highlights, Blueprints, SFX)'
+        : 'Remotion packages not installed. Run "npm install" or bash setup-linux.sh');
+
+    // Built-in Vidnets is optional when native Remotion is used
+    if (process.env.MUSE_VIDNETS_COMMAND || process.env.MUSE_VIDNETS_ROOT) {
+      try {
+        const command = vidnets.agentCommand();
+        add('Vidnets launcher', 'pass', command);
+        try {
+          const ready = await vidnets.ensureReady();
+          add('Vidnets service', 'pass', ready.url || 'ready');
+        } catch (error) {
+          add('Vidnets service', 'warn', error.message);
+        }
+      } catch (error) {
+        add('Vidnets launcher', 'warn', error.message);
+      }
+    }
   }
 
   add('Thumbnail adapter', String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() ? 'pass' : (media.ffmpeg ? 'pass' : 'fail'),
     String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() || 'FFmpeg frame extraction from the finished master');
 
-  if (!renderCommand) {
-    const missing = ['PEXELS_API_KEY', 'PIXABAY_API_KEY'].filter(key => !String(process.env[key] || '').trim());
-    add('Stock provider keys', missing.length === 0 ? 'pass' : 'warn',
-      missing.length === 0 ? 'Pexels and Pixabay configured' : `Missing ${missing.join(', ')}; real stock rescue will be limited`);
-    add('Vidnets pairing', vidnetsOk ? 'pass' : 'warn', vidnetsOk ? 'Local agent service is ready' : 'Fix the Vidnets service check above');
-  }
+  const missing = ['PEXELS_API_KEY', 'PIXABAY_API_KEY'].filter(key => !String(process.env[key] || '').trim());
+  add('Stock provider keys', missing.length === 0 ? 'pass' : 'warn',
+    missing.length === 0 ? 'Pexels and Pixabay configured' : `Missing ${missing.join(', ')}; real stock rescue will be limited`);
 
   console.log(checks.map(check => `${check.level === 'pass' ? 'PASS' : check.level === 'warn' ? 'WARN' : 'FAIL'}  ${check.name}: ${log.redact(check.detail)}`).join('\n'));
   const failures = checks.filter(check => check.level === 'fail').length;
