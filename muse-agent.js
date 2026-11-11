@@ -433,18 +433,9 @@ async function claimCommand(args) {
   } else {
     const steps = [
       `1. SCRIPT: Write complete source-grounded narration matching channel style to scriptPath (${scriptPath}). Target: ~${summary.targetWordCount} words (at least ${summary.minimumWords} words required for ${summary.targetDurationMinutes}min duration).`,
-      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`
+      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`,
+      `3. DELIVER: Once the script and master exist in workDir, run: node muse-agent.js deliver --job ${job.jobId} --skip-thumbnail (thumbnails are generated locally by Pikgen; do not generate or upload a thumbnail)`
     ];
-    // Thumbnails are skipped by this worker — no thumbnail step, and the
-    // deliver step carries --skip-thumbnail (Nov 10, 2026).
-    if (jobRunner.thumbnailsSkipped()) {
-      steps.push('3. DELIVER: Once the script and master exist in workDir, run: node muse-agent.js deliver --job ' + job.jobId + ' --skip-thumbnail');
-    } else {
-      steps.push(
-        `3. THUMBNAIL: Create a high-CTR 16:9 thumbnail styled after the reference (${summary.thumbnailStyle.referenceImageUrl || summary.thumbnailStyle.referenceUrl || 'see concept'}) executing concept "${summary.thumbnailStyle.concept}" to thumbnailPath (${thumbnailPath}).`,
-        `4. DELIVER: Once all files exist in workDir, run: node muse-agent.js deliver --job ${job.jobId}`
-      );
-    }
     instructions = steps;
   }
 

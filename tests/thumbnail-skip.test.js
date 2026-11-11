@@ -23,9 +23,9 @@ afterEach(() => {
   for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('thumbnailsSkipped follows VIDZEO_SKIP_THUMBNAILS', () => {
+test('thumbnailsSkipped follows VIDZEO_SKIP_THUMBNAILS (defaults to true)', () => {
   delete process.env.VIDZEO_SKIP_THUMBNAILS;
-  assert.equal(jobRunner.thumbnailsSkipped(), false);
+  assert.equal(jobRunner.thumbnailsSkipped(), true);
 
   process.env.VIDZEO_SKIP_THUMBNAILS = '1';
   assert.equal(jobRunner.thumbnailsSkipped(), true);
@@ -36,7 +36,7 @@ test('thumbnailsSkipped follows VIDZEO_SKIP_THUMBNAILS', () => {
   process.env.VIDZEO_SKIP_THUMBNAILS = '0';
   assert.equal(jobRunner.thumbnailsSkipped(), false);
 
-  process.env.VIDZEO_SKIP_THUMBNAILS = '';
+  process.env.VIDZEO_SKIP_THUMBNAILS = 'false';
   assert.equal(jobRunner.thumbnailsSkipped(), false);
 });
 

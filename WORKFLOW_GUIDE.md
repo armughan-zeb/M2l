@@ -30,7 +30,7 @@ Think of this system like a **film production company**:
 |  - Builds the scene-by-scene editing manifest               |
 |  - Renders 1080p documentary video using Remotion (React)   |
 |  - Animates maps, blueprints, word highlights, & SFX        |
-|  - Sends finished MP4 video + thumbnail back to CMS         |
+|  - Sends finished MP4 video back to CMS (Pikgen handles thumbnails) |
 +-------------------------------------------------------------+
 ```
 
@@ -84,9 +84,10 @@ sequenceDiagram
     Worker->>CMS: Starts Heartbeat (Every 3s: "I'm alive")
     CMS-->>Worker: "Here is a job: How a Train Changes Tracks"
     Worker->>Worker: Synthesizes script + builds Remotion manifest
-    Worker->>Worker: Renders 1080p Remotion documentary MP4 + extracts thumbnail
-    Worker->>CMS: Delivers completed video.mp4 + thumbnail.jpg
-    CMS-->>User: Video verified & ready in CMS for upload!
+    Worker->>Worker: Renders 1080p Remotion documentary MP4
+    Worker->>CMS: Delivers completed script + video.mp4 (--skip-thumbnail)
+    Note over CMS: Pikgen produces thumbnail locally in parallel
+    CMS-->>User: Video and thumbnail verified & ready in CMS for upload!
 ```
 
 ---
@@ -158,7 +159,7 @@ PASS  Work folder: ...
 PASS  FFprobe: ffprobe
 PASS  FFmpeg: ffmpeg
 PASS  Remotion Engine: Native Remotion documentary engine active (Maps, Word Highlights, Blueprints, SFX)
-PASS  Thumbnail adapter: FFmpeg frame extraction from finished master
+PASS  Thumbnail handling: Skipped on worker (CMS generates thumbnails locally via Pikgen)
 All blocking checks passed.
 ```
 
@@ -217,12 +218,9 @@ Once your worker daemon is running, it watches the CMS queue. Here is the exact 
   • Applies film grain, vignette, audio mixing, and SFX cues.
        |
        v
-[ Step 4: Thumbnail Extraction ] (Status: 95%)
-  • High-impact 16:9 thumbnail frame extracted from the finished master.
-       |
-       v
-[ Step 5: Artifact Delivery to CMS ] (Status: 100%)
-  • Worker streams video.mp4 and thumbnail.jpg back to CMS.
+[ Step 4: Artifact Delivery to CMS ] (Status: 100%)
+  • Worker streams video.mp4 and script back to CMS (`--skip-thumbnail`).
+  • Pikgen produces the thumbnail locally in parallel on the CMS.
   • CMS validates duration, 1080p resolution, audio integrity, and file size (>1MB).
   • Job is marked COMPLETE and queued for YouTube upload via UploadIT!
 ```
@@ -239,7 +237,7 @@ All commands are run inside the `M2l` folder on your Linux machine:
 | `node muse-agent.js status` | Shows current pairing status, registered agent name, and active job (if any). |
 | `node muse-agent.js start` | Starts the worker loop in the current terminal window. |
 | `node muse-agent.js claim` | Manually claims the next pending job from the CMS. |
-| `node muse-agent.js deliver` | Delivers the finished video and thumbnail from the work folder. |
+| `node muse-agent.js deliver` | Delivers the finished script and video from the work folder (`--skip-thumbnail`). |
 | `node muse-agent.js fail "reason"` | Reports an error and releases the active job. |
 | `node muse-agent.js unpair` | Removes the local token and unpairs the machine. |
 

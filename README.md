@@ -1,8 +1,8 @@
 # Vidzeo Muse Worker
 
 An authenticated worker for the Vidzeo CMS **Muse mode**. It pairs with the CMS,
-claims one production job at a time, produces narration plus a 1080p master and
-thumbnail, and uploads the artifacts. The CMS validates every artifact again
+claims one production job at a time, produces narration plus a 1080p master,
+and uploads the artifacts (thumbnails are generated locally by Pikgen). The CMS validates every artifact again
 before packaging and publishing.
 
 The worker is fully Linux/Ubuntu native (also compatible with Boost cloud, VPS,
@@ -157,21 +157,19 @@ The command prints JSON with the job and its exact paths:
 ```text
 work/<jobId>/script.txt      write the complete narration here
 work/<jobId>/video.mp4       render the 1080p master with audio here
-work/<jobId>/thumbnail.jpg   optional 16:9 thumbnail
 work/<jobId>/inference/      Vidnets reasoning/vision requests (built-in renderer)
 ```
 
 After the files exist:
 
 ```bash
-node muse-agent.js deliver --job <jobId>
+node muse-agent.js deliver --job <jobId> --skip-thumbnail
 ```
 
-`deliver` validates the narration length, the master duration/1080p/audio/full
-decode, and the thumbnail size/aspect, then uploads and completes the job.
-Pass `--script`, `--video` or `--thumbnail` to deliver files produced elsewhere;
-they are copied into the job checkpoint. If no thumbnail is supplied, a real
-frame is extracted from the finished master.
+`deliver` validates the narration length and the master duration/1080p/audio/full
+decode, then uploads and completes the job. Thumbnails are generated locally on the
+CMS using Pikgen, so the worker delivers script + video only. Pass `--script` or
+`--video` to deliver files produced elsewhere; they are copied into the job checkpoint.
 
 If the work cannot be finished, report an actionable reason:
 

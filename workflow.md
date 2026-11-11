@@ -59,7 +59,7 @@ node muse-agent.js status
 ## 2. Job lifecycle (one CMS job, end to end)
 
 The CMS gives the title; the daemon claims it; the worker produces
-script + video + thumbnail, uploads to the CMS, marks completed.
+script + video, uploads to the CMS, marks completed (thumbnails are generated locally by Pikgen).
 
 | Step | What happens | "Done" looks like | If it fails |
 |---|---|---|---|
@@ -69,7 +69,7 @@ script + video + thumbnail, uploads to the CMS, marks completed.
 | Vidnets mixed-media | LLM writes queries from the scenes → search YouTube clips + web images → FILTER THE BEST (rank, keep the best real media; reject only clearly-wrong footage) → vision ranks (scores) → Remotion edits | Most scenes real, most of them clips where clips exist | See §5. One bounded media re-plan per job, before a 0-real fail only |
 | Render | Remotion renders the 1080p master (6 h CMS hard limit per attempt; 20 min inactivity limit) | Video ≥ 1920×1080, ≥ target minutes, h264+aac, ≥ 1 MB, audio stream present | Render stalls: check memory admission (`:5010` status) and the wrapper log — do not restart mid-render |
 | Validate | Wrapper checks the edit plan: real-media count, video size, decode | `Edit plan: N/total scenes real media` with N ≥ 1 | N = 0 → wrapper fails the job (after the one bounded re-plan). Never deliver a graphics-only video |
-| Deliver | Worker uploads video + thumbnail (16:9, ≥ 1 KB) + script to the CMS, marks completed | CMS shows the job completed | Delivery validation fails → fix the artifact, do not weaken the checks |
+| Deliver | Worker uploads video + script to the CMS (--skip-thumbnail), marks completed | CMS shows the job completed (Pikgen handles thumbnails locally) | Delivery validation fails → fix the artifact, do not weaken the checks |
 
 ## 3. How filter-best works (the architecture, in one paragraph)
 
