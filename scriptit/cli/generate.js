@@ -27,6 +27,9 @@
  *     with SCRIPTIT_AGENT_KEY=agent-bridge:<owner> (default local-user).
  *   - OpenRouter: set SCRIPTIT_API_KEY / SCRIPTIT_OPENROUTER_API_KEY /
  *     OPENROUTER_API_KEY, or pass --api-key. Then --model selects the model.
+ *     FORBIDDEN when MUSE_INFERENCE_COMPULSORY=1 (the production worker
+ *     sets this): Muse inference is compulsory and the CLI refuses to run
+ *     with an OpenRouter key present.
  *
  * Output: exactly one JSON object on stdout:
  *   { "scriptText": "...", "meta": {...} }
@@ -78,12 +81,29 @@ function parseArgs(argv) {
 }
 
 function readStdin() {
+  // A piped stdin that never closes (e.g. an exec session holding the pipe
+  // open) used to hang the CLI forever before it did any work — 43 minutes
+  // lost on one run. If no data arrives quickly, there is no job JSON coming:
+  // proceed with the flags instead of waiting for 'end'.
   return new Promise((resolve, reject) => {
     let data = '';
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(data), 1000);
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (chunk) => { data += chunk; });
-    process.stdin.on('end', () => resolve(data));
-    process.stdin.on('error', reject);
+    process.stdin.on('end', () => finish(data));
+    process.stdin.on('error', (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
@@ -91,6 +111,27 @@ function durationLabel(minutes) {
   const n = Number(minutes);
   if (Number.isFinite(n) && n > 0) return `${n}min`;
   return '10min';
+}
+
+function durationMinutes(label) {
+  const match = String(label || '').trim().match(/^(\d+(?:\.\d+)?)\s*min/i);
+  if (match) return Number(match[1]);
+  const bare = Number(String(label || '').trim());
+  return Number.isFinite(bare) && bare > 0 ? bare : null;
+}
+
+// Research-mode default: an explicit --research-mode flag or
+// SCRIPTIT_RESEARCH_MODE wins. Otherwise short videos (<= 2 min) use the
+// 'standard' middle ground — one fast research pass, still publishable —
+// because the deep pass buys little for ~250 words of narration; longer
+// videos keep 'thorough'. Unknown explicit values fall through to the
+// duration default rather than crashing a production run.
+function resolveResearchMode({ flag, env, duration }) {
+  const explicit = String(flag || env || '').trim().toLowerCase();
+  if (['quick', 'standard', 'thorough'].includes(explicit)) return explicit;
+  const minutes = durationMinutes(duration);
+  if (minutes !== null && minutes <= 2) return 'standard';
+  return 'thorough';
 }
 
 // Node 24's bundled undici crashes the whole process with
@@ -155,13 +196,20 @@ async function main() {
   const voice = String(flags.voice || scriptSettings.tone || 'conversational').trim();
   const customStructure = String(flags.structure || scriptSettings.customStructure || job?.requirements?.sceneGuidelines?.structure || '').trim();
   const duration = String(flags.duration || durationLabel(job?.targetDurationMinutes) || '10min').trim();
-  const researchMode = String(flags['research-mode'] || process.env.SCRIPTIT_RESEARCH_MODE || 'thorough').trim().toLowerCase();
+  const researchMode = resolveResearchMode({ flag: flags['research-mode'], env: process.env.SCRIPTIT_RESEARCH_MODE, duration });
   const model = String(flags.model || process.env.SCRIPTIT_MODEL || 'nvidia/nemotron-3.5-super-vl:free').trim();
 
   // Model selection: an explicit OpenRouter key wins; otherwise the
   // agent-bridge handle (no key, Muse answers through the Vidnets inbox).
   const openRouterKey = String(flags['api-key'] || process.env.SCRIPTIT_API_KEY
     || process.env.SCRIPTIT_OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY || '').trim();
+  // Muse inference is compulsory on the production worker: refuse to run
+  // with an OpenRouter key when MUSE_INFERENCE_COMPULSORY=1 is set, rather
+  // than silently writing a script with another provider.
+  if (openRouterKey && String(process.env.MUSE_INFERENCE_COMPULSORY || '').trim() === '1') {
+    fail('Muse inference is compulsory (MUSE_INFERENCE_COMPULSORY=1): an OpenRouter key is present in the environment. Remove it — ScriptIT must use the agent-bridge inbox, answered by Muse.');
+    return;
+  }
   const bridgeMode = !openRouterKey;
   const apiKey = openRouterKey
     || String(process.env.SCRIPTIT_AGENT_KEY || 'agent-bridge:local-user').trim();
@@ -177,7 +225,11 @@ async function main() {
   const totalDeadlineMs = bridgeMode
     ? Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 2700000)
     : Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 600000);
-  const timeoutMs = bridgeMode ? 300000 : 120000;
+  // Was 300000 in bridge mode: the CLI's per-request cap expired the
+  // writer/synthesis requests at 5 minutes while the 600s bridge wall
+  // still allowed the operator to answer. Now 600000 to match the wall.
+  // Total job deadline above (2700000) is unchanged.
+  const timeoutMs = bridgeMode ? 600000 : 120000;
 
   let result;
   try {
@@ -239,6 +291,10 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  fail(`ScriptIT CLI crashed: ${err && err.message ? err.message : err}`);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    fail(`ScriptIT CLI crashed: ${err && err.message ? err.message : err}`);
+  });
+}
+
+module.exports = { resolveResearchMode, durationMinutes };

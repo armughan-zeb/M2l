@@ -117,7 +117,10 @@ def test_memory_wait_resumes_once_free_ram_reaches_floor(monkeypatch, tmp_path):
     result = native.render_semantic_documentary({'width': 1920, 'height': 1080, 'scenes': []},
         tmp_path / 'out.mp4', config={'continue_render_while_active': True})
     assert len(calls) == 2
-    assert sleeps == [2.0]
+    # Worker-aware wait (Nov 10, 2026): admission is re-checked on the
+    # short 0.5s poll instead of the old fixed 2.0s sleep, so the render
+    # starts within ~0.5s of the worker exit that freed the memory.
+    assert sleeps == [0.5]
     assert calls[0]['release_idle'] is True
     assert calls[1]['release_idle'] is False
     assert result['render_resources']['recommended_workers'] == 1

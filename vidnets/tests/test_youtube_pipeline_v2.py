@@ -1022,14 +1022,15 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertFalse(vision_available)
 
-    def test_visual_gate_frames_clamped_to_three_or_five(self):
+    def test_visual_gate_frames_clamped_to_one_or_two(self):
+        # Media-selection spec: 1-2 frames per clip at the matched timestamp.
         with mock.patch.dict(os.environ, {"VIDZEO_YT_VISUAL_GATE_FRAMES": "8"}, clear=False):
-            self.assertEqual(ytv2._visual_gate_frames(), 5)
+            self.assertEqual(ytv2._visual_gate_frames(), 2)
         with mock.patch.dict(os.environ, {"VIDZEO_YT_VISUAL_GATE_FRAMES": "1"}, clear=False):
-            self.assertEqual(ytv2._visual_gate_frames(), 3)
+            self.assertEqual(ytv2._visual_gate_frames(), 1)
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VIDZEO_YT_VISUAL_GATE_FRAMES", None)
-            self.assertEqual(ytv2._visual_gate_frames(), 5)
+            self.assertEqual(ytv2._visual_gate_frames(), 2)
 
     def test_whisper_timing_windows_override_provisional_scene_durations(self):
         self.assertAlmostEqual(

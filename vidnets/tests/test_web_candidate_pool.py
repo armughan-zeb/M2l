@@ -22,7 +22,7 @@ def test_same_query_pool_is_wide_but_bounded(monkeypatch):
     assert _same_query_candidate_limit(20, 2.0) == 20
 
 
-def test_strong_same_query_result_keeps_eight_unique_candidates_for_vision(
+def test_strong_same_query_result_keeps_twelve_unique_candidates_for_vision(
     monkeypatch, tmp_path
 ):
     """A good query must retain a page of unique results for verification."""
@@ -40,7 +40,7 @@ def test_strong_same_query_result_keeps_eight_unique_candidates_for_vision(
             "tags": "Jaguar E-Type side view classic automobile",
             "description": "Jaguar E-Type classic automobile side view",
         }
-        for index in range(10)
+        for index in range(14)
     ]
     downloaded_urls = []
 
@@ -87,12 +87,67 @@ def test_strong_same_query_result_keeps_eight_unique_candidates_for_vision(
     )
 
     assert result and result.get("path")
-    assert len(downloaded_urls) == 8
-    assert result["downloaded_candidate_count"] == 8
-    assert result["candidate_pool_size"] == 8
+    assert len(downloaded_urls) == 12
+    assert result["downloaded_candidate_count"] == 12
+    assert result["candidate_pool_size"] == 12
     shortlist = result["_vision_shortlist"]
-    assert len(shortlist) == 8
-    assert len({candidate["url"] for candidate in shortlist}) == 8
+    assert len(shortlist) == 12
+    assert len({candidate["url"] for candidate in shortlist}) == 12
+
+
+def test_library_of_congress_is_wired_into_fast_sources(monkeypatch):
+    """Web-first audit (Nov 10, 2026): LOC was defined but never dispatched.
+
+    The Library of Congress public JSON API needs no key and returns
+    rights-documented photos (verified live: 'locomotive' -> 20 rows).
+    It must be in the default fast set and routable through the api
+    dispatcher like wikimedia.
+    """
+    from services.web_image import resolver
+
+    for key in (
+        "VIDZEO_WEB_ONLY_PROVIDER",
+        "VIDZEO_ENABLE_LEGACY_WEB_SEARCH",
+        "VIDZEO_SEARXNG_ENABLE",
+        "VIDZEO_SEARXNG_URLS",
+        "VIDZEO_SEARXNG_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    names = [name for name, _kind in resolver._enabled_fast_sources()]
+    assert "library_of_congress" in names
+    assert ("library_of_congress", "api") in resolver._FAST_SOURCES
+
+    from services.sources.base_source import ImageCandidate
+
+    class FakeLoc:
+        def search(self, query, limit=20):
+            return [
+                ImageCandidate(
+                    id="loc_test",
+                    source="library_of_congress",
+                    title="Locomotive 3840",
+                    description="A steam locomotive",
+                    download_url="https://tile.loc.gov/storage-services/service/pnp/cph/3a30000/3a30100/3a30132r.jpg",
+                    preview_url="https://tile.loc.gov/storage-services/service/pnp/cph/3a30000/3a30100/3a30132r.jpg",
+                    metadata={"provider": "library_of_congress", "foreign_url": "https://www.loc.gov/pictures/item/abc/"},
+                )
+            ]
+
+    monkeypatch.setattr(resolver, "_LOC_SOURCE", FakeLoc())
+    rows = resolver._discover_api_urls("library_of_congress", "locomotive")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "library_of_congress"
+    assert rows[0]["url"].startswith("https://tile.loc.gov/")
+
+
+def test_five_hundred_px_stays_out_of_slow_sources():
+    """500px needs a logged-in cookie and returns no URLs without it
+    (verified live Nov 10, 2026: 40s, zero URLs). It stays undispatched
+    so the slow harvest does not burn its budget on a dead lane."""
+    from services.web_image import resolver
+
+    assert ("500px", "gdl") not in resolver._SLOW_SOURCES
+    assert ("500px", "https://500px.com/search?q={query}&type=photos") in resolver._GALLERYDL_SOURCES
 
 
 def test_streaming_vision_winner_keeps_the_downloaded_alternates_for_later_review():
@@ -446,3 +501,30 @@ def test_exhaustive_recovery_cascades_into_secondary_sources(
         "universal_scraper", "yandex", "flickr_api", "bing_hybrid", "ddg_hybrid"
     }
     assert ('openverse', 'Prince Harry photo') in provider_calls
+
+
+def test_web_only_provider_cannot_drop_universal_scraper(monkeypatch):
+    """The universal scraper is the web-image path by permanent operator
+    instruction: no VIDZEO_WEB_ONLY_PROVIDER allowlist may drop it. The
+    allowlist restricts the OTHER lanes only."""
+    from services.web_image.resolver import _enabled_fast_sources
+
+    monkeypatch.setenv("VIDZEO_WEB_ONLY_PROVIDER", "wikimedia")
+    names = [name for name, _kind in _enabled_fast_sources()]
+    assert "universal_scraper" in names
+    assert "wikimedia" in names
+    # The allowlist still restricts every other lane.
+    assert "yandex" not in names
+    assert "bing_hybrid" not in names
+    assert "flickr_api" not in names
+
+    monkeypatch.setenv("VIDZEO_WEB_ONLY_PROVIDER", "yandex,google_images")
+    names = [name for name, _kind in _enabled_fast_sources()]
+    assert "universal_scraper" in names
+    assert "yandex" in names
+    assert "google_images" in names
+    assert "wikimedia" not in names
+
+    # With no allowlist the scraper is in the defaults as well.
+    monkeypatch.delenv("VIDZEO_WEB_ONLY_PROVIDER", raising=False)
+    assert "universal_scraper" in [name for name, _kind in _enabled_fast_sources()]

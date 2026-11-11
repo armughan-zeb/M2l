@@ -13,6 +13,7 @@ const { xSearch } = require('../providers/xSearch');
 const { hnSearch } = require('../providers/hackernews');
 const { detectNiche } = require('./nicheDetector');
 const { runProvider, providerHealth } = require('../research/resilience');
+const { runBatches } = require('../utils/concurrency');
 const { gdeltSearch, openAlexSearch, crossrefSearch, usgsSearch } = require('../providers/freeData');
 const { relevanceScore, isOfficial } = require('./evidence');
 
@@ -29,7 +30,7 @@ async function safe(fn) {
 // Each lane is isolated. A provider can time out, be rate limited, or open a
 // circuit without taking down the rest of the research run.
 function retry(provider, fn, options = {}) {
-  return runProvider(provider, fn, { attempts: 2, delayMs: 400, timeoutMs: 20000, ...options });
+  return runProvider(provider, fn, { attempts: 3, delayMs: 400, timeoutMs: 20000, ...options });
 }
 
 function normalizeDate(value) {
@@ -74,7 +75,7 @@ function canonicalUrl(value) {
     const url = new URL(String(value));
     url.hash = '';
     for (const key of [...url.searchParams.keys()]) {
-      if (/^(utm_|gclid|fbclid|si|oc)$/i.test(key)) url.searchParams.delete(key);
+      if (/^(utm_[a-z]+|gclid|fbclid|si|oc)$/i.test(key)) url.searchParams.delete(key);
     }
     return url.href.replace(/\/$/, '');
   } catch (_) {
@@ -202,18 +203,22 @@ async function gatherQuickResearch(query, { includeReddit = true, fetchLimit = 5
   // first-party discovery, Reddit, and public X discovery. X is discovered
   // through search results because direct scraping is frequently gated by
   // authentication and anti-bot challenges.
-  const results = await Promise.all([
-    quickRetry('bing', () => bingSearch(query, { limit: 8, timeoutMs: 6500 })),
-    quickRetry('duckduckgo', () => ddgSearch(query, { limit: 8, timeoutMs: 6500 })),
-    quickRetry('yandex', () => yandexSearch(query, { limit: 7, timeoutMs: 6500 })),
-    quickRetry('wikipedia', () => wikipediaDeep(query, { limit: 2, timeoutMs: 7500 })),
-    quickRetry('rss', () => searchRss(query, { limit: 10, niche })),
-    quickRetry('bing-official', () => bingSearch(primaryQuery, { limit: 6, timeoutMs: 6500 })),
+  // Batched 3-at-a-time, not one big Promise.all: the egress proxy
+  // serializes concurrent connections, so firing all 8 providers at once
+  // made them ALL time out (Bing, Wikipedia, Reddit and X aborted
+  // together in a live probe) while the same calls succeed sequentially.
+  const results = await runBatches([
+    () => quickRetry('bing', () => bingSearch(query, { limit: 8, timeoutMs: 6500 })),
+    () => quickRetry('duckduckgo', () => ddgSearch(query, { limit: 8, timeoutMs: 6500 })),
+    () => quickRetry('yandex', () => yandexSearch(query, { limit: 7, timeoutMs: 6500 })),
+    () => quickRetry('wikipedia', () => wikipediaDeep(query, { limit: 2, timeoutMs: 7500 })),
+    () => quickRetry('rss', () => searchRss(query, { limit: 10, niche })),
+    () => quickRetry('bing-official', () => bingSearch(primaryQuery, { limit: 6, timeoutMs: 6500 })),
     includeReddit
-      ? quickRetry('reddit', () => redditSearch(query, { limit: 6, timeoutMs: 6500 }))
-      : Promise.resolve({ results: [] }),
-    quickRetry('x-discovery', () => xSearch(query, { limit: 6, timeoutMs: 6500 })),
-  ]);
+      ? () => quickRetry('reddit', () => redditSearch(query, { limit: 6, timeoutMs: 6500 }))
+      : () => Promise.resolve({ results: [] }),
+    () => quickRetry('x-discovery', () => xSearch(query, { limit: 6, timeoutMs: 6500 })),
+  ], 3, (fn) => fn());
 
   const [bing, ddg, yandex, wiki, rss, officialSearch, reddit, xDiscovery] = results;
   const bingList = uniqueByUrl([...(Array.isArray(bing) ? bing : []), ...(Array.isArray(officialSearch) ? officialSearch : [])]);
@@ -238,10 +243,12 @@ async function gatherQuickResearch(query, { includeReddit = true, fetchLimit = 5
     .sort((a, b) => Number(isOfficial(b)) - Number(isOfficial(a)) || relevanceScore(b, query) - relevanceScore(a, query))
     .slice(0, Math.max(1, fetchLimit));
 
-  const fetched = await Promise.all(candidates.map(async (item) => ({
-    url: item.url,
-    article: await fetchArticle(item.url, { timeoutMs: 4500, maxChars: 6000 }),
-  })));
+  const fetched = await runBatches(candidates, 3, async (item) => {
+    signal?.throwIfAborted();
+    const article = await fetchArticle(item.url, { timeoutMs: 4500, maxChars: 6000 });
+    signal?.throwIfAborted();
+    return { url: item.url, article };
+  });
   const articleByUrl = new Map(fetched.filter((entry) => entry.article?.text).map((entry) => [entry.url, entry.article]));
   const hydrate = (items) => (Array.isArray(items) ? items : []).map((item) => {
     const article = articleByUrl.get(item.url);
@@ -310,29 +317,39 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
   const niche = detectNiche(query).niche;
   const officialSeeds = officialSourceSeeds(query, niche);
 
+  // Thunks, not promises: runBatches starts them 3 at a time. Firing all
+  // ~15 provider calls at once through the egress proxy made them all
+  // stall and time out together (verified live: a concurrent burst lost
+  // Bing, Wikipedia, Reddit and X; sequential calls succeed in 1-3s).
   const tasks = [
-    retry('duckduckgo', () => ddgSearch(query, { limit: 8 })),
-    retry('duckduckgo-news', () => ddgSearch(`${query} latest news`, { limit: 6 })),
-    retry('rss', () => searchRss(query, { limit: 16, niche })),
-    retry('bing', () => bingSearch(query, { limit: 8, timeoutMs: 15000 })),
-    retry('bing-official', () => bingSearch(`${query} official announcement`, { limit: 8, timeoutMs: 15000 })),
-    retry('wikipedia', () => wikipediaDeep(query, { limit: 2 })),
-    retry('hackernews', () => hnSearch(query, { limit: 6 })),
+    () => retry('duckduckgo', () => ddgSearch(query, { limit: 8 })),
+    () => retry('duckduckgo-news', () => ddgSearch(`${query} latest news`, { limit: 6 })),
+    () => retry('rss', () => searchRss(query, { limit: 16, niche })),
+    () => retry('bing', () => bingSearch(query, { limit: 8, timeoutMs: 15000 })),
+    () => retry('bing-official', () => bingSearch(`${query} official announcement`, { limit: 8, timeoutMs: 15000 })),
+    () => retry('wikipedia', () => wikipediaDeep(query, { limit: 2 })),
+    () => retry('hackernews', () => hnSearch(query, { limit: 6 })),
+    () => retry('yandex', () => yandexSearch(query, { limit: 8 })),
+    () => retry('yandex-news', () => yandexNewsSearch(query, { limit: 6 })),
   ];
   const primaryQuery = PRIMARY_SEARCHES[niche] && PRIMARY_SEARCHES[niche](query);
-  if (primaryQuery) tasks.push(retry('bing-primary', () => bingSearch(primaryQuery, { limit: 8, timeoutMs: 15000 })));
+  if (primaryQuery) tasks.push(() => retry('bing-primary', () => bingSearch(primaryQuery, { limit: 8, timeoutMs: 15000 })));
   if (includeReddit) {
-    tasks.push(retry('reddit', () => redditSearch(query, { limit: 6 })));
+    tasks.push(() => retry('reddit', () => redditSearch(query, { limit: 6 })));
   }
   const structuredStartIndex = tasks.length;
   if (includeStructured) {
-    tasks.push(retry('gdelt', () => gdeltSearch(query, { limit: phase === 'deep' ? 10 : 5 }), { timeoutMs: 15000 }));
+    // Thread the timeout into the provider call too: getJson's own 12s
+    // abort used to fire under proxy congestion while the outer
+    // runProvider budget was 15s, surfacing as a bare AbortError and
+    // tripping the circuit after 3 attempts (Cooper run: gdelt aborted).
+    tasks.push(() => retry('gdelt', () => gdeltSearch(query, { limit: phase === 'deep' ? 10 : 5, timeoutMs: 15000 }), { timeoutMs: 15000 }));
     if (phase === 'deep') {
       if (['science', 'health', 'finance', 'tech'].includes(niche)) {
-        tasks.push(retry('openalex', () => openAlexSearch(query, { limit: 6 }), { timeoutMs: 15000 }));
-        tasks.push(retry('crossref', () => crossrefSearch(query, { limit: 6 }), { timeoutMs: 15000 }));
+        tasks.push(() => retry('openalex', () => openAlexSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
+        tasks.push(() => retry('crossref', () => crossrefSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
       }
-      tasks.push(retry('usgs', () => usgsSearch(query, { limit: 6 }), { timeoutMs: 15000 }));
+      tasks.push(() => retry('usgs', () => usgsSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
     }
   }
   // Deep research should investigate specific gaps rather than only increase
@@ -346,17 +363,17 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
     .slice(0, phase === 'deep' ? 8 : 4);
   const targetedStartIndex = tasks.length;
   plannedQueries.forEach((targetQuery, index) => {
-    tasks.push(retry(`targeted-bing-${index + 1}`, () => bingSearch(targetQuery, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 20000 }));
+    tasks.push(() => retry(`targeted-bing-${index + 1}`, () => bingSearch(targetQuery, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 20000 }));
     if (index < (phase === 'deep' ? 4 : 2)) {
-      tasks.push(retry(`targeted-duckduckgo-${index + 1}`, () => ddgSearch(targetQuery, { limit: 6 }), { timeoutMs: 20000 }));
+      tasks.push(() => retry(`targeted-duckduckgo-${index + 1}`, () => ddgSearch(targetQuery, { limit: 6 }), { timeoutMs: 20000 }));
     }
   });
 
-  const results = await Promise.all(tasks);
+  const results = await runBatches(tasks, 3, (fn) => fn());
   signal?.throwIfAborted();
-  const [ddg, ddgNews, rss, bing, bingOfficial, wiki, hn] = results;
-  const primary = primaryQuery ? results[7] : [];
-  const reddit = includeReddit ? results[primaryQuery ? 8 : 7] : null;
+  const [ddg, ddgNews, rss, bing, bingOfficial, wiki, hn, yandex, yandexNews] = results;
+  const primary = primaryQuery ? results[9] : [];
+  const reddit = includeReddit ? results[primaryQuery ? 10 : 9] : null;
   const structured = results.slice(structuredStartIndex, structuredEndIndex).flatMap((result) => Array.isArray(result) ? result : []);
   const targeted = results.slice(targetedStartIndex).flatMap((result) => Array.isArray(result) ? result : []);
   const rssList = Array.isArray(rss) ? rss : [];
@@ -369,6 +386,10 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
   ]);
   const wikiList = Array.isArray(wiki) ? wiki : [];
   const hnList = Array.isArray(hn) ? hn : [];
+  const yandexList = uniqueByUrl([
+    ...(Array.isArray(yandex) ? yandex : []),
+    ...(Array.isArray(yandexNews) ? yandexNews : []),
+  ]);
 
   // Dated (news) sources first, newest first, then undated web results.
   const byDateDesc = (a, b) => {
@@ -390,6 +411,7 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
     ...bingList,
     ...ddgNewsList.filter((x) => !isGoogleNewsWrapper(x.url)),
     ...ddgList,
+    ...yandexList,
     ...wikiList.filter((x) => !x.isWiki),
     ...hnList,
     ...structured,
@@ -414,12 +436,12 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
     })
     .slice(0, fetchLimit);
 
-  const fetched = await Promise.all(unique.map(async (item) => {
+  const fetched = await runBatches(unique, 3, async (item) => {
     signal?.throwIfAborted();
     const article = await fetchArticle(item.url, { signal });
     signal?.throwIfAborted();
     return { url: item.url, article };
-  }));
+  });
   signal?.throwIfAborted();
   const articleByUrl = new Map(fetched.filter((entry) => entry.article && entry.article.text).map((entry) => [entry.url, entry.article]));
 
@@ -445,6 +467,7 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
   const hnH = hydrate(hnList);
   const structuredH = hydrate(structured);
   const targetedH = hydrate(targeted);
+  const yandexH = hydrate(yandexList);
   const redditResults = reddit && Array.isArray(reddit.results) ? reddit.results : [];
   const redditH = hydrate(redditResults);
   // Preserve canonical first-party pages when robots/anti-bot controls block
@@ -454,7 +477,7 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
   // to collapse into "no attributable external claims".
   const officialH = hydrate(officialSeeds);
 
-  const allHydrated = [...officialH, ...rssH, ...bingH, ...ddgNewsH, ...ddgH, ...wikiH, ...hnH, ...redditH, ...structuredH]
+  const allHydrated = [...officialH, ...rssH, ...bingH, ...ddgNewsH, ...ddgH, ...yandexH, ...wikiH, ...hnH, ...redditH, ...structuredH]
     .filter((x) => x.articleText || x.snippet || x.title)
     .filter((x) => x.url)
     .sort((a, b) => {
@@ -472,6 +495,7 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
     duckduckgoNews: ddgNewsH,
     rss: rssH,
     bing: bingH,
+    yandex: yandexH,
     wikipedia: wikiH,
     hackernews: hnH,
     reddit: redditResults,
@@ -480,7 +504,7 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
     official: officialH,
     redditBlocked: !!(reddit && reddit.blocked),
     redditViaRss: !!(reddit && reddit.viaRss),
-    errors: [ddg, ddgNews, rss, bing, bingOfficial, wiki, hn, primary, reddit, ...results.slice(structuredStartIndex)]
+    errors: [ddg, ddgNews, rss, bing, bingOfficial, wiki, hn, yandex, yandexNews, primary, reddit, ...results.slice(structuredStartIndex)]
       .filter((x) => x && x.error && !String(x.error).includes('RSS fallback'))
       .map((x) => `${x.provider || 'provider'}: ${x.error}`),
     stats: {

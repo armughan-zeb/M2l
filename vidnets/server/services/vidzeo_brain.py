@@ -460,15 +460,26 @@ _GENERIC_ANCHOR = {
 def _mechanical_scene_plan(scene_text: str, scene_number: int, section_subject: str = "",
                             topic: str = "") -> Dict:
     """Ultra-minimal mechanical fallback when Brain completely fails."""
+    # A section label is not a searchable subject: "In February" is a
+    # calendar marker, not the thing on screen. Fall back to the film topic
+    # (compacted) instead of building queries around the label, which is how
+    # scenes ended up searching "In February February Amtrak departures".
+    _SECTION_LABEL_MONTHS = (
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+    )
     subject = section_subject or topic or "topic"
+    if any(month in subject.lower() for month in _SECTION_LABEL_MONTHS):
+        subject = topic or subject
     words = re.findall(r'[a-zA-Z]{4,}', scene_text or "")
+    subject_words = {w.lower() for w in re.findall(r'[a-zA-Z]+', subject or "")}
     visual_words = [w for w in words if w.lower() not in {
         "the", "this", "that", "with", "from", "they", "have", "been", "were",
         "what", "when", "where", "which", "their", "them", "about", "into",
         "could", "would", "should", "there", "these", "those", "because",
         "just", "also", "very", "more", "than", "then", "some", "made",
         "make", "like", "than", "even", "still", "after", "before",
-    }][:3]
+    } and w.lower() not in subject_words][:3]
     base = " ".join(visual_words) if visual_words else subject
 
     return {
@@ -1054,7 +1065,18 @@ Return one container row for every scene in order."""
                 worker_limit = 4
             from .media_query_strategy import query_planning_budget
             if deadline_monotonic is None:
-                deadline_monotonic = time.monotonic() + query_planning_budget(len(chunks), worker_limit)
+                # Queries are the foundation of the whole video: they get a
+                # full agent round-trip per wave, not a 120s cut-off. An agent
+                # answer needs the hook wake (~4.5 min) plus composition, so
+                # a 120s wave expired before the first answer arrived and the
+                # chunk was filled with mechanical word-salad queries.
+                per_wave = None
+                if getattr(getattr(self, "_client", None), "provider", "") == "external_agent":
+                    try:
+                        per_wave = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
+                    except (TypeError, ValueError):
+                        per_wave = 600.0
+                deadline_monotonic = time.monotonic() + query_planning_budget(len(chunks), worker_limit, per_wave_seconds=per_wave)
 
             def _plan_scene_chunk(chunk):
                 start, chunk_texts, chunk_subjects = chunk

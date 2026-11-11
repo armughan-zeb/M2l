@@ -626,7 +626,85 @@ class QueueManager:
                     print(f"▶️ Resumed job {job_id}")
                     return True
         return False
-    
+
+    def record_debugger_event(self, job_id: str, text: str) -> bool:
+        """Append a stuck-job debugger diagnosis/action line to a job's
+        progress history. Same event shape as the startup-recovery events:
+        next seq, capped at the last 12. Best-effort visibility -- never
+        raises, never touches the worker's own progress values."""
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return False
+        try:
+            with self._queue_lock:
+                item = next(
+                    (row for row in self.queue if row.get("id") == job_id),
+                    None,
+                )
+                if item is None:
+                    return False
+                events = list(item.get("progress_events") or [])
+                try:
+                    seq = max(
+                        int(item.get("progress_seq") or 0),
+                        max(
+                            (int(event.get("seq") or 0) for event in events
+                             if isinstance(event, dict)),
+                            default=0,
+                        ),
+                    ) + 1
+                except (TypeError, ValueError):
+                    seq = len(events) + 1
+                try:
+                    progress = max(0, min(100, int(item.get("progress") or 0)))
+                except (TypeError, ValueError):
+                    progress = 0
+                item["progress_seq"] = seq
+                events.append(
+                    {"seq": seq, "progress": progress, "text": clean_text}
+                )
+                item["progress_events"] = events[-12:]
+            self._save_queue()
+            return True
+        except Exception as exc:
+            print(f"⚠️ Debugger event record failed for {job_id}: {exc}")
+            return False
+
+    def request_scene_advance(
+        self, job_id: str, scene_number: int, reason: str = ""
+    ) -> bool:
+        """Record a debugger scene advance on the queue item and register it
+        with the in-process advance registry the media coordinator checks.
+        The scene number is the 1-based number from the progress label
+        (``Preparing media N/M``). Returns False when the job is unknown."""
+        try:
+            from services.job_debugger import set_scene_advance
+        except Exception:
+            set_scene_advance = None  # type: ignore[assignment]
+        with self._queue_lock:
+            item = next(
+                (row for row in self.queue if row.get("id") == job_id),
+                None,
+            )
+            if item is None:
+                return False
+            item["debugger_advance"] = {
+                "scene_number": int(scene_number),
+                "reason": str(reason or ""),
+                "at": datetime.now().isoformat(),
+            }
+        self._save_queue()
+        if set_scene_advance is not None:
+            try:
+                set_scene_advance(job_id, int(scene_number), str(reason or ""))
+            except Exception as exc:
+                print(f"⚠️ Debugger advance registry failed: {exc}")
+        print(
+            f"⏭️ Debugger advance requested for job {job_id} "
+            f"scene {scene_number}: {reason}"
+        )
+        return True
+
     def clear_completed(self) -> int:
         """Remove all completed/cancelled/error items"""
         with self._queue_lock:

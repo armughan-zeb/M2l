@@ -20,6 +20,28 @@ function emptyResearch(query, error) {
   };
 }
 
+// Canonical dedup key for a research item. Same article reached via a
+// search link (?utm_source=...) and a direct link must collapse to one row.
+// NOTE: agents/researcher.canonicalUrl has the same job but its param
+// filter only strips a param literally named `utm_` (regex /^(utm_|...)$/),
+// so utm_source/utm_medium survive there — this local version strips the
+// whole utm_* family. That researcher bug is reported, not patched here:
+// researcher.js is outside this sweep's file set.
+function mergeItemKey(item) {
+  const raw = String(item?.url || `${item?.title || ''}|${item?.source || ''}`);
+  if (!item?.url) return raw.toLowerCase();
+  try {
+    const url = new URL(raw);
+    url.hash = '';
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(utm_.*|gclid|fbclid|si|oc)$/i.test(key)) url.searchParams.delete(key);
+    }
+    return url.href.replace(/\/$/, '').toLowerCase();
+  } catch (_) {
+    return raw.toLowerCase();
+  }
+}
+
 function mergeResearch(fast, deep) {
   const merged = { ...(fast || {}), ...(deep || {}) };
   for (const key of new Set([...Object.keys(fast || {}), ...Object.keys(deep || {})])) {
@@ -27,7 +49,7 @@ function mergeResearch(fast, deep) {
       const values = [...(fast?.[key] || []), ...(deep?.[key] || [])];
       const selected = new Map();
       for (const item of values) {
-        const keyValue = String(item?.url || `${item?.title || ''}|${item?.source || ''}`).toLowerCase();
+        const keyValue = mergeItemKey(item);
         if (!keyValue) continue;
         const old = selected.get(keyValue);
         const bodySize = value => value?.hasArticleBody === true ? String(value.articleText || '').length : 0;
@@ -51,6 +73,17 @@ async function safeStoreCall(fn) {
   try { return await fn(); } catch (err) { return { error: err.message || String(err) }; }
 }
 
+// Provider failures used to live only in research.errors, which the CLI job
+// log never printed. Mirror each distinct provider error into warnings so a
+// run that "succeeded" with 1 of 8 providers still says which ones died
+// and why (provider name + error class travel inside the error string).
+function noteProviderFailures(warnings, errors) {
+  for (const errText of errors || []) {
+    const warning = `Research provider failed: ${errText}`;
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+}
+
 async function runResearchJob({ topic, input = {}, store, backgroundDeep = true, includeReddit = true, quick, gatherResearchFn = gatherResearch, signal } = {}) {
   signal?.throwIfAborted();
   const trimmedTopic = normalizeTopic(topic).canonical;
@@ -62,7 +95,17 @@ async function runResearchJob({ topic, input = {}, store, backgroundDeep = true,
   const job = await researchStore.createJob({ ...input, topic: trimmedTopic, niche });
   const jobId = job.id;
   const warnings = [];
-  const quickMode = typeof quick === 'boolean' ? quick : input.researchMode !== 'thorough';
+  const quickMode = typeof quick === 'boolean' ? quick : input.researchMode === 'quick';
+  // Standard mode is the short-video middle ground: one fast research pass
+  // like quick, but publishable like thorough. It skips the deep pass
+  // (the second gather call over open questions) WHEN the fast pass
+  // already satisfies the evidence-sufficiency gate — and only then. When
+  // the fast pass is thin, standard falls through to the deep pass below
+  // (same as thorough): the evidence is usually one more direct-retrieval
+  // pass away, and a short video must not fail for evidence that was
+  // retrievable. It still fails honestly when even the deep pass finds
+  // nothing. The gate itself never moves.
+  const standardMode = !quickMode && input.researchMode === 'standard';
 
   await safeStoreCall(() => researchStore.saveResearchPlan({ jobId, plan: researchPlan }));
 
@@ -89,6 +132,7 @@ async function runResearchJob({ topic, input = {}, store, backgroundDeep = true,
   let coverage = buildCoverageReport({ plan: researchPlan, evidence });
   evidence.coverage = coverage;
   let brief = buildBrief(fast);
+  noteProviderFailures(warnings, fast.errors);
   await safeStoreCall(() => researchStore.saveResearchBundle({ jobId, research: fast, evidence, brief, plan: researchPlan, coverage }));
   await safeStoreCall(() => researchStore.saveResearchPlan({ jobId, plan: researchPlan, coverage }));
   await researchStore.checkpointJob(jobId, { status: 'fast_ready', phase: 'fast_ready', progress: 35, result: { research: fast, evidence, brief, plan: researchPlan, coverage }, warnings, errors: fast.errors || [] });
@@ -106,6 +150,27 @@ async function runResearchJob({ topic, input = {}, store, backgroundDeep = true,
     });
     return { jobId, research: fast, evidence, brief, plan: researchPlan, coverage, warnings, partial: limited, quick: true, deepPending: false };
   }
+
+  if (standardMode && evidence.sufficient) {
+    // Fast research already satisfies the sufficiency gate: skip the deep
+    // pass entirely. Unlike quick this is a real production run — the
+    // result is final, not a preview, and the writer's publishability
+    // gate applies unchanged (evidence.sufficient decides).
+    await researchStore.checkpointJob(jobId, {
+      status: 'context_ready',
+      phase: 'context_ready',
+      progress: 70,
+      result: { research: fast, evidence, brief, plan: researchPlan, coverage },
+      warnings,
+      errors: fast.errors || [],
+      retryable: false,
+    });
+    return { jobId, research: fast, evidence, brief, plan: researchPlan, coverage, warnings, partial: false, quick: false, deepPending: false };
+  }
+  // Standard mode with insufficient fast evidence falls through to the
+  // deep pass below (same as thorough); see the standardMode comment
+  // above. The deepened result is stamped quick: false / deepPending:
+  // false at the return so the standard contract holds either way.
 
   const deepen = async () => {
     signal?.throwIfAborted();
@@ -129,6 +194,7 @@ async function runResearchJob({ topic, input = {}, store, backgroundDeep = true,
     coverage = buildCoverageReport({ plan: researchPlan, evidence });
     evidence.coverage = coverage;
     brief = buildBrief(merged);
+    noteProviderFailures(warnings, merged.errors);
     await safeStoreCall(() => researchStore.saveResearchBundle({ jobId, research: merged, evidence, brief, plan: researchPlan, coverage }));
     await safeStoreCall(() => researchStore.saveResearchPlan({ jobId, plan: researchPlan, coverage }));
     // Keep source sufficiency as the hard safety gate for now. Coverage is
@@ -148,7 +214,8 @@ async function runResearchJob({ topic, input = {}, store, backgroundDeep = true,
     }));
     return { jobId, research: fast, evidence, brief, warnings, partial: false, deepPending: true };
   }
-  return deepen();
+  const deepened = await deepen();
+  return standardMode ? { ...deepened, quick: false, deepPending: false } : deepened;
 }
 
 async function resumeResearchJob(jobId, { store, backgroundDeep = false } = {}) {
@@ -161,7 +228,7 @@ async function resumeResearchJob(jobId, { store, backgroundDeep = false } = {}) 
     store: researchStore,
     backgroundDeep,
     includeReddit: Boolean(existing.input && existing.input.includeReddit),
-    quick: existing.input?.researchMode !== 'thorough',
+    quick: existing.input?.researchMode === 'quick',
   });
 }
 

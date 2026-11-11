@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -94,6 +95,8 @@ from .constants import (
     WATERMARK_SIGNALS,
 )
 from .safety import candidate_is_safe
+
+LOGGER = logging.getLogger(__name__)
 
 DUCKDUCKGO_HOMEPAGE = "https://duckduckgo.com/"
 DUCKDUCKGO_IMAGE_API = "https://duckduckgo.com/i.js"
@@ -482,8 +485,11 @@ def search_bing(query: str, limit: int = 36) -> List[Dict]:
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     all_results.append(r_item)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Was silently swallowed: a dead Bing lane looked identical to a
+        # query with no results. Pass 2 still runs, but the failure is now
+        # in the log with its error class.
+        LOGGER.warning("bing search pass 1 failed for %r: %s: %s", q[:60], type(exc).__name__, exc)
 
     # Pass 2: editorial site enrichment if we need more results
     if len(all_results) < limit:
@@ -516,7 +522,16 @@ def search_bing(query: str, limit: int = 36) -> List[Dict]:
 
 # ── URL DISCOVERY: DuckDuckGo (requests) ────────────────────────────
 def search_ddg(query: str, limit: int = 36) -> List[Dict]:
-    """Search DuckDuckGo synchronously."""
+    """Search DuckDuckGo synchronously.
+
+    Raises RuntimeError when the lane itself fails (homepage unreachable,
+    no vqd token, image API error). The old code returned [] in all those
+    cases, so a bot-blocked DDG was indistinguishable from a query with no
+    results and the resolver never recorded a provider failure. Callers
+    already catch exceptions per source (_discover_hybrid_urls) or per
+    query (search_hybrid), so raising here makes the failure visible
+    without changing the fallback behaviour.
+    """
     q = re.sub(r"\s+", " ", (query or "").strip())
     if not q:
         return []
@@ -527,20 +542,19 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
     # Get vqd token
     try:
         r = _request_get_with_retries(session, DUCKDUCKGO_HOMEPAGE, params={"q": q, "kp": "1"}, timeout=10)
-        if r is None:
-            return []
-        token_match = (
-            re.search(r"vqd=['\"]?([0-9A-Za-z\-_]+)['\"]?", r.text)
-            or re.search(r"vqd=([0-9A-Za-z\-_]+)&", r.text)
-        )
-        if not token_match:
-            return []
-        vqd = token_match.group(1)
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError(f"DDG homepage unreachable: {type(exc).__name__}: {exc}") from exc
+    if r is None:
+        raise RuntimeError("DDG homepage unreachable after retries")
+    token_match = (
+        re.search(r"vqd=['\"]?([0-9A-Za-z\-_]+)['\"]?", r.text)
+        or re.search(r"vqd=([0-9A-Za-z\-_]+)&", r.text)
+    )
+    if not token_match:
+        raise RuntimeError("DDG vqd token unavailable (bot check or markup change)")
+    vqd = token_match.group(1)
 
     # Get images
-    results = []
     try:
         r = _request_get_with_retries(
             session,
@@ -553,12 +567,16 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
             },
             timeout=10,
         )
-        if r is None:
-            return []
+    except Exception as exc:
+        raise RuntimeError(f"DDG image API failed: {type(exc).__name__}: {exc}") from exc
+    if r is None:
+        raise RuntimeError("DDG image API unreachable after retries")
+    try:
         payload = r.json()
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError(f"DDG image API returned unparseable JSON: {type(exc).__name__}: {exc}") from exc
 
+    results = []
     for row in payload.get("results") or []:
         if not isinstance(row, dict):
             continue
@@ -606,13 +624,34 @@ def search_hybrid(
     def _search_one(q: str) -> Tuple[str, List[Dict]]:
         results = []
         seen = set()
-        # Bing + DDG in sequence within one thread (2 HTTP calls max)
-        for engine_results in [search_bing(q, limit_per_query), search_ddg(q, limit_per_query)]:
+        seen_keys = set()
+        # Each engine is isolated: the old code built
+        # [search_bing(...), search_ddg(...)] eagerly, so a DDG failure
+        # raised away Bing's already-fetched results for the query. A dead
+        # engine must cost only its own rows, and the failure is logged
+        # with its error class instead of swallowed.
+        for engine_name, engine_fn in (("bing", search_bing), ("ddg", search_ddg)):
+            try:
+                engine_results = engine_fn(q, limit_per_query)
+            except Exception as exc:
+                LOGGER.warning(
+                    "hybrid search engine %s failed for %r: %s: %s",
+                    engine_name, q[:60], type(exc).__name__, exc,
+                )
+                continue
             for r in engine_results:
                 uk = r.get("image_url", "")
-                if uk and uk not in seen:
-                    seen.add(uk)
-                    results.append(r)
+                if not uk or uk in seen:
+                    continue
+                # Dedup on (host, path) as well as the exact URL: CDNs serve
+                # the same image under many signed/thumbnail query strings,
+                # and those duplicates used to fill the per-query shortlist.
+                key = _canonical_image_key(uk)
+                if key in seen_keys:
+                    continue
+                seen.add(uk)
+                seen_keys.add(key)
+                results.append(r)
         return q, results[:limit_per_query]
 
     out: Dict[str, List[Dict]] = {}
@@ -622,9 +661,21 @@ def search_hybrid(
             try:
                 q, results = future.result(timeout=30)
                 out[q] = results
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.warning(
+                    "hybrid search failed for %r: %s: %s",
+                    futures[future][:60], type(exc).__name__, exc,
+                )
     return out
+
+
+def _canonical_image_key(url: str) -> Tuple[str, str]:
+    """Host + path dedup key for an image URL (query strings ignored)."""
+    try:
+        parsed = urlparse(url)
+        return (parsed.netloc.lower(), parsed.path.rstrip("/").lower())
+    except Exception:
+        return ("", str(url or ""))
 
 
 # ── IMAGE DOWNLOAD: aiohttp bulk (fast, parallel) ────────────────────

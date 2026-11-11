@@ -1,0 +1,218 @@
+'use strict';
+
+// CMS-outage resilience (Nov 9, 2026): the daemon used to die on every
+// restart while the CMS returned 502/530, because resumeActiveJob()
+// re-threw a transient error from its one-shot progress probe. These
+// tests pin the fix: transient errors are retried with backoff and then
+// deferred (marker kept, no throw); only 409 clears the marker and only
+// 401 / non-transient errors still throw. The health monitor is covered
+// by a fixture dry-run at the bottom — it must detect a dead daemon and
+// a stale inbox request without touching anything live.
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { test } = require('node:test');
+
+// Point the worker state at a scratch dir BEFORE requiring jobRunner:
+// lib/config.js reads MUSE_WORK_DIR at load time.
+const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cms-resilience-work-'));
+process.env.MUSE_WORK_DIR = workRoot;
+process.env.MUSE_CMS_RETRY_BASE_MS = '10';
+process.env.MUSE_CMS_RETRY_MAX_MS = '50';
+
+const { isTransientCmsError, retryDelayMs, cmsRetryOptions } = require('../lib/cmsRetry');
+const config = require('../lib/config');
+const jobRunner = require('../lib/jobRunner');
+
+function cmsError(status) {
+  return Object.assign(new Error(`CMS returned HTTP ${status}`), { status });
+}
+
+function transientClient(failures) {
+  // failures: array of errors to throw in order, then succeed.
+  let calls = 0;
+  return {
+    get calls() { return calls; },
+    async progress() {
+      calls += 1;
+      const next = failures[calls - 1];
+      if (next) throw next;
+    }
+  };
+}
+
+let jobCounter = 0;
+
+function writeActiveJob({ withCheckpoint = true } = {}) {
+  // A fresh job id per test: resume tests share one work root, and a
+  // leftover job.json / active marker from another test would let a
+  // probe succeed into executeJob (which renders for real).
+  jobCounter += 1;
+  const jobId = `r_test${jobCounter}`;
+  const jobDir = path.join(workRoot, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+  const marker = path.join(jobDir, 'job.json');
+  if (withCheckpoint) {
+    fs.writeFileSync(
+      marker,
+      JSON.stringify({ digest: 'x', job: { jobId, title: 'Test title' } })
+    );
+  } else {
+    try { fs.unlinkSync(marker); } catch { /* no checkpoint on purpose */ }
+  }
+  config.writeActiveJob({
+    jobId,
+    payload: { jobId, title: 'Test title' },
+    attempt: 1,
+    digest: 'x',
+    startedAt: new Date().toISOString()
+  });
+  return jobId;
+}
+
+test('transient CMS errors are the gateway/overload set, terminal ones are not', () => {
+  for (const status of [408, 429, 500, 502, 503, 504, 530]) {
+    assert.equal(isTransientCmsError(cmsError(status)), true, `HTTP ${status} must be transient`);
+  }
+  for (const status of [400, 401, 403, 404, 409, 422]) {
+    assert.equal(isTransientCmsError(cmsError(status)), false, `HTTP ${status} must NOT be transient`);
+  }
+  assert.equal(isTransientCmsError(new Error('Could not reach the CMS at https://cms.vidnets.com: fetch failed')), true);
+  assert.equal(isTransientCmsError(new Error('The CMS did not answer in time; its saved job state is unchanged')), true);
+  assert.equal(isTransientCmsError(new Error('something else broke')), false);
+  assert.equal(isTransientCmsError(null), false);
+});
+
+test('retry delay doubles from the base and caps at the max', () => {
+  assert.equal(retryDelayMs(0, { baseMs: 2000, maxMs: 60000 }), 2000);
+  assert.equal(retryDelayMs(1, { baseMs: 2000, maxMs: 60000 }), 4000);
+  assert.equal(retryDelayMs(2, { baseMs: 2000, maxMs: 60000 }), 8000);
+  assert.equal(retryDelayMs(5, { baseMs: 2000, maxMs: 60000 }), 60000);
+  assert.equal(retryDelayMs(100, { baseMs: 2000, maxMs: 60000 }), 60000);
+});
+
+test('retry tunables come from the environment with safe defaults', () => {
+  assert.deepEqual(
+    cmsRetryOptions({ MUSE_CMS_RESUME_ATTEMPTS: '3', MUSE_CMS_RETRY_BASE_MS: '500', MUSE_CMS_RETRY_MAX_MS: '5000' }),
+    { baseMs: 500, maxMs: 5000, maxAttempts: 3 }
+  );
+  assert.deepEqual(cmsRetryOptions({}), { baseMs: 2000, maxMs: 60000, maxAttempts: 12 });
+  assert.equal(cmsRetryOptions({ MUSE_CMS_RESUME_ATTEMPTS: '0' }).maxAttempts, 1);
+});
+
+test('resume defers (no throw, marker kept) after bounded transient failures', async () => {
+  const jobId = writeActiveJob();
+  const client = transientClient([cmsError(530), cmsError(502), cmsError(530)]);
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 3 });
+  assert.deepEqual(
+    { deferred: result.deferred, jobId: result.jobId },
+    { deferred: true, jobId }
+  );
+  assert.equal(client.calls, 3, 'all bounded attempts are used');
+  assert.equal(config.readActiveJob()?.jobId, jobId, 'the resume marker must survive a CMS outage');
+});
+
+test('resume retries through transient failures, then a 409 clears the marker', async () => {
+  writeActiveJob();
+  const client = transientClient([cmsError(530), cmsError(530), cmsError(409)]);
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 5 });
+  assert.equal(result, null);
+  assert.equal(client.calls, 3);
+  assert.equal(config.readActiveJob(), null, 'a settled job clears the resume marker');
+});
+
+test('resume still throws immediately on a revoked credential (401)', async () => {
+  const jobId = writeActiveJob();
+  const client = transientClient([cmsError(401)]);
+  await assert.rejects(
+    jobRunner.resumeActiveJob({ client, maxAttempts: 3 }),
+    error => error.status === 401
+  );
+  assert.equal(client.calls, 1, '401 is terminal — no retries');
+  assert.equal(config.readActiveJob()?.jobId, jobId, 'the marker is kept so a re-pair can resume');
+});
+
+test('resume still throws immediately on a non-transient error', async () => {
+  writeActiveJob();
+  const client = transientClient([cmsError(400)]);
+  await assert.rejects(
+    jobRunner.resumeActiveJob({ client, maxAttempts: 3 }),
+    error => error.status === 400
+  );
+  assert.equal(client.calls, 1);
+});
+
+test('a successful probe with no local checkpoint clears the marker without running the job', async () => {
+  writeActiveJob({ withCheckpoint: false });
+  const client = transientClient([]);
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 3 });
+  assert.equal(result, null);
+  assert.equal(client.calls, 1);
+  assert.equal(config.readActiveJob(), null);
+});
+
+test('health monitor dry-run detects a dead daemon and a stale inbox request without acting', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-monitor-'));
+  const repo = path.join(dir, 'repo');
+  const runtime = path.join(dir, 'runtime');
+  const bridge = path.join(runtime, 'temp', 'agent-bridge');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(path.join(repo, 'work'), { recursive: true });
+  fs.mkdirSync(path.join(repo, 'vidnets'), { recursive: true });
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  // No work/active-job.json: no render can be in progress in the fixture.
+
+  const hookDef = path.join(dir, 'hook.json');
+  fs.writeFileSync(hookDef, JSON.stringify({ enabled: false, id: 'vidnets-inbox-watch' }));
+
+  const now = Math.floor(Date.now() / 1000);
+  const stale = path.join(bridge, 'stale00000000000000000000000001');
+  fs.mkdirSync(stale, { recursive: true });
+  fs.writeFileSync(path.join(stale, 'request.json'), JSON.stringify({
+    id: 'stale00000000000000000000000001', state: 'pending',
+    created_at: now - 3600, expires_at: now - 60, kind: 'vision', operation: 'review', job_id: ''
+  }));
+  const halfTtl = path.join(bridge, 'half000000000000000000000000002');
+  fs.mkdirSync(halfTtl, { recursive: true });
+  fs.writeFileSync(path.join(halfTtl, 'request.json'), JSON.stringify({
+    id: 'half000000000000000000000000002', state: 'pending',
+    created_at: now - 400, expires_at: now + 400, kind: 'text', operation: 'plan', job_id: ''
+  }));
+
+  const script = path.join(os.homedir(), 'hooks', 'scripts', 'vidnets-health-monitor.sh');
+  const output = await new Promise((resolve, reject) => {
+    execFile('bash', [script], {
+      timeout: 60000,
+      env: {
+        ...process.env,
+        VIDMON_DRY_RUN: '1',
+        VIDMON_REPO: repo,
+        VIDMON_RUNTIME_ROOT: runtime,
+        VIDMON_BRIDGE_DIR: bridge,
+        VIDMON_VIDNETS_URL: 'http://127.0.0.1:9',
+        VIDMON_CMS_URL: 'http://127.0.0.1:9',
+        VIDMON_HOOK_DEF: hookDef,
+        VIDMON_STATE_DIR: stateDir,
+        VIDMON_DAEMON_PATTERN: 'definitely-no-such-daemon-xyz'
+      }
+    }, (error, stdout, stderr) => {
+      if (error && error.code !== 2) return reject(new Error(`monitor failed: ${error.message}\n${stdout}\n${stderr}`));
+      resolve({ code: error ? error.code : 0, stdout: String(stdout) });
+    });
+  });
+
+  assert.equal(output.code, 2, 'fixture faults must make the monitor report needs_user');
+  assert.match(output.stdout, /vidnets: :5010 DOWN; WOULD restart/);
+  assert.match(output.stdout, /daemon: NOT RUNNING and Vidnets is down/);
+  assert.match(output.stdout, /hook: vidnets-inbox-watch is DISABLED/);
+  assert.match(output.stdout, /inbox: request stale00000000000000000000000001 expired.*WOULD mark expired/);
+  assert.match(output.stdout, /past half their TTL still pending: half000000000000000000000000002/);
+  assert.match(output.stdout, /HEALTH_MONITOR result=needs_user/);
+  // Dry-run must not have changed the fixture: the stale request is untouched.
+  const staleAfter = JSON.parse(fs.readFileSync(path.join(stale, 'request.json'), 'utf8'));
+  assert.equal(staleAfter.state, 'pending', 'dry-run must not mark requests expired');
+});

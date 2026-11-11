@@ -408,6 +408,63 @@ _KNOWN_CRICKET_VENUES: Set[str] = {
 }
 
 
+# Concrete identifiers worth appending to a non-cricket scene query: vehicle /
+# unit numbers ("locomotive 160", "BNSF 1555") and the scene's named place
+# ("Cajon Pass"). The old non-cricket path returned at most a year, and
+# _extract_visual_keywords strips all digits, so a scene about a specific
+# locomotive searched as if it were about trains in general. Numbers are
+# only accepted with a vehicle/operator word attached — a bare number in
+# narration ("82 not out", "10 minutes") is a score or a duration, not an
+# identifier, and must never become a query term.
+_VEHICLE_NUMBER_RE = re.compile(
+    r'\b(?:locomotive|engine|unit|train)\s+(?:no\.?\s+|#\s*)?(\d{2,4})\b', re.I)
+_OPERATOR_NUMBER_RE = re.compile(
+    r'\b(BNSF|Amtrak|Union Pacific|CSX|Norfolk Southern|Canadian National|'
+    r'Canadian Pacific|Southern Pacific|Santa Fe|Indian Railways)\s+(\d{2,4})\b')
+_HASH_NUMBER_RE = re.compile(r'#(\d{2,4})\b')
+_PLACE_PHRASE_RE = re.compile(r'\b([A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,}){1,2})\b')
+_PLACE_PHRASE_SKIP_FIRST = {
+    'the', 'a', 'an', 'in', 'on', 'at', 'from', 'with', 'this', 'that',
+    'it', 'they', 'he', 'she', 'when', 'where', 'after', 'before',
+}
+
+
+def _extract_scene_identifiers(text: str, subject: str = "") -> List[str]:
+    """Return up to 2 concrete identifiers from scene text, most specific first."""
+    if not text:
+        return []
+    found: List[str] = []
+
+    def _add(value: str) -> None:
+        cleaned = re.sub(r'\s+', ' ', str(value or '').strip())
+        if cleaned and cleaned.lower() not in {v.lower() for v in found}:
+            found.append(cleaned)
+
+    has_vehicle_word = bool(re.search(
+        r'\b(?:locomotive|engine|unit|train|railway|railroad)\b', text, re.I))
+    for m in _OPERATOR_NUMBER_RE.finditer(text):
+        _add(f"{m.group(1)} {m.group(2)}")
+    for m in _VEHICLE_NUMBER_RE.finditer(text):
+        _add(f"locomotive {m.group(1)}")
+    if has_vehicle_word:
+        for m in _HASH_NUMBER_RE.finditer(text):
+            _add(f"locomotive {m.group(1)}")
+    if len(found) < 2:
+        subject_lower = (subject or '').casefold()
+        for m in _PLACE_PHRASE_RE.finditer(text):
+            phrase = m.group(1)
+            words = phrase.split()
+            if words[0].lower() in _PLACE_PHRASE_SKIP_FIRST:
+                continue
+            if phrase.casefold() == subject_lower:
+                continue
+            if all(w.lower() in subject_lower for w in words):
+                continue
+            _add(phrase)
+            break
+    return found[:2]
+
+
 def _extract_scene_context(scene_text: str, full_script: str = "",
                              subject: str = "") -> Dict[str, List[str]]:
     """Extract years, match types, potential opponents, venues from scene text + script.
@@ -430,6 +487,7 @@ def _extract_scene_context(scene_text: str, full_script: str = "",
         "opponents": [],
         "venues": [],
         "qualifiers": [],
+        "identifiers": [],
     }
 
     # 1. Years (broad range 1900-2099 for general content)
@@ -437,7 +495,17 @@ def _extract_scene_context(scene_text: str, full_script: str = "",
     ctx["years"] = sorted(y for y in years if 1900 <= int(y) <= 2099)
 
     if not cricketish:
-        ctx["qualifiers"] = ctx["years"][-1:] if ctx["years"] else []
+        # Non-cricket scenes used to qualify with at most a year, so a scene
+        # about locomotive 160 searched as "trains in general". Concrete
+        # identifiers (vehicle/unit numbers, named places) outrank the year:
+        # they are the terms that separate this scene's footage from any
+        # other train/snow/bridge photo. Cap stays 2 qualifiers.
+        identifiers = _extract_scene_identifiers(combined, subject)
+        ctx["identifiers"] = identifiers
+        qualifiers = list(identifiers)
+        if ctx["years"]:
+            qualifiers.append(ctx["years"][-1])
+        ctx["qualifiers"] = qualifiers[:2]
         return ctx
 
     # 2. Match types / tournaments

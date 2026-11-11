@@ -747,7 +747,18 @@ def _late_local_verification_deadline(candidate_count: int, delivery_deadline: O
         seconds = 60.0
     seconds = max(2.0, min(90.0, seconds)) if candidate_count else 0.0
     deadline = now + seconds
-    return min(deadline, delivery_deadline) if delivery_deadline is not None else deadline
+    if delivery_deadline is None:
+        return deadline
+    if delivery_deadline > now:
+        return min(deadline, delivery_deadline)
+    # The delivery wall is already spent (a long YouTube batch consumed it
+    # before any quota clip reached vision, e.g. ff377408: 954s discovery
+    # against a 1033s media deadline). Clamping to the spent wall would make
+    # this lane dead on arrival, so the already-downloaded clips never get
+    # their one bounded vision pass. Floor the window instead: at most 60s
+    # past the wall, only for already-local candidates, never new discovery.
+    # Callers still bound every future by the remaining window.
+    return now + min(seconds, 60.0)
 
 
 def _youtube_fail_open_on_visual_unavailable(scene: Mapping[str, Any]) -> bool:
@@ -2923,6 +2934,255 @@ def _verification_result(
     return final_accepted, "visual_pass" if final_accepted else "visual_rejected", score, result
 
 
+def _scene_top_candidates_limit() -> int:
+    """Per-scene metadata top-N retained for vision selection (spec: 12).
+
+    Rank by metadata first, keep the top 12 results per scene, send the
+    top 3 to vision, resolve to the top 1. Tunable via
+    VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE; the shape (12 -> 3 -> 1) stays.
+    """
+    try:
+        return max(
+            1,
+            min(
+                16,
+                int(
+                    os.environ.get(
+                        "VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE", "12"
+                    )
+                    or 12
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 12
+
+
+def _scene_finalist_limit() -> int:
+    """How many of the per-scene top-12 go to vision (spec: 3).
+
+    The old default verified only the strongest two candidates per scene in
+    long-form jobs; the selection spec sends three. The operator override
+    VIDZEO_VISUAL_FINALIST_LIMIT still wins.
+    """
+    try:
+        configured = os.environ.get("VIDZEO_VISUAL_FINALIST_LIMIT")
+        if configured is None:
+            configured = "3"
+        return max(1, min(12, int(configured or 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _visual_gate_workers(primary_count: int) -> int:
+    """Parallel vision checks in the primary gate (default 12, cap 24).
+
+    Was a hardcoded 6. The old bound was written for OpenRouter/free-model
+    rate limits; vision now goes through the inbox hook, where the cost is
+    one ~4.5-minute worker round trip per call — so the wave's wall time is
+    roughly ceil(work / workers) round trips, and 6 workers turned a
+    38-candidate wave into ~7 sequential rounds. 12 halves that; the vision
+    deadline still bounds the whole gate. Env VIDZEO_VISUAL_GATE_WORKERS
+    wins.
+    """
+    try:
+        configured = int(os.environ.get("VIDZEO_VISUAL_GATE_WORKERS") or 12)
+    except (TypeError, ValueError):
+        configured = 12
+    return max(1, min(24, configured, max(1, int(primary_count or 1))))
+
+
+def _visual_relative_floor() -> float:
+    """Relative metadata floor for the per-scene top-12 pool (default 0.5).
+
+    A pool entry scoring below this fraction of the scene's best metadata
+    score never reaches vision (it can still be re-admitted by the
+    recovery/cross-source paths if everything better fails). The finalist
+    slots are always kept, so the floor only trims the weak tail of the
+    expansion pool. Env VIDZEO_VISUAL_RELATIVE_FLOOR wins, clamped 0-0.9.
+    """
+    try:
+        value = float(os.environ.get("VIDZEO_VISUAL_RELATIVE_FLOOR") or 0.5)
+    except (TypeError, ValueError):
+        value = 0.5
+    return max(0.0, min(0.9, value))
+
+
+def _select_scene_finalists(viable, finalist_limit, top_candidates=12, relative_floor=None):
+    """Split a metadata-ranked per-scene pool into vision finalists + pool.
+
+    ``viable`` must already be sorted best-first by metadata (identity
+    proof, then metadata score). Returns ``(finalists, top_pool)`` where
+    ``top_pool`` is the retained top-N (spec: 12) and ``finalists`` the top-K
+    of it sent to vision (spec: 3). The YouTube motion reservation is drawn
+    from the same top-N pool, so a low-ranked clip cannot displace a
+    metadata-strong still. Before the reservation, the pool is tightened by
+    the relative floor: entries scoring below ``relative_floor`` times the
+    best metadata score are dropped, but the top ``finalist_limit`` entries
+    are always kept, so vision never receives fewer finalists than the spec.
+    """
+    keep = max(1, int(finalist_limit or 3))
+    top_pool = list(viable[: max(1, int(top_candidates or 12))])
+    if relative_floor is None:
+        relative_floor = _visual_relative_floor()
+    try:
+        floor = float(relative_floor)
+    except (TypeError, ValueError):
+        floor = 0.5
+    if top_pool and floor > 0.0:
+        best = float(top_pool[0][1] or 0.0)
+        if best > 0.0:
+            cutoff = floor * best
+            tightened = [
+                item for index, item in enumerate(top_pool)
+                if index < keep or float(item[1] or 0.0) >= cutoff
+            ]
+            if len(tightened) >= keep:
+                top_pool = tightened
+    finalists = list(top_pool[:keep])
+    if top_pool:
+        # Reserve one paid verification slot for the requested motion lane.
+        # Web metadata can otherwise occupy all finalist slots, leaving a
+        # downloaded clean YouTube candidate recorded as
+        # ``not_selected_finalist`` and silently producing a still-only
+        # quota scene.
+        youtube_finalist = next(
+            (item for item in top_pool if item[4] == "youtube"),
+            None,
+        )
+        if youtube_finalist is not None and not any(
+            item[3] is youtube_finalist[3] for item in finalists
+        ):
+            if finalists:
+                finalists[-1] = youtube_finalist
+            else:
+                finalists.append(youtube_finalist)
+    return finalists, top_pool
+
+
+def _pick_spare_candidate(
+    scene_index: int,
+    scene: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    discovered: Sequence[Sequence[Mapping[str, Any]]],
+    gated_outcomes: Mapping[Any, Any],
+    reuse_counts: Mapping[str, int],
+) -> Optional[tuple[float, float, Dict[str, Any], Dict[str, Any]]]:
+    """Best vision-accepted candidate from ANOTHER scene's pool (Nov 10, 2026).
+
+    Fallback tier (a): when a scene's own lanes found nothing usable, reuse
+    an already-downloaded, vision-checked asset from the job's pool before
+    fetching anything new (tier (b) YT clip frames) or falling back to a
+    graphic (tier (c), last). Unselected top-12 pool members count — they
+    were vision-checked even though their own scene picked something else.
+
+    Ranking: same container first, then nearest origin scene, then
+    (visual_score, metadata_score). Skipped: same-scene origin,
+    ADJACENT origins (the same still in two consecutive scenes reads as
+    a frozen frame — the diversity check enforces this downstream too),
+    unverified or fatally-rejected verdicts, files no longer on disk,
+    candidates that fail this scene's hard identity gate, and assets
+    whose reuse cap is already spent (web 2, YouTube 1 — a replayed clip
+    is not a new moment).
+
+    Returns an ``accepted``-shaped tuple ``(score, source_tie, candidate,
+    qwen)`` or None. The candidate is a copy stamped ``spare_pool_reuse``.
+    """
+    from .job_debugger import _is_fatal_verdict
+
+    current_container = str(scene.get("container_id") or "").strip()
+    best: Optional[tuple[float, float, Dict[str, Any], Dict[str, Any]]] = None
+    best_key: Optional[tuple] = None
+    for (origin_index, path), outcome in dict(gated_outcomes).items():
+        try:
+            origin_index = int(origin_index)
+        except (TypeError, ValueError):
+            continue
+        if origin_index == scene_index:
+            continue
+        # Non-adjacent only (Nov 10, 2026): the same still in two
+        # consecutive scenes reads as a frozen frame. The same-container
+        # reuse tier and the physical-asset diversity check both enforce
+        # this; a spare must not jump the queue past them. Pool reuse is
+        # for LATER in the video, not the very next scene.
+        if abs(origin_index - scene_index) <= 1:
+            continue
+        if not isinstance(outcome, (tuple, list)) or len(outcome) < 6:
+            continue
+        verified, visual_score, qwen = outcome[2], outcome[4], outcome[5]
+        if not verified:
+            continue
+        if _is_fatal_verdict(outcome):
+            continue
+        try:
+            visual_score = float(visual_score or 0.0)
+        except (TypeError, ValueError):
+            visual_score = 0.0
+        try:
+            metadata_score = float(outcome[0] or 0.0)
+        except (TypeError, ValueError):
+            metadata_score = 0.0
+        source_tie = outcome[1]
+        # The candidate dict lives in its origin scene's discovered pool.
+        candidate = None
+        if 0 <= origin_index < len(discovered):
+            for row in discovered[origin_index] or []:
+                if isinstance(row, Mapping) and str(row.get("path") or "") == str(path or ""):
+                    candidate = row
+                    break
+        if candidate is None:
+            continue
+        local_path = str(candidate.get("cleaned_path") or candidate.get("path") or "").strip()
+        if not local_path:
+            continue
+        try:
+            if not os.path.isfile(local_path) or os.path.getsize(local_path) <= 1024:
+                continue
+        except OSError:
+            continue
+        passed, _reason = _candidate_hard_gate(scene, candidate)
+        if not passed:
+            continue
+        # Reuse cap: a web still may serve a second non-adjacent scene, a
+        # YouTube file may not be replayed. Probe a resolution so the cap
+        # uses the same identity the final ledger records.
+        probe = SceneResolution(
+            scene_index=int(scene.get("scene_index", scene_index)),
+            provider=str(candidate.get("source") or candidate.get("provider") or ""),
+            selected_path=local_path,
+            asset_fingerprint=str(candidate.get("asset_fingerprint") or candidate.get("fingerprint") or ""),
+            source_url=str(candidate.get("origin_url") or candidate.get("source_url") or candidate.get("url") or ""),
+        )
+        identity = _resolution_asset_identity(probe)
+        if not identity:
+            continue
+        if reuse_counts.get(identity, 0) >= _reuse_limit_for_resolution(
+            scene, probe, non_mixed_limit=2
+        ):
+            continue
+        origin_container = ""
+        if 0 <= origin_index < len(rows):
+            origin_container = str((rows[origin_index] or {}).get("container_id") or "").strip()
+        key = (
+            1 if (current_container and origin_container == current_container) else 0,
+            -abs(origin_index - scene_index),
+            visual_score,
+            metadata_score,
+        )
+        if best_key is None or key > best_key:
+            spare = dict(candidate)
+            spare["fallback_layer"] = "spare_pool_reuse"
+            spare["resolution_kind"] = "spare_pool_reuse"
+            best_key = key
+            best = (
+                visual_score * 1000.0 + metadata_score,
+                source_tie,
+                spare,
+                qwen if isinstance(qwen, dict) else {},
+            )
+    return best
+
+
 def resolve_storyboard_media_v2(
     scenes: Sequence[Any],
     *,
@@ -3028,6 +3288,16 @@ def resolve_storyboard_media_v2(
         return True, box.get("value"), None
 
     def discover(index: int, source: str, lane):
+        # Debugger advance: a scene the watchdog flagged as stuck stops
+        # burning new discovery waves. Its resolution comes from media
+        # already on disk (see the advance branch in the resolution loop).
+        try:
+            from .job_debugger import is_scene_advance_requested
+
+            if is_scene_advance_requested(index):
+                return index, source, [], "advance"
+        except Exception:
+            pass
         # A provider row that reached the coordinator after the discovery wall
         # still needs its cheap deterministic decision when no live vision
         # verifier is configured.  The no-key path is deliberately
@@ -3329,11 +3599,15 @@ def resolve_storyboard_media_v2(
     # not silently re-verify every lower-ranked discovery when a cached gate
     # outcome is absent.
     primary_finalist_keys: Dict[int, set[str]] = {index: set() for index in range(len(rows))}
+    # Metadata top-12 pool per scene (spec: 12 -> 3 -> 1). The retained
+    # expansion wave may only verify candidates from this pool, never the
+    # full discovery list, so vision never sees a 9th-ranked row.
+    primary_top_pool_keys: Dict[int, set[str]] = {index: set() for index in range(len(rows))}
     gate_lock = threading.Lock()
     primary_work: List[tuple] = []
     for index, scene in enumerate(rows):
         preference_rank = preference_ranks[index]
-        viable: List[tuple[float, int, Dict[str, Any], str]] = []
+        viable: List[tuple[float, float, int, Dict[str, Any], str]] = []
         for candidate in discovered[index]:
             source = _normalize_candidate_source(candidate)
             passed, reason = _candidate_hard_gate(scene, candidate)
@@ -3351,51 +3625,43 @@ def resolve_storyboard_media_v2(
                 or candidate.get("metadata_score")
                 or 0.0
             )
-            viable.append((metadata_score, -preference_rank.get(source, 9), candidate, source))
-        viable.sort(key=lambda value: (value[0], value[1]), reverse=True)
+            # Identity-aware pre-ranking: a candidate whose asset metadata
+            # proves the required entity (an Amtrak frame for an Amtrak
+            # scene) outranks one that merely scores well on generic terms
+            # (a CSX frame). Vision only sees the top finalists, so a
+            # wrong-operator candidate must not occupy a slot a proven one
+            # could have taken.
+            identity_proof = False
+            requirement = scene.get("visual_requirement")
+            if isinstance(requirement, Mapping):
+                _matched, _match_reason, match_evidence = candidate_requirement_match(requirement, candidate)
+                identity_proof = bool((match_evidence or {}).get("identity_proof"))
+            viable.append((1.0 if identity_proof else 0.0, metadata_score, -preference_rank.get(source, 9), candidate, source))
+        viable.sort(key=lambda value: (value[0], value[1], value[2]), reverse=True)
         distinct_viable = []
         seen_web_assets = set()
         for item in viable:
-            if item[3] == 'web':
-                identity = _web_asset_identity(item[2])
+            if item[4] == 'web':
+                identity = _web_asset_identity(item[3])
                 if identity and identity in seen_web_assets:
                     continue
                 if identity:
                     seen_web_assets.add(identity)
             distinct_viable.append(item)
         viable = distinct_viable
-        # Keep discovery pools intact, but verify only the strongest two
-        # candidates per scene in long-form jobs. The old three-candidate
-        # default produced 39 remote checks for a 13-scene storyboard and
-        # left the UI parked in relevance checking. Rejected scenes still get
-        # retained-candidate expansion and cross-source recovery below.
-        # Small jobs retain a wider first choice; operator overrides win.
-        configured_finalist_limit = os.environ.get("VIDZEO_VISUAL_FINALIST_LIMIT")
-        if configured_finalist_limit is None:
-            configured_finalist_limit = "2" if len(rows) > 6 else "4"
-        finalist_limit = max(
-            1,
-            min(12, int(configured_finalist_limit or 8)),
+        # Spec: rank by metadata, keep the top 12 per scene, send the top 3
+        # to vision, resolve to the top 1. Rejected scenes still get
+        # retained-candidate expansion (bounded to the same top-12 pool) and
+        # cross-source recovery below.
+        finalists, top_pool = _select_scene_finalists(
+            viable,
+            finalist_limit=_scene_finalist_limit(),
+            top_candidates=_scene_top_candidates_limit(),
         )
-        finalists = list(viable[:finalist_limit])
-        if viable:
-            # Reserve one paid verification slot for the requested motion
-            # lane. Web metadata can otherwise occupy all three finalist
-            # slots, leaving a downloaded clean YouTube candidate recorded as
-            # ``not_selected_finalist`` and silently producing a still-only
-            # quota scene.
-            youtube_finalist = next(
-                (item for item in viable if item[3] == "youtube"),
-                None,
-            )
-            if youtube_finalist is not None and not any(
-                item[2] is youtube_finalist[2] for item in finalists
-            ):
-                if finalists:
-                    finalists[-1] = youtube_finalist
-                else:
-                    finalists.append(youtube_finalist)
-        for metadata_score, source_tie, candidate, source in finalists:
+        primary_top_pool_keys[index] = {
+            str(item[3].get("path") or "") for item in top_pool
+        }
+        for _identity_proof, metadata_score, source_tie, candidate, source in finalists:
             primary_finalist_keys[index].add(str(candidate.get("path") or ""))
             primary_work.append((index, source_tie, candidate, source, metadata_score))
 
@@ -3464,10 +3730,12 @@ def resolve_storyboard_media_v2(
             except Exception:
                 pass
         # The verifier is already bounded by VisualDecisionContext's shared
-        # semaphore. Six workers prevent a large storyboard's independent
-        # vision checks from forming a long serial tail while retaining a
-        # conservative upper bound for OpenRouter/free-model rate limits.
-        gate_workers = max(1, min(6, len(primary_work)))
+        # semaphore. Twelve workers keep a large storyboard's independent
+        # vision checks from forming a long serial tail (each inbox round
+        # trip costs ~4.5 minutes, so the wave's wall time is roughly
+        # ceil(work / workers) round trips); the vision deadline still
+        # bounds the whole gate. Env VIDZEO_VISUAL_GATE_WORKERS wins.
+        gate_workers = _visual_gate_workers(len(primary_work))
         gate_started = time.monotonic()
         gate_pool = ThreadPoolExecutor(max_workers=gate_workers, thread_name_prefix="media-v2-gate")
         gate_futures = {gate_pool.submit(_gate_one_primary, item): item for item in primary_work}
@@ -3952,6 +4220,19 @@ def resolve_storyboard_media_v2(
                                 visual_score,
                                 inline_qwen or {},
                             )
+                            # Record the inline verdict where the late quota
+                            # lane looks for it. Without this, a
+                            # deadline-skipped quota clip looked
+                            # "never vision-checked" to quota retention,
+                            # which then promoted it on "downloaded" alone
+                            # and the downstream contract gate rejected it
+                            # as unverified (ff377408 scenes 1, 2, 6). A
+                            # recorded skip carries a deadline/unavailable
+                            # reason, so the late lane retries it; a
+                            # recorded hard rejection stays a rejection.
+                            gated_outcomes.setdefault(
+                                (index, str(candidate.get("path") or "")), outcome
+                            )
                             metadata_score, source_tie, verified, verify_reason, visual_score, qwen = outcome
                         else:
                             if visual_budget_open("visual_gate_inline", source):
@@ -4157,10 +4438,15 @@ def resolve_storyboard_media_v2(
         # sorted ahead of it on identical metadata scores.
         if not accepted and primary_rows and recovery_budget_open("primary_finalist_expansion"):
             primary_keys = primary_finalist_keys.get(index, set())
+            top_pool_keys = primary_top_pool_keys.get(index, set())
             expansion_rows = [
                 (candidate, source)
                 for candidate, source in primary_rows
                 if str(candidate.get("path") or "") not in primary_keys
+                and (
+                    not top_pool_keys
+                    or str(candidate.get("path") or "") in top_pool_keys
+                )
             ]
             if expansion_rows:
                 try:
@@ -4333,6 +4619,26 @@ def resolve_storyboard_media_v2(
                     if accepted:
                         break
 
+        # Spare-pool reuse (Nov 10, 2026): fallback tier (a). When a scene's
+        # own lanes found nothing usable, reuse an already-downloaded,
+        # vision-checked asset from another scene's top-12 pool before
+        # fetching anything new (tier (b) YT clip frames below) or falling
+        # back to a graphic (tier (c), last). The scene's own exact search
+        # already outranks another scene's spare — cross-lane ran first.
+        if not accepted:
+            spare = _pick_spare_candidate(
+                index, scene, rows, discovered, gated_outcomes, reuse_counts
+            )
+            if spare is not None:
+                accepted.append(spare)
+                attempts[index].append({
+                    "source": _normalize_candidate_source(spare[2]),
+                    "stage": "spare_pool_reuse",
+                    "status": "accepted",
+                    "candidate_id": str(spare[2].get("candidate_id") or spare[2].get("id") or ""),
+                    "path": str(spare[2].get("path") or ""),
+                })
+
         # Same-video timestamp recovery. A downloaded YouTube clip can be
         # semantically valid even when the selected cut opens on a transition,
         # title card, or weak frame. Extract a few distinct local timestamps
@@ -4376,6 +4682,62 @@ def resolve_storyboard_media_v2(
                     item for item in accepted
                     if reuse_counts.get(_web_asset_identity(item[2]), 0) < cap
                 ]
+
+        # Debugger advance (tier 1 of the stall policy): the watchdog
+        # flagged this scene as stuck. Resolve it from media already on
+        # disk, vision-checked and scored, instead of hunting further.
+        # Tiers 2 (same-job approved media) and 3 (graphic) already exist
+        # below; falling through reaches them when no on-disk candidate
+        # qualifies. The injected candidate flows through the normal
+        # accepted path, so the ledger, alternates and reuse caps apply.
+        if not accepted:
+            try:
+                from .job_debugger import (
+                    consume_scene_advance,
+                    is_scene_advance_requested,
+                    pick_advance_candidate,
+                )
+
+                if is_scene_advance_requested(index):
+                    pick = pick_advance_candidate(
+                        index, discovered.get(index), gated_outcomes
+                    )
+                    if pick is not None:
+                        advance_candidate, advance_score, advance_qwen = pick
+                        advance_copy = dict(advance_candidate)
+                        advance_copy["resolution_kind"] = (
+                            "debugger_advance_ondisk_reuse"
+                        )
+                        advance_copy["fallback_reason"] = (
+                            "debugger_advance:scene_stuck"
+                        )
+                        accepted = [
+                            (
+                                float(advance_score),
+                                0,
+                                advance_copy,
+                                advance_qwen,
+                            )
+                        ]
+                        attempts[index].append(
+                            {
+                                "source": str(
+                                    advance_candidate.get("source")
+                                    or advance_candidate.get("provider")
+                                    or ""
+                                ),
+                                "stage": "debugger_advance",
+                                "status": "ondisk_reuse",
+                                "candidate_id": str(
+                                    advance_candidate.get("candidate_id")
+                                    or advance_candidate.get("id")
+                                    or ""
+                                ),
+                            }
+                        )
+                    consume_scene_advance(index)
+            except Exception:
+                pass
 
         if accepted:
             explicit_order = _source_policy_value(scene, 'media_source_priority', None)
@@ -5797,8 +6159,24 @@ def resolve_storyboard_media_v2(
                         has_fatal_mismatch = False
                         qwen["fatal_mismatch"] = False
 
+                # A downloaded cut is not a vision verdict. Minting
+                # accepted/visual_checked from "the file exists" let quota
+                # retention promote clips whose only evidence was a
+                # download, and the downstream contract gate then rejected
+                # them as unverified (ff377408: 4 retained, 3 rejected, 1
+                # survived). Only a live gated verdict, the candidate's
+                # own live accepted check, or a scene that does not require
+                # visual verification may stamp acceptance.
+                live_vision_accept = bool(
+                    successful_visual_gate
+                    or (
+                        qwen.get("accepted") is True
+                        and (qwen.get("visual_checked") or qwen.get("semantic_verified") or qwen.get("visual_available"))
+                    )
+                )
+                strict_scene = scene_requires_visual_verification(rows[index]) if index < len(rows) else False
                 valid_pool_download = is_pool_cut and is_downloaded_clean and not has_fatal_mismatch
-                if valid_pool_download:
+                if valid_pool_download and (live_vision_accept or not strict_scene):
                     qwen["accepted"] = True
                     qwen["visual_checked"] = True
                     if not qwen.get("status") or qwen.get("status") == "unverified":
@@ -5810,7 +6188,6 @@ def resolve_storyboard_media_v2(
                     or qwen.get("semantic_verified")
                     or qwen.get("visual_available")
                     or (qwen_status in {"accepted", "verified"})
-                    or valid_pool_download
                 )
 
                 if (
@@ -5899,7 +6276,18 @@ def resolve_storyboard_media_v2(
             if yt_cand is not None:
                 scene = rows[index]
                 selected_path = str(yt_cand.get("path") or "")
-                qwen = dict(yt_cand.get("visual_decision") or yt_cand.get("qwen_result") or {})
+                # Use the gate-approved verdict, not a fresh read of the
+                # candidate's raw decision. The fresh read discarded the
+                # acceptance stamped above, so the stored row claimed
+                # status=accepted while its visual_decision still said
+                # accepted=false / visual_verification_pending — and the
+                # downstream contract gate rejected it with
+                # 'visual_verdict_rejected' (ff377408 scenes 1, 2, 6).
+                # The gate block above is the only place acceptance may be
+                # minted, and only on a live verdict (or a non-strict
+                # scene); this construction must not reintroduce the raw
+                # pending decision.
+                qwen = dict(qwen)
                 qwen["reason"] = qwen.get("reason") or "youtube_quota_upgrade"
                 scene_req = scene.get("visual_requirement") if isinstance(scene.get("visual_requirement"), Mapping) else {}
                 expected_req_hash = str(scene_req.get("requirement_hash") or "").strip()

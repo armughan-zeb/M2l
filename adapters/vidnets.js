@@ -15,6 +15,8 @@ const log = require('../lib/log');
 const { runCommand, parseJsonOutput, quoteArg } = require('../lib/command');
 const { minimumVideoDurationSeconds } = require('../lib/mediaRules');
 const { sleep } = require('../lib/sleep');
+const { assertNoOpenRouterKey } = require('../lib/museInference');
+const { readRequestedWorkers } = require('../lib/remotionWorkers');
 
 const MINUTE = 60 * 1000;
 
@@ -82,11 +84,40 @@ async function ensureReady({ signal } = {}) {
 }
 
 function buildRequest(job, scriptText, packageDir) {
+  // Muse inference is compulsory: an OpenRouter key in the environment
+  // must never be handed to Vidnets, even if the server would accept it.
+  assertNoOpenRouterKey(process.env);
   const options = job.channel?.videoOptions || {};
   const minutes = Math.max(1, Number(job.targetDurationMinutes) || 8);
-  const concurrency = Math.max(1, Math.min(8, Number(process.env.MUSE_RENDER_CONCURRENCY) || 4));
+  // Parallel Remotion workers: MUSE_RENDER_CONCURRENCY (aliases
+  // VIDZEO_REMOTION_WORKERS / MUSE_REMOTION_WORKERS /
+  // VIDZEO_REMOTION_CONCURRENCY), default 2 (tested safe on this VM).
+  // This is the REQUESTED count; the Vidnets server + render script
+  // auto-degrade it from CPU / available memory at render start
+  // (vidnets/scripts/render-remotion-manifest.js adaptiveConcurrency).
+  const concurrency = readRequestedWorkers(process.env);
   const coverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET);
-  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.4, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.6;
+  // Floor 0.3, not 0.4: the Nov 10, 2026 media-speedups decision set the
+  // YouTube accepted-coverage target to 0.30 (web is the main source now;
+  // 0.8 was per-job values from before). The server default is 0.30 when
+  // no explicit target is sent, so the adapter must not clamp above it.
+  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.3, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.6;
+  // FILTER-BEST (Nov 9, 2026): Vidnets' native mixed-media design ranks
+  // candidates and keeps the best real media per scene — vision is ADVISORY
+  // by default ("an uncertain verdict must not prevent video delivery",
+  // app.py _visual_required_for_job). Our wiring used to force
+  // strict_retrieval_accuracy + visual_required, which flipped the whole
+  // job to hard-required mode: every web/YouTube asset needed a completed
+  // verdict before the renderer, and a strict job with ANY unresolved
+  // scene failed outright (app.py _repair_unresolved_media) instead of
+  // degrading. That is the misuse the user corrected: filter-best, not
+  // hard-reject. With both flags false, vision still RUNS (visual_
+  // understanding + final_visual_gate_mode) and still RANKS (final_score);
+  // only named-entity scenes (strict_identity) still require a live
+  // verdict, per scene_requires_visual_verification. The ONE hard rule
+  // lives in the render wrapper, not here: never DELIVER a video with 0
+  // real-media scenes. MUSE_MEDIA_STRICT=1 restores the old strict flags.
+  const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
   const deliveryBudget = Math.max(600, Math.round((Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE) / 1000));
 
   return {
@@ -117,12 +148,16 @@ function buildRequest(job, scriptText, packageDir) {
     stock_last_resort_in_coordinator: true,
     stock_video_only: true,
     visual_understanding: true,
-    visual_required: true,
+    visual_required: strictMedia,
     final_visual_gate_mode: 'run',
     media_sources: ['pexels', 'pixabay'],
     pexels_api_key: String(process.env.PEXELS_API_KEY || '').trim(),
     pixabay_api_key: String(process.env.PIXABAY_API_KEY || '').trim(),
-    strict_retrieval_accuracy: true,
+    // Muse inference is compulsory: never send an OpenRouter key to
+    // Vidnets. llm_provider=external_agent is the only provider, and the
+    // server must never select Qwen for an external_agent job.
+    openrouter_api_key: '',
+    strict_retrieval_accuracy: strictMedia,
     fail_on_unresolved_media: true,
     allow_emergency_media: true,
     scene_mode: 'Every Beat',
@@ -267,6 +302,9 @@ function resultVideoPath(item) {
 }
 
 async function render(job, scriptText, workDir, { signal, onProgress } = {}) {
+  // Muse inference is compulsory: refuse before any Vidnets call if an
+  // OpenRouter key is present in the environment.
+  assertNoOpenRouterKey(process.env);
   const transport = inferenceTransport();
   if (!transport) {
     throw new Error(

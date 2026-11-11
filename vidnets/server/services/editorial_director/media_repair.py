@@ -5,7 +5,7 @@ import re
 import time
 from concurrent.futures import wait
 
-from ..job_context import JobThreadPoolExecutor, phase_scope, remaining_seconds
+from ..job_context import JobThreadPoolExecutor, current_job, phase_scope, remaining_seconds
 from ..recovery_contract import is_recovery_media, _align_explanation_ownership
 
 
@@ -93,7 +93,17 @@ def repair_failed_shots(manifest, config=None, client=None):
     if not targets:
         return report
     reserve = float(config.get('_render_reserve_seconds') or config.get('render_reserve_seconds') or 150)
-    budget = max(0, min(35, float(config.get('post_media_direction_seconds') or 30), remaining_seconds(900) - reserve))
+    repair_seconds = min(35.0, float(config.get('post_media_direction_seconds') or 30))
+    if current_job().get('llm_provider') == 'external_agent':
+        # The repair call answers through the polling inbox, so it needs the
+        # full agent answer floor — a 30s budget expires before the answer
+        # arrives (the phase scope below caps the request wall at it).
+        try:
+            agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
+        except (TypeError, ValueError):
+            agent_wall = 600.0
+        repair_seconds = max(repair_seconds, agent_wall)
+    budget = max(0, min(repair_seconds, remaining_seconds(900) - reserve))
     if budget < .01:
         report['status'] = 'render_reserve_preserved'
         return report

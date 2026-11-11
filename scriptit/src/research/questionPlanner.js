@@ -33,6 +33,12 @@ function buildResearchPlan({ topic, niche = 'general' } = {}) {
   const questions = [
     question('identity', 'identity', `What exactly is ${cleanTopic}, and what is the central event or subject?`, cleanTopic, {
       suffix: 'explained', priority: 'high',
+      // Exact-phrase variant: for niche titles ("A BNSF Whiteout Crossing")
+      // the generic suffix queries return broad/topic-adjacent pages, while
+      // a quoted phrase forces the engines to match the title itself. The
+      // researcher tries every planned query through Bing + DDG, so this is
+      // an extra lane, not a replacement.
+      queries: [`"${cleanTopic}"`],
     }),
     question('primary-record', 'primary', `What do first-party, official, government, institutional, or original records say about ${cleanTopic}?`, cleanTopic, {
       suffix: 'official announcement statement filing report', queries: [`${cleanTopic} official`, `${cleanTopic} primary source`], priority: 'high',

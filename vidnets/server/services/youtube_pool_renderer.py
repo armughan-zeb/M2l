@@ -1583,9 +1583,9 @@ def _probe_pool_candidates(
         )
     )
     try:
-        probe_workers = max(2, min(10, int(os.environ.get("VIDZEO_YT_POOL_PROBE_CONCURRENCY", "8") or 8)))
+        probe_workers = _pool_probe_workers()
     except (TypeError, ValueError):
-        probe_workers = 8
+        probe_workers = 10
     probe_duration = max(
         1.5,
         min(5.0, float(os.environ.get("VIDZEO_YT_POOL_PROBE_SECONDS", "3") or 3)),
@@ -1670,10 +1670,24 @@ def _probe_pool_candidates(
         candidate = _source_candidate(record)
         duration = max(0.0, float(getattr(record, "duration", 0.0) or 0.0))
         safe_max_start = max(0.0, duration - probe_duration - 0.25) if duration else 0.0
-        # Deterministic quarter/center sampling gives different candidates a
-        # stable preview without pretending the full source is already known.
-        fraction = ((sum(ord(char) for char in source_id) % 3) + 1) / 4.0
-        start = min(safe_max_start, max(0.0, safe_max_start * fraction))
+        # Transcript + frame selection: when a scene assigned to this source
+        # has a transcript moment, probe AT the moment so vision scores the
+        # frames the cut will actually use. The cut starts at the moment too,
+        # so the probe window and the first cut agree. Only a real transcript
+        # match steers the window; otherwise fall back to deterministic
+        # quarter/center sampling, exactly as before.
+        probe_moment = _best_probe_moment(pools, source_id)
+        probe_window_source = "quarter_center"
+        if probe_moment is not None:
+            try:
+                moment_start = float(getattr(probe_moment, "start", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                moment_start = 0.0
+            start = min(safe_max_start, max(0.0, moment_start))
+            probe_window_source = "transcript_moment"
+        else:
+            fraction = ((sum(ord(char) for char in source_id) % 3) + 1) / 4.0
+            start = min(safe_max_start, max(0.0, safe_max_start * fraction))
         probe_path = probe_root / f"{source_id}.probe.mp4"
         row = {
             "source_id": source_id,
@@ -1682,11 +1696,24 @@ def _probe_pool_candidates(
             "metadata_score": float(getattr(record, "metadata_score", 0.0) or 0.0),
             "probe_start": round(float(start), 3),
             "probe_duration": round(float(probe_duration), 3),
+            "probe_window_source": probe_window_source,
             "status": "probe_started",
             "overlay_policy": "preserve_source_no_blur",
             "overlay_types": [],
             "rejection_reason": "",
         }
+        if probe_moment is not None:
+            try:
+                row.update({
+                    "probe_moment_start": round(float(getattr(probe_moment, "start", 0.0) or 0.0), 3),
+                    "probe_moment_end": round(float(getattr(probe_moment, "end", 0.0) or 0.0), 3),
+                    "probe_moment_text": str(getattr(probe_moment, "transcript_text", "") or "")[:240],
+                    "probe_moment_score": round(float(getattr(probe_moment, "match_score", 0.0) or 0.0), 3),
+                    "probe_moment_scene": int(getattr(probe_moment, "scene_index", 0) or 0),
+                    "probe_moment_reason": str(getattr(probe_moment, "match_reason", "") or ""),
+                })
+            except (TypeError, ValueError):
+                pass
         try:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
@@ -2168,6 +2195,41 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _pool_probe_workers() -> int:
+    """Parallel 1-4s probe downloads per pool (default 10, cap 12).
+
+    Probes are tiny segments; the cost is one yt-dlp invocation each, so
+    parallelism is the whole win. Counts stay modest: the egress proxy
+    serializes concurrent connections (sequential 1-3s, ~72 concurrent
+    collapse to 30s+). Env VIDZEO_YT_POOL_PROBE_CONCURRENCY wins.
+    """
+    return _env_int("VIDZEO_YT_POOL_PROBE_CONCURRENCY", 10, minimum=2, maximum=12)
+
+
+def _source_download_workers() -> int:
+    """Parallel full shared-source downloads (default 6, cap 8).
+
+    Was default 4, cap 6. Env VIDZEO_YT_SOURCE_DOWNLOAD_CONCURRENCY wins.
+    """
+    return _env_int("VIDZEO_YT_SOURCE_DOWNLOAD_CONCURRENCY", 6, minimum=1, maximum=8)
+
+
+def _source_batch_deadline_seconds() -> float:
+    """Wall for the shared-source download batch (default 300s).
+
+    Was 120s: a batch of several 1080p segments through the throttled
+    egress can exceed it, cancelling work the direct-clip lane then has to
+    re-download. The deadline is a wall, not a target — fast batches still
+    finish fast. Env VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS wins.
+    """
+    return _env_float(
+        "VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS",
+        300.0,
+        minimum=0.05,
+        maximum=1800.0,
+    )
+
+
 class _DeadlineCancellation:
     """Compose job cancellation with a local cooperative wall deadline."""
 
@@ -2343,6 +2405,131 @@ def _build_visual_veto_policy(
     }
 
 
+def _best_probe_moment(pools: Any, source_id: str) -> Any | None:
+    """Return the best transcript moment for a probe candidate, if any.
+
+    Only a real transcript match counts: heuristic moments carry score 0.0
+    and an ungrounded timestamp, so they must never steer the probe window.
+    The highest match_score wins; ties break toward the earliest start.
+    """
+    try:
+        assignments = getattr(pools, "moment_assignments", None) or {}
+    except Exception:
+        return None
+    best = None
+    try:
+        moments = []
+        for scene_moments in assignments.values():
+            for moment in scene_moments or []:
+                moment_id = str(
+                    getattr(moment, "source_id", "") or getattr(moment, "video_id", "")
+                )
+                if moment_id != str(source_id):
+                    continue
+                if bool(getattr(moment, "heuristic", False)):
+                    continue
+                try:
+                    score = float(getattr(moment, "match_score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if score <= 0.0:
+                    continue
+                moments.append((score, moment))
+        if not moments:
+            return None
+        moments.sort(
+            key=lambda pair: (
+                -pair[0],
+                float(getattr(pair[1], "start", 0.0) or 0.0),
+            )
+        )
+        best = moments[0][1]
+    except Exception:
+        return None
+    return best
+
+
+def _prefetch_probe_transcript_moments(
+    pipeline: Any,
+    pools: Any,
+    probe_candidates_by_pool: Mapping[str, list[str]],
+    records: Mapping[str, Any],
+    session_jar: Any = None,
+) -> dict[str, Any]:
+    """Fetch transcripts for the bounded probe set so probes can sample at
+    transcript moments instead of arbitrary quarter/center windows.
+
+    Mirrors the post-probe admitted-source refresh, but runs BEFORE the
+    probe and is capped at a tight deadline (default 60s) so a slow
+    transcript provider cannot eat the probe wall. Cache-first: sources
+    already in the transcript disk cache return in milliseconds. Never
+    raises: a failure leaves moment_assignments empty and the probe falls
+    back to quarter/center sampling.
+    """
+    audit: dict[str, Any] = {"requested": 0, "available": 0, "status": "not_requested"}
+    prepare = getattr(pipeline, "_prepare_pool_transcript_moments", None)
+    if prepare is None or not probe_candidates_by_pool:
+        return audit
+    try:
+        probe_pool_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        seen: set[str] = set()
+        for pool_key, source_ids in probe_candidates_by_pool.items():
+            for source_id in source_ids or []:
+                if source_id in seen or source_id not in records:
+                    continue
+                seen.add(source_id)
+                probe_pool_candidates[pool_key].append(_source_candidate(records[source_id]))
+        if not probe_pool_candidates:
+            return audit
+        try:
+            preprobe_deadline = max(
+                5.0,
+                min(
+                    300.0,
+                    float(os.environ.get("VIDZEO_YT_POOL_PREPROBE_TRANSCRIPT_DEADLINE_SECONDS", "60") or 60),
+                ),
+            )
+        except (TypeError, ValueError):
+            preprobe_deadline = 60.0
+        documents, moments, metadata = prepare(
+            list(getattr(pools, "rows", None) or []),
+            dict(probe_pool_candidates),
+            scene_durations=list(getattr(pools, "scene_durations", None) or []),
+            force=True,
+            session_jar=session_jar,
+            deadline_seconds=preprobe_deadline,
+        )
+        if documents:
+            pools.transcript_documents = documents
+        if moments:
+            pools.moment_assignments = moments
+        if metadata:
+            pools.source_metadata = metadata
+        audit = {
+            "requested": len(seen),
+            "available": sum(
+                1 for document in (documents or {}).values()
+                if getattr(document, "available", False)
+            ),
+            "moments": sum(len(items or []) for items in (moments or {}).values()),
+            "status": "completed",
+        }
+        print(
+            f"   [yt-pool] pre-probe transcripts: {audit['available']}/"
+            f"{audit['requested']} available, {audit['moments']} moment(s)",
+            flush=True,
+        )
+    except Exception as exc:
+        audit = {
+            "requested": 0,
+            "available": 0,
+            "status": "failed",
+            "error": f"{type(exc).__name__}:{exc}"[:240],
+        }
+        print(f"   [yt-pool] pre-probe transcript fetch failed: {type(exc).__name__}", flush=True)
+    return audit
+
+
 def resolve_pool_first(
     pipeline,
     pools,
@@ -2372,7 +2559,26 @@ def resolve_pool_first(
     probe_audit: dict[str, dict[str, Any]] = {}
     selected_source_ids = _source_shortlist(pools)
     selected_by_pool: dict[str, dict[str, Any]] = {}
+    # Direct ranged mode is deliberately transcript-optional (see the
+    # post-probe refresh below). The pre-probe fetch is skipped there too.
+    direct_clip_mode = str(
+        os.environ.get("VIDZEO_YT_POOL_DIRECT_CLIPS_ONLY", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     if probe_candidates_by_pool:
+        # Transcript + frame selection: fetch transcripts for the bounded
+        # probe set BEFORE probing, so each probe samples at the transcript
+        # moment matching its scene. A failed or empty fetch leaves
+        # moment_assignments empty and the probe falls back to quarter/center
+        # sampling; the post-probe refresh below still runs for admitted
+        # sources as before.
+        if not direct_clip_mode:
+            _prefetch_probe_transcript_moments(
+                pipeline,
+                pools,
+                probe_candidates_by_pool,
+                records,
+                session_jar=session_jar,
+            )
         probe_audit = _probe_pool_candidates(
             pipeline,
             pools,
@@ -2435,9 +2641,6 @@ def resolve_pool_first(
     # moving-footage timestamp.  Start cutting immediately; transcript data is
     # still used whenever it is already cached, but it must never block clip
     # transport in the fast path.
-    direct_clip_mode = str(
-        os.environ.get("VIDZEO_YT_POOL_DIRECT_CLIPS_ONLY", "0") or "0"
-    ).strip().lower() in {"1", "true", "yes", "on"}
     if probe_candidates_by_pool and selected_source_ids and hasattr(pipeline, "_prepare_pool_transcript_moments") and not direct_clip_mode:
         try:
             admitted_pool_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2595,13 +2798,8 @@ def resolve_pool_first(
         audit.setdefault("status", "transport_unavailable")
         return source_id, None
 
-    source_workers = max(1, min(6, int(os.environ.get("VIDZEO_YT_SOURCE_DOWNLOAD_CONCURRENCY", "4") or 4)))
-    source_batch_seconds = _env_float(
-        "VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS",
-        120.0,
-        minimum=0.05,
-        maximum=1800.0,
-    )
+    source_workers = _source_download_workers()
+    source_batch_seconds = _source_batch_deadline_seconds()
     source_batch_started = time.monotonic()
     source_batch_deadline = source_batch_started + source_batch_seconds
     source_deadline_reached = False

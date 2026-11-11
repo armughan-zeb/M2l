@@ -848,9 +848,16 @@ def render_semantic_documentary_remotion(
         env["VIDZEO_REMOTION_CRF"] = str(selected_crf)
         # Resource preflight chose the fastest safe count for the current RAM,
         # CPU and frame size. The Node renderer applies its own fresh RAM cap.
+        # NOTE: the M2l worker sends its request as `concurrency` AND
+        # `semantic_render_concurrency` (adapters/vidnets.js buildRequest,
+        # MUSE_RENDER_CONCURRENCY, default 2). The server layer only
+        # forwards semantic_render_concurrency into the render config, so
+        # read it here too — otherwise the requested count never reaches
+        # the Node script and the render silently uses its own default.
         user_concurrency = (
             cfg.get("concurrency")
             or cfg.get("remotion_concurrency")
+            or cfg.get("semantic_render_concurrency")
             or os.environ.get("VIDZEO_REMOTION_CONCURRENCY")
         )
         if user_concurrency:
@@ -910,7 +917,17 @@ def render_semantic_documentary_remotion(
             archive = None
             vision_key = str(cfg.get('openrouter_api_key') or os.environ.get('OPENROUTER_API_KEY') or os.environ.get('VIDZEO_OPENROUTER_API_KEY') or '')
             client_factory = cfg.get('_creative_review_client_factory')
-            if not callable(client_factory) and vision_key:
+            # Muse inference is compulsory for external_agent jobs: the
+            # creative-review pixel audit must never call Qwen directly when
+            # this render belongs to a Muse-inference job. (The audit is
+            # advisory — when the factory is unset the render proceeds
+            # without it — so skipping it here loses nothing.)
+            from .job_context import current_job as _current_job
+            _is_external_agent = (
+                str(cfg.get('llm_provider') or '') == 'external_agent'
+                or str(_current_job().get('llm_provider') or '') == 'external_agent'
+            )
+            if not callable(client_factory) and vision_key and not _is_external_agent:
                 from .visual_intelligence.vision_client import QwenVisionClient
                 client_factory = lambda remaining: QwenVisionClient(api_key=vision_key, max_attempts=1,
                 timeout_seconds=max(1,min(18,remaining)),fast_mode=True)
@@ -1705,7 +1722,11 @@ def render_semantic_documentary(
     try:
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-        from .render_resource_manager import prepare_render_resources, RenderMemoryLowError
+        from .render_resource_manager import (
+            prepare_render_resources,
+            RenderMemoryLowError,
+            wait_for_render_memory,
+        )
 
         selected_backend = str(
             (config or {}).get("render_backend")
@@ -1732,32 +1753,73 @@ def render_semantic_documentary(
                     break
             if video_heavy:
                 break
-        waiting_on_resources = False
         try:
             memory_wait_seconds = max(1.0, min(1200.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_WAIT_SECONDS') or 120)))
         except (TypeError, ValueError):
             memory_wait_seconds = 120.0
-        memory_wait_deadline = min(wait_deadline, time.monotonic() + memory_wait_seconds)
-        while True:
+        try:
+            memory_poll_seconds = max(0.1, min(5.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_POLL_SECONDS') or 0.5)))
+        except (TypeError, ValueError):
+            memory_poll_seconds = 0.5
+        try:
+            memory_worker_extend_seconds = max(1.0, min(300.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_WORKER_EXTEND_SECONDS') or 30)))
+        except (TypeError, ValueError):
+            memory_worker_extend_seconds = 30.0
+        try:
+            memory_no_worker_grace_seconds = max(0.0, min(120.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_NO_WORKER_GRACE_SECONDS') or 10)))
+        except (TypeError, ValueError):
+            memory_no_worker_grace_seconds = 10.0
+        # Worker-aware memory wait (Nov 10, 2026): the old loop slept a
+        # fixed 2s and expired after a flat 120s even while this job's own
+        # media workers (YouTube ffmpeg downloads, search workers) were
+        # still running — the job then paused and burned wrapper retries
+        # until a retry happened to land after a worker exit. Now admission
+        # is re-checked every ~0.5s, the deadline extends in 30s steps
+        # while media workers are alive (bounded by the delivery budget),
+        # and the wait fails fast once no worker is left to free memory.
+        prepare_state = {'attempts': 0}
+
+        def _prepare_once():
+            prepare_state['attempts'] += 1
+            return prepare_render_resources(
+                require_remotion=selected_backend in {"remotion", "react"},
+                width=render_width, height=render_height, video_heavy=video_heavy,
+                release_idle=prepare_state['attempts'] <= 1,
+            )
+
+        def _check_active():
             check_job_active()
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            try:
-                memory_snapshot = prepare_render_resources(
-                    require_remotion=selected_backend in {"remotion", "react"},
-                    width=render_width, height=render_height, video_heavy=video_heavy,
-                    release_idle=not waiting_on_resources,
-                )
-                break
-            except RenderMemoryLowError as exc:
-                if not continue_render or time.monotonic() >= memory_wait_deadline:
-                    raise
-                waiting_on_resources = True
-                message = f"Waiting for render memory ({exc.memory_snapshot.get('available_mb', 0)} MB available); saved edit retained"
-                print(f"   [render-memory] {message}", flush=True)
-                if progress_callback:
+
+        def _on_memory_wait(info):
+            workers = info.get('live_workers') or []
+            message = (
+                f"Waiting for render memory ({info.get('available_mb', 0)} MB available; "
+                f"{len(workers)} media worker(s) holding "
+                f"{info.get('live_worker_rss_mb', 0)} MB, "
+                f"{info.get('deadline_in_seconds', 0):.0f}s of memory wait left); saved edit retained"
+            )
+            print(f"   [render-memory] {message}", flush=True)
+            if progress_callback:
+                try:
                     progress_callback(0.0, message)
-                time.sleep(2.0)
+                except Exception:
+                    pass
+
+        if continue_render:
+            memory_snapshot = wait_for_render_memory(
+                _prepare_once,
+                wait_deadline=wait_deadline,
+                base_wait_seconds=memory_wait_seconds,
+                poll_seconds=memory_poll_seconds,
+                worker_extend_seconds=memory_worker_extend_seconds,
+                no_worker_grace_seconds=memory_no_worker_grace_seconds,
+                on_wait=_on_memory_wait,
+                check_active=_check_active,
+            )
+        else:
+            memory_snapshot = _prepare_once()
         result = _render_semantic_documentary_unlocked(
             manifest=manifest,
             output_path=output_path,

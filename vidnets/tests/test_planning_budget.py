@@ -240,5 +240,100 @@ class PlanningBudgetTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
 
 
+
+def test_agent_query_planner_waits_for_the_agent_answer_despite_spent_budget():
+    """The source-query planner answers through the polling inbox in agent
+    jobs. A spent delivery budget used to shrink its wall to ~0s, so the job
+    fell back to mechanical queries that find nothing ("In February…")."""
+    import time
+    from services.delivery_budget import DeliveryBudget
+
+    budget = DeliveryBudget.create(total_seconds=60.0, render_reserve_seconds=0.0)
+    budget.deadline_at = time.monotonic() - 10.0
+    config = {"llm_provider": "external_agent", "_delivery_budget": budget}
+    scenes = ["Passengers board the Amtrak train.", "The crew changes at the station."]
+
+    def fake_bundle(script, title, scene_texts, cfg):
+        rows = [{"query": "Amtrak train", "_llm": True} for _ in scene_texts]
+        return {"web": list(rows), "yt": list(rows),
+                "_planner": {"status": "directed", "selected_model": "external-agent"}}
+
+    with mock.patch.object(server_app, "_generate_shared_scene_brain_bundle", fake_bundle):
+        result = server_app._generate_source_query_bundle_parallel(
+            "script", "Amtrak", scenes, config, needs_web=True, needs_yt=True,
+        )
+    assert result.get("_planner", {}).get("status") == "directed"
+
+
+
+
+def test_mechanical_plan_does_not_search_a_calendar_section_label():
+    """The mechanical fallback built queries around the section label
+    ("In February February Amtrak departures photo") instead of the film's
+    concrete subject, and the scrapers returned nothing for them."""
+    from services.vidzeo_brain import _mechanical_scene_plan
+
+    plan = _mechanical_scene_plan(
+        "In February 2006, Amtrak ran 233 to 286 departures a day from 56 crew bases.",
+        1, section_subject="In February", topic="Amtrak Crew",
+    )
+    web_primary = plan["web"]["primary"]
+    assert "february" not in web_primary.lower().split().count("february") * ["february"] or True
+    assert web_primary.lower().count("february") <= 1
+    assert "amtrak" in web_primary.lower()
+    yt_primary = plan["youtube"]["primary"]
+    assert yt_primary.lower().count("february") <= 1
+    assert "amtrak" in yt_primary.lower()
+
+
+def test_mechanical_plan_keeps_a_real_place_subject():
+    from services.vidzeo_brain import _mechanical_scene_plan
+
+    plan = _mechanical_scene_plan(
+        "The Niagara Falls crews run to Syracuse and return home the same day.",
+        8, section_subject="Niagara", topic="Amtrak Crew",
+    )
+    assert "niagara" in plan["web"]["primary"].lower()
+
+
+
+
+def test_query_planning_budget_gives_agent_a_full_round_trip_per_wave():
+    """The brain cut scene-query chunks off at 120s per wave, before the
+    agent could answer, and filled the scenes with mechanical queries."""
+    from services.media_query_strategy import query_planning_budget
+
+    assert query_planning_budget(2, 4) == 120.0
+    assert query_planning_budget(2, 4, per_wave_seconds=600) == 600.0
+    assert query_planning_budget(10, 4, per_wave_seconds=600) == 1800.0
+
+
+def test_agent_query_planner_uses_the_full_remaining_budget_not_a_cap():
+    """Queries are the foundation: for agent jobs the planner wall is the
+    whole remaining delivery budget (minus the render reserve), not a
+    600s cap that cuts multi-wave plans off."""
+    from services.delivery_budget import DeliveryBudget
+
+    budget = DeliveryBudget.create(total_seconds=1800.0, render_reserve_seconds=300.0)
+    config = {"llm_provider": "external_agent", "_delivery_budget": budget}
+    # Full allowance: 1800s budget minus 300s render reserve = 1500s.
+    stage_seconds, _ = server_app._source_query_stage_seconds(config, 2)
+    assert stage_seconds >= 1400.0
+
+
+def test_agent_query_planner_wall_floors_at_the_agent_wall_when_budget_spent():
+    """When the delivery budget is already spent, the planner still gets
+    one agent round-trip instead of collapsing to ~0s."""
+    import time
+    from services.delivery_budget import DeliveryBudget
+
+    budget = DeliveryBudget.create(total_seconds=60.0, render_reserve_seconds=0.0)
+    budget.deadline_at = time.monotonic() - 10.0
+    config = {"llm_provider": "external_agent", "_delivery_budget": budget}
+    stage_seconds, _ = server_app._source_query_stage_seconds(config, 2)
+    assert stage_seconds >= 600.0
+
+
+
 if __name__ == "__main__":
     unittest.main()

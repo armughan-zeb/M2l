@@ -1124,9 +1124,47 @@ def _attributes(text: str, subject: str, subject_type: str) -> Dict[str, str]:
     return attributes
 
 
+# Major North American rail operators, current and historic. A scene about one
+# of them must not be illustrated with another's footage — the metadata gate
+# cannot tell an Amtrak passenger train from a CSX freight locomotive without
+# this list, and heritage units are the same trap: a Denver & Rio Grande
+# Western locomotive is real rail footage but the wrong operator for an
+# Amtrak scene. Historic names are included for the same reason; "santa fe"
+# is deliberately absent (it collides with the place name) — only the
+# unambiguous "santa fe railway" is listed.
+_RAIL_OPERATORS = (
+    "amtrak",
+    "bnsf",
+    "csx",
+    "union pacific",
+    "norfolk southern",
+    "canadian national",
+    "canadian pacific",
+    "kansas city southern",
+    "cpkc",
+    "rio grande",
+    "denver and rio grande western",
+    "southern pacific",
+    "pennsylvania railroad",
+    "new york central",
+    "great northern",
+    "northern pacific",
+    "chessie system",
+    "conrail",
+    "santa fe railway",
+)
+
+
 def _forbidden(subject: str, subject_type: str, attributes: Mapping[str, Any]) -> Tuple[str, ...]:
     values: list[str] = []
     subject_norm = _norm(subject)
+    # A rail subject naming one operator must not accept another operator's
+    # footage: a CSX freight frame is not an Amtrak passenger shot, and the
+    # metadata gate cannot tell them apart without this list.
+    for operator in _RAIL_OPERATORS:
+        if operator in subject_norm:
+            values.extend(other for other in _RAIL_OPERATORS if other != operator)
+            break
     if "prince harry" in subject_norm:
         values.extend(["harry potter", "potter", "half-blood prince", "half blood prince", "hogwarts", "voldemort", "quidditch", "dumbledore", "gryffindor", "slytherin", "order of the phoenix"])
         # A royal-person contract must never silently accept an animal/toy
@@ -1993,6 +2031,21 @@ def candidate_requirement_match(requirement: Mapping[str, Any], candidate: Mappi
             for token in identity_tokens
         )
     ) or any(_contains_phrase(normalized, alias) for alias in req.aliases)
+    if not identity_proof:
+        # Rail-operator proof: a title-derived canonical ("Amtrak's Long
+        # Run…") rarely matches in full, so a candidate naming the required
+        # operator in its asset metadata is proof of identity even without
+        # a full-phrase match. Wrong-operator candidates are rejected below
+        # via forbidden_subjects. Record it in the evidence now so it
+        # survives the canonical-mismatch early return below.
+        required_operator = next(
+            (operator for operator in _RAIL_OPERATORS if operator in _norm(req.canonical_entity)),
+            None,
+        )
+        if required_operator and _contains_phrase(normalized, required_operator):
+            identity_proof = True
+    if identity_proof:
+        evidence["identity_proof"] = req.canonical_entity
     forbidden_hits = [
         forbidden for forbidden in req.forbidden_subjects
         if _contains_phrase(normalized, forbidden)

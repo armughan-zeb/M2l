@@ -177,6 +177,15 @@ def start_server():
 
     print('[Vidzeo] Backend booting in lazy mode...')
     run_startup_maintenance()
+    # Stuck-job debugger: background watchdog that notices a processing job
+    # with no progress change and escalates (re-wake, advance scene, or
+    # restart for auto-resume). Never raises; a failed start is logged only.
+    try:
+        from server.services.job_debugger import start_job_debugger
+
+        start_job_debugger()
+    except Exception as exc:
+        print(f'[job-debugger] failed to start: {exc}')
     bind_host = os.environ.get('VIDZEO_BIND_HOST', '127.0.0.1').strip() or '127.0.0.1'
     try:
         port = int(os.environ.get('VIDZEO_PORT', '5000') or 5000)

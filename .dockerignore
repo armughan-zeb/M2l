@@ -1,0 +1,37 @@
+# Build context exclusions. The image installs its own node_modules
+# (npm ci from the lockfiles) and Python deps (pip from requirements.txt);
+# shipping the host's copies would bloat the build and leak local state.
+# Secrets and runtime state must never enter the image.
+.git/
+node_modules/
+vidnets/node_modules/
+remotion-linux/node_modules/
+scriptit/node_modules/
+.venv/
+vidnets/.venv/
+**/__pycache__/
+.cache/
+work/
+run/
+data/
+output/
+artifacts/
+temp/
+logs/
+vidnets/temp/
+vidnets/logs/
+vidnets/output/
+vidnets/cache/
+remotion-linux/out/
+*.log
+*.pid
+.env
+.env.local
+.env.*.local
+.muse-agent.json
+.muse-agent.json.*
+cookies.txt
+youtube-session-meta.json
+.vidzeo_*
+*.pem
+*.key

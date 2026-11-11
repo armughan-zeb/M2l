@@ -2,6 +2,7 @@
 
 const { chatCompletion } = require('../providers/openrouter');
 const { isAgentHandle, agentChat } = require('../providers/agentInference');
+const { isBridgeHandle, agentBridgeChat } = require('../providers/agentBridge');
 const { MODEL, normalizeModel } = require('../providers/modelPolicy');
 
 function cleanText(value) {
@@ -37,7 +38,16 @@ async function synthesizeEncyclopedicDossier({ topic, niche = 'general', apiKey,
   const cleanTopic = cleanText(topic);
   if (!cleanTopic) throw new Error('Topic is required for research synthesis');
 
-  const selectedModel = isAgentHandle(apiKey) ? 'external-agent' : normalizeModel(model || MODEL);
+  // Either agent handle format routes to Muse — never through OpenRouter's
+  // model policy. 'external-agent:' is the paired-agent HTTP transport,
+  // 'agent-bridge:' is the Vidnets inbox transport. A handle-derived model
+  // string such as 'agent-bridge' is not an OpenRouter model id, so
+  // normalizeModel must never see it (it throws and the synthesis — and
+  // with it the whole job — dies before Muse is ever asked).
+  const isBridge = isBridgeHandle(apiKey);
+  const selectedModel = isAgentHandle(apiKey) ? 'external-agent'
+    : isBridge ? 'agent-bridge'
+    : normalizeModel(model || MODEL);
 
   const systemPrompt = `You are an encyclopedic historical and documentary researcher.
 Your task is to provide an accurate, chronological, factual research briefing on the topic: "${cleanTopic}".
@@ -69,7 +79,26 @@ Output JSON schema:
 Provide at least 8 specific factual claims and at least 3 dated timeline entries. Output valid JSON only.`;
 
   let content = '';
-  if (isAgentHandle(apiKey)) {
+  if (isBridge) {
+    const res = await agentBridgeChat({
+      apiKey,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      responseFormat: { type: 'json_object' },
+      maxTokens: 2500,
+      // Was 180000: the caller expired the request while the 600s bridge
+      // wall (Vidnets agent_post floor) still allowed the operator to
+      // answer. Match the bridge wall so one synthesis attempt gets the
+      // full window instead of dying at 3 minutes.
+      timeoutMs: 600000,
+      operation: 'scriptit.research-synthesis',
+      kind: 'text',
+      signal
+    });
+    content = res.content || '';
+  } else if (isAgentHandle(apiKey)) {
     const res = await agentChat({
       apiKey,
       messages: [
@@ -78,7 +107,11 @@ Provide at least 8 specific factual claims and at least 3 dated timeline entries
       ],
       responseFormat: { type: 'json_object' },
       maxTokens: 2500,
-      timeoutMs: 180000,
+      // Same synthesis request via the other Muse handle (external-agent):
+      // same 180s -> 600s alignment with the bridge wall. The OpenRouter
+      // branch below (60000) is a real model API, not the bridge, and is
+      // intentionally left alone.
+      timeoutMs: 600000,
       operation: 'scriptit.research-synthesis',
       kind: 'text',
       signal

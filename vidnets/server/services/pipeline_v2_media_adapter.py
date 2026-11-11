@@ -584,10 +584,16 @@ def _mixed_web_scene_worker_limit(config: Mapping[str, Any] | None = None) -> in
 
 
 def _web_recovery_stage_seconds(scene_count: int, workers: int, configured: Any = None) -> float:
-    """Budget bounded query waves so later scenes reach retrieval too."""
+    """Budget bounded query waves so later scenes reach retrieval too.
+
+    An explicitly configured value may run up to 3600s: agent jobs pass
+    their remaining delivery budget here so recovery is bounded by the
+    shared job deadline instead of a fixed 300s cap. The default path
+    stays 90-300s.
+    """
     if configured not in (None, "", 0, "0"):
         try:
-            return max(60.0, min(300.0, float(configured)))
+            return max(60.0, min(3600.0, float(configured)))
         except (TypeError, ValueError):
             pass
     waves = math.ceil(max(1, scene_count) / max(1, workers))
@@ -1881,17 +1887,30 @@ def build_qwen_verifier(
     context_config["visual_call_timeout_seconds"] = visual_timeout
     context_config["visual_call_max_attempts"] = visual_attempts
     context_config["visual_fail_closed"] = True
-    key = str(
-        context_config.get("openrouter_api_key")
-        or context_config.get("openrouterApiKey")
-        or os.environ.get("OPENROUTER_API_KEY")
-        or os.environ.get("VIDZEO_OPENROUTER_API_KEY")
-        or ""
-    ).strip()
-    if key and "visual_understanding" not in context_config:
-        context_config["visual_understanding"] = True
-    if key and "openrouter_api_key" not in context_config:
-        context_config["openrouter_api_key"] = key
+    # Muse inference is compulsory for external_agent jobs: the visual
+    # verifier must be Muse through the agent-bridge inbox, never Qwen
+    # via OpenRouter — even if an OpenRouter key is present in the
+    # environment or the job config. The worker side refuses to start or
+    # render with such a key set; this server-side gate is the second
+    # layer, so a stray key can never be selected for an agent job.
+    # visual_fail_closed stays True above: without a Muse verdict, the
+    # candidate is discarded instead of silently accepted.
+    if external_agent:
+        key = ""
+        context_config["openrouter_api_key"] = ""
+        context_config["openrouterApiKey"] = ""
+    else:
+        key = str(
+            context_config.get("openrouter_api_key")
+            or context_config.get("openrouterApiKey")
+            or os.environ.get("OPENROUTER_API_KEY")
+            or os.environ.get("VIDZEO_OPENROUTER_API_KEY")
+            or ""
+        ).strip()
+        if key and "visual_understanding" not in context_config:
+            context_config["visual_understanding"] = True
+        if key and "openrouter_api_key" not in context_config:
+            context_config["openrouter_api_key"] = key
     # A legacy provider may leave a disabled transport context on the config.
     # It is not a valid final semantic verifier: reuse only an already-enabled
     # job context, otherwise construct the verifier from the current config so
@@ -2885,7 +2904,7 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
 
     Explicit accepted-coverage overrides and explicit per-channel UI source
     maps control the quota. Generated niche/prebuilt preferences do not lower
-    the default 60% scene-slot target; that target remains best-effort because
+    the default 30% scene-slot target; that target remains best-effort because
     relevance and reuse-clearance checks decide which clips may be accepted.
     """
     explicit_keys = ("youtube_accepted_coverage_target", "youtube_coverage_target", "youtube_target_percentage", "yt_percentage", "footage_percentage", "video_percentage", "youtube_percentage", "youtube_ratio")
@@ -2911,7 +2930,7 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
 
     # Explicit per-channel UI percentages are authoritative when present.
     # Generated niche/prebuilt weights are preferences; the shared default
-    # target remains 60% and never bypasses candidate relevance checks.
+    # target remains 30% and never bypasses candidate relevance checks.
     candidate_maps = []
     raw_weights = config.get("mixed_media_weights") or config.get("media_weights")
     if isinstance(raw_weights, Mapping):
@@ -2930,7 +2949,7 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
         except (TypeError, ValueError):
             continue
 
-    return 0.60
+    return 0.30
 
 
 def _automatic_youtube_scene_indices(
@@ -3177,6 +3196,29 @@ def _mixed_youtube_branch_wall_seconds(config: Mapping[str, Any]) -> float:
         requested, _ = mixed_youtube_time_budget(
             quota_count, requested, download_workers=1, coverage_target=1.0,
         )
+    if str(config.get("llm_provider") or "") == "external_agent":
+        # No fixed branch wall for agent jobs: the shared delivery budget
+        # (which scales with the job) is the only bound. A fixed 360s cap
+        # starves long-form YouTube retrieval that legitimately needs
+        # longer; the media stage deadline still clamps to the budget.
+        try:
+            from .delivery_budget import get_delivery_budget
+
+            _budget = get_delivery_budget(config)
+        except Exception:
+            _budget = None
+        if _budget is not None:
+            try:
+                _reserve = float(
+                    config.get("_render_reserve_seconds")
+                    or _budget.render_reserve_seconds
+                )
+            except (TypeError, ValueError):
+                _reserve = float(_budget.render_reserve_seconds)
+            requested = max(
+                requested,
+                _budget.allowance(None, reserve_after_seconds=_reserve),
+            )
     return max(120.0, requested)
 
 
@@ -3279,6 +3321,17 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
         delivery_budget = get_delivery_budget(config)
     except Exception:
         delivery_budget = None
+    # Floor: never collapse the media stage below one agent round-trip (or
+    # 300s). A 1s wall terminalises every scene as a graphic fallback and
+    # silently produces a footage-free video. The delivery budget is a soft
+    # target; real footage matters more than the clock.
+    if str(config.get('llm_provider') or '') == 'external_agent':
+        try:
+            media_floor = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
+        except (TypeError, ValueError):
+            media_floor = 600.0
+    else:
+        media_floor = 300.0
     if delivery_budget is not None:
         try:
             reserve_after = float(
@@ -3292,8 +3345,8 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
             reserve_after_seconds=reserve_after,
         )
         if available <= 0.0:
-            return 1.0
-        return max(1.0, min(computed, available))
+            return media_floor
+        return max(media_floor, min(computed, available))
     return computed
 
 
@@ -5546,10 +5599,35 @@ def resolve_existing_provider_branches_v2(
                     value = float(default)
                 return max(float(lower), min(float(upper), value))
 
+            _recovery_configured = config.get("web_fallback_stage_deadline_seconds")
+            if (
+                _recovery_configured in (None, "", 0, "0")
+                and str(config.get("llm_provider") or "") == "external_agent"
+            ):
+                # Agent jobs: recovery is bounded by the shared delivery
+                # budget, not a fixed 300s cap, so long-form jobs keep
+                # rescuing rejected scenes instead of giving up on them.
+                try:
+                    from .delivery_budget import get_delivery_budget
+
+                    _recovery_budget = get_delivery_budget(config)
+                except Exception:
+                    _recovery_budget = None
+                if _recovery_budget is not None:
+                    try:
+                        _recovery_reserve = float(
+                            config.get("_render_reserve_seconds")
+                            or _recovery_budget.render_reserve_seconds
+                        )
+                    except (TypeError, ValueError):
+                        _recovery_reserve = float(_recovery_budget.render_reserve_seconds)
+                    _recovery_configured = _recovery_budget.allowance(
+                        None, reserve_after_seconds=_recovery_reserve
+                    )
             lane_config["web_stage_deadline_seconds"] = _web_recovery_stage_seconds(
                 len(active_indices),
                 int(lane_config.get("web_max_scene_workers") or 6),
-                config.get("web_fallback_stage_deadline_seconds"),
+                _recovery_configured,
             )
             lane_config["web_query_deadline_seconds"] = max(
                 1.5,
@@ -5638,6 +5716,41 @@ def resolve_existing_provider_branches_v2(
                 )
             except (TypeError, ValueError):
                 web_wall_cap = max(web_wall_floor, 180.0)
+            if str(config.get("llm_provider") or "") == "external_agent":
+                # Agent-driven jobs answer through the local inbox and the
+                # user requires quality over speed: no fixed wall here. The
+                # shared delivery budget already scales with the job (long
+                # jobs get up to 7200s), so it is the only bound — a fixed
+                # 600s cap would starve long-form discovery that legitimately
+                # needs longer. Fall back to the agent wall when no budget
+                # is installed yet.
+                try:
+                    agent_wall = max(
+                        60.0,
+                        float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600),
+                    )
+                except (TypeError, ValueError):
+                    agent_wall = 600.0
+                try:
+                    from .delivery_budget import get_delivery_budget
+
+                    _budget = get_delivery_budget(config)
+                except Exception:
+                    _budget = None
+                if _budget is not None:
+                    try:
+                        _reserve = float(
+                            config.get("_render_reserve_seconds")
+                            or _budget.render_reserve_seconds
+                        )
+                    except (TypeError, ValueError):
+                        _reserve = float(_budget.render_reserve_seconds)
+                    agent_wall = max(
+                        agent_wall,
+                        _budget.allowance(None, reserve_after_seconds=_reserve),
+                    )
+                web_wall_floor = agent_wall
+                web_wall_cap = max(web_wall_cap, agent_wall)
             # Ultra-long documentaries need a larger aggregate web window,
             # but short/medium jobs should keep the fast 120s cap.  Scale the
             # cap only once the storyboard is large enough to amortize the
@@ -5680,6 +5793,13 @@ def resolve_existing_provider_branches_v2(
                 "   [budget] mixed web wall: disabled; waiting for all provider workers",
                 flush=True,
             )
+        if str(config.get("llm_provider") or "") == "external_agent":
+            # Agent jobs wait for every provider. The per-query 15s wall
+            # discarded real results under proxy load (Bing/Yandex return
+            # in ~50s); with wait_until_complete the resolver sets no
+            # stage/query wall and transport timeouts (300s) plus the
+            # delivery budget still bound the stage.
+            lane_config["web_wait_until_complete"] = True
         try:
             bundle = web_runner(
                 local_scene_texts,

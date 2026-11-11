@@ -20,18 +20,23 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
     hard = min(internal, positive(settings.get('yt_hard_timeout_seconds'), internal))
     search_ceiling = min(120.0, hard * 0.28)
     search = min(search_ceiling, positive(settings.get('yt_search_timeout_seconds'), search_ceiling))
-    if 0 < scene_count <= 12:
+    if 0 < scene_count <= 12 and str(settings.get('llm_provider') or '') != 'external_agent':
+        # Short non-agent jobs keep the fast 35s search cap. Agent jobs
+        # answer through the local inbox and fan out dozens of yt-dlp
+        # searches: 35s timed out the whole search phase with 0 candidates
+        # even though a single yt-dlp search answers in ~3s. Agent jobs
+        # keep the ceiling instead; the branch wall still bounds the stage.
         search = min(search, 35.0)
     plan = {'yt_search_timeout_seconds': search, 'yt_hard_timeout_seconds': hard}
     if scene_count > 0 and not settings.get('yt_pool_first'):
         preselected = bool(settings.get('_youtube_quota_preselected'))
         try:
             coverage = 1.0 if preselected else float(settings.get('youtube_accepted_coverage_target',
-                                                                    settings.get('youtube_coverage_target', 0.60)))
+                                                                    settings.get('youtube_coverage_target', 0.30)))
             if not math.isfinite(coverage):
-                coverage = 1.0 if preselected else 0.60
+                coverage = 1.0 if preselected else 0.30
         except (TypeError, ValueError):
-            coverage = 1.0 if preselected else 0.60
+            coverage = 1.0 if preselected else 0.30
         coverage = max(0.0, min(1.0, coverage))
         target_scenes = max(1, math.ceil(scene_count * coverage))
         waves = math.ceil(target_scenes / max(1, int(download_workers)))

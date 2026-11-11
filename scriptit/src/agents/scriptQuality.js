@@ -266,7 +266,14 @@ function assessScript({ script, topic = '', wordTarget, previousScripts = [], co
   if (maxSimilarity > 0.22) issues.push('The draft is too similar to a recent script.');
   const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
   const minAllowedWords = wordTarget ? Math.max(10, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance)) : 0;
-  if (wordTarget && (words < minAllowedWords || lengthRatio > 1.35)) issues.push('The draft misses the requested length.');
+  // The upper bound must leave room for the writer's own aim: the revision
+  // prompt tells the model to aim for wordTarget + max(50, 8%), i.e. a
+  // 1.31 ratio at 160 words, and a model overshoots that aim by a few
+  // percent. The old 1.35 cap rejected a good 219-word draft for a
+  // 160-word target (ratio 1.37) — 3 words over the cap — and failed the
+  // job. 1.5 still catches real overshoots (a 2x script); the CMS only
+  // enforces a duration floor, so a modestly long narration is valid.
+  if (wordTarget && (words < minAllowedWords || lengthRatio > 1.5)) issues.push('The draft misses the requested length.');
   if (words >= 180 && paragraphs.length < 3) issues.push('The draft has no usable spoken pacing breaks.');
   if (words >= 180 && !hook) issues.push('The opening does not create a specific question, tension, or concrete scene.');
   if (questionCount > Math.max(4, Math.ceil(words / 180))) issues.push('The draft overuses rhetorical questions.');

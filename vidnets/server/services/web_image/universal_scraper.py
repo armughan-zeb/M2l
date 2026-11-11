@@ -29,7 +29,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from ..job_context import JobThreadPoolExecutor as ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
@@ -259,14 +259,21 @@ class YandexEngine(_Engine):
         if safe_search:
             url += "&family=yes"
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=6)
+            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=6)
+            response = requests.get(url, headers=_HEADERS, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Yandex returned HTTP status {status}")
         raw = html.unescape(str(getattr(response, "text", "") or ""))
+        # Yandex serves its SmartCaptcha page (HTTP 200) instead of results
+        # when the egress IP is gated. Same markers as ScriptIT's
+        # isYandexChallengePage(): fail fast with the real reason instead of
+        # returning a silent empty list that looks like "no results".
+        if re.search(r"captcha_smart", raw, re.I) and re.search(r"captcha", raw, re.I) \
+                and not re.search(r"serp-item|Organic", raw):
+            raise RuntimeError("Yandex bot challenge (SmartCaptcha; egress IP gated)")
         # The source project's unescaped SERP parser is retained here.  The
         # newer state parser often exposes ``img_href`` before card metadata.
         images = [_normalize_url(v) for v in _Y_IMG_RE.findall(raw)]
@@ -315,10 +322,10 @@ class BingEngine(_Engine):
             f"q={urllib.parse.quote(query)}&first={first}&count={limit}&mmasync=1&adlt={safe}"
         )
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=6)
+            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=6)
+            response = requests.get(url, headers=_HEADERS, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Bing returned HTTP status {status}")
@@ -364,12 +371,34 @@ class DuckDuckGoEngine(_Engine):
         if DDGS is None:
             raise RuntimeError("optional dependency 'ddgs' is not installed")
         start = max(0, (page - 1) * limit)
+        # DuckDuckGo intermittently serves a 202 anomaly interstitial from
+        # this egress IP (verified live 2026-11-10: 0 results on one query,
+        # 10 on the next). The old 4s budget was also too tight for a ddgs
+        # call through the throttled proxy, so the budget is now 15s and a
+        # clean empty result is retried once. A hung worker is different:
+        # it must return [] immediately (never retry a hang), per the
+        # timeout contract. A persistent clean empty fails loudly instead
+        # of returning a silent empty list that hid the bot-gate for weeks.
+        for attempt in range(2):
+            try:
+                out = self._search_once(query, limit, start, safe_search)
+            except subprocess.TimeoutExpired:
+                return []
+            if out:
+                return out
+            if attempt == 0:
+                LOGGER.debug("DuckDuckGo empty on attempt 1 for %r; retrying once", query)
+        raise RuntimeError(
+            "DuckDuckGo returned no results after 2 attempts (likely bot-gate interstitial)"
+        )
+
+    def _search_once(self, query: str, limit: int, start: int, safe_search: bool) -> List[UniversalImageResult]:
         out: List[UniversalImageResult] = []
         process = None
         try:
             from ..job_context import check_job_active, remaining_seconds
             check_job_active()
-            budget = min(4.0, remaining_seconds(4.0))
+            budget = min(15.0, remaining_seconds(15.0))
             if budget <= 0:
                 return out
             process = subprocess.Popen(
@@ -380,6 +409,8 @@ class DuckDuckGoEngine(_Engine):
                 'timeout': budget, 'safe_search': safe_search, 'limit': start + limit}), timeout=budget)
             check_job_active()
             raw_items = json.loads(output[:1000000])
+            if not isinstance(raw_items, list):
+                return out
             for idx, item in enumerate(raw_items or []):
                 if idx < start:
                     continue
@@ -395,6 +426,10 @@ class DuckDuckGoEngine(_Engine):
                     out.append(row)
                 if len(out) >= limit:
                     break
+        except subprocess.TimeoutExpired:
+            # Hung worker: the finally block kills it; let the caller see
+            # the timeout so it can return [] without retrying a hang.
+            raise
         except Exception as exc:
             LOGGER.debug("DuckDuckGo search error: %s", exc)
         finally:
@@ -411,6 +446,16 @@ class DuckDuckGoEngine(_Engine):
 class BaiduEngine(_Engine):
     name = "baidu"
 
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _get_client(self):
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = _IsolatedNativeClient() if primp is not None else requests.Session()
+            self._local.client = client
+        return client
+
     def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
         del safe_search
         start = max(0, (page - 1) * limit)
@@ -420,7 +465,11 @@ class BaiduEngine(_Engine):
             f"&fp=result&queryWord={encoded}&word={encoded}&cl=2&lm=-1&ie=utf-8&oe=utf-8"
             f"&pn={start}&rn={limit}"
         )
-        response = requests.get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=5)
+        try:
+            response = self._get_client().get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
+        except Exception:
+            self._local.client = None
+            response = requests.get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Baidu returned HTTP status {status}")
@@ -429,6 +478,13 @@ class BaiduEngine(_Engine):
             data = json.loads(raw, strict=False)
         except Exception as exc:
             raise RuntimeError(f"Baidu JSON parse failed: {exc}")
+        # Baidu answers this egress IP with {"antiFlag": 1, "message":
+        # "Forbid spider access"} (HTTP 200, no results). Fail fast with the
+        # real reason instead of returning a silent empty list.
+        if isinstance(data, dict) and (
+            data.get("antiFlag") or "forbid spider" in str(data.get("message") or "").lower()
+        ):
+            raise RuntimeError("Baidu forbids spider access from this egress IP (antiFlag=1)")
         out: List[UniversalImageResult] = []
         for item in data.get("data", []) if isinstance(data, dict) else []:
             replacements = item.get("replaceUrl") if isinstance(item, dict) else None
@@ -452,13 +508,27 @@ class BaiduEngine(_Engine):
 class OpenverseEngine(_Engine):
     name = "openverse"
 
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _get_client(self):
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = _IsolatedNativeClient() if primp is not None else requests.Session()
+            self._local.client = client
+        return client
+
     def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
         del safe_search
         url = (
             f"https://api.openverse.org/v1/images/?q={urllib.parse.quote(query)}"
             f"&page={max(1, page)}&page_size={min(limit, 50)}"
         )
-        response = requests.get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=6)
+        try:
+            response = self._get_client().get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
+        except Exception:
+            self._local.client = None
+            response = requests.get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Openverse returned HTTP status {status}")
@@ -490,11 +560,25 @@ class OpenverseEngine(_Engine):
 class FlickrEngine(_Engine):
     name = "flickr"
 
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _get_client(self):
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = _IsolatedNativeClient() if primp is not None else requests.Session()
+            self._local.client = client
+        return client
+
     def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
         del safe_search
         tags = urllib.parse.quote(query.replace(" ", ","))
         url = f"https://www.flickr.com/services/feeds/photos_public.gne?tags={tags}&format=json&nojsoncallback=1"
-        response = requests.get(url, headers=_HEADERS, timeout=5)
+        try:
+            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
+        except Exception:
+            self._local.client = None
+            response = requests.get(url, headers=_HEADERS, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Flickr returned HTTP status {status}")
@@ -518,9 +602,18 @@ class FlickrEngine(_Engine):
 
 
 class UniversalScraperManager:
-    """Run the supplied six-engine search strategy as a resolver lane."""
+    """Run the supplied four-engine search strategy as a resolver lane.
 
-    DEFAULT_ENGINES = ("yandex", "bing", "duckduckgo", "baidu", "openverse", "flickr")
+    Baidu and Openverse are NOT in the default set: Baidu answers this
+    egress IP with ``{"antiFlag": 1, "message": "Forbid spider access"}``
+    and api.openverse.org 504s through the egress proxy (verified live
+    2026-11-10). Their engine classes stay available and raise a clear
+    error if called directly, so they can be re-enabled if the egress
+    IP/proxy situation changes — but production must not spend a worker
+    slot on an engine that cannot return results.
+    """
+
+    DEFAULT_ENGINES = ("yandex", "bing", "duckduckgo", "flickr")
 
     def __init__(
         self,
@@ -596,13 +689,14 @@ class UniversalScraperManager:
             return UniversalSearchResponse(clean, 0, [], [])
         engine_timeout = max(
             0.5,
-            min(20.0, float(timeout_seconds or self.engine_timeout_seconds or 6.0))
+            min(300.0, float(timeout_seconds or self.engine_timeout_seconds or 6.0))
         )
-        if wait_until_complete:
-            # wait_until_complete waits for all parallel engines rather than
-            # returning on first completion, but still bounds the wait so stalled
-            # engines (e.g. Baidu, DDG) cannot hang the pipeline.
-            engine_timeout = min(engine_timeout, 6.0)
+        # No forced 6s cap here: wait_until_complete means wait for every
+        # engine up to the batch timeout. A 6s cap discarded every engine
+        # that needed longer than 6s under proxy load (Bing/Yandex return
+        # 20 results in ~50s), so batches came back empty. The batch wall
+        # itself (engine_timeout) and the stage/delivery walls above it
+        # already bound stalled engines.
         timeout_label = f"{engine_timeout:.1f}s"
         self._log(
             f"[universal] batch start query='{clean[:72]}' engines={','.join(selected)} "
@@ -683,6 +777,33 @@ class UniversalScraperManager:
                 seen.add(key)
                 merged.append(row)
         stats = [stats_by_engine.get(e, UniversalEngineStat(e, 0, 0, False, "engine timeout")) for e in selected]
+        # Host learning (no reordering: engine round-robin order and relevance
+        # are untouched). Tag each row with whether its image host is already
+        # in the persistent seen-host store, so the resolver can prefer
+        # already-approved hosts at download time without spending a fresh
+        # per-host approval card. The store is learned from actual downloads
+        # (see host_allowlist), never from discovery alone.
+        try:
+            from .host_allowlist import is_seen_host, load_seen_hosts
+
+            _seen = load_seen_hosts()
+            _new_hosts = set()
+            annotated: List[UniversalImageResult] = []
+            for _row in merged:
+                _host = urlparse(_row.image_url).netloc.lower()
+                if _host and not is_seen_host(_host, _seen):
+                    _new_hosts.add(_host)
+                annotated.append(
+                    _dc_replace(
+                        _row,
+                        metadata={**dict(_row.metadata or {}), "host_seen": is_seen_host(_host, _seen)},
+                    )
+                )
+            merged = annotated
+            if _new_hosts:
+                self._log(f"[universal] batch surfaced {len(_new_hosts)} unseen image host(s)")
+        except Exception:
+            pass
         response = UniversalSearchResponse(clean, len(merged), merged, stats)
         with self._lock:
             self._last_response = response
@@ -728,6 +849,10 @@ def universal_result_to_candidate(row: UniversalImageResult, query: str = "") ->
         "license": str(row.metadata.get("license") or ""),
         "license_url": str(row.metadata.get("foreign_url") or ""),
         "rights_status": str(row.metadata.get("rights_status") or "unknown"),
+        # Set by UniversalScraperManager.search from the persistent
+        # seen-host store; the resolver uses it to prefer already-approved
+        # hosts at download time. Absent (False) for rows from other lanes.
+        "host_seen": bool(row.metadata.get("host_seen")),
     }
 
 

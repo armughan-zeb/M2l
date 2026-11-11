@@ -1387,3 +1387,222 @@ def test_quota_retention_upgrades_fallback_stills_to_ready_youtube_cuts(tmp_path
     assert result[1].provider == "youtube"
     assert result[1].media_type == "video"
     assert result[1].selected_path == str(clip_1)
+
+
+def _quota_retention_strict_scene(tmp_path, clip_path, still_path, pool_decision_extra=None):
+    """One strict quota scene whose YouTube cut arrives late (lazy lane).
+
+    Mirrors ff377408: the clip is downloaded and on disk, its pool decision
+    is still ``visual_verification_pending`` (no live vision verdict yet),
+    and the scene falls back to a web still in the primary gate.
+    """
+    clip_path.write_bytes(b"verified rail crew cut bytes")
+    still_path.write_bytes(b"web still bytes")
+    scene = {
+        "scene_id": "quota-strict-scene",
+        "scene_index": 0,
+        "container_id": "rail-crew",
+        "text": "Test rail crew operations documentary scene",
+        "visual_requirement": {
+            "strict_identity": True,
+            "domain": "rail_transport",
+            "subject_type": "rail_crew",
+            "canonical_entity": "Test Rail Crew",
+            "requirement_hash": "quota-strict-requirement-hash",
+        },
+        "source_policy": {
+            "mixed_media": True,
+            "youtube_quota": True,
+        },
+    }
+
+    class FakeLazyYoutubeLane:
+        def __init__(self):
+            self._calls = 0
+            # Deliberately NOT named ``_rows``: the batch promoter falls
+            # back to ``lane._rows`` when get_row returns None, which would
+            # leak the cut into the primary gate.
+            self._late_rows = {
+                0: {
+                    "path": str(clip_path),
+                    "source": "youtube",
+                    "provider": "youtube",
+                    "media_type": "video",
+                    "status": "downloaded",
+                    "verification_status": "visual_verification_pending",
+                    "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    "asset_fingerprint": "quota-strict-clip",
+                    "overlay_clean": True,
+                    "title": "Test rail crew operations footage",
+                    "visual_decision": {
+                        "accepted": False,
+                        "status": "visual_verification_pending",
+                        "source": "youtube_pool_moment",
+                        "recovery_kind": "disk_verified_pool_cut",
+                        "visual_checked": False,
+                        "semantic_verified": False,
+                        "visual_available": False,
+                        "deterministic_only": True,
+                        "requirement_hash": "quota-strict-requirement-hash",
+                        **(pool_decision_extra or {}),
+                    },
+                },
+            }
+
+        def __call__(self, scene, cancel_event):
+            return None
+
+        def get_row(self, index, timeout=0.0):
+            # The cut finishes downloading after the pre-gate batch
+            # promotions (two get_row calls) but before quota retention:
+            # the production case the quota lane exists for. Returning it
+            # earlier would let the primary gate select it directly and
+            # the test would not exercise the upgrade construction.
+            self._calls += 1
+            if self._calls <= 2:
+                return None
+            return self._late_rows.get(index)
+
+    def fake_web_lane(scene, _cancel_event):
+        return {
+            "path": str(still_path),
+            "source": "web",
+            "provider": "web",
+            "media_type": "image",
+            "status": "accepted",
+            "verification_status": "verified",
+            "title": "Test rail crew operations photo",
+            "visual_decision": {"accepted": True},
+        }
+
+    return scene, FakeLazyYoutubeLane(), fake_web_lane
+
+
+def test_quota_upgrade_stores_gate_approved_vision_verdict(tmp_path):
+    """A vision-accepted quota clip survives to the final plan (ff377408).
+
+    The late quota lane gives the downloaded clip its bounded vision pass;
+    the upgrade must store that live verdict — accepted + visual_checked +
+    bound requirement hash + bound asset sha — so the downstream contract
+    gate (_visual_requirement_issue) accepts the row instead of rejecting
+    it as 'visual_verdict_rejected'. Before the fix the construction block
+    re-read the candidate's raw pending decision, so the row claimed
+    accepted while its decision said pending, and 3 of 4 retained clips
+    were dropped to graphics.
+    """
+    import hashlib
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+    from services.pipeline_v2_media_adapter import _visual_requirement_issue
+
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _quota_retention_strict_scene(tmp_path, clip, still)
+    clip_sha = hashlib.sha256(clip.read_bytes()).hexdigest()
+
+    def live_verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            return {
+                "accepted": True,
+                "status": "accepted",
+                "visual_checked": True,
+                "semantic_verified": True,
+                "visual_available": True,
+                "identity_score": 90.0,
+                "final_score": 90.0,
+                "reason": "Authentic rail crew footage",
+            }
+        return {"accepted": True, "status": "accepted", "visual_checked": True}
+
+    result = resolve_storyboard_media_v2(
+        [scene],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        visual_verifier=live_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+    )
+
+    assert result[0].provider == "youtube"
+    assert result[0].selected_path == str(clip)
+    decision = dict(result[0].visual_decision or {})
+    assert decision.get("accepted") is True
+    assert decision.get("visual_checked") is True
+    assert decision.get("verified_requirement_hash") == "quota-strict-requirement-hash"
+    assert decision.get("verified_asset_sha256") == clip_sha
+    assert any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+    # The downstream gate that dropped ff377408 scenes 1, 2, 6 must accept
+    # this row: a live, bound vision verdict is present.
+    assert (
+        _visual_requirement_issue(scene, result[0].to_dict(), result[0], "YouTube Clips")
+        == ""
+    )
+
+
+def test_quota_upgrade_never_mints_acceptance_from_download_alone(tmp_path):
+    """A downloaded clip with no live vision accept is not upgraded.
+
+    Fail-closed: the pool already looked at this cut (visual_checked) and
+    did not accept it, and the coordinator has no live gated verdict for
+    it — the late lane skips already-checked candidates. The only remaining
+    evidence is "the file exists and is clean" (the ff377408 shape: the
+    clip downloaded, vision never accepted it). Quota retention must leave
+    the scene on its web still instead of minting accepted/visual_checked
+    from the download and promoting a clip the downstream gate then
+    rejects as unverified.
+    """
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _quota_retention_strict_scene(
+        tmp_path, clip, still, pool_decision_extra={"visual_checked": True}
+    )
+
+    def unavailable_verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            return {"accepted": False, "status": "vision_unavailable", "visual_available": False}
+        return {"accepted": True, "status": "accepted", "visual_checked": True}
+
+    result = resolve_storyboard_media_v2(
+        [scene],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        visual_verifier=unavailable_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+    )
+
+    assert result[0].provider == "web"
+    assert result[0].selected_path == str(still)
+    assert not any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+
+
+def test_late_verification_deadline_floors_when_delivery_wall_spent():
+    """The late quota vision lane still runs when the delivery wall is spent.
+
+    ff377408: YouTube discovery took 954s of a 1033s media deadline, so the
+    delivery deadline was already past when quota retention ran and the old
+    min() clamp made the late lane dead on arrival. The floor keeps a
+    bounded window (at most the configured late seconds, capped at 60s past
+    the wall) for already-downloaded clips only; it never reopens discovery.
+    """
+    import time
+
+    from services.media_resolution_coordinator import _late_local_verification_deadline
+
+    now = time.monotonic()
+    spent = _late_local_verification_deadline(2, delivery_deadline=now - 10.0)
+    # +1s tolerance: ``now`` was captured just before the call.
+    assert now < spent <= now + 61.0
+    future = _late_local_verification_deadline(2, delivery_deadline=now + 30.0)
+    assert now < future <= now + 31.0
+    assert _late_local_verification_deadline(0, delivery_deadline=now - 10.0) <= now + 1.0

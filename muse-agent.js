@@ -7,7 +7,7 @@
  *   node muse-agent.js pair --cms http://HOST:3210 --code MUSE-XXXX-XXXX [--name "Studio GPU"]
  *   node muse-agent.js start
  *   node muse-agent.js claim [--wait 60]
- *   node muse-agent.js deliver --job <id> [--script file] [--video file] [--thumbnail file]
+ *   node muse-agent.js deliver --job <id> [--script file] [--video file] [--thumbnail file] [--skip-thumbnail] [--allow-all-graphic]
  *   node muse-agent.js fail --job <id> --error "reason"
  *   node muse-agent.js status
  *   node muse-agent.js doctor
@@ -26,6 +26,7 @@ const { createClient, publicStatus } = require('./lib/cms');
 const { jsonRequest } = require('./lib/httpClient');
 const jobRunner = require('./lib/jobRunner');
 const { sleep } = require('./lib/sleep');
+const { retryDelayMs, cmsRetryOptions } = require('./lib/cmsRetry');
 const ffmpeg = require('./lib/ffmpeg');
 const python = require('./lib/python');
 const vidnets = require('./adapters/vidnets');
@@ -59,8 +60,13 @@ function capabilities() {
   return list;
 }
 
-function heartbeatInfo(currentJobId = '') {
-  return {
+function heartbeatInfo(currentJobId = '', current = null) {
+  // The heartbeat is the second live channel to the CMS (every 20s):
+  // besides status/currentJobId it now carries the job's current stage,
+  // percent and detail, so the CMS can show live progress even if a
+  // progress POST is lost to a transient outage. Unknown fields are
+  // ignored by the CMS when it does not know them.
+  const info = {
     status: currentJobId ? 'busy' : 'idle',
     currentJobId,
     deviceId: config.deviceId(),
@@ -68,6 +74,12 @@ function heartbeatInfo(currentJobId = '') {
     platform: platform(),
     capabilities: capabilities()
   };
+  if (currentJobId && current && typeof current.stage === 'string') {
+    info.currentStage = current.stage;
+    info.currentProgress = current.progress;
+    info.currentDetail = current.detail;
+  }
+  return info;
 }
 
 function requireClient() {
@@ -195,13 +207,20 @@ async function statusCommand() {
       jobId: active.jobId,
       title: active.payload?.title || '',
       attempt: active.attempt || 1,
-      workDir: config.workDir(active.jobId)
+      workDir: config.workDir(active.jobId),
+      // Last known stage from the live progress checkpoint (progress.json),
+      // so `status` shows where the job really is without asking the CMS.
+      lastProgress: jobRunner.readProgressCheckpoint(config.workDir(active.jobId))
     } : null
   };
   if (saved.token) {
     try {
       const client = createClient({ baseUrl: config.cmsUrl(saved), token: saved.token });
-      const heartbeat = await client.heartbeat(heartbeatInfo(active?.jobId || ''));
+      const heartbeat = await client.heartbeat(heartbeatInfo(active?.jobId || '', active ? {
+        stage: result.activeJob?.lastProgress?.stage,
+        progress: result.activeJob?.lastProgress?.progress,
+        detail: result.activeJob?.lastProgress?.detail
+      } : null));
       result.cmsMode = heartbeat.mode;
       result.activeWorker = heartbeat.active === true;
       result.connected = true;
@@ -277,14 +296,34 @@ async function doctorCommand() {
   add('Python 3', py.ok ? 'pass' : 'warn',
     py.ok ? `${py.binary}${py.version ? ' (v' + py.version + ')' : ''}` : 'Not found. Install python3 (e.g. sudo apt install python3) or set VIDNETS_PYTHON.');
 
-  add('Script adapter', String(process.env.MUSE_SCRIPT_COMMAND || '').trim() ? 'pass' : 'warn',
-    String(process.env.MUSE_SCRIPT_COMMAND || '').trim() || 'Automated mode needs MUSE_SCRIPT_COMMAND. Agent-driven mode writes script.txt and uses "deliver".');
+  add('Script adapter', 'pass',
+    String(process.env.MUSE_SCRIPT_COMMAND || '').trim()
+    || 'Default ScriptIT CLI in agent-bridge mode (Muse inference compulsory; template fallback is opt-in only).');
 
   const renderCommand = String(process.env.MUSE_RENDER_COMMAND || '').trim();
   if (renderCommand) {
     add('Render adapter', 'pass', renderCommand);
-    add('Muse inference', 'pass', 'Handled by the render command');
   } else {
+    add('Render adapter', 'fail',
+      'No MUSE_RENDER_COMMAND is set. Production renders must use render-vidnets-linux.js ' +
+      '(Vidnets + Muse agent-bridge inbox). The native Remotion engine is not a render path.');
+  }
+
+  // Muse inference is COMPULSORY and is verified for real: Vidnets server
+  // healthy, agent-bridge inbox writable, vidnets-inbox-watch hook enabled,
+  // and no OpenRouter key in the environment. A render command alone proves
+  // nothing — an earlier doctor marked inference PASS with "Handled by the
+  // render command" without checking any of this.
+  {
+    const { verifyMuseInferenceBridge } = require('./lib/museInference');
+    const inference = await verifyMuseInferenceBridge(process.env);
+    add('Muse inference (compulsory)', inference.ok ? 'pass' : 'fail',
+      inference.ok
+        ? 'Vidnets server healthy; agent-bridge inbox writable; vidnets-inbox-watch hook enabled; no OpenRouter key'
+        : inference.failures.join('; '));
+  }
+
+  if (!renderCommand) {
     let remotionReady = false;
     try {
       require('@remotion/bundler');
@@ -298,12 +337,14 @@ async function doctorCommand() {
       } catch (_) {}
     }
 
-    add('Remotion Engine', remotionReady ? 'pass' : 'warn',
+    // The native Remotion engine is NOT a render path: it fetches no media
+    // and uses no Muse inference. It is listed here only for diagnosis.
+    add('Remotion Engine', 'fail',
       remotionReady
-        ? 'Native Remotion documentary engine active (Maps, Word Highlights, Blueprints, SFX)'
-        : 'Remotion packages not installed. Run "npm install" or bash setup-linux.sh');
+        ? 'Native Remotion engine is installed, but it is not a render path — it renders graphics with no media and no Muse inference. Set MUSE_RENDER_COMMAND to render-vidnets-linux.js.'
+        : 'Remotion packages not installed. Set MUSE_RENDER_COMMAND to render-vidnets-linux.js.');
 
-    // Built-in Vidnets is optional when native Remotion is used
+    // Built-in Vidnets launcher (only relevant when Vidnets is configured)
     if (process.env.MUSE_VIDNETS_COMMAND || process.env.MUSE_VIDNETS_ROOT) {
       try {
         const command = vidnets.agentCommand();
@@ -353,13 +394,59 @@ async function claimCommand(args) {
 
   const job = claim.job;
   const digest = jobRunner.payloadDigest(job);
+  // RESUME RULE (Nov 10, 2026): same job ID = same job. Before printing
+  // fresh-run instructions, check whether this job already has local
+  // work — a finished master is delivered, mid-run work is resumed.
+  const inspected = await jobRunner.inspectClaim(job);
+  const decision = inspected.decision;
+  const existing = inspected.existing;
   const workDir = jobRunner.prepareWorkDir(job, digest);
   config.writeActiveJob({ jobId: job.jobId, payload: job, attempt: claim.attempt || 1, digest, startedAt: new Date().toISOString() });
-  log.info(`Claimed Muse job ${job.jobId}: ${job.title}`);
+  log.info(`Claimed Muse job ${job.jobId}: ${job.title} — ${decision.decision} (${decision.reason})`);
   const summary = jobRunner.jobSummary(job);
   const scriptPath = path.join(workDir, 'script.txt');
   const videoPath = path.join(workDir, 'video.mp4');
   const thumbnailPath = path.join(workDir, 'thumbnail.jpg');
+
+  // The instructions follow the claim decision, not a fresh run: when an
+  // existing master is on disk the operator delivers it; when mid-run
+  // work exists the daemon re-attaches to it. Only a job with no local
+  // work gets the script/render/deliver steps.
+  let instructions;
+  if (decision.decision === 'deliver' && existing) {
+    const master = existing.masterPath || existing.vidnetsMasterPath || (existing.vidnetsMp4s && existing.vidnetsMp4s[0]) || videoPath;
+    const deliverParts = [`node muse-agent.js deliver --job ${job.jobId}`, `--script ${path.join(existing.directory, 'script.txt')}`, `--video ${master}`];
+    // Thumbnails are skipped by this worker (VIDZEO_SKIP_THUMBNAILS=1):
+    // never ask for one, and pass --skip-thumbnail so deliver does not
+    // generate or upload one.
+    if (jobRunner.thumbnailsSkipped()) deliverParts.push('--skip-thumbnail');
+    else if (existing.thumbnailPath) deliverParts.push(`--thumbnail ${existing.thumbnailPath}`);
+    instructions = [
+      `EXISTING WORK FOUND (${decision.reason}). Do NOT regenerate the script or re-render the video.`,
+      `DELIVER: ${deliverParts.join(' ')}`
+    ];
+  } else if (decision.decision === 'resume') {
+    instructions = [
+      `EXISTING WORK FOUND (${decision.reason}). Do NOT start from the script stage.`,
+      `RESUME: run "node muse-agent.js start" — the daemon re-attaches to the saved work and continues it.`
+    ];
+  } else {
+    const steps = [
+      `1. SCRIPT: Write complete source-grounded narration matching channel style to scriptPath (${scriptPath}). Target: ~${summary.targetWordCount} words (at least ${summary.minimumWords} words required for ${summary.targetDurationMinutes}min duration).`,
+      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`
+    ];
+    // Thumbnails are skipped by this worker — no thumbnail step, and the
+    // deliver step carries --skip-thumbnail (Nov 10, 2026).
+    if (jobRunner.thumbnailsSkipped()) {
+      steps.push('3. DELIVER: Once the script and master exist in workDir, run: node muse-agent.js deliver --job ' + job.jobId + ' --skip-thumbnail');
+    } else {
+      steps.push(
+        `3. THUMBNAIL: Create a high-CTR 16:9 thumbnail styled after the reference (${summary.thumbnailStyle.referenceImageUrl || summary.thumbnailStyle.referenceUrl || 'see concept'}) executing concept "${summary.thumbnailStyle.concept}" to thumbnailPath (${thumbnailPath}).`,
+        `4. DELIVER: Once all files exist in workDir, run: node muse-agent.js deliver --job ${job.jobId}`
+      );
+    }
+    instructions = steps;
+  }
 
   console.log(JSON.stringify({
     ok: true,
@@ -370,14 +457,13 @@ async function claimCommand(args) {
       scriptPath,
       videoPath,
       thumbnailPath,
-      inferenceDir: path.join(workDir, 'inference')
+      inferenceDir: path.join(workDir, 'inference'),
+      claimDecision: decision.decision,
+      claimReason: decision.reason,
+      existingWorkDir: existing ? existing.directory : null,
+      existingWorkSource: existing ? existing.source : null
     },
-    instructions: [
-      `1. SCRIPT: Write complete source-grounded narration matching channel style to scriptPath (${scriptPath}). Target: ~${summary.targetWordCount} words (at least ${summary.minimumWords} words required for ${summary.targetDurationMinutes}min duration).`,
-      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`,
-      `3. THUMBNAIL: Create a high-CTR 16:9 thumbnail styled after the reference (${summary.thumbnailStyle.referenceImageUrl || summary.thumbnailStyle.referenceUrl || 'see concept'}) executing concept "${summary.thumbnailStyle.concept}" to thumbnailPath (${thumbnailPath}).`,
-      `4. DELIVER: Once all files exist in workDir, run: node muse-agent.js deliver --job ${job.jobId}`
-    ]
+    instructions
   }, null, 2));
 }
 
@@ -390,7 +476,14 @@ async function deliverCommand(args) {
     attempt,
     scriptFile: args.script ? String(args.script) : '',
     videoFile: args.video ? String(args.video) : '',
-    thumbnailFile: args.thumbnail ? String(args.thumbnail) : ''
+    thumbnailFile: args.thumbnail ? String(args.thumbnail) : '',
+    // Refusing an all-graphic master is the default (BNSF incident, Nov 10,
+    // 2026). Only an explicit --allow-all-graphic ships blank cards.
+    allowAllGraphic: args['allow-all-graphic'] === true,
+    // Thumbnails are skipped by this worker (VIDZEO_SKIP_THUMBNAILS=1 in
+    // the Docker package). --skip-thumbnail forces the skip even when the
+    // env var is unset; without either, a --thumbnail file is used.
+    skipThumbnail: args['skip-thumbnail'] === true
   });
   console.log(JSON.stringify({
     ok: result.ok === true,
@@ -399,7 +492,9 @@ async function deliverCommand(args) {
     abandoned: result.abandoned || false,
     message: result.abandoned
       ? 'The CMS no longer considers this job active; saved artifacts were kept.'
-      : 'Narration, thumbnail and master delivered. The CMS validates the master before upload.'
+      : result.thumbnailPath
+        ? 'Narration, thumbnail and master delivered. The CMS validates the master before upload.'
+        : 'Narration and master delivered (thumbnail skipped). The CMS validates the master before upload.'
   }, null, 2));
 }
 
@@ -478,7 +573,9 @@ async function startCommand(args) {
     if (heartbeatBusy || stopping) return;
     heartbeatBusy = true;
     try {
-      const response = await client.heartbeat(heartbeatInfo(current?.jobId || ''));
+      // `current` is kept fresh by executeJob's onBusy on every report(),
+      // so the heartbeat carries the live stage/%/detail to the CMS.
+      const response = await client.heartbeat(heartbeatInfo(current?.jobId || '', current));
       if (response.active === false) {
         log.warn('This worker is paired but not the Active Worker. Select it in Muse agents to receive jobs.');
       }
@@ -500,13 +597,11 @@ async function startCommand(args) {
     clearInterval(timer);
     abort.abort();
     if (current?.jobId) {
-      try {
-        await client.fail(current.jobId, 'Muse worker stopped by the operator; saved work is retained; retry the run to resume.');
-        config.clearActiveJob();
-        log.info(`Reported the operator stop for job ${current.jobId}`);
-      } catch (error) {
-        log.warn('Could not report the operator stop; the CMS will retain the job state: ' + error.message);
-      }
+      // Never fail the job or clear the resume marker on shutdown: a SIGTERM
+      // from a VM reboot (or an operator restart) must leave the job
+      // resumable — the next start re-attaches to its checkpoints and
+      // continues. Failing here used to destroy the resume on every reboot.
+      log.info(`Worker stopping with job ${current.jobId} in flight; saved work retained for resume`);
     }
     releaseLock();
     process.exit(code);
@@ -519,12 +614,31 @@ async function startCommand(args) {
   await heartbeat();
   if (fatal) throw fatal;
 
-  const resumed = await jobRunner.resumeActiveJob({
-    client,
-    signal: abort.signal,
-    onBusy: (jobId, stage, progress, detail) => { current = { jobId, stage, progress, detail }; }
-  });
-  if (resumed) {
+  // A deferred resume means the CMS was unreachable while probing the
+  // saved job: the marker is kept and the poll loop below re-attempts
+  // the resume (single probe per iteration, backing off) instead of
+  // claiming a new job or exiting. See lib/jobRunner.js resumeActiveJob.
+  // The initial probe is guarded like the loop's: only a 401 is fatal —
+  // any other throw defers instead of killing the daemon on boot.
+  let resumed = null;
+  try {
+    resumed = await jobRunner.resumeActiveJob({
+      client,
+      signal: abort.signal,
+      onBusy: (jobId, stage, progress, detail) => { current = { jobId, stage, progress, detail }; }
+    });
+  } catch (error) {
+    if (error.status === 401) {
+      fatal = new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
+      throw fatal;
+    }
+    const savedJob = config.readActiveJob();
+    log.warn(`Saved-job resume probe failed at startup (${error.message}); daemon keeps polling and will resume it when the CMS answers`);
+    resumed = { deferred: true, jobId: savedJob?.jobId };
+  }
+  if (resumed?.deferred) {
+    log.warn(`Resume of saved job ${resumed.jobId} deferred (CMS unavailable); daemon keeps polling and will resume it when the CMS answers`);
+  } else if (resumed) {
     log.info(`Saved job ${resumed.ok ? 'delivered' : 'settled without delivery'}`);
     current = null;
   }
@@ -532,15 +646,68 @@ async function startCommand(args) {
   timer = setInterval(() => { heartbeat(); }, heartbeatMs);
   timer.unref?.();
 
+  // Exponential backoff state for the two polling paths. Both reset on
+  // success, so a brief blip costs seconds and a hours-long outage
+  // settles at one probe a minute instead of hammering a down CMS.
+  const retryOptions = cmsRetryOptions();
+  let pollFailures = 0;
+  let resumeFailures = 0;
+
   while (!stopping) {
     if (fatal) break;
+
+    // Never claim a new job while a saved job is still owed a resume:
+    // the previous run may have failed to report its failure to a down
+    // CMS, so the marker is still there and the job must be re-attached
+    // (executeJob reuses its checkpoints) before anything new is claimed.
+    if (config.readActiveJob()) {
+      let retry = null;
+      try {
+        retry = await jobRunner.resumeActiveJob({
+          client,
+          signal: abort.signal,
+          maxAttempts: 1,
+          onBusy: (jobId, stage, progress, detail) => { current = { jobId, stage, progress, detail }; }
+        });
+      } catch (error) {
+        if (error.status === 401) {
+          fatal = new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
+          abort.abort();
+          break;
+        }
+        resumeFailures += 1;
+        const delay = retryDelayMs(resumeFailures - 1, { baseMs: pollMs, maxMs: retryOptions.maxMs });
+        log.warn(`Saved-job resume probe failed (attempt ${resumeFailures}, ${error.message}); retrying in ${Math.round(delay / 1000)}s — saved work retained`);
+        await sleep(delay, abort.signal);
+        continue;
+      }
+      if (retry?.deferred) {
+        resumeFailures += 1;
+        const delay = retryDelayMs(resumeFailures - 1, { baseMs: pollMs, maxMs: retryOptions.maxMs });
+        log.warn(`CMS still unavailable for saved job ${retry.jobId}; resume deferred, re-probing in ${Math.round(delay / 1000)}s — saved work retained`);
+        await sleep(delay, abort.signal);
+        continue;
+      }
+      resumeFailures = 0;
+      if (retry) {
+        log.info(`Saved job ${retry.ok ? 'delivered' : 'settled without delivery'}`);
+        current = null;
+        continue;
+      }
+      // retry === null: the marker was cleared (409 / no checkpoint) —
+      // fall through to normal queue polling below.
+    }
+
     let claim;
     try {
       claim = await client.nextJob();
+      pollFailures = 0;
     } catch (error) {
       if (error.status === 401) throw new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
-      log.warn('Muse job poll failed; retrying: ' + error.message);
-      await sleep(Math.min(30000, pollMs * 4), abort.signal);
+      pollFailures += 1;
+      const delay = retryDelayMs(pollFailures - 1, { baseMs: pollMs, maxMs: retryOptions.maxMs });
+      log.warn(`Muse job poll failed (attempt ${pollFailures}, ${error.message}); retrying in ${Math.round(delay / 1000)}s`);
+      await sleep(delay, abort.signal);
       continue;
     }
 
@@ -555,14 +722,20 @@ async function startCommand(args) {
     current = { jobId: job.jobId };
     log.info(`Claimed Muse job ${job.jobId}: ${job.title}`);
     try {
-      const result = await jobRunner.executeJob({
+      // RESUME RULE (Nov 10, 2026 — BNSF incident): same job ID = same
+      // job. A claim is never a fresh run by default: resolveClaim first
+      // looks up the existing local work for this job id and delivers or
+      // resumes it. Only a job with no local work at all starts fresh.
+      const result = await jobRunner.resolveClaim({
         client,
         job,
         attempt: claim.attempt || 1,
         signal: abort.signal,
         onBusy: (jobId, stage, progress, detail) => { current = { jobId, stage, progress, detail }; }
       });
-      if (result.abandoned) log.warn(`Job ${job.jobId} is no longer active in the CMS; saved work kept`);
+      if (result.decision === 'busy') {
+        log.warn(`Job ${job.jobId} not started: ${result.activeJobId} is still active on this worker — one video at a time`);
+      } else if (result.abandoned) log.warn(`Job ${job.jobId} is no longer active in the CMS; saved work kept`);
     } catch (error) {
       if (error.status === 401) {
         fatal = new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
@@ -609,7 +782,7 @@ Usage:
   node muse-agent.js configure --cms <url>
   node muse-agent.js start [--once]
   node muse-agent.js claim [--wait 60]
-  node muse-agent.js deliver [--job <id>] [--script <file>] [--video <file>] [--thumbnail <file>]
+  node muse-agent.js deliver [--job <id>] [--script <file>] [--video <file>] [--thumbnail <file>] [--skip-thumbnail] [--allow-all-graphic]
   node muse-agent.js fail --job <id> --error "reason"
   node muse-agent.js status
   node muse-agent.js doctor

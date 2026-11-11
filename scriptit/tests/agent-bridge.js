@@ -13,9 +13,14 @@ const { isBridgeHandle, bridgeOwner, agentBridgeChat, AgentBridgeError } = requi
 function requestDirs() {
   const root = process.env.SCRIPTIT_AGENT_BRIDGE_DIR;
   if (!fs.existsSync(root)) return [];
+  // Sort by request-file creation time: the checks below read .at(-1) as
+  // "the newest request", but readdirSync order is filesystem order, not
+  // creation order, so an unsorted listing flaked step 4 (it read an
+  // earlier 'answered' request instead of the expired one).
   return fs.readdirSync(root)
     .map((id) => ({ id, dir: path.join(root, id) }))
-    .filter(({ dir }) => fs.existsSync(path.join(dir, 'request.json')));
+    .filter(({ dir }) => fs.existsSync(path.join(dir, 'request.json')))
+    .sort((a, b) => fs.statSync(path.join(a.dir, 'request.json')).mtimeMs - fs.statSync(path.join(b.dir, 'request.json')).mtimeMs);
 }
 
 function readRequest(dir) {

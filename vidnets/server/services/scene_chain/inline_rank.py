@@ -58,10 +58,11 @@ def build_pipelines(
             client = visual_context.get_client()
         except Exception:
             client = None
+    # Spec: 1-2 frames per clip for vision ranking, frames only.
     try:
-        final_clip_frames = max(3, min(5, int(os.environ.get("VIDZEO_VIP_FINAL_CLIP_FRAMES", "3") or 3)))
+        final_clip_frames = max(1, min(2, int(os.environ.get("VIDZEO_VIP_FINAL_CLIP_FRAMES", "2") or 2)))
     except Exception:
-        final_clip_frames = 3
+        final_clip_frames = 2
     visual_required = bool(getattr(visual_context, "visual_required", False))
     image_pipeline = ImageIntelligencePipeline(client, visual_required=visual_required)
     clip_pipeline = ClipIntelligencePipeline(

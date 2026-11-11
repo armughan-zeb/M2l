@@ -11,6 +11,56 @@ fallback for agent jobs. Reasoning, writing and vision belong to the Muse
 environment; this repository only transports jobs, runs the operator's commands,
 and performs objective media checks.
 
+**Muse inference is compulsory.** Every vision call, script-writing call and
+Vidnets brain / LLM call must go through Muse via the `external_agent`
+agent-bridge inbox, answered by the `vidnets-inbox-watch` hook operator.
+`node muse-agent.js start` refuses to run unless the bridge is verified
+(Vidnets server healthy, agent-bridge inbox writable, hook enabled, no
+OpenRouter key in the environment — see `lib/museInference.js`), and
+`MUSE_AUTO_LOOP=1` never exempts that check. `node muse-agent.js doctor`
+checks the same bridge and FAILS when it is absent. A job whose inference
+goes unanswered fails closed; a job with 0 real-media scenes is never
+delivered as graphics. Before failing for 0 real-media scenes the
+render wrapper attempts one bounded media re-plan with fresh queries (see
+`render-vidnets-linux.js`).
+
+**Filter-best (Nov 9, 2026).** Vidnets' native mixed-media flow is used
+as built: LLM writes queries from the scenes → search YouTube clips +
+web images → filter the BEST (rank, keep the best real media; reject
+only clearly-wrong footage) → Remotion edits. Vision is advisory by
+default (`MUSE_MEDIA_STRICT=0`); the only hard rule is the delivery
+rule above. See `rules.md`, `workflow.md`, and `HYBRID_WIRING.md`
+("Filter-best").
+
+**Simplified pipeline (Nov 9, 2026).** One data pass (all research
+providers in parallel once, one shared deadline
+`MUSE_RESEARCH_TIMEOUT_MS`, default 180s), one script (at most
+`MUSE_SCRIPT_MAX_DRAFTS` model calls, default 2: draft 1 + one fix
+pass — a draft that still fails the gate is returned non-publishable
+and the job fails loudly), one media pass per scene (YouTube clips
+first, then web images, then stock; one bounded re-plan per job
+before a 0-real-media fail), one monitor. All knobs live in
+`.env` / `.env.example`. Full flow and settings:
+`HYBRID_WIRING.md` ("Simplified pipeline").
+
+**Health monitor.** The `vidnets-health-monitor` cron runs
+`~/hooks/scripts/vidnets-health-monitor.sh` every 5 minutes: it checks
+the daemon (alive + connected), Vidnets `:5010` (healthy + memory
+admission), the CMS (reachable + outage duration), the inbox-watch hook
+(enabled), stale/past-half-TTL inbox requests, and disk/tmp space. It
+fixes what it can itself (restart a dead daemon via `start-daemon.sh`,
+restart a dead Vidnets server, mark expired inbox requests) and only
+messages the user when it cannot fix something or a job is affected.
+It never claims, delivers, or restarts a job mid-render. It is the
+only monitor — the old `vidnets-recovery-watch` self-removed on Nov 9.
+Full rules: `HYBRID_WIRING.md` ("CMS-outage resilience + health monitor").
+
+**Daemon resilience.** The daemon survives CMS 502/530 outages
+in-process (`lib/cmsRetry.js`: transient errors retry with exponential
+backoff, capped at 60s; a saved job's resume is deferred, never dropped
+on a transient error). systemd is not used as a supervisor — see
+`HYBRID_WIRING.md` for why.
+
 ## Requirements
 
 - **Linux (Ubuntu 20.04/22.04/24.04, Debian, Boost)** or Windows 10/11 / macOS.
@@ -68,15 +118,18 @@ node muse-agent.js start
 `start` registers a heartbeat, resumes a saved job after a crash, claims jobs,
 reports progress and uploads each finished job. Use `--once` to process at most
 one job and exit. Before it heartbeats or claims anything, the automated loop
-checks that its script and render/inference adapters are configured. This keeps
-an incomplete worker from taking CMS jobs and immediately failing them.
+verifies the compulsory Muse inference bridge (see above). This keeps a worker
+with no inference from taking CMS jobs and delivering graphics-only videos.
 
-The automated loop requires `MUSE_SCRIPT_COMMAND` plus either
-`MUSE_RENDER_COMMAND`, or the built-in Vidnets path with
-`MUSE_INFERENCE_COMMAND` / `MUSE_INFERENCE_URL`. If the Muse agent itself writes
-the narration and renders in its own environment, use the agent-driven
+The automated loop requires the Muse inference bridge: `MUSE_RENDER_COMMAND`
+set to `render-vidnets-linux.js` (Vidnets + Muse agent-bridge inbox) with the
+`vidnets-inbox-watch` hook enabled, or the built-in Vidnets path with
+`MUSE_INFERENCE_COMMAND` / `MUSE_INFERENCE_URL`. An OpenRouter key anywhere in
+the environment refuses to start. If the Muse agent itself writes the narration
+and renders in its own environment, use the agent-driven
 `claim` → write/render into the returned work folder → `deliver` flow instead
-of `start`.
+of `start` (that flow is a human agent in the loop, so the start gate does not
+apply to it).
 
 If the CMS address changes, update the saved endpoint without replacing the
 worker credential:
@@ -151,17 +204,29 @@ fails honestly instead of shipping generic narration. Set
 `MUSE_SCRIPT_ALLOW_TEMPLATE_FALLBACK=1` to bring back the old template
 synthesizer (opt-in only, labelled generic).
 
-Without a render command, the worker uses **Vidnets**:
+Production renders use **Vidnets through `render-vidnets-linux.js`**
+(`MUSE_RENDER_COMMAND`):
 - Vidnets is started through `VIDNETS_AGENT.sh` (Linux) or `VIDNETS_AGENT.cmd` (Windows) and runs with
-  `llm_provider: external_agent`; it never receives an OpenRouter key.
-- While the render runs, the worker polls Vidnets' local inference inbox and
-  answers every writing, director, query and vision request through
-  `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL`.
+  `llm_provider: external_agent`; it never receives an OpenRouter key
+  (`adapters/vidnets.js` sends `openrouter_api_key: ''`, and the server's
+  visual verifier discards any environment key for external_agent jobs).
+- While the render runs, every writing, director, query and vision request
+  is posted to Vidnets' local agent-bridge inbox, and the
+  `vidnets-inbox-watch` hook wakes a Muse operator to answer it. That is
+  the only inference path in production — `MUSE_INFERENCE_COMMAND` /
+  `MUSE_INFERENCE_URL` are an alternate transport and are deliberately
+  unset in the production wiring (a second answerer would double-answer).
+- The wrapper fails the job instead of delivering graphics if the finished
+  edit plan has no Muse-verified real-media scene, or no Muse-answered
+  vision verdict at all.
 - Set `MUSE_VIDNETS_ROOT` if Vidnets lives outside `./vidnets`.
 - Built-in Vidnets needs `PEXELS_API_KEY` and `PIXABAY_API_KEY` for stock rescue.
 
-Without `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL`, external-agent Vidnets
-jobs cannot answer their scene requests; `doctor` reports this as blocking.
+There is no fallback to the native Remotion engine: it fetches no media and
+uses no Muse inference, so `adapters/video.js` throws instead of rendering
+graphics when no Muse-inference render path is configured. Without a
+verified bridge, external-agent Vidnets jobs cannot answer their scene
+requests; `doctor` reports this as blocking (`Muse inference (compulsory)`).
 
 ---
 

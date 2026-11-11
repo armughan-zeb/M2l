@@ -183,7 +183,18 @@ def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
     owner = str(context.get('agent_owner_id') or (handle[len(AGENT_HANDLE):] if handle.startswith(AGENT_HANDLE) else ''))
     if not owner:
         raise AgentBridgeError('Pair a local agent before starting an agent-powered job.')
-    wall = min(float(timeout), remaining_seconds(float(timeout)))
+    # An external agent answers through a polling inbox: the watcher polls
+    # every 60s and reading the prompt plus composing a schema-valid answer
+    # takes minutes, so the fast-API timeouts callers pass (20-300s) expire
+    # before the answer can arrive. Floor the wall for agent requests; the
+    # job's remaining budget still caps it. VIDZEO_AGENT_MIN_WALL_SECONDS
+    # tunes the floor (default 600s).
+    try:
+        min_wall = max(0.0, float(os.environ.get('VIDZEO_AGENT_MIN_WALL_SECONDS', '600') or 600))
+    except (TypeError, ValueError):
+        min_wall = 600.0
+    effective_timeout = max(float(timeout), min_wall)
+    wall = min(effective_timeout, remaining_seconds(effective_timeout))
     request_id = secrets.token_hex(16)
     path = _request_path(request_id)
     path.parent.mkdir(parents=True)

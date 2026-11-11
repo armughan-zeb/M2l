@@ -23,7 +23,11 @@ def main():
         return
     with contextlib.redirect_stdout(sys.stderr):
         from ddgs import DDGS
-        with DDGS(timeout=min(3.5, max(.1, float(request['timeout'])))) as provider:
+        # 12s, not 3.5s: a ddgs call through the throttled egress proxy
+        # routinely needs more than 3.5s, and the engine gives this worker
+        # a 15s budget (see DuckDuckGoEngine). A timeout here surfaces as
+        # an empty result, which the engine retries once.
+        with DDGS(timeout=min(12.0, max(.1, float(request['timeout'])))) as provider:
             limit = min(100, max(1, int(request.get('limit', 8))))
             search = provider.images if request.get('kind') == 'images' else provider.text
             rows = list(search(str(request['query'])[:300], max_results=limit,

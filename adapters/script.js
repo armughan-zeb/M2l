@@ -12,6 +12,8 @@ const fs = require('fs');
 const path = require('path');
 const { minimumScriptWords } = require('../lib/mediaRules');
 const { runCommand, parseJsonOutput, quoteArg } = require('../lib/command');
+const { registerStageProcess } = require('../lib/stageCleanup');
+const { assertNoOpenRouterKey } = require('../lib/museInference');
 
 function minimumWords(job) {
   return minimumScriptWords(job.targetDurationMinutes || 8);
@@ -61,6 +63,7 @@ async function runScriptCommand(command, job, workDir, { signal, onDetail, expan
     signal,
     timeoutMs: Number(timeoutMs) || Number(process.env.MUSE_SCRIPT_TIMEOUT_MS) || 10 * 60 * 1000,
     label: 'Muse script command',
+    onSpawn: spawn => registerStageProcess(job.jobId, 'script', spawn),
     env: {
       MUSE_JOB_ID: job.jobId,
       MUSE_WORK_DIR: workDir,
@@ -166,6 +169,12 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
     return { scriptText: synthesized, words: check.words, resumed: false, meta: { engine: 'template-synthesizer-generic' } };
   }
 
+  // Muse inference is compulsory: an OpenRouter key in the environment
+  // would make ScriptIT pick OpenRouter over the agent-bridge. Refuse
+  // before any script command runs — a script must never be written by
+  // another provider, and the template fallback below stays opt-in only.
+  assertNoOpenRouterKey(process.env);
+
   // Default engine: the ScriptIT headless CLI. In agent-bridge mode it needs
   // no OpenRouter key — Muse answers its inference requests through the
   // Vidnets inbox. A custom MUSE_SCRIPT_COMMAND still wins when set.
@@ -182,10 +191,12 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
   let result = await runScriptCommand(effectiveCommand, job, workDir, { signal, onDetail, timeoutMs });
   let check = validateScript(result.scriptText, job);
 
-  // One bounded expansion. The CMS allows a slightly shorter narration only
-  // when the words still cover the requested runtime, so a short first pass is
-  // worth a single explicit continuation request rather than a silent upload.
-  if (!check.ok && process.env.MUSE_SCRIPT_EXPAND_ON_SHORT !== '0') {
+  // SIMPLIFIED PIPELINE (Nov 9, 2026): the script is written ONCE. The old
+  // default re-ran the whole ScriptIT generation (research + drafts) when
+  // the narration came back short — a second full generation hiding inside
+  // the adapter. Expansion is now opt-in only (MUSE_SCRIPT_EXPAND_ON_SHORT=1);
+  // otherwise a short script fails loudly here with a clear message.
+  if (!check.ok && process.env.MUSE_SCRIPT_EXPAND_ON_SHORT === '1') {
     onDetail?.(`Narration returned ${check.words} of ${check.minimumWords} words; requesting one bounded expansion`);
     onProgress?.(45, 'Narration is short; requesting one bounded expansion');
     try {

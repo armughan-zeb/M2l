@@ -56,6 +56,7 @@ from .constants import (
 from .runtime import _web_log, resolve_gallery_dl
 from .hybrid_search import download_bulk, search_bing, search_ddg
 from .flickr_api_source import flickr_last_search_network_failure, search_flickr_api
+from .host_allowlist import is_seen_host, load_seen_hosts, record_hosts
 from .safety import candidate_is_safe, image_is_safe
 from ..visual_requirement import (
     candidate_asset_metadata,
@@ -64,7 +65,7 @@ from ..visual_requirement import (
     candidate_requirement_match,
     provider_query_variants,
 )
-from services.sources import OpenverseSource, DuckDuckGoSource, RedditSource, WikimediaSource, BraveSource, SearXNGSource
+from services.sources import OpenverseSource, DuckDuckGoSource, RedditSource, WikimediaSource, BraveSource, SearXNGSource, LibraryOfCongressSource
 from services.sources.google_images_source import GoogleImagesSource
 from services.sources.yandex_source import YandexSource
 from .source_broker import web_image_source_catalog, web_image_fallback_layers
@@ -88,14 +89,23 @@ _DUCKDUCKGO_SOURCE = DuckDuckGoSource()
 _REDDIT_SOURCE = RedditSource()
 _GOOGLE_IMAGES_SOURCE = GoogleImagesSource()
 _YANDEX_SOURCE = YandexSource()
+# Library of Congress: public JSON API, no key, rights-documented photos.
+# Wired into the defaults Nov 10, 2026 (web-first audit) — it was defined
+# in services/sources/loc_source.py but never dispatched.
+_LOC_SOURCE = LibraryOfCongressSource()
 try:
     _universal_workers = int(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_WORKERS", "6") or 6)
 except (TypeError, ValueError):
     _universal_workers = 6
 try:
-    _universal_timeout = float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "8") or 8)
+    # Search engines answer slowly through the egress proxy; an 8s
+    # per-engine cut-off dropped engines that would have returned
+    # candidates, so scenes ended up with an empty pool. Quality first:
+    # give each engine a full 30s (they run in parallel, so the stage
+    # wall, not this timeout, bounds the total).
+    _universal_timeout = float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "30") or 30)
 except (TypeError, ValueError):
-    _universal_timeout = 8.0
+    _universal_timeout = 30.0
 _UNIVERSAL_SCRAPER = UniversalScraperManager(
     max_workers=_universal_workers,
     engine_timeout_seconds=_universal_timeout,
@@ -713,13 +723,14 @@ _GALLERYDL_TIMEOUTS = {
 # scraper on this stack and consistently returns 12+ usable candidates.
 _FAST_SOURCES = [
     ("primary_archive", "hybrid"), # Official publishers enter the same identity/vision gates.
-    ("universal_scraper", "universal"), # six-engine parallel scraper adapter
+    ("universal_scraper", "universal"), # four-engine parallel scraper adapter
     ("yandex", "api"),             # Yandex Images HTML scraper — priority lane
     ("flickr_api", "flickr_api"),  # Flickr REST API — fast, reliable, no scraping
     ("bing_hybrid", "hybrid"),     # Bing image search
     ("ddg_hybrid", "hybrid"),      # DuckDuckGo image search
     ("openverse", "api"),          # Openverse CC image API
     ("wikimedia", "api"),
+    ("library_of_congress", "api"),  # LOC public JSON API — no key, rights-documented
     ("google_images", "api"),      # Google Images HTML scraper (fail-soft, JS-gated)
     ("brave_images", "api"),       # Brave documented Image Search API
     ("searxng_images", "api"),     # Free SearXNG JSON image aggregation
@@ -732,6 +743,12 @@ _SLOW_SOURCES = [
     ("reddit", "api"),             # Registered for diagnostics; disabled by default below
     ("reddit", "gdl"),             # Registered for diagnostics; disabled by default below
     ("flickr", "gdl"),             # gallery-dl Flickr (slow, fallback)
+    # 500px is listed in _GALLERYDL_SOURCES but deliberately NOT
+    # dispatched here: gallery-dl's 500px search needs a logged-in
+    # 'x-500px-access-token-prod' cookie and returns no URLs without it
+    # (verified live Nov 10, 2026 — 40s, zero URLs). Wiring it in would
+    # burn up to 10s of the slow-harvest budget per failed query for
+    # nothing. Revisit only if a 500px login is ever supplied.
 ]
 
 _ALL_SOURCES = _FAST_SOURCES + _SLOW_SOURCES
@@ -753,6 +770,7 @@ _PROVIDER_HOSTS = {
     # blocked by one serial DNS probe here.
     "universal_scraper": "",
     "wikimedia": "commons.wikimedia.org",
+    "library_of_congress": "www.loc.gov",
     "flickr_api": "www.flickr.com",
     "bing_hybrid": "www.bing.com",
     "ddg_hybrid": "duckduckgo.com",
@@ -808,9 +826,13 @@ def _enabled_fast_sources() -> List[Tuple[str, str]]:
     # Operator-scoped allowlist used for controlled source benchmarks and
     # single-provider production jobs.  Keep it here so the shared warm pool,
     # per-scene waves, telemetry, and recovery all obey the same boundary.
+    # The universal scraper is the web-image path by deliberate, permanent
+    # operator instruction: it runs for every web-image query and no
+    # allowlist may drop it. The allowlist restricts the OTHER lanes only.
     only = str(os.environ.get("VIDZEO_WEB_ONLY_PROVIDER", "") or "").strip().lower()
     if only:
         wanted = {item.strip() for item in only.split(",") if item.strip()}
+        wanted.add("universal_scraper")
         return [(name, kind) for name, kind in _FAST_SOURCES if name in wanted]
     legacy_setting = os.environ.get("VIDZEO_ENABLE_LEGACY_WEB_SEARCH")
     legacy = str(legacy_setting or "0").strip().lower() in {
@@ -821,14 +843,21 @@ def _enabled_fast_sources() -> List[Tuple[str, str]]:
     # create hundreds of provider requests before *any* scene returned.  The
     # default batch uses one complementary request per provider.  The older
     # expansion lanes remain available behind the existing legacy switch.
+    # Host-cost cut (2026-11-10, BNSF job): every default lane costs at least
+    # one fresh per-host network approval card, and each lane's results can
+    # fan out to arbitrary publisher hosts. Demoted from the defaults:
+    #  - "openverse": api.openverse.org 504s through the egress proxy
+    #    (already dropped from the universal scraper's defaults in 1d441ef,
+    #    but this resolver lane still hit it per scene query).
+    #  - "getty_bing" / "getty_ddg": 1 row in the BNSF pool's first 51
+    #    candidates, and Getty images are watermarked editorial frames the
+    #    vision gate usually rejects anyway.
+    # All three stay reachable via VIDZEO_ENABLE_LEGACY_WEB_SEARCH=1 or
+    # VIDZEO_WEB_ONLY_PROVIDER. Wikimedia remains the rights-friendly lane.
     default_names = {
         "universal_scraper",
-        # Keep every bounded HTTP/API lane in the normal resolver. The old
-        # default silently omitted Getty's complementary Bing/DDG searches,
-        # reducing recall and making a single provider outage look like a
-        # blank scene.
-        "wikimedia", "flickr_api", "bing_hybrid", "openverse",
-        "yandex", "google_images", "getty_bing", "getty_ddg",
+        "wikimedia", "flickr_api", "bing_hybrid",
+        "yandex", "google_images", "library_of_congress",
     }
     if _BRAVE_SOURCE.is_available():
         default_names.add("brave_images")
@@ -1067,6 +1096,8 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
         elif source_name == "wikimedia":
             candidates = _WIKIMEDIA_SOURCE.search(query, limit=20)
             candidates = _WIKIMEDIA_SOURCE.enrich_rights(candidates, limit=6)
+        elif source_name == "library_of_congress":
+            candidates = _LOC_SOURCE.search(query, limit=20)
         elif source_name == "yandex":
             candidates = _YANDEX_SOURCE.search(query, limit=20)
             # Yandex signals a robot/challenge page by opening its own
@@ -1145,15 +1176,15 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
 
 
 def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> List[Dict]:
-    """Run the copied six-engine scraper and map rows into resolver records."""
+    """Run the copied four-engine scraper and map rows into resolver records."""
     global _UNIVERSAL_LAST_AUDIT
     try:
         enabled = str(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_ENGINES", "") or "").strip()
         engine_ids = [part.strip() for part in enabled.split(",") if part.strip()] or None
         limit = max(6, min(30, int(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_LIMIT", "20") or 20)))
-        timeout = max(2.0, min(15.0, float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "8") or 8)))
+        timeout = max(2.0, min(300.0, float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "30") or 30)))
     except (TypeError, ValueError):
-        engine_ids, limit, timeout = None, 20, 8.0
+        engine_ids, limit, timeout = None, 20, 30.0
     response = _UNIVERSAL_SCRAPER.search(
         query,
         engine_ids=engine_ids,
@@ -1439,7 +1470,7 @@ def _warm_shared_discovery_pool(
             kind,
             query,
             gallery_cmd,
-            max_timeout=5,
+            max_timeout=30,
             wait_until_complete=wait_until_complete,
         )
         if discovery_cache is not None:
@@ -1513,7 +1544,7 @@ def _warm_shared_discovery_pool(
                 )
             )
             # Universal discovery is the primary copied scraper lane. Let it
-            # finish its own six-engine fan-out before closing a full pool so
+            # finish its own four-engine fan-out before closing a full pool so
             # the winning rows are actually available to scene assignment;
             # otherwise a fast legacy provider could fill the numeric target
             # while the universal callback was still running in the background.
@@ -2037,10 +2068,13 @@ def _same_query_candidate_limit(max_candidate_downloads: int = 20, top_score: fl
     env_val = os.environ.get("VIDZEO_WEB_SAME_QUERY_CANDIDATES")
     if float(top_score or 0.0) >= 8.0:
         try:
-            configured = max(3, min(12, int(env_val))) if env_val else 8
+            # Default matches the per-scene top-12 pool (Nov 10, 2026):
+            # a high-confidence query keeps a full page of 12, not 8, so
+            # the vision shortlist can actually reach 12.
+            configured = max(3, min(12, int(env_val))) if env_val else 12
             return min(ceiling, configured)
         except Exception:
-            return min(ceiling, 8)
+            return min(ceiling, 12)
     if float(top_score or 0.0) >= 5.0:
         # A decent metadata hit still is not proof that the first result is
         # the best frame. Keep a wider bounded page so the cross-scene
@@ -2055,10 +2089,10 @@ def _vision_shortlist_limit() -> int:
     """Return the maximum downloaded candidates sent to visual comparison."""
     try:
         configured = int(
-            os.environ.get("VIDZEO_WEB_VISION_SHORTLIST", "8") or 8
+            os.environ.get("VIDZEO_WEB_VISION_SHORTLIST", "12") or 12
         )
     except Exception:
-        configured = 8
+        configured = 12
     return max(3, min(12, configured))
 
 
@@ -2356,7 +2390,7 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
         return None
     if _is_biographical_person(main_subject) and not _metadata_has_identity(item.get("title", ""), url, "", identity_terms):
         return None
-    dl_results = download_bulk([url], scene_dir, max_concurrent=1, timeout_seconds=12)
+    dl_results = download_bulk([url], scene_dir, max_concurrent=1, timeout_seconds=30)
     for _url, fpath, err in dl_results:
         if err or not fpath or not fpath.exists():
             continue
@@ -2438,8 +2472,55 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
     return None
 
 
-def _diverse_download_candidates(scored, limit):
-    """Diversify similarly relevant rows without promoting weak host results."""
+# Hosts the pipeline has already fetched images from in earlier jobs, so a
+# fetch from one of them does not pop a new per-host network approval card.
+# Proven by the running BNSF pool (51/51 candidates resolved on 2026-11-10):
+# i.ytimg.com, live.staticflickr.com, upload.wikimedia.org, i.pinimg.com,
+# pinterest.com, youtube.com, flickr.com, rrpicturearchives.net. Override
+# (comma-separated) with VIDZEO_PREFERRED_IMAGE_HOSTS; an empty value
+# disables the preference entirely.
+_DEFAULT_PREFERRED_IMAGE_HOSTS = (
+    "upload.wikimedia.org",
+    "live.staticflickr.com",
+    "i.ytimg.com",
+    "i.pinimg.com",
+    "pinterest.com",
+    "www.pinterest.com",
+    "flickr.com",
+    "youtube.com",
+    "rrpicturearchives.net",
+)
+
+
+def _preferred_image_hosts():
+    """Hosts whose fetches are already approved; env override, else default."""
+    raw = os.environ.get("VIDZEO_PREFERRED_IMAGE_HOSTS")
+    if raw is None:
+        return set(_DEFAULT_PREFERRED_IMAGE_HOSTS)
+    return {host.strip().lower() for host in raw.split(",") if host.strip()}
+
+
+def _host_is_preferred(host, preferred):
+    host = (host or "").lower()
+    return any(host == item or host.endswith("." + item) for item in preferred)
+
+
+def _diverse_download_candidates(scored, limit, preferred_hosts=None):
+    """Diversify similarly relevant rows without promoting weak host results.
+
+    Among hosts within the relevance slack, prefer hosts the pipeline has
+    already fetched from: each new host costs a per-host network approval
+    card and can stall media search, so a near-equal candidate from a
+    known host wins over a slightly better one from an unseen host. A
+    preferred host never overrides a real relevance gap — it must still be
+    within slack of the best candidate — and the alternate-host reserve
+    below is kept.
+    """
+    preferred = (
+        _preferred_image_hosts()
+        if preferred_hosts is None
+        else {str(host).strip().lower() for host in preferred_hosts if str(host).strip()}
+    )
     groups = {}
     for score, item in scored:
         host = urllib.parse.urlparse(str(item.get("url") or "")).netloc.lower()
@@ -2452,7 +2533,15 @@ def _diverse_download_candidates(scored, limit):
         best = max(rows[0][0] for rows in groups.values())
         slack = max(.25, abs(best) * .1)
         eligible = [host for host, rows in groups.items() if rows[0][0] >= best - slack]
-        host = min(eligible, key=lambda key: (uses.get(key, 0), -groups[key][0][0], key))
+        host = min(
+            eligible,
+            key=lambda key: (
+                0 if _host_is_preferred(key, preferred) else 1,
+                uses.get(key, 0),
+                -groups[key][0][0],
+                key,
+            ),
+        )
         selected.append(groups[host].pop(0))
         uses[host] = uses.get(host, 0) + 1
         if not groups[host]:
@@ -2463,7 +2552,10 @@ def _diverse_download_candidates(scored, limit):
                       for _score, item in selected}
     reserves = [(rows[0][0], host) for host, rows in groups.items() if host not in selected_hosts]
     if len(selected) > 1 and len(selected_hosts) == 1 and reserves:
-        _score, host = max(reserves)
+        _score, host = max(
+            reserves,
+            key=lambda pair: (_host_is_preferred(pair[1], preferred), pair[0]),
+        )
         selected[-1] = groups[host][0]
     return selected
 
@@ -2614,12 +2706,25 @@ def _download_candidate_batch(items, output_dir, max_concurrent, timeout_seconds
             if path and Path(path).is_file():
                 cache[url] = str(path)
             # Retain ownership while its preview rescue is still pending.
+    # Preview rescue is an optional second fetch wave to thumbnail CDNs
+    # (Bing tse1/2/3.mm.bing.net, ts3.mm.bing.net, Yandex
+    # avatars.mds.yandex.net) — up to 5 hosts that otherwise each cost a
+    # fresh per-host approval card, for a small low-res image. Only rescue
+    # from a preview host the pipeline has already fetched from (persistent
+    # seen-host store, or the sibling preferred-host defaults); otherwise
+    # the candidate stays failed and the next candidate is used instead.
+    try:
+        _seen_preview_hosts = load_seen_hosts() | _preferred_image_hosts()
+    except Exception:
+        _seen_preview_hosts = set()
     fallback = {}
     for url, path, error in results:
         item = by_url.get(url, {})
         preview = str(item.get("preview_url") or item.get("thumbnail_url") or "").strip()
         if not path and preview.startswith(("https://", "http://")) and preview != url:
-            fallback[url] = preview
+            _preview_host = urllib.parse.urlparse(preview).netloc.lower()
+            if _preview_host and is_seen_host(_preview_host, _seen_preview_hosts):
+                fallback[url] = preview
     if fallback:
         previews = download_bulk(
             list(dict.fromkeys(fallback.values())), output_dir,
@@ -2652,6 +2757,21 @@ def _download_candidate_batch(items, output_dir, max_concurrent, timeout_seconds
                 # scene. Retry after a short job-local cooldown, not forever.
                 cache[url] = failed_prefix + str(time.monotonic()) + ':' + str(error or 'download_failed')[:80]
     collect_pending()
+    # Learn the hosts this batch actually downloaded from, so the next job
+    # reuses them instead of popping a fresh per-host approval card. Only
+    # successful downloads count (a host in search results is not a fetch).
+    # Best-effort: a store failure must never fail the batch.
+    try:
+        _downloaded_hosts = {
+            urllib.parse.urlparse(str(url)).netloc.lower()
+            for url, path, _error in list(ready_results) + list(results)
+            if path and Path(path).is_file() and str(url).startswith(("http://", "https://"))
+        }
+        _downloaded_hosts.discard("")
+        if _downloaded_hosts:
+            record_hosts(_downloaded_hosts, source="job")
+    except Exception:
+        pass
     return ready_results + results
 
 
@@ -2749,8 +2869,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
     # failures. The shared scene budget covers every query and replacement.
     if fast_mode:
         try:
+            # Default matches the per-scene top-12 pool (Nov 10, 2026):
+            # fast mode keeps 12 downloads per query, not 8, so the
+            # vision shortlist can actually reach 12.
             configured_fast_per_query = int(
-                os.environ.get("VIDZEO_WEB_FAST_CANDIDATES_PER_QUERY", "8") or 8
+                os.environ.get("VIDZEO_WEB_FAST_CANDIDATES_PER_QUERY", "12") or 12
             )
             # Named-person contracts need enough independent pixels for the
             # final vision gate to choose a real portrait.  Three downloads
@@ -2766,12 +2889,12 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             )
             fast_per_query = max(
                 1,
-                min(8, configured_fast_per_query),
+                min(12, configured_fast_per_query),
             )
             if person_recall:
                 fast_per_query = max(5, fast_per_query)
         except (TypeError, ValueError):
-            fast_per_query = 8
+            fast_per_query = 12
         try:
             scene_download_budget = max(
                 fast_per_query,
@@ -3735,7 +3858,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 ):
                     continue
                 # The universal lane already fanned out once for the shared
-                # topic. Avoid multiplying six-engine requests for every
+                # topic. Avoid multiplying four-engine requests for every
                 # scene query; existing provider lanes remain the per-scene
                 # fallback. A single-scene job (no shared pool) still uses it.
                 if (
@@ -3753,15 +3876,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     # pool before scenes resolve.
                     deferred_universal_task = (src_name, src_type, q_str)
                     continue
-                if (
-                    src_name == "universal_scraper"
-                    and not exhaustive_fallback
-                    and shared_pool_query
-                    and not is_shared_query
-                    and not universal_scene_fallback
-                    and not _scene_specific_wave_required
-                ):
-                    continue
+                # The universal scraper is the web-image path by deliberate,
+                # permanent operator instruction: it is never skipped for a
+                # scene query just because the shared topic pool already
+                # fanned out once. Scene queries differ from the topic query,
+                # so the scraper runs for them as well.
                 if source_health is not None and not source_health.healthy(src_name):
                     continue
                 api_tasks.append((src_name, src_type, q_str))
@@ -3930,8 +4049,14 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                         accepted_sources.add(source_name)
                 # A completed provider with useful rows is enough to begin
                 # ranking/downloading. Do not make it wait for a throttled
-                # secondary provider.
-                if len(discovered_candidates) >= enough_candidates and not collect_all_sources:
+                # secondary provider. The universal scraper is exempt: it is
+                # the web-image path by operator instruction, so a wave must
+                # not close (and cancel its future) while it is still in
+                # flight. The query deadline still bounds the wait.
+                universal_pending = any(
+                    futures[future] == "universal_scraper" for future in pending
+                )
+                if len(discovered_candidates) >= enough_candidates and not collect_all_sources and not universal_pending:
                     break
                 # Even with collect-all enabled, stop the per-scene correction
                 # wave once it has a diverse shortlist.  The shared warm pool
@@ -3941,6 +4066,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     adaptive_fast_stop
                     and len(discovered_candidates) >= max(enough_candidates, 6)
                     and len(accepted_sources) >= 2
+                    and not universal_pending
                 ):
                     _web_log(
                         f"scene {idx + 1} adaptive provider stop: "
@@ -3968,7 +4094,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         if not discovered_candidates and searx_configured and not searx_fallback_used and not _deadline_reached():
             searx_fallback_used = True
             _harvest_source_query("searxng_images", "api", q_str, max_timeout=8)
-        # Standalone resolver calls use the universal six-engine scraper only
+        # Standalone resolver calls use the universal four-engine scraper only
         # after the established fast providers produced no usable candidates.
         # This preserves the layered fallback contract without multiplying
         # requests when a primary provider already succeeded.

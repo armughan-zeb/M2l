@@ -150,7 +150,17 @@ def install_delivery_budget(
         if str(config.get('llm_provider') or '') == 'external_agent':
             # One connected host services bounded scene/vision inbox turns.
             # Explicit configured ceilings remain authoritative.
-            total = max(total, 1800.0)
+            # Preparation is dominated by per-scene inbox round trips (each
+            # direction/retrieval turn waits ~4.5 min for the hook to wake a
+            # worker), so the budget must scale with scene count, not just
+            # audio length. Cooper (2,243 words, 147 scenes) got 3037s from
+            # the audio formula and its tail scenes fell back to graphics
+            # when preparation ran out. Estimate scenes from the script
+            # (~16 words/scene observed on Zephyr + Cooper) and allow
+            # ~35s/scene of preparation for agent jobs, capped at 7200s.
+            est_scenes = (word_count / 16.0) if word_count > 0 else 0.0
+            scene_floor = 1800.0 + est_scenes * 35.0
+            total = max(total, 1800.0, min(7200.0, scene_floor))
     else:
         total = configured_total
 

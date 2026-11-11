@@ -106,6 +106,36 @@ def test_production_worst_case_stage_chain_keeps_safety_margin():
     assert budget.remaining_seconds() == 35
 
 
+def test_agent_job_budget_scales_with_scene_count(monkeypatch):
+    """Cooper got 3037s from the audio formula and its tail fell back.
+
+    Agent preparation is per-scene inbox round trips, so the budget must
+    scale with scene count: a 1600-word script (~100 scenes) lifts the
+    agent floor to 1800 + 100*35 = 5300s, while the same script without
+    an agent provider keeps the audio-formula total (~2339s).
+    """
+    monkeypatch.delenv("VIDZEO_VIDEO_DELIVERY_BUDGET_SECONDS", raising=False)
+    monkeypatch.delenv("VIDZEO_RENDER_RESERVE_SECONDS", raising=False)
+
+    agent = install_delivery_budget(
+        {"script": ("word " * 1600).strip(), "llm_provider": "external_agent"},
+        clock=FakeClock(),
+    )
+    assert agent.total_seconds == 5300.0
+
+    cooper_like = install_delivery_budget(
+        {"script": ("word " * 2243).strip(), "llm_provider": "external_agent"},
+        clock=FakeClock(),
+    )
+    assert 6000.0 < cooper_like.total_seconds <= 7200.0
+
+    plain = install_delivery_budget(
+        {"script": ("word " * 1600).strip()},
+        clock=FakeClock(),
+    )
+    assert 2300.0 < plain.total_seconds < 2400.0
+
+
 def test_remotion_uses_remaining_time_without_unreachable_legacy_reserve():
     from server.services.delivery_budget import render_stage_allowance
     clock = FakeClock(0)

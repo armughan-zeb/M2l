@@ -867,7 +867,18 @@ class QwenVisionClient:
         structured_fallback_used = False
         attempts = min(self.max_attempts, 2) if current_job().get('cost_profile') == 'efficient' else self.max_attempts
         request_budget = attempts + (1 if json_mode else 0)
-        verdict_deadline = time.monotonic() + max(0.1, self.timeout_seconds * max(2, request_budget) + 10.0)
+        # An agent-backed verifier answers through the polling inbox, so one
+        # attempt needs the full agent answer floor — otherwise the phase
+        # scope below caps the request wall under it and the verdict expires
+        # before the answer arrives.
+        timeout_seconds = self.timeout_seconds
+        if current_job().get('llm_provider') == 'external_agent':
+            try:
+                agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
+            except (TypeError, ValueError):
+                agent_wall = 600.0
+            timeout_seconds = max(timeout_seconds, agent_wall)
+        verdict_deadline = time.monotonic() + max(0.1, timeout_seconds * max(2, request_budget) + 10.0)
         for attempt in range(request_budget):
             if time.monotonic() >= verdict_deadline:
                 break

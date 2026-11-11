@@ -196,6 +196,7 @@ async function summarizeTranscript({ apiKey, video, model = NARRATOR_MODEL, chat
 
 async function buildNarratorProfile({ videoUrl, apiKey, model = NARRATOR_MODEL, useCache = true, chatCompletionFn, fetchTranscriptFn }) {
   if (require('../providers/agentInference').isAgentHandle(apiKey)) model = 'external-agent';
+  else if (require('../providers/agentBridge').isBridgeHandle(apiKey)) model = 'agent-bridge';
   else model = require('../providers/modelPolicy').normalizeModel(model);
   const url = String(videoUrl || '').trim();
   if (!url) throw new Error('videoUrl is required');

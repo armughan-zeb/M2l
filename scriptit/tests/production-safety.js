@@ -362,6 +362,45 @@ async function main() {
     assert.equal(quickPhases, 1, 'quick research should complete after one bounded source pass');
     assert.equal(quickPipeline.quick, true);
 
+    let standardPhases = 0;
+    const standardPipeline = await runResearchJob({
+      topic: 'Apollo mission standard',
+      store,
+      input: { researchMode: 'standard', idempotencyKey: 'apollo-standard-pipeline' },
+      gatherResearchFn: async (_topic, options) => { standardPhases += 1; assert.equal(options.quick, false); return { ...research, query: 'Apollo mission standard' }; },
+    });
+    assert.equal(standardPhases, 1, 'standard research should skip the deep pass like quick');
+    assert.equal(standardPipeline.quick, false, 'standard is a production run, not a preview');
+    assert.equal(standardPipeline.deepPending, false, 'standard returns its final result immediately');
+    assert.equal(standardPipeline.partial, false, 'sufficient fast research keeps standard usable');
+    assert.equal((await store.getJob(standardPipeline.jobId)).status, 'context_ready');
+
+    // Standard mode deepens when the fast pass is thin: the deep pass is
+    // skipped only when fast evidence already satisfies the gate. A live
+    // 1-min Apollo run failed RESEARCH_INSUFFICIENT before this fix
+    // because fast-only research carries no primary/article-body claims.
+    // (Topic words must appear in the fixture text: relevance needs 2 of
+    // the topic's anchor words, so 'standard thin' would fail the deep
+    // pass on relevance alone instead of exercising the fall-through.)
+    let thinPhases = 0;
+    const thinPipeline = await runResearchJob({
+      topic: 'Apollo mission history',
+      store,
+      input: { researchMode: 'standard', idempotencyKey: 'apollo-standard-thin' },
+      backgroundDeep: false,
+      gatherResearchFn: async (_topic, options) => {
+        thinPhases += 1;
+        if (options.phase === 'fast') return { query: 'Apollo mission history' };
+        assert.equal(options.quick, false);
+        return { ...research, query: 'Apollo mission history' };
+      },
+    });
+    assert.equal(thinPhases, 2, 'thin fast research must fall through to the deep pass');
+    assert.equal(thinPipeline.quick, false, 'deepened standard stays a production run');
+    assert.equal(thinPipeline.deepPending, false, 'deepened standard returns its final result');
+    assert.equal(thinPipeline.partial, false, 'deep pass supplies the missing evidence');
+    assert.equal((await store.getJob(thinPipeline.jobId)).status, 'context_ready');
+
     const blocked = validateScriptForPublish({ script: 'too short', title: 'Test', description: 'Test', meta: { publishable: false } });
     assert.equal(blocked.ok, false);
     assert.ok(blocked.errors.length >= 2);
@@ -405,6 +444,13 @@ async function main() {
     assert.equal(scoped.official.length, 1, 'historical narration must not drift into current vehicle shopping');
     const { formatPlainNarration, openingHasHook, assessScript } = require('../src/agents/scriptQuality');
     assert.ok(assessScript({ script: 'word '.repeat(1100), wordTarget: 1500 }).issues.includes('The draft misses the requested length.'), 'a ten-minute documentary cannot pass with three quarters of the requested narration');
+    // Nov 9, 2026: the old 1.35 upper cap rejected a good 219-word draft
+    // for a 160-word target (ratio 1.37) — 3 words over the cap — while
+    // the revision prompt itself aims the model at wordTarget + max(50,
+    // 8%) (ratio 1.31 at 160 words). A modest overshoot is valid (the
+    // CMS only floors duration); only a real overshoot must fail.
+    assert.ok(!assessScript({ script: 'word '.repeat(219), wordTarget: 160 }).issues.includes('The draft misses the requested length.'), 'a 219-word draft for a 160-word target must pass the length check');
+    assert.ok(assessScript({ script: 'word '.repeat(320), wordTarget: 160 }).issues.includes('The draft misses the requested length.'), 'a 2x overshoot must still fail the length check');
     assert.equal(formatPlainNarration('It’s 80% efficient, costs £50, and André agrees.'), "It's 80% efficient, costs £50, and André agrees.");
     assert.equal(openingHasHook('A small car.\n\nBut the Mini Cooper brought a different idea.\n\nHow did it happen?'), true, 'short spoken paragraphs must share the opening window');
     assert.equal(openingHasHook('In 1834 Parliament changed how England provided relief to the poor. ' + 'The documented historical background '.repeat(20) + '. ' + 'The later documented legislation '.repeat(20) + '.'), true, 'later exposition cannot invalidate an already concrete opening sentence');

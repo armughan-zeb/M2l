@@ -3595,7 +3595,7 @@ _DIRECTOR_RESPONSE_SCHEMA = {
                     "scene_index": {"type": "integer", "minimum": 0},
                     "type": {"type": "string", "enum": list(UNIVERSAL_SCENE_TYPES)},
                     "variant": {"type": "string", "maxLength": 48},
-                    "visual_intent": {"type": "string", "maxLength": 180},
+                    "visual_intent": {"type": "string", "maxLength": 400},
                     "frame_mode": {"type": "string", "enum": ["media_only", "chapter", "map", "portrait", "evidence", "data", "diagram", "quote", "kinetic"]},
                     "visual_role": {"type": "string", "enum": ["media_overlay", "primary_explanation", "map_canvas"]},
                     "overlay_policy": {"type": "string", "enum": ["none", "single_short_highlight"]},
@@ -3699,10 +3699,20 @@ def director_planning_budget(scene_count: int) -> Dict[str, float]:
     composition = number('VIDZEO_EDITORIAL_DIRECTOR_COMPOSITION_TIMEOUT_SECONDS', 40, 0, 40)
     repair = number("VIDZEO_EDITORIAL_DIRECTOR_REPAIR_TIMEOUT_SECONDS", 10, 3, 10)
     from ..job_context import current_job
+    agent_wall = 0.0
     if current_job().get('llm_provider') == 'external_agent':
         # A tool-driven host needs time to read and answer the inbox. Keep
         # every request bounded while preserving adaptive parallel chunks.
-        art, scene_call, composition, repair = 180, 300, 180, 60
+        # Each call must last at least the agent answer floor
+        # (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s): the phase scope
+        # caps the request wall, so a shorter call budget expires the
+        # answer mid-composition — the inbox watcher alone needs ~4.5 min
+        # to wake a worker.
+        try:
+            agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
+        except (TypeError, ValueError):
+            agent_wall = 600.0
+        art, scene_call, composition, repair = agent_wall, agent_wall, agent_wall, agent_wall
         batch_size, workers = 4, 2
         waves = max(1, (max(1, int(scene_count)) + batch_size * workers - 1) // (batch_size * workers))
     base = number("VIDZEO_EDITORIAL_DIRECTOR_TOTAL_TIMEOUT_SECONDS", 90, 15, 3600)
@@ -3723,7 +3733,27 @@ def director_planning_budget(scene_count: int) -> Dict[str, float]:
         "waves": waves,
         "scene_batch_size": batch_size,
         "scene_workers": workers,
+        "agent_wall_seconds": agent_wall,
     }
+
+
+def _min_director_call_budget(agent_wall_seconds):
+    """Smallest director call budget that can ever be answered on this job.
+
+    Plain API calls need only a few seconds, but an external-agent call is
+    answered by a polling inbox watcher that needs minutes to wake a worker
+    (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s). A director call issued
+    with less than that wall is guaranteed to expire before its answer
+    arrives (job 75fa1baa: a scene-72 composition repair issued with 77s
+    and a scene-direction call with 38s both expired unanswered). Callers
+    must skip the call instead of issuing it when the remaining budget is
+    below this floor; the scene degrades gracefully either way.
+    """
+    try:
+        floor = float(agent_wall_seconds or 0)
+    except (TypeError, ValueError):
+        floor = 0.0
+    return max(6.0, floor)
 
 
 def _director_visual_argument_board(scene_texts: Sequence[str]) -> List[Dict[str, Any]]:
@@ -4260,7 +4290,7 @@ def _plan_llm_scenes(
                 try:
                     remaining = min(scene_timeout, deadline - time.monotonic() - repair_timeout)
                     batch_deadline = time.monotonic() + remaining
-                    if remaining < 4.0:
+                    if remaining < _min_director_call_budget(budget.get('agent_wall_seconds')):
                         raise TimeoutError("director scene planning budget exhausted")
                     response = _bounded_chat(worker_client, remaining,
                         user_prompt=batch_prompt + '\nFIRST PASS: For Diagram return template_recipe=null with grounded actors/links and layout intent for the separate composition pass. Return concise decisions, not repeated policy or reasoning.',
@@ -4319,7 +4349,7 @@ def _plan_llm_scenes(
                         # later repair just because a recipe dictionary exists.
                         decision['template_recipe'] = None
                         design_remaining = min(budget['composition_seconds'], batch_deadline + budget['composition_seconds'] - time.monotonic(), deadline - time.monotonic() - repair_timeout)
-                        if design_remaining < 6:
+                        if design_remaining < _min_director_call_budget(budget.get('agent_wall_seconds')):
                             decision['_composition_pass'] = 'budget_exhausted'
                             continue
                         # Per-scene state cannot leak from a preceding recipe,
@@ -4406,7 +4436,7 @@ def _plan_llm_scenes(
                                 batch_deadline + budget['composition_seconds'] - time.monotonic(),
                                 deadline - time.monotonic() - repair_timeout,
                             )
-                            if correction_budget >= 6 and composition_user_prompt and recipe_schema:
+                            if correction_budget >= _min_director_call_budget(budget.get('agent_wall_seconds')) and composition_user_prompt and recipe_schema:
                                 try:
                                     corrected = _bounded_chat(composition_client, correction_budget,
                                         user_prompt=composition_user_prompt + '\nCORRECTION PASS: The previous layout was rejected because: ' + str(design_error)[:220] + '. Redesign the shapes and positions to fix this exact issue. Keep the same approved actors, narration facts, palette, and visual argument; make each actor substantial and distinct, prevent label collisions, and leave a readable hold.',

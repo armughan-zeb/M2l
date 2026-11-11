@@ -15,6 +15,252 @@ MAX_REMOTION_WORKERS = 8
 MIN_REMOTION_WORKERS = 1
 MIN_REMOTION_AVAILABLE_MB = 384
 
+# How often the render memory wait re-checks admission (seconds). The old
+# loop slept 2s; a media worker that frees memory was therefore noticed up
+# to 2s late, and — worse — the fixed 120s wait expired while the job's own
+# media workers were still running, pausing the job instead of waiting for
+# them. The wait below is worker-aware: it extends while media workers are
+# alive and fails fast once none are left.
+DEFAULT_MEMORY_POLL_SECONDS = 0.5
+DEFAULT_MEMORY_WORKER_EXTEND_SECONDS = 30.0
+DEFAULT_MEMORY_NO_WORKER_GRACE_SECONDS = 10.0
+
+# Process names that are Vidnets media workers (children of this server, or
+# members of its process group). Only these are ever counted as "workers
+# that may free memory when they exit"; the Vidnets server, the daemon, the
+# CMS worker and the user's apps are never in this set.
+_MEDIA_WORKER_NAMES = {
+    "ffmpeg", "ffprobe", "yt-dlp", "yt_dlp",
+    "chrome", "chromium", "chrome-headless-shell", "headless_shell",
+    "google-chrome", "chromium-browser",
+}
+# Command-line tokens that identify a media worker whose executable name is
+# a generic interpreter (python/node). A bare `node` or `python` process is
+# never a media worker on its name alone.
+_MEDIA_WORKER_CMDLINE_TOKENS = (
+    "headless_agent", "research_search_worker", "youtube_pipeline",
+    "youtube_pool", "yt-dlp", "remotion", "render-vidnets",
+    "chrome-headless-shell", "puppeteer",
+)
+
+
+def _is_media_worker(name: str, cmdline: str) -> bool:
+    lowered_name = (name or "").strip().lower()
+    lowered_cmd = (cmdline or "").lower()
+    if lowered_name in _MEDIA_WORKER_NAMES:
+        return True
+    if lowered_name in {"python", "python3", "python.exe", "node", "node.exe"}:
+        return any(token in lowered_cmd for token in _MEDIA_WORKER_CMDLINE_TOKENS)
+    return False
+
+
+def _proc_cmdline(proc) -> str:
+    try:
+        parts = proc.cmdline()
+    except Exception:
+        return ""
+    return " ".join(str(part) for part in (parts or []))
+
+
+def live_media_workers() -> List[Dict[str, Any]]:
+    """List this server's live media workers (ffmpeg/Chrome/search workers).
+
+    Union of two ownership proofs, so a worker is found even after its
+    intermediate parent died (Vidnets ffmpeg downloads are reparented to
+    PID 1 but keep the server's process group): (a) descendants of this
+    process, (b) members of this process's group. Only processes whose
+    name/cmdline matches a media worker are returned; the server itself,
+    the daemon and unrelated processes are never listed. Returns [] when
+    process enumeration is unavailable, so callers treat "unknown" as "no
+    workers" and fail fast instead of waiting forever.
+    """
+    own_pid = os.getpid()
+    found: Dict[int, Dict[str, Any]] = {}
+    try:
+        import psutil
+
+        try:
+            me = psutil.Process(own_pid)
+            children = me.children(recursive=True)
+        except Exception:
+            children = []
+        try:
+            group = os.getpgid(own_pid)
+        except Exception:
+            group = None
+        group_members: List[Any] = []
+        if group is not None and os.name != "nt":
+            try:
+                for proc in psutil.process_iter(["pid"]):
+                    try:
+                        if os.getpgid(proc.pid) == group:
+                            group_members.append(proc)
+                    except Exception:
+                        continue
+            except Exception:
+                group_members = []
+        for proc in list(children) + group_members:
+            try:
+                pid = int(proc.pid)
+            except Exception:
+                continue
+            if pid == own_pid or pid in found:
+                continue
+            try:
+                name = str(proc.name() or "")
+                cmdline = _proc_cmdline(proc)
+                rss = int(proc.memory_info().rss // (1024 * 1024))
+            except Exception:
+                continue
+            if _is_media_worker(name, cmdline):
+                found[pid] = {"pid": pid, "name": name, "rss_mb": rss, "cmdline": cmdline[:300]}
+        return [found[pid] for pid in sorted(found)]
+    except Exception:
+        pass
+    # Fallback without psutil: scan /proc (Linux only) for group members
+    # and direct children, matching on the same name/cmdline rules.
+    if os.name == "nt":
+        return []
+    try:
+        own_group = os.getpgid(own_pid)
+    except Exception:
+        return []
+    try:
+        proc_ids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except Exception:
+        return []
+    for pid_text in proc_ids:
+        pid = int(pid_text)
+        if pid == own_pid or pid in found:
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
+                stat_parts = handle.read().rsplit(")", 1)[-1].split()
+            ppid = int(stat_parts[1])
+            pgrp = int(stat_parts[2])
+            if ppid != own_pid and pgrp != own_group:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                raw = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+            with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="replace") as handle:
+                status_text = handle.read()
+            name = ""
+            rss_kb = 0
+            for line in status_text.splitlines():
+                if line.startswith("Name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+            if _is_media_worker(name, raw):
+                found[pid] = {"pid": pid, "name": name, "rss_mb": rss_kb // 1024, "cmdline": raw[:300]}
+        except Exception:
+            continue
+    return [found[pid] for pid in sorted(found)]
+
+
+def wait_for_render_memory(
+    prepare,
+    *,
+    wait_deadline,
+    base_wait_seconds=120.0,
+    poll_seconds=DEFAULT_MEMORY_POLL_SECONDS,
+    worker_extend_seconds=DEFAULT_MEMORY_WORKER_EXTEND_SECONDS,
+    no_worker_grace_seconds=DEFAULT_MEMORY_NO_WORKER_GRACE_SECONDS,
+    live_workers=None,
+    on_wait=None,
+    check_active=None,
+    sleep=None,
+    monotonic=None,
+):
+    """Wait for render admission, releasing promptly when workers exit.
+
+    ``prepare`` is a zero-argument callable returning the render snapshot
+    or raising :class:`RenderMemoryLowError`. The wait:
+
+    * re-checks admission every ``poll_seconds`` (default 0.5s) instead of
+      the old fixed 2s sleep, so a render starts within ~0.5s of the
+      worker exit that freed the memory;
+    * while any of this job's media workers (see :func:`live_media_workers`)
+      are still alive, extends the deadline in ``worker_extend_seconds``
+      steps — those workers will free memory when they finish, so expiring
+      the wait (and pausing the job) while they run is a false stall.
+      Extensions never pass ``wait_deadline`` (the delivery budget);
+    * once no media worker is alive, fails fast after
+      ``no_worker_grace_seconds`` instead of burning the whole base wait:
+      with nothing left to free memory, waiting longer cannot help;
+    * reclaims this process's own garbage (``gc`` + ``malloc_trim``) when
+      the worker set shrinks, i.e. exactly at the moment memory freed.
+
+    Raises the last :class:`RenderMemoryLowError` when the (possibly
+    extended) deadline passes or the no-worker grace expires.
+    """
+    live_workers = live_workers or live_media_workers
+    # Resolve late (not as default args) so a patched time.sleep /
+    # time.monotonic — e.g. in tests — is honoured by the wait loop.
+    sleep = sleep or time.sleep
+    monotonic = monotonic or time.monotonic
+    poll = max(0.05, float(poll_seconds))
+    extend = max(1.0, float(worker_extend_seconds))
+    grace = max(0.0, float(no_worker_grace_seconds))
+    memory_deadline = min(float(wait_deadline), monotonic() + max(1.0, float(base_wait_seconds)))
+    no_worker_since = None
+    previous_worker_pids: set[int] = set()
+    last_error = None
+    last_report_at = 0.0
+    first_report = True
+    while True:
+        if check_active is not None:
+            check_active()
+        try:
+            return prepare()
+        except RenderMemoryLowError as exc:
+            last_error = exc
+        now = monotonic()
+        if now >= memory_deadline:
+            raise last_error
+        try:
+            workers = list(live_workers() or [])
+        except Exception:
+            workers = []
+        worker_pids = {int(worker.get("pid") or 0) for worker in workers} - {0}
+        extended = False
+        if workers:
+            no_worker_since = None
+            new_deadline = min(float(wait_deadline), now + extend)
+            if new_deadline > memory_deadline:
+                memory_deadline = new_deadline
+                extended = True
+        else:
+            if no_worker_since is None:
+                no_worker_since = now
+            elif now - no_worker_since >= grace:
+                raise last_error
+        if worker_pids < previous_worker_pids:
+            # A worker exited since the last check: memory just freed, so
+            # reclaim our own idle garbage now instead of on the next
+            # prepare() call, which may be a full admission attempt.
+            try:
+                gc.collect(2)
+            except Exception:
+                pass
+            _trim_current_process_working_set()
+        previous_worker_pids = worker_pids
+        if on_wait is not None and (first_report or extended or now - last_report_at >= 30.0):
+            first_report = False
+            last_report_at = now
+            try:
+                on_wait({
+                    "available_mb": int((last_error.memory_snapshot or {}).get("available_mb") or 0),
+                    "minimum_available_mb": MIN_REMOTION_AVAILABLE_MB,
+                    "live_workers": workers,
+                    "live_worker_rss_mb": sum(int(worker.get("rss_mb") or 0) for worker in workers),
+                    "deadline_in_seconds": max(0.0, memory_deadline - now),
+                    "extended": extended,
+                })
+            except Exception:
+                pass
+        sleep(poll)
+
 
 class RenderMemoryLowError(RuntimeError):
     """A retryable render preflight failure with the measured RAM snapshot."""
@@ -197,7 +443,14 @@ def select_remotion_workers(
     reserve_bytes = min(2 * 1024**3, max(384 * 1024**2, int(total_bytes * 0.07)))
     frame_bytes = max(1, int(width)) * max(1, int(height)) * 4
     configured_worker_mb = 256
-    frame_buffers = (2 if available_mb < 3072 else 8) if video_heavy else 1
+    # Frame buffers are pipelining, not output quality: in extreme
+    # low-memory mode (< 1024 MB available, the regime where renders get
+    # held) drop to a single 1080p RGBA buffer (~8 MB saved per worker).
+    # Above that keep 2 buffers so throughput does not regress.
+    if video_heavy:
+        frame_buffers = 1 if available_mb < 1024 else (2 if available_mb < 3072 else 8)
+    else:
+        frame_buffers = 1
     worker_overhead_mb = 128 if video_heavy else 64
     worker_bytes = configured_worker_mb * 1024**2 + frame_bytes * frame_buffers + worker_overhead_mb * 1024**2
     shared_bytes = ((128 if available_mb < 3072 else 256) + 96) * 1024**2
@@ -246,7 +499,10 @@ def render_memory_status() -> Dict[str, Any]:
     )
     return {**snapshot, **plan, 'warning': warning, 'warning_threshold_mb': 1024,
             'render_blocked': blocked, 'can_start_render': None if not known else not blocked,
-            'admission_state': state, 'message': message}
+            'admission_state': state, 'message': message,
+            # Machine-readable hold reason for the wrapper/API: empty unless
+            # a render is actually held, so a held render is unambiguous.
+            'held_reason': message if blocked else ''}
 
 
 def prepare_render_resources(
@@ -353,6 +609,24 @@ def prepare_render_resources(
                 emergency_cleanup=emergency_cleanup
             )
             return snapshot
+        # A held render must be unmistakable in the server log: one line
+        # naming the measured headroom and the floor, so the wrapper/job
+        # error is never mistaken for unanswered inference requests.
+        print(
+            "   [render-memory] HELD: render refused: only "
+            f"{after_recovery.get('available_mb', 0)} MB available; at least "
+            f"{MIN_REMOTION_AVAILABLE_MB} MB is needed for one Remotion worker. "
+            "Free memory and retry.",
+            flush=True,
+        )
+        # Report the freshest measurement, not the stale one: the snapshot
+        # was built from the earlier `after` reading, and the paused job
+        # (and the wrapper's memory note) would otherwise quote an
+        # available_mb that is already out of date.
+        for key in ("total_mb", "available_mb", "free_mb", "process_rss_mb"):
+            if after_recovery.get(key) is not None:
+                snapshot[key] = int(after_recovery[key])
+        snapshot["available_at_raise_mb"] = int(after_recovery.get("available_mb") or 0)
         raise RenderMemoryLowError(
             "Available memory is below the admission floor for one Remotion worker. "
             f"Only {after_recovery.get('available_mb', 0)} MB is available; "

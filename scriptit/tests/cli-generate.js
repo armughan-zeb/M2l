@@ -87,6 +87,18 @@ function startFakeOperator(bridgeRoot) {
 }
 
 async function main() {
+  // 0. Research-mode default (unit check, no spawn): short videos default
+  // to the publishable 'standard' middle ground, longer ones to thorough;
+  // an explicit flag or env value always wins.
+  const { resolveResearchMode } = require('../cli/generate.js');
+  assert.equal(resolveResearchMode({ flag: undefined, env: undefined, duration: '1min' }), 'standard');
+  assert.equal(resolveResearchMode({ flag: undefined, env: undefined, duration: '2min' }), 'standard');
+  assert.equal(resolveResearchMode({ flag: undefined, env: undefined, duration: '3min' }), 'thorough');
+  assert.equal(resolveResearchMode({ flag: undefined, env: undefined, duration: '10min' }), 'thorough');
+  assert.equal(resolveResearchMode({ flag: 'thorough', env: undefined, duration: '1min' }), 'thorough');
+  assert.equal(resolveResearchMode({ flag: undefined, env: 'quick', duration: '10min' }), 'quick');
+  assert.equal(resolveResearchMode({ flag: 'bogus', env: undefined, duration: '1min' }), 'standard');
+
   // 1. No title.
   const noTitle = await runCli({ stdin: '', env: {}, cwd: os.tmpdir(), timeoutMs: 30000 });
   assert.notEqual(noTitle.code, 0, 'CLI without a title must fail');

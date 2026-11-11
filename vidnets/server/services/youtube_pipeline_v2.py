@@ -2112,8 +2112,8 @@ def _search_youtube_uncached(
         "no_warnings": True,
         "extract_flat": True,
         "skip_download": True,
-        "socket_timeout": int(os.environ.get("VIDZEO_YT_METADATA_SOCKET_TIMEOUT", "8") or 8),
-        "retries": int(os.environ.get("VIDZEO_YT_METADATA_RETRIES", "1") or 1),
+        "socket_timeout": int(os.environ.get("VIDZEO_YT_METADATA_SOCKET_TIMEOUT", "15") or 15),
+        "retries": int(os.environ.get("VIDZEO_YT_METADATA_RETRIES", "2") or 2),
     }
     opts.update(_youtube_js_runtime_options())
     # Regional relevance: without hl/gl, YouTube ranks results for the
@@ -3573,10 +3573,50 @@ def _ranged_download_worker_limit(requested: int, available_mb: int, total_bytes
     # Range transfers normally remux AVC rather than decode a full master.
     # Reserve OS/UI headroom and a conservative decode/screen allowance per
     # worker; one worker remains the minimum on genuinely constrained hosts.
+    # The egress proxy serializes concurrent connections, so the win from
+    # more workers is bounded — but on this VM the old flat 2-worker cap for
+    # every host under 12 GB total was the binding constraint (12 ranged
+    # downloads at 2 workers = 6 sequential rounds of slow yt-dlp work).
+    # Tier the small-host cap by total memory instead: under 6 GB stays at
+    # 2, 6-12 GB gets 4, and the per-worker allowance ((available-256)//320)
+    # still scales the count down automatically when memory is tight.
     fit = max(1, (max(0, int(available_mb)) - 256) // 320)
-    if total_bytes < 12 * 1024**3:
+    if total_bytes < 6 * 1024**3:
         fit = min(2, fit)
-    return max(1, min(6, int(requested), fit))
+    elif total_bytes < 12 * 1024**3:
+        fit = min(4, fit)
+    return max(1, min(8, int(requested), fit))
+
+
+def _requested_download_workers(download_concurrency=None) -> int:
+    """Requested ranged-download worker count, before the memory fit.
+
+    Default 6, hard cap 8. Env override ``VIDZEO_YT_DOWNLOAD_CONCURRENCY``
+    wins; an explicit ``download_concurrency`` wins over the env.
+    """
+    try:
+        configured = int(
+            download_concurrency
+            if download_concurrency is not None
+            else os.environ.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY", "6")
+            or 6
+        )
+    except (TypeError, ValueError):
+        configured = 6
+    return max(1, min(configured, 8))
+
+
+def _ranged_download_workers(download_concurrency=None, *, available_mb=None, total_bytes=None) -> int:
+    """How many ranged YouTube downloads run in parallel.
+
+    Default 6, hard cap 8 (was default 4, cap 6). The memory fit from
+    ``_ranged_download_worker_limit`` still applies when host memory is
+    known, so a tight host scales down on its own.
+    """
+    workers = _requested_download_workers(download_concurrency)
+    if available_mb is not None and total_bytes is not None:
+        workers = _ranged_download_worker_limit(workers, available_mb, total_bytes)
+    return workers
 
 
 def _youtube_quality_formats(*, source: bool = False, max_filesize: Optional[int] = None) -> List[str]:
@@ -5081,7 +5121,11 @@ def _search_container_pools(
         max(search_timeout, float(os.environ.get("VIDZEO_YT_V2_SEARCH_TIMEOUT_HARD_CAP", "240") or 240)),
         _ceiling,
     )
-    if search_timeout > 0 and search_timeout_seconds is None:
+    if search_timeout > 0:
+        # The rounds floor applies whether or not the caller passed a
+        # timeout: a 36-query fan-out at 8 workers is 5 rounds, and a
+        # caller wall sized for one round cancels the queue before the
+        # first search returns under load. The hard cap still bounds it.
         search_timeout = max(search_timeout, min(_worst_per_search * _rounds + 15.0, _hard_cap))
 
     # Authentication fallback shares one search wall. Giving it a fresh
@@ -5387,6 +5431,23 @@ def _assign_candidates(
                 candidate.get("query_text") or "",
                 retrieval_context,
             )
+            # Propagate the best metadata score back onto the raw pool
+            # record. _score_candidate writes v2_score only onto the
+            # per-(row, candidate) copy above; build_sources() reads
+            # v2_score off the raw pool records to stamp metadata_score, so
+            # without this every source record scored 0.0 and the pool
+            # shortlist/probe gates (metadata_score > 0) dropped the whole
+            # pool — Cooper's 481 ranked candidates shortlisted zero
+            # sources. Keep the max across rows: a candidate's pool score is
+            # its best scene fit. Candidates that never reach scoring (hard
+            # requirement reject, `continue` above) get no stamp.
+            if isinstance(raw_candidate, dict):
+                try:
+                    prior_score = float(raw_candidate.get("v2_score") or 0.0)
+                except (TypeError, ValueError):
+                    prior_score = 0.0
+                if score > prior_score:
+                    raw_candidate["v2_score"] = round(score, 2)
             # In lenient mode, metadata is a recall gate: only explicit hard
             # blocks (-999) are discarded. Strict vision then decides relevance
             # progressively, so weak-but-plausible footage still gets a chance.
@@ -5880,19 +5941,13 @@ def get_youtube_clips(
         download_cancellation = CancellationContext(job_id="youtube-v2")
     pass_download_cancellation = cancellation is not None
     results: List[Optional[str]] = [None] * requested_scene_count
-    try:
-        configured_download_workers = int(
-            download_concurrency
-            if download_concurrency is not None
-            else os.environ.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY", "4")
-            or 4
-        )
-    except (TypeError, ValueError):
-        configured_download_workers = 4
-    # Ranged clips are network bound. Let a mixed-media job raise the worker
-    # count to six when requested, while keeping a conservative global cap so
-    # low-end systems do not thrash during decode/render.
-    download_workers = max(1, min(configured_download_workers, 6))
+    # Ranged clips are network bound. Default 6 workers, cap 8; the memory
+    # fit inside _ranged_download_workers still scales a tight host down on
+    # its own (see _ranged_download_worker_limit). A mixed-media job may
+    # raise the count through download_concurrency / the env override.
+    # Keep the pre-fit requested count for the telemetry receipt below.
+    configured_download_workers = _requested_download_workers(download_concurrency)
+    download_workers = _ranged_download_workers(download_concurrency)
     try:
         import psutil
         memory = psutil.virtual_memory()
@@ -6955,6 +7010,7 @@ def _prepare_pool_transcript_moments(
     scene_durations: List[float],
     force: bool = False,
     session_jar: Any = None,
+    deadline_seconds: float | None = None,
 ) -> tuple[Dict[str, Any], Dict[int, List[Any]], Dict[str, Dict[str, Any]]]:
     if not force and str(os.environ.get("VIDZEO_YT_POOL_TRANSCRIPTS", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
         return {}, {}, {}
@@ -7038,11 +7094,16 @@ def _prepare_pool_transcript_moments(
             break
     index = YouTubeTranscriptIndex(session_jar=session_jar)
     try:
+        # An explicit deadline overrides the shared env wall. The pre-probe
+        # transcript fetch passes a tight one so it cannot eat the probe
+        # wall; every other caller keeps the env default.
         transcript_deadline = max(
             0.05,
             min(
                 300.0,
-                float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "25") or 25),
+                float(deadline_seconds)
+                if deadline_seconds is not None
+                else float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "25") or 25),
             ),
         )
     except (TypeError, ValueError):
@@ -7165,14 +7226,16 @@ def make_resolve_state(pools: ClipPools) -> ClipResolveState:
 def _visual_gate_frames() -> int:
     """Number of frames Qwen sees to decide on a downloaded clip.
 
-    The whole clip is never analyzed, but a single frame is not evidence of
-    temporal relevance. Sample three to five chronological frames so title
-    cards, transitions, and unrelated inserts cannot pass as the scene.
+    Spec: 1-2 frames per clip, taken at the transcript-matched moment,
+    frames only — the full clip is never sent to vision. The probe clip
+    starts at the matched moment timestamp, so the first and last samples
+    of the probe window bracket the moment. Fewer frames per clip also
+    means fewer vision payloads per selection wave.
     """
     try:
-        return max(3, min(5, int(os.environ.get("VIDZEO_YT_VISUAL_GATE_FRAMES", "5") or 5)))
+        return max(1, min(2, int(os.environ.get("VIDZEO_YT_VISUAL_GATE_FRAMES", "2") or 2)))
     except Exception:
-        return 5
+        return 2
 
 
 def _youtube_relaxed_visual_gate_enabled() -> bool:

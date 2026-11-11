@@ -22,6 +22,15 @@
  * not fail the whole script generation. Throws AgentBridgeError (retryable)
  * only when the budget is exhausted or the operator returns an error.
  *
+ * Per-request wall: 600s (MAX_WALL_MS), matching the Vidnets server floor
+ * (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s, in
+ * vidnets/server/services/agent_bridge.py). The hook polls every 60s and
+ * composing a grounded draft takes minutes, so a 300s wall expired while
+ * the operator was still writing. NOTE: the wall is only as long as the
+ * caller's budget — scriptWriter caps agent-model calls at 300s, the
+ * encyclopedic synthesizer passes 180s, and the ScriptIT CLI passes 300s,
+ * so those caps still dominate until they are raised to 600s too.
+ *
  * Handle format: `agent-bridge:<owner-id>` (owner is `local-user` in
  * sign-in-free local mode). Never a model provider key.
  */
@@ -33,7 +42,11 @@ const crypto = require('crypto');
 
 const PREFIX = 'agent-bridge:';
 const DEFAULT_OWNER = 'local-user';
-const MAX_WALL_MS = 300000; // 5 minutes per single inbox request
+// One inbox round-trip gets the same 600s the Vidnets server floors its
+// agent requests at (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s): the
+// hook polls every 60s and a grounded draft takes minutes to compose.
+// A 300s wall expired mid-composition and wasted the operator's answer.
+const MAX_WALL_MS = 600000; // 10 minutes per single inbox request
 const POLL_MS = 250;
 
 function isBridgeHandle(value) {
@@ -163,7 +176,7 @@ async function agentBridgeChat({
   responseFormat,
   maxTokens,
   signal,
-  timeoutMs = 300000,
+  timeoutMs = 600000,
   operation = 'scriptit.completion',
   kind = 'text',
   jobId = '',
@@ -172,7 +185,10 @@ async function agentBridgeChat({
   const owner = bridgeOwner(apiKey);
   // Correlate inbox requests with the calling job when the worker sets it.
   jobId = jobId || process.env.SCRIPTIT_JOB_ID || '';
-  const budget = Math.max(1000, Math.min(1800000, Number(timeoutMs) || 300000));
+  // Default budget is one full 600s wall, matching the Vidnets server
+  // floor; callers that pass a smaller timeoutMs still dominate (see the
+  // header note — the ScriptIT writer/CLI caps must be raised to match).
+  const budget = Math.max(1000, Math.min(1800000, Number(timeoutMs) || 600000));
   const startedAt = Date.now();
   let attempts = 0;
   let lastError = null;
@@ -204,4 +220,4 @@ async function agentBridgeChat({
   throw lastError || new AgentBridgeError('The external agent did not answer within this request budget.');
 }
 
-module.exports = { PREFIX, isBridgeHandle, bridgeOwner, bridgeRoot, agentBridgeChat, AgentBridgeError };
+module.exports = { PREFIX, isBridgeHandle, bridgeOwner, bridgeRoot, agentBridgeChat, AgentBridgeError, MAX_WALL_MS };

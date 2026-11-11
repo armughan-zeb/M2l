@@ -2332,3 +2332,22 @@ def test_youtube_fallback_retries_rejected_quota_candidates(monkeypatch, tmp_pat
         return False
 
     assert _has_usable(primary_rows[0]) is False
+
+
+def test_media_stage_never_collapses_to_a_one_second_wall_when_budget_is_spent():
+    """An exhausted delivery budget used to hand the media stage a 1s wall,
+    terminalising every scene as a graphic fallback. The stage now keeps at
+    least one agent round-trip (600s) for agent jobs and 300s otherwise."""
+    import time
+    from services.delivery_budget import DeliveryBudget
+    from services.pipeline_v2_media_adapter import _media_stage_deadline_seconds
+
+    def exhausted_budget():
+        budget = DeliveryBudget.create(total_seconds=60.0, render_reserve_seconds=0.0)
+        budget.deadline_at = time.monotonic() - 10.0
+        return budget
+
+    agent_config = {"llm_provider": "external_agent", "_delivery_budget": exhausted_budget()}
+    assert _media_stage_deadline_seconds(agent_config, "Mixed Media") == 600.0
+    plain_config = {"_delivery_budget": exhausted_budget()}
+    assert _media_stage_deadline_seconds(plain_config, "Mixed Media") == 300.0

@@ -526,8 +526,17 @@ function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false }
   const rawMemoryLimit = Math.max(0, Math.floor((availableBytes - reserveBytes - sharedBytes) / (workerBytes + 64 * 1024 ** 2)));
   const singleWorkerFallback = availableBytes >= MIN_REMOTION_AVAILABLE_MB * 1024 ** 2 && rawMemoryLimit < 1;
   const memoryLimit = availableBytes >= MIN_REMOTION_AVAILABLE_MB * 1024 ** 2 ? Math.max(1, rawMemoryLimit) : 0;
+  // Requested workers: VIDZEO_REMOTION_CONCURRENCY first, then the M2l
+  // worker env (MUSE_RENDER_CONCURRENCY / VIDZEO_REMOTION_WORKERS /
+  // MUSE_REMOTION_WORKERS). Default 2 — the tested-safe value on the
+  // 4 vCPU VM (Nov 7, 2026: 2 parallel 1080p renders finished in 42s).
+  // The memory and CPU caps below auto-degrade any higher request at
+  // render start; a request for 5 only runs as 5 when ~2.5 GB is free.
   const requestedWorkers = Math.max(1, Math.min(maximumWorkers, Math.floor(
-    positiveNumber(process.env.VIDZEO_REMOTION_CONCURRENCY, maximumWorkers),
+    positiveNumber(process.env.VIDZEO_REMOTION_CONCURRENCY,
+      positiveNumber(process.env.MUSE_RENDER_CONCURRENCY,
+        positiveNumber(process.env.VIDZEO_REMOTION_WORKERS,
+          positiveNumber(process.env.MUSE_REMOTION_WORKERS, 2)))),
   )));
   if (memoryLimit < 1) {
     const error = new Error(`[Remotion] Waiting for memory: ${Math.round(availableBytes / (1024 ** 2))} MB available; ${MIN_REMOTION_AVAILABLE_MB} MB needed to attempt serial rendering.`);

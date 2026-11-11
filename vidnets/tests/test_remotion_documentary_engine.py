@@ -19,6 +19,7 @@ from services.editorial_director.director import (
     _director_story_map,
     _director_runtime_capabilities,
     _extract_numbers_from_text,
+    _min_director_call_budget,
     _recipe_is_grounded,
     _recipe_supports_visual_type,
     _validated_motion_cues,
@@ -351,6 +352,44 @@ def test_adaptive_director_budget_scales_with_parallel_scene_waves(monkeypatch):
     assert director_planning_budget(900)["total_seconds"] == 3600
     monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "0")
     assert director_planning_budget(60)["total_seconds"] == 90
+
+
+def test_external_agent_director_calls_last_at_least_the_agent_wall(monkeypatch):
+    from services.job_context import job_scope
+
+    monkeypatch.setenv("VIDZEO_AGENT_MIN_WALL_SECONDS", "600")
+    monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
+    with job_scope({"llm_provider": "external_agent"}):
+        budget = director_planning_budget(15)
+    # The phase scope caps the agent request wall, so a shorter director
+    # call budget expires the answer mid-composition (the inbox watcher
+    # alone needs ~4.5 min to wake a worker).
+    assert budget["scene_call_seconds"] >= 600
+    assert budget["art_seconds"] >= 600
+    assert budget["composition_seconds"] >= 600
+    assert budget["repair_seconds"] >= 600
+
+
+def test_director_budget_exposes_agent_wall_seconds(monkeypatch):
+    monkeypatch.setenv("VIDZEO_AGENT_MIN_WALL_SECONDS", "600")
+    monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
+    assert director_planning_budget(15)["agent_wall_seconds"] == 0.0
+    from services.job_context import job_scope
+
+    with job_scope({"llm_provider": "external_agent"}):
+        budget = director_planning_budget(15)
+    assert budget["agent_wall_seconds"] == 600.0
+
+
+def test_director_call_budget_floor_is_the_agent_wall():
+    """A director call issued below the agent floor is guaranteed to
+    expire: job 75fa1baa lost a scene-72 composition repair issued with
+    77s and a scene-direction call with 38s, both far under the 600s
+    floor. The call sites skip instead of issuing a doomed request."""
+    assert _min_director_call_budget(0) == 6.0
+    assert _min_director_call_budget(None) == 6.0
+    assert _min_director_call_budget(600) == 600.0
+    assert _min_director_call_budget(1200) == 1200.0
 
 
 def test_director_defaults_to_eight_scene_parallel_chunks(monkeypatch):

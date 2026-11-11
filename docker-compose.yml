@@ -1,0 +1,89 @@
+# Vidzeo Muse worker — docker-compose.
+# Single service by design: the daemon spawns the Vidnets server itself
+# (vidnets/VIDNETS_AGENT.sh --runtime-root /data/runtime), so there is no
+# separate Vidnets service to split out. See docker/Dockerfile + docker/README.md.
+#
+# Quickstart: ./setup.sh  (prompts for CMS URL + agent key, pairs the worker)
+# Then:      docker compose up -d && docker compose logs -f
+#
+# BUILD IS UNVERIFIED: docker is not installed on the reference VM; this file
+# was validated by YAML parse + review only, never by `docker compose up`.
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: vidzeo-muse-worker:3f2d875
+    container_name: vidzeo-muse-worker
+    env_file:
+      - .env
+    environment:
+      # Container paths (match docker/Dockerfile ENV + docker/entrypoint.sh).
+      MUSE_INFERENCE_COMPULSORY: "1"
+      MUSE_AUTO_LOOP: "1"
+      MUSE_RENDER_COMMAND: "node /app/render-vidnets-linux.js"
+      MUSE_VIDNETS_ROOT: "/app/vidnets"
+      MUSE_VIDNETS_COMMAND: "bash /app/vidnets/VIDNETS_AGENT.sh --runtime-root /data/runtime"
+      MUSE_REPO_ROOT: "/app"
+      MUSE_RENDER_CONCURRENCY: "1"
+      # Nov 10, 2026 standing decisions — do not "fix" these back.
+      # YT coverage 0.30 (web is the main source; the old 0.8 was stale),
+      # web pool 12/scene, finalists 3, vision pool 12, relative floor 0.5,
+      # YT vision frames 2/clip, YT downloads 4, wall floor 1200s.
+      MUSE_YOUTUBE_COVERAGE_TARGET: "0.30"
+      MUSE_MEDIA_STRICT: "0"
+      VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE: "12"
+      VIDZEO_VISUAL_FINALIST_LIMIT: "3"
+      VIDZEO_VISUAL_GATE_WORKERS: "12"
+      VIDZEO_VISUAL_RELATIVE_FLOOR: "0.5"
+      VIDZEO_YT_VISUAL_GATE_FRAMES: "2"
+      VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY: "4"
+      VIDZEO_YT_DOWNLOAD_CONCURRENCY: "4"
+      VIDZEO_AGENT_MIN_WALL_SECONDS: "1200"
+      # Thumbnails are SKIPPED: this worker delivers script + video only.
+      VIDZEO_SKIP_THUMBNAILS: "1"
+      # TLS: the image's own CA bundle (never a host path).
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/certs/ca-certificates.crt"
+      SSL_CERT_FILE: "/etc/ssl/certs/ca-certificates.crt"
+      VIDZEO_RUNTIME_ROOT: "/data/runtime"
+      VIDZEO_TEMP_DIR: "/data/runtime/temp"
+      TMPDIR: "/data/runtime/temp"
+      MUSE_WORK_DIR: "/data/work"
+      MUSE_CONFIG_FILE: "/data/.muse-agent.json"
+      VIDZEO_BRIDGE_ROOT: "/data/runtime/temp/agent-bridge"
+      MUSE_INBOX_HOOK_DEFINITION: "/host-hooks/vidnets-inbox-watch.json"
+      VIDNETS_PYTHON: "python3"
+      # No OpenRouter key may ever be set here. Muse inference is compulsory.
+    volumes:
+      # All persistent state in one host dir: runtime (Vidnets output/temp/
+      # secure + agent-bridge inbox), work (claimed-job state), and the
+      # paired worker credential .muse-agent.json. Never delete ./data
+      # while a job is running; it holds the only copy of the credential.
+      - ./data:/data
+      # Host Muse hook definitions, read-only. The daemon start gate reads
+      # /host-hooks/vidnets-inbox-watch.json to confirm the inbox operator
+      # exists and is enabled. Mounting the whole directory (not the single
+      # file) avoids compose creating a directory when the file is absent.
+      # Override with HOST_HOOKS_DIR if your Muse VM keeps hooks elsewhere.
+      - ${HOST_HOOKS_DIR:-${HOME}/hooks/definitions}:/host-hooks:ro
+    # Vidnets binds 127.0.0.1:5010-5110 inside the container; nothing is
+    # published to the host by default. Uncomment to inspect it locally:
+    # ports:
+    #   - "127.0.0.1:5010:5010"
+    restart: unless-stopped
+    # Chrome/Remotion need shared memory; the reference VM has 4 vCPU / 7.7 GB.
+    shm_size: 2gb
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 7G
+    healthcheck:
+      # Reports unhealthy until the worker is paired (setup.sh) — that is
+      # expected on first boot, not a failure.
+      test: ["CMD", "node", "/app/muse-agent.js", "status"]
+      interval: 60s
+      timeout: 10s
+      start_period: 180s
+      retries: 3

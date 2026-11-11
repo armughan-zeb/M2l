@@ -60,6 +60,47 @@ def test_shortlist_keeps_alternative_hosts():
     assert rows[-1] in selected
 
 
+def test_shortlist_prefers_already_approved_host_within_slack():
+    # A near-equal candidate from a host the pipeline already fetches from
+    # (live.staticflickr.com is in the default preferred set) must win over
+    # a slightly better candidate from an unseen host: each unseen host
+    # costs a per-host network approval card and stalls media search.
+    from services.web_image.resolver import _diverse_download_candidates
+    rows = [(10 - i / 10, {"url": f"https://new.test/{i}"}) for i in range(20)]
+    preferred_row = (9.7, {"url": "https://live.staticflickr.com/5685/photo_b.jpg"})
+    rows.append(preferred_row)
+    selected = _diverse_download_candidates(rows, 4)
+    assert len(selected) == 4
+    assert selected[0] == preferred_row
+    assert preferred_row in selected
+
+
+def test_shortlist_preferred_host_does_not_override_relevance_gap():
+    from services.web_image.resolver import _diverse_download_candidates
+    rows = [(10 - i / 10, {"url": f"https://new.test/{i}"}) for i in range(20)]
+    weak_preferred = (5, {"url": "https://live.staticflickr.com/5685/photo_b.jpg"})
+    rows.append(weak_preferred)
+    selected = _diverse_download_candidates(rows, 4)
+    # It may only appear as the single alternate-host reserve in last place,
+    # never ahead of the relevant rows.
+    assert selected[0] == rows[0]
+    assert weak_preferred not in selected[:3]
+
+
+def test_preferred_hosts_env_override(monkeypatch):
+    from services.web_image import resolver
+    monkeypatch.setenv("VIDZEO_PREFERRED_IMAGE_HOSTS", "custom.test, other.test")
+    assert resolver._preferred_image_hosts() == {"custom.test", "other.test"}
+    rows = [(10, {"url": "https://new.test/1"}), (9.7, {"url": "https://custom.test/1"})]
+    selected = resolver._diverse_download_candidates(rows, 1)
+    assert selected[0] == rows[1]
+    # An empty override disables the preference: best score wins again.
+    monkeypatch.setenv("VIDZEO_PREFERRED_IMAGE_HOSTS", "")
+    assert resolver._preferred_image_hosts() == set()
+    selected = resolver._diverse_download_candidates(rows, 1)
+    assert selected[0] == rows[0]
+
+
 def test_yandex_robot_check_is_reported_and_other_sources_remain_enabled(capsys):
     from services.sources.yandex_source import YandexSource
     from services.web_image.resolver import _enabled_fast_sources
@@ -68,7 +109,9 @@ def test_yandex_robot_check_is_reported_and_other_sources_remain_enabled(capsys)
     assert source.search("Royal Family") == []
     assert not source.is_available()
     assert "Robot check" in capsys.readouterr().out
-    assert {"bing_hybrid", "flickr_api", "openverse", "wikimedia"} <= {name for name, kind in _enabled_fast_sources()}
+    assert {name for name, kind in _enabled_fast_sources()} >= {"bing_hybrid", "flickr_api", "wikimedia"}
+    # Openverse is no longer a default lane (api.openverse.org 504s through
+    # the egress proxy); the robot check must still leave the other lanes up.
 
 
 def test_yandex_challenge_trips_resolver_job_breaker(monkeypatch):
@@ -90,6 +133,28 @@ def test_yandex_challenge_trips_resolver_job_breaker(monkeypatch):
 
 
 def test_failed_original_uses_provider_preview(monkeypatch, tmp_path):
+    from services.web_image import host_allowlist, resolver
+    path = tmp_path / "preview.jpg"
+    path.write_bytes(b"preview fixture")
+    calls = []
+    def download(urls, *args, **kwargs):
+        calls.append(urls)
+        return [(u, path if "preview" in u else None, "" if "preview" in u else "HTTP 400") for u in urls]
+    monkeypatch.setattr(resolver, "download_bulk", download)
+    # Preview rescue is gated to already-approved hosts: the preview host
+    # must be in the seen-host store, or the rescue would cost a fresh
+    # per-host approval card for a low-res thumbnail.
+    store_path = tmp_path / "seen_hosts.json"
+    monkeypatch.setenv("VIDZEO_SEEN_HOSTS_PATH", str(store_path))
+    host_allowlist.record_hosts(["provider.test"], source="test", path=store_path)
+    items = [{"url": "https://publisher.test/original", "preview_url": "https://provider.test/preview"}]
+    result = resolver._download_candidate_batch(items, tmp_path, 3, 10)
+    assert result == [(items[0]["url"], path, "")]
+    assert len(calls) == 2
+    assert items[0]["download_url_used"] == items[0]["preview_url"]
+
+
+def test_failed_original_skips_preview_on_unseen_host(monkeypatch, tmp_path):
     from services.web_image import resolver
     path = tmp_path / "preview.jpg"
     path.write_bytes(b"preview fixture")
@@ -98,11 +163,12 @@ def test_failed_original_uses_provider_preview(monkeypatch, tmp_path):
         calls.append(urls)
         return [(u, path if "preview" in u else None, "" if "preview" in u else "HTTP 400") for u in urls]
     monkeypatch.setattr(resolver, "download_bulk", download)
+    # Empty seen-host store: the unseen preview host must NOT be fetched.
+    monkeypatch.setenv("VIDZEO_SEEN_HOSTS_PATH", str(tmp_path / "seen_hosts.json"))
     items = [{"url": "https://publisher.test/original", "preview_url": "https://provider.test/preview"}]
     result = resolver._download_candidate_batch(items, tmp_path, 3, 10)
-    assert result == [(items[0]["url"], path, "")]
-    assert len(calls) == 2
-    assert items[0]["download_url_used"] == items[0]["preview_url"]
+    assert result == [(items[0]["url"], None, "HTTP 400")]
+    assert len(calls) == 1
 
 
 def test_download_bulk_enforces_byte_cap_before_buffering(tmp_path):

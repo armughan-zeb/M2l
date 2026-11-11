@@ -548,7 +548,16 @@ def _generate_with_llm(
             for start_index, chunk_scene_texts in chunks
         }
         from .media_query_strategy import query_planning_budget
-        completed, pending = wait(future_map, timeout=query_planning_budget(len(chunks), worker_count))
+        # Queries are the foundation: an agent answer needs a full
+        # round-trip per wave, not a 120s cut-off that replaces real queries
+        # with mechanical ones.
+        per_wave = None
+        if str(provider or "").lower() == "external_agent":
+            try:
+                per_wave = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
+            except (TypeError, ValueError):
+                per_wave = 600.0
+        completed, pending = wait(future_map, timeout=query_planning_budget(len(chunks), worker_count, per_wave_seconds=per_wave))
         for future in completed:
             start_index = future_map[future]
             try:
