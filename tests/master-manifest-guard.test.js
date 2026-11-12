@@ -243,8 +243,9 @@ test('deliverSaved delivers the good master and uploads it', async () => {
       client, job, attempt: 1, scriptFile, videoFile: video, thumbnailFile
     });
     assert.equal(result.ok, true);
-    assert.equal(client.calls.upload.length, 2);
+    assert.deepEqual(client.calls.upload.map(call => call.kind), ['video']);
     assert.equal(client.calls.complete.length, 1);
+    assert.equal(client.calls.complete[0].body.scriptText.trim(), words(240));
   } finally {
     restore();
   }
