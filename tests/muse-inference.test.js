@@ -140,15 +140,21 @@ test('video render with no render path throws instead of falling back to Remotio
 
 test('real scenes count adapter-accepted media; Muse rejection always wins', () => {
   const { countRealScenes } = require('../render-vidnets-linux');
-  // The proven 0bb3f900 edit plan: 1 real YouTube clip, Muse vision
-  // accepted (visual_checked=true), the other 14 scenes are graphics.
-  const planDir = '/home/hatch/workspace/vidnets-runtime/output/' +
-    "Amtrak's Long Run Through the Crew's Day_20261108_141818_71f36cd9";
-  const counted = countRealScenes(planDir);
-  assert.ok(counted, 'edit plan should be found');
-  assert.equal(counted.total, 15);
-  assert.equal(counted.real, 1);
-  assert.equal(counted.verified, 1);
+  // Exercise the same one-real, fourteen-graphic case without depending
+  // on a private video package on one particular Muse machine.
+  const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-verified-plan-'));
+  try {
+    const scenes = [{ media: { type: 'video', src: '/tmp/clip.mp4', visual_decision: { visual_checked: true, accepted: true } } }];
+    for (let index = 0; index < 14; index++) scenes.push({ media: { type: 'graphic', src: `/tmp/graphic_fallback_${index}.png` } });
+    fs.writeFileSync(path.join(planDir, 'fixture_remotion_edit_plan.json'), JSON.stringify({ scenes }));
+    const counted = countRealScenes(planDir);
+    assert.ok(counted, 'edit plan should be found');
+    assert.equal(counted.total, 15);
+    assert.equal(counted.real, 1);
+    assert.equal(counted.verified, 1);
+  } finally {
+    fs.rmSync(planDir, { recursive: true, force: true });
+  }
 
   // Filter-best: a real-looking image with no Muse verdict and no
   // adapter acceptance still does not count.

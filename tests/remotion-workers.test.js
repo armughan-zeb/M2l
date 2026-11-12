@@ -151,14 +151,18 @@ test('requested 5 can never run as 5 on this 4-vCPU box (CPU cap is 3)', () => {
   assert.equal(plan.cpuLimit, 3);
   assert.equal(plan.chosen, 3);
   const { adaptiveConcurrency } = require('../vidnets/scripts/render-remotion-manifest');
+  const os = require('node:os');
+  const savedParallelism = os.availableParallelism;
   const saved = { ...process.env };
   try {
+    os.availableParallelism = () => 4;
     process.env.MUSE_RENDER_CONCURRENCY = '5';
     process.env.VIDZEO_REMOTION_AVAILABLE_RAM_MB = '12000';
     const five = adaptiveConcurrency({ width: 1920, height: 1080 }, { scenes: [] }, {});
     assert.ok(five.concurrency <= 3, `script must cap 5 at 3 on 4 vCPU, got ${five.concurrency}`);
     assert.equal(five.cpu_limit, 3);
   } finally {
+    os.availableParallelism = savedParallelism;
     process.env = saved;
   }
 });
