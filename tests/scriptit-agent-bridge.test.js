@@ -272,7 +272,7 @@ test('agent-bridge round-trip wall is 600s, matching the Vidnets server floor', 
   }
 });
 
-test('simplified pipeline: a failing draft gets ONE fix pass, then fails loudly (max 2 draft calls)', async () => {
+test('a completed Muse draft is retained without a second writing request', async () => {
   // Nov 9, 2026 simplification: draft 1 + one fix pass, never a 4–6 draft
   // loop over 17 minutes. A stub writer returns a short generic draft
   // every time, so the gate can never pass; the generation must stop
@@ -314,8 +314,9 @@ test('simplified pipeline: a failing draft gets ONE fix pass, then fails loudly 
       research: realResearch,
       chatCompletionFn: fakeChat,
     });
-    assert.equal(calls, 2, `expected exactly 2 draft calls (draft + one fix pass), got ${calls}`);
-    assert.equal(out.meta.timing.draftCalls, 2, 'meta must report 2 draft calls');
+    assert.equal(calls, 1, `expected exactly one complete draft call, got ${calls}`);
+    assert.equal(out.meta.timing.draftCalls, 1, 'meta must report one draft call');
+    assert.ok(out.script.trim(), 'the written narration is retained');
     assert.equal(out.meta.publishable, false, 'a gate-failing draft must not be publishable');
     assert.ok((out.meta.quality.issues || []).length > 0, 'the failure must name its reasons');
   } finally {

@@ -17,11 +17,18 @@
 
 const fs = require('fs');
 const path = require('path');
-const { runCommand, parseJsonOutput } = require('../lib/command');
+const { runCommand, parseJsonOutput, quoteArg } = require('../lib/command');
 const config = require('../lib/config');
 const log = require('../lib/log');
 const { registerStageProcess } = require('../lib/stageCleanup');
 const vidnets = require('./vidnets');
+
+function resolveRenderCommand(command, root = config.ROOT) {
+  // Job processes run in their own work directory. Resolve only our known
+  // bundled renderer, leaving custom commands and their arguments untouched.
+  return String(command).replace(/^(\s*(?:node|node\.exe)\s+)(?:["'](?:\.\/)?render-vidnets-linux\.js["']|(?:\.\/)?render-vidnets-linux\.js)(?=\s|$)/i,
+    (_match, prefix) => prefix + quoteArg(path.join(root, 'render-vidnets-linux.js')));
+}
 
 /**
  * Parse one stderr line from render-vidnets-linux.js into live progress.
@@ -131,7 +138,7 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
 
 async function render(job, scriptText, workDir, options = {}) {
   const command = String(process.env.MUSE_RENDER_COMMAND || '').trim();
-  if (command) return runRenderCommand(command, job, scriptText, workDir, options);
+  if (command) return runRenderCommand(resolveRenderCommand(command), job, scriptText, workDir, options);
 
   // If external Vidnets launcher is explicitly configured, use it. A
   // Vidnets failure is terminal: falling back to the native Remotion
@@ -151,4 +158,4 @@ async function render(job, scriptText, workDir, options = {}) {
   );
 }
 
-module.exports = { render, copyIntoWorkDir, parseRenderProgressLine };
+module.exports = { render, copyIntoWorkDir, parseRenderProgressLine, resolveRenderCommand };

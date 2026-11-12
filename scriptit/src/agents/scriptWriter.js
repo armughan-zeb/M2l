@@ -59,7 +59,7 @@ const { getResearchStore } = require('../research/store');
 const { buildResearchPlan, buildCoverageReport } = require('../research/questionPlanner');
 const { normalizeTopic, researchSubject } = require('../research/topicNormalizer');
 const { runUniversalEngine } = require('../engine/universalEngine');
-const { generateHook, buildDeterministicHooks } = require('../engine/agents/hookAgent');
+const { buildDeterministicHooks } = require('../engine/agents/hookAgent');
 const { deSlopScript, cleanVoiceRules, evaluateVoiceAuthenticity } = require('../engine/agents/voiceAgent');
 const { generateScriptFromStructure } = require('./structureCloner');
 const { auditNarration, auditConsistency, correctFindings } = require('./factualAudit');
@@ -615,7 +615,7 @@ async function runScriptGeneration({
   // pass. The draft budget is the TOTAL number of model draft calls per
   // generation — draft 1 + one fix pass — never a 4–6 draft loop over 17
   // minutes. Override with MUSE_SCRIPT_MAX_DRAFTS (1–6); default 2.
-  const draftBudgetMax = Math.max(1, Math.min(6, Number(process.env.MUSE_SCRIPT_MAX_DRAFTS) || 2));
+  const draftBudgetMax = 1; // One complete narration response per job.
   // One shared research deadline for the whole data pass: the pipeline call
   // and any direct-research recovery share it — the recovery never gets
   // fresh time. Override with MUSE_RESEARCH_TIMEOUT_MS; default 180000.
@@ -939,28 +939,6 @@ async function runScriptGeneration({
       generationCheckpoint.phase = 'editorial';
       notify(80, 'Restoring the preserved narration checkpoint');
       await saveDraft(result.content);
-    } else if (!quickMode && !chatCompletionFn && wordTarget >= 700) {
-      draftCalls += 1;
-      notify(48, 'Planning source-grounded narration beats');
-      result = await writeSections({ topic: trimmedTopic, wordTarget, evidenceText, signal, model, requestTimeoutMs: effectiveTimeoutMs,
-        onDraft: saveDraft,
-        initialCheckpoint: generationCheckpoint.sectionCheckpoint,
-        onCheckpoint: async checkpoint => { generationCheckpoint.sectionCheckpoint = checkpoint; await saveDraft(generationCheckpoint.draft || ''); },
-        editorialContext: [titleContext, customStructure, narratorText, 'Voice: ' + voice].filter(Boolean).join('\n'),
-        previousDraft: preservedDraft,
-        continuityReview: false,
-        onProgress: (beat, total) => notify(48 + Math.floor(beat / total * 7), 'Writing narration beat ' + beat + ' of ' + total),
-        complete: options => chatCompletion({ apiKey, model, temperature: 0.2, fallbackModels: [],
-          responseFormat: options.responseFormat,
-          // Schema routing requires every sent parameter. The selected Qwen
-          // writer supports schema output, but not the optional reasoning hint.
-           timeoutMs: effectiveTimeoutMs, signal: options.signal,
-           maxAttemptsPerModel: 1, maxTotalAttempts: 1,
-          reasoning: writerReasoning(model, !!options.responseFormat),
-          messages: [{ role: 'system', content: options.system }, { role: 'user', content: options.user }], maxTokens: options.maxTokens }),
-      });
-      generationCheckpoint.phase = 'editorial';
-      await saveDraft(result.content);
     } else result = await callDraft({
       apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, chatCompletionFn,
     });
@@ -1195,28 +1173,9 @@ async function runScriptGeneration({
     };
   }
 
-  // Hook variants are alternates for the title/thumbnail cold open; the
-  // draft's own opening already passed the hook gate, so never prepend a
-  // second hook. Prefer the hook agent's scored LLM variants when the model
-  // is available; deterministic variants are the fallback. Variants are
-  // cached in the generation checkpoint so a resume reuses them instead of
-  // spending another provider call on work already done.
-  let hookInfo = buildDeterministicHooks(trimmedTopic, cleanFinalScript);
-  if (Array.isArray(generationCheckpoint.hookVariants) && generationCheckpoint.hookVariants.length) {
-    hookInfo = { variants: generationCheckpoint.hookVariants, selectedHook: generationCheckpoint.selectedHook || null };
-  } else if (modelAvailable) {
-    try {
-      const hookResult = await generateHook({ topic: trimmedTopic, bodyScript: cleanFinalScript, thesisStatement: plan.strategy?.id || trimmedTopic, apiKey, model });
-      if (hookResult?.variants?.length) {
-        hookInfo = hookResult;
-        generationCheckpoint.hookVariants = hookResult.variants;
-        generationCheckpoint.selectedHook = hookResult.selectedHook || null;
-        await saveDraft(cleanFinalScript);
-      }
-    } catch (err) {
-      console.warn('[ScriptIT] Hook variants unavailable, using deterministic hooks:', err.message);
-    }
-  }
+  // The narration already contains its opening; do not ask Muse for hooks
+  // again after the script. Retain local metadata for existing consumers.
+  const hookInfo = buildDeterministicHooks(trimmedTopic, cleanFinalScript);
   const voiceCheck = evaluateVoiceAuthenticity(cleanFinalScript);
   // Deterministic rescue drafts are evidence-safe emergency output, not a
   // style exemplar for future similarity checks. Recording them would make a
