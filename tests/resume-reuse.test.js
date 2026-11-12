@@ -245,7 +245,8 @@ test('resolveClaim delivers an archived finished master without starting script/
     const videoUpload = client.calls.upload.find(call => call.kind === 'video');
     assert.ok(videoUpload, 'the master must be uploaded');
     assert.equal(videoUpload.filePath, path.join(workRoot, job.jobId, 'video.mp4'), 'the archived master is staged into the work dir and uploaded');
-    assert.ok(client.calls.upload.find(call => call.kind === 'thumbnail'), 'the thumbnail must be uploaded');
+    assert.equal(Boolean(client.calls.upload.find(call => call.kind === 'thumbnail')),
+      !jobRunner.thumbnailsSkipped(), 'respect the worker thumbnail configuration when resuming');
     assert.ok(
       client.calls.progress.some(call => call.detail.includes('Delivering the existing master')),
       'the CMS must be told an existing master is being delivered'

@@ -18,7 +18,7 @@
 // restarting from scratch.
 //
 // The end-to-end tests (executeJob + kill/resume) are gated behind
-// MUSE_RUN_E2E_PROGRESS_TEST=1: they generate a real 31s 1080p fixture
+// MUSE_RUN_E2E_PROGRESS_TEST=1: they generate a real 61s 1080p fixture
 // with ffmpeg (~10s) and run a full local job against a stub CMS.
 // Run: MUSE_RUN_E2E_PROGRESS_TEST=1 node --test tests/daemon-progress-checkpoints.test.js
 
@@ -37,7 +37,7 @@ process.env.MUSE_WORK_DIR = workRoot;
 process.env.MUSE_CMS_RETRY_BASE_MS = '10';
 process.env.MUSE_CMS_RETRY_MAX_MS = '50';
 
-const { runCommand } = require('../lib/command');
+const { runCommand, commandLine } = require('../lib/command');
 const log = require('../lib/log');
 const config = require('../lib/config');
 const { createClient } = require('../lib/cms');
@@ -71,7 +71,7 @@ test('runCommand streams stderr lines to onStderrLine while the command runs', a
   ].join('\n'));
   const seen = [];
   const startedAt = Date.now();
-  const result = await runCommand(`node ${script}`, {
+  const result = await runCommand(commandLine(process.execPath, [script]), {
     label: 'stderr stream test',
     onStderrLine: line => seen.push({ line, atMs: Date.now() - startedAt })
   });
@@ -90,7 +90,7 @@ test('runCommand flushes a final stderr line without a trailing newline', async 
   const script = path.join(dir, 'emit-tail.js');
   fs.writeFileSync(script, "process.stderr.write('tail-no-newline');\n");
   const seen = [];
-  await runCommand(`node ${script}`, {
+  await runCommand(commandLine(process.execPath, [script]), {
     label: 'stderr tail test',
     onStderrLine: line => seen.push(line)
   });
@@ -196,7 +196,7 @@ test('video adapter streams wrapper stderr into live onProgress calls (via MUSE_
     "});"
   ].join('\n'));
   const previous = process.env.MUSE_RENDER_COMMAND;
-  process.env.MUSE_RENDER_COMMAND = `node ${stub} ${fakeVideo}`;
+  process.env.MUSE_RENDER_COMMAND = commandLine(process.execPath, [stub, fakeVideo]);
   try {
     const job = { jobId: 'r_test_adapter', title: 'Adapter streaming test', targetDurationMinutes: 1 };
     const seen = [];
@@ -366,8 +366,8 @@ async function makeFixtureMp4(dir) {
   await new Promise((resolve, reject) => {
     execFile('ffmpeg', [
       '-v', 'error',
-      '-f', 'lavfi', '-i', 'testsrc=size=1920x1080:rate=10:duration=31',
-      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=31',
+      '-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=10:duration=61',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=61',
       '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
       '-b:v', '1500k', '-maxrate', '2000k', '-bufsize', '4000k',
       '-c:a', 'aac', '-shortest', '-y', out
@@ -405,8 +405,8 @@ function testJob(jobId) {
   return {
     jobId,
     title: 'Progress E2E test title',
-    targetDurationMinutes: 0.5,
-    targetWordCount: 75,
+    targetDurationMinutes: 1,
+    targetWordCount: 150,
     channel: { name: 'Test Channel', id: 'c_test' },
     requirements: { minimumWords: 60 },
     outputLocations: {}
@@ -470,7 +470,7 @@ test('e2e: executeJob reports live Vidnets progress with log lines to the CMS', 
   fs.writeFileSync(path.join(jobDir, 'script.txt'), scriptFixture(150) + '\n', 'utf8');
   const stub = writeStubRender(dir, { fixture, jobId });
   const previous = process.env.MUSE_RENDER_COMMAND;
-  process.env.MUSE_RENDER_COMMAND = `node ${stub}`;
+  process.env.MUSE_RENDER_COMMAND = commandLine(process.execPath, [stub]);
   try {
     const client = recordingClient();
     const result = await jobRunner.executeJob({
@@ -541,7 +541,7 @@ test('e2e: daemon killed mid-render resumes mid-job instead of restarting', { sk
   const env = {
     ...process.env,
     MUSE_WORK_DIR: workRoot,
-    MUSE_RENDER_COMMAND: `node ${slowStub}`,
+    MUSE_RENDER_COMMAND: commandLine(process.execPath, [slowStub]),
     MUSE_PROGRESS_KEEPALIVE_MS: '90000'
   };
   const child = spawn('node', [driver], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -582,7 +582,7 @@ test('e2e: daemon killed mid-render resumes mid-job instead of restarting', { sk
   // saved Vidnets job id instead of submitting fresh.
   const fastStub = writeStubRender(dir, { fixture, jobId, reattachId: 'stub-vidnets-1' });
   const previous = process.env.MUSE_RENDER_COMMAND;
-  process.env.MUSE_RENDER_COMMAND = `node ${fastStub}`;
+  process.env.MUSE_RENDER_COMMAND = commandLine(process.execPath, [fastStub]);
   try {
     const client = recordingClient();
     const resumed = await jobRunner.resumeActiveJob({ client, maxAttempts: 1 });

@@ -72,10 +72,11 @@ function copyIntoWorkDir(source, workDir, name) {
   return resolved;
 }
 
-async function runRenderCommand(command, job, scriptText, workDir, { signal, onProgress } = {}) {
+async function runRenderCommand(command, job, scriptText, workDir, { signal, onProgress, attempt } = {}) {
   const input = JSON.stringify({
     type: 'render',
     job,
+    attempt,
     scriptText,
     scriptPath: path.join(workDir, 'script.txt'),
     workDir,

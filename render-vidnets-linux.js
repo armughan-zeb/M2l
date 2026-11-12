@@ -40,6 +40,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { checkMuseInferenceBridge } = require('./lib/museInference');
 const { writeJsonAtomic } = require('./lib/config');
+const { readRenderReceipt, submitRender } = require('./lib/vidnetsSubmission');
 
 const VIDNETS_ROOT = String(process.env.MUSE_VIDNETS_ROOT || '').trim()
   || path.join(__dirname, 'vidnets');
@@ -331,41 +332,31 @@ async function main() {
   const { buildRequest } = require('./adapters/vidnets');
   const request = buildRequest(job, scriptText, packageDir);
   const requestFile = path.join(workDir, 'vidnets-request.json');
-  writeJsonAtomic(requestFile, request);
-
   const jobFile = path.join(workDir, 'vidnets-job.json');
-  let vidnetsJobId = '';
-  // The one bounded re-plan is per JOB, not per wrapper run: if a previous
-  // run already spent it, the saved file says so (replanAttempted: 1) and
-  // a resume must not earn a second one.
-  let replanAttempted = false;
-  try {
-    const saved = JSON.parse(fs.readFileSync(jobFile, 'utf8'));
-    if (saved && saved.id && saved.jobId === job.jobId) {
-      vidnetsJobId = String(saved.id);
-      replanAttempted = replanAlreadyUsed(saved);
-      log(`Re-attaching to existing Vidnets job ${vidnetsJobId} for ${job.jobId}${replanAttempted ? ' (media re-plan already used)' : ''}`);
-    }
-  } catch { /* no saved Vidnets job: submit a fresh one */ }
+  let receipt = readRenderReceipt(jobFile, job.jobId);
+  let vidnetsJobId = receipt?.id || '';
+  let replanAttempted = replanAlreadyUsed(receipt);
+  const cmsAttempt = Math.max(1, Number(input.attempt) || 1);
+  const submit = filePath => vidnets(['submit', filePath], 2 * MINUTE);
+  const saveReceipt = fields => {
+    receipt = { ...receipt, ...fields, id: vidnetsJobId, jobId: job.jobId, packageDir };
+    writeJsonAtomic(jobFile, receipt);
+  };
+  if (vidnetsJobId) log(`Re-attaching to existing Vidnets job ${vidnetsJobId} for ${job.jobId}`);
 
   log('Ensuring Vidnets service is ready');
   await vidnets(['start'], 2 * MINUTE);
 
   if (!vidnetsJobId) {
-    const submitted = await vidnets(['submit', requestFile], 2 * MINUTE);
-    vidnetsJobId = String(submitted.item?.id || '').trim();
-    if (!vidnetsJobId) fail('Vidnets did not return a queue job id');
-    writeJsonAtomic(jobFile, {
-      id: vidnetsJobId, jobId: job.jobId, packageDir,
-      submittedAt: new Date().toISOString()
-    });
+    vidnetsJobId = await submitRender({ jobId: job.jobId, filePath: requestFile, request, submit });
+    saveReceipt({ cmsAttempt, submittedAt: new Date().toISOString() });
     log(`Vidnets job ${vidnetsJobId} submitted for "${job.title}"`);
   }
 
   const deadline = Date.now()
     + Math.max(10 * MINUTE, Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE);
   const pollMs = Math.max(2000, Number(process.env.MUSE_VIDNETS_POLL_MS) || 5000);
-  let retries = 0;
+  let retries = Number(receipt.cmsAttempt) === cmsAttempt ? (Number(receipt.pausedRetries) || 0) : 0;
   // replanAttempted is declared above (restored from the saved job file on
   // re-attach) so a resume cannot earn a second re-plan.
   let lastProgress = -1;
@@ -386,6 +377,7 @@ async function main() {
       if (!snapshot.item?.status) throw new Error('Vidnets returned no job status');
       statusFailures = 0;
     } catch (error) {
+      if (/returned (400|401|403|404)\b/i.test(error.message)) throw error;
       statusFailures += 1;
       const delayMs = Math.min(30000, pollMs * 2 ** Math.min(statusFailures - 1, 5));
       log(`Vidnets status unavailable for ${vidnetsJobId}; will recheck the same render in ${Math.round(delayMs / 1000)}s: ${error.message}`);
@@ -458,14 +450,11 @@ async function main() {
           const previousId = vidnetsJobId;
           const retryRequest = buildRetryRequest(request);
           const retryRequestFile = path.join(workDir, 'vidnets-request-replan.json');
-          writeJsonAtomic(retryRequestFile, retryRequest);
           log(`0 real-media scenes — attempting the one bounded media re-plan (fresh queries, plan cache bypassed) with ${Math.round(msRemaining / 60000)} min left in the render budget`);
-          const submitted = await vidnets(['submit', retryRequestFile], 2 * MINUTE);
-          vidnetsJobId = String(submitted.item?.id || '').trim();
-          if (!vidnetsJobId) fail('Vidnets did not return a queue job id for the media re-plan');
-          writeJsonAtomic(jobFile, {
-            id: vidnetsJobId, jobId: job.jobId, packageDir,
-            submittedAt: new Date().toISOString(), replanOf: previousId, replanAttempted: 1
+          vidnetsJobId = await submitRender({ jobId: job.jobId, filePath: retryRequestFile, request: retryRequest, submit });
+          saveReceipt({
+            cmsAttempt, pausedRetries: 0, submittedAt: new Date().toISOString(),
+            replanOf: previousId, replanAttempted: 1
           });
           log(`Media re-plan submitted as Vidnets job ${vidnetsJobId} (re-plan of ${previousId})`);
           retries = 0;
@@ -498,6 +487,13 @@ async function main() {
       return;
     }
     if (['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
+      if (item.status !== 'cancelled' && cmsAttempt > Number(receipt.cmsAttempt || 1)) {
+        log(`CMS attempt ${cmsAttempt}: resuming failed Vidnets job ${vidnetsJobId} from its checkpoint`);
+        await vidnets(['retry', vidnetsJobId], 2 * MINUTE);
+        saveReceipt({ cmsAttempt, pausedRetries: 0 });
+        retries = 0;
+        continue;
+      }
       fail('Vidnets render failed: ' + String(item.error || item.paused_reason || item.progress_text || `status ${item.status}`).slice(0, 700));
     }
     if (item.status === 'paused') {
@@ -541,6 +537,7 @@ async function main() {
       } else {
         log(`Vidnets job paused (attempt ${retries}/3); retrying`);
       }
+      saveReceipt({ cmsAttempt, pausedRetries: retries });
       await vidnets(['retry', vidnetsJobId], 2 * MINUTE);
     }
 
