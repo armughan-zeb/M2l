@@ -1,3 +1,22 @@
+function normalizeNarration(raw) {
+  let value = raw;
+  for (let depth = 0; depth < 4; depth++) {
+    if (typeof value === 'string') {
+      const text = value.trim();
+      const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+      const candidate = fenced ? fenced[1].trim() : text;
+      if (!/^[{"\[]/.test(candidate)) return value;
+      try { value = JSON.parse(candidate); } catch { return value; }
+      if (typeof value === 'string') continue;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return typeof raw === 'string' ? raw : '';
+    const next = value.scriptText ?? value.script ?? value.narration ?? value.result ?? value.content;
+    if (typeof next !== 'string' && (!next || typeof next !== 'object' || Array.isArray(next))) return typeof raw === 'string' ? raw : '';
+    value = next;
+  }
+  return typeof value === 'string' ? value : (typeof raw === 'string' ? raw : '');
+}
+
 function stripThinkingProcess(raw) {
   let text = String(raw || '');
   text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
@@ -12,7 +31,7 @@ function stripThinkingProcess(raw) {
 }
 
 function writerOutput(content, target) {
-  const stripped = stripThinkingProcess(content);
+  const stripped = stripThinkingProcess(normalizeNarration(content));
   const script = stripped.replace(/<\/?evidence(?::[^>]+)?>/gi, '').trim();
   const words = script.split(/\s+/).filter(Boolean).length;
   const issues = [];
@@ -394,7 +413,7 @@ async function safeWriteDraft(options) {
 }
 
 function evaluateDraft(content, { topic = '', wordTarget, previousScripts, evidence, contentType }) {
-  const raw = String(content || '');
+  const raw = normalizeNarration(content);
   const validIds = new Set((evidence && evidence.claims ? evidence.claims : []).map((claim) => claim.id));
   const markers = [...raw.matchAll(/<evidence:\s*([^>]+)>/gi)]
     .flatMap((match) => match[1].match(/claim-[a-z0-9]+/gi) || []);
@@ -878,7 +897,7 @@ async function runScriptGeneration({
     ? JSON.parse(JSON.stringify(suppliedCheckpoint)) : { version: 1, contextHash: checkpointHash, phase: 'drafting' };
   const saveDraft = async content => {
     signal?.throwIfAborted();
-    const cleanContent = stripThinkingProcess(content);
+    const cleanContent = stripThinkingProcess(normalizeNarration(content));
     if (cleanContent) generationCheckpoint.draft = String(cleanContent);
     if (!onDraft) return;
     await onDraft({ script: String(cleanContent).replace(/<\/?evidence(?::[^>]+)?>/gi, '').trim(),
@@ -904,6 +923,7 @@ async function runScriptGeneration({
       providerOptions: quickProviderOptions,
       hardTimeoutMs: quickMode ? Math.max(25, remainingQuickMs) : 0,
     });
+    if (draft && typeof draft.content === 'string') draft.content = normalizeNarration(draft.content);
     await saveDraft(draft?.content);
     return draft;
   };
@@ -993,10 +1013,13 @@ async function runScriptGeneration({
     const minRequired = Math.max(80, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance));
     const avoid = `Revise the CURRENT DRAFT below, retaining only supported facts. Fix every issue: ${quality.issues.join(' ')}. Its measured narration length is ${quality.words} words; the required target is ${wordTarget}. Aim for ${promptTarget} words (minimum acceptable is ${minRequired} words). ${quality.words < minRequired ? `Develop at least ${minRequired - quality.words} additional words of supported context across the existing beats; do not compress the current draft or append filler.` : 'Preserve its useful depth while correcting unsupported claims.'} Open with a documented fact, tension or question that hooks the viewer with an explicit promise; never imagine a scene. Use 3–5 meaningful beats, varied sentence rhythm and at least 5 blank-line paragraphs for a 700+ word script. Do not invent reactions, motives or company intent. Return the complete corrected spoken narration with valid evidence markers, not a summary or a list of edits. Revision ${revision} of 1 — the only fix pass.\n\nCURRENT DRAFT:\n${String(result?.content || quality.script).slice(0, 30000)}`;
     try {
-      result = await callDraft({
+      const revised = await callDraft({
         apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, avoid, temperature: 0.35, chatCompletionFn,
       });
-      quality = evaluateDraft(result && result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
+      if (revised?.content?.trim()) {
+        result = revised;
+        quality = evaluateDraft(result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
+      }
     } catch (revErr) {
       console.warn('[ScriptIT] Revision attempt failed:', revErr.message);
     }
@@ -1098,17 +1121,18 @@ async function runScriptGeneration({
     // research-status paragraph is not a usable script and caused the UI to
     // look broken. It remains non-publishable until the evidence gate passes.
     const fallbackDraft = buildEvidenceFallbackScript(trimmedTopic, evidence, wordTarget) || buildPartialResearchScript(trimmedTopic, evidence);
-    const partial = [cleanFinalScript, bestSafeDraft, fallbackDraft]
+    const partial = [cleanFinalScript, bestSafeDraft, generationCheckpoint.draft, fallbackDraft]
       .map((draft) => String(draft || '').replace(/<evidence:\s*[^>]+>/gi, '').trim())
-      .sort((left, right) => right.split(/\s+/).filter(Boolean).length - left.split(/\s+/).filter(Boolean).length)[0]
+      .find(Boolean) || '';
+    const cleanedPartial = partial
       .replace(/<evidence:\s*[^>]+>/gi, '')
       .trim();
-    const partialQuality = evaluateDraft(partial, { topic: trimmedTopic, wordTarget, previousScripts: [], evidence, contentType: plan.contentType });
+    const partialQuality = evaluateDraft(cleanedPartial, { topic: trimmedTopic, wordTarget, previousScripts: [], evidence, contentType: plan.contentType });
     const finalDetails = researchIncomplete
       ? `research remains incomplete: ${researchGapReasons}`
       : (partialQuality.issues || []).slice(0, 5).join(' ') || 'the draft remains an editorial draft';
     return {
-      script: partial,
+      script: cleanedPartial,
       meta: {
         topic: trimmedTopic,
         model,
@@ -1271,6 +1295,7 @@ module.exports = {
   runUniversalEngine,
   buildEvidenceFallbackScript,
   writerOutput,
+  normalizeNarration,
   evaluateDraft,
   sanitizeUnsupportedSentences,
   mergeSafeDrafts,

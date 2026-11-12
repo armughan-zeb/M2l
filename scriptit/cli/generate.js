@@ -279,12 +279,14 @@ async function main() {
         log(`Could not save draft file: ${err.message}`);
       }
     }
-    log('Refusing to present a failed draft as a finished script. Returning it with publishable=false so the worker can decide.');
+    // Keep the explicit quality verdict and issues in the result, but let the
+    // worker use a nonempty draft rather than discard the Muse response.
+    log('Continuing with the saved draft; editorial warnings remain attached.');
     process.stdout.write(JSON.stringify({
       scriptText,
       meta: { ...meta, publishable: false },
     }) + '\n');
-    process.exit(2);
+    process.exit(0);
   }
   log(`done: ${meta.quality?.words || scriptText.split(/\s+/).length} words, quality score ${meta.quality?.score ?? 'n/a'}, hook=${meta.quality?.hook === true}`);
   process.stdout.write(JSON.stringify({ scriptText, meta }) + '\n');

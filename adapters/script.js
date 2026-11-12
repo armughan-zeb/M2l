@@ -37,12 +37,13 @@ function validateScript(text, job) {
   const warnings = [];
   if (!scriptText) return { ok: false, words: 0, minimumWords: requiredWords, warnings, error: 'Narration is empty' };
   if (words < requiredWords) {
+    warnings.push(`Narration is shorter than the requested ${job.targetDurationMinutes || 8}-minute runtime (${words} words; target ${requiredWords})`);
     return {
-      ok: false,
+      ok: true,
       words,
       minimumWords: requiredWords,
       warnings,
-      error: `Narration is too short for ${job.targetDurationMinutes || 8} minutes (${words} words; at least ${requiredWords} needed)`
+      error: ''
     };
   }
   return { ok: true, words, minimumWords: requiredWords, warnings };
@@ -208,6 +209,8 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
   onProgress?.(10, isDefault ? 'Generating narration with ScriptIT (agent-bridge mode)' : 'Generating narration with the Muse agent');
   let result = await runScriptCommand(effectiveCommand, job, workDir, { signal, onDetail, timeoutMs });
   let check = validateScript(result.scriptText, job);
+  if (result.meta?.publishable === false) onDetail?.('Narration retained with editorial warnings: ' + (result.meta?.quality?.issues || []).slice(0, 3).join('; '));
+  if (check.warnings.length) onDetail?.(check.warnings.join('; '));
 
   // SIMPLIFIED PIPELINE (Nov 9, 2026): the script is written ONCE. The old
   // default re-ran the whole ScriptIT generation (research + drafts) when

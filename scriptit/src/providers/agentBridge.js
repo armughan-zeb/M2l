@@ -145,6 +145,10 @@ async function postOnce({ owner, jobId, operation, messages, responseFormat, max
       if (reply) {
         if (reply.error) throw new AgentBridgeError('External agent could not answer: ' + String(reply.error).slice(0, 300));
         if (typeof reply.content === 'string' && reply.content.trim()) return { content: reply.content, requestId };
+        // Some agents write a parsed object as content instead of a JSON
+        // string. Preserve it as JSON for structured callers; narration is
+        // unwrapped later, only in the script-writing path.
+        if (reply.content && typeof reply.content === 'object') return { content: JSON.stringify(reply.content), requestId };
         throw new AgentBridgeError('External agent returned an empty completion');
       }
       if (Date.now() >= deadline) {
