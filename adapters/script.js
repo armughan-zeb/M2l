@@ -57,7 +57,9 @@ async function runScriptCommand(command, job, workDir, { signal, onDetail, expan
     requirements: job.requirements || {}
   };
   if (expansion) payload.expansion = expansion;
-  const result = await runCommand(command, {
+  let result;
+  try {
+    result = await runCommand(command, {
     input: JSON.stringify(payload),
     cwd: workDir,
     signal,
@@ -70,7 +72,19 @@ async function runScriptCommand(command, job, workDir, { signal, onDetail, expan
       MUSE_STAGE: 'script',
       MUSE_EXPANSION: expansion ? '1' : '0'
     }
-  });
+    });
+  } catch (error) {
+    // ScriptIT emits its actionable failure as JSON on stdout and diagnostic
+    // progress on stderr. Preserve the actual cause instead of reporting only
+    // the progress lines when its process exits unsuccessfully.
+    const response = parseJsonOutput(error.stdout);
+    if (response && typeof response === 'object' && typeof response.error === 'string' && response.error.trim()) {
+      const failure = new Error('Muse script command failed: ' + response.error.trim());
+      failure.code = error.code;
+      throw failure;
+    }
+    throw error;
+  }
   const parsed = parseJsonOutput(result.stdout);
   const normalized = normalizeScriptResult(parsed ?? result.stdout);
   if (!normalized) throw new Error('Muse script command returned no narration text');
@@ -180,6 +194,10 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
   // Vidnets inbox. A custom MUSE_SCRIPT_COMMAND still wins when set.
   const scriptitCli = path.join(__dirname, '..', 'scriptit', 'cli', 'generate.js');
   const isDefault = !command;
+  if (isDefault) {
+    const readiness = require('../lib/scriptReadiness').checkScriptReadiness();
+    if (!readiness.ok) throw new Error(`ScriptIT is not installed correctly: missing ${readiness.missing.join(', ')}. Run npm ci --omit=dev in scriptit, or rebuild the Docker image.`);
+  }
   const effectiveCommand = command || `node ${quoteArg(scriptitCli)}`;
   // Agent-bridge round-trips are human-speed (inbox + operator); give the
   // default engine a 45-minute budget. A custom command keeps the 10-minute

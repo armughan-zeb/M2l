@@ -14,16 +14,17 @@
 # revoked credential (401), a fatal start-gate failure, or SIGTERM/SIGINT.
 set -euo pipefail
 cd "$(dirname "$0")"
+REPO_ROOT="$(pwd -P)"
 
 export MUSE_AUTO_LOOP=1
 export MUSE_INFERENCE_COMPULSORY=1
-export MUSE_RENDER_COMMAND="node /home/hatch/workspace/M2l/render-vidnets-linux.js"
-export MUSE_VIDNETS_ROOT="/home/hatch/workspace/M2l/vidnets"
-export MUSE_YOUTUBE_COVERAGE_TARGET=0.8
-export MUSE_MEDIA_STRICT=0
-export MUSE_RENDER_CONCURRENCY=1
-export TMPDIR="/home/hatch/workspace/vidnets-runtime/temp"
-export VIDZEO_TEMP_DIR="/home/hatch/workspace/vidnets-runtime/temp"
+export MUSE_RENDER_COMMAND="${MUSE_RENDER_COMMAND:-node $(printf '%q' "$REPO_ROOT/render-vidnets-linux.js")}"
+export MUSE_VIDNETS_ROOT="${MUSE_VIDNETS_ROOT:-$REPO_ROOT/vidnets}"
+export MUSE_YOUTUBE_COVERAGE_TARGET="${MUSE_YOUTUBE_COVERAGE_TARGET:-0.30}"
+export MUSE_MEDIA_STRICT="${MUSE_MEDIA_STRICT:-0}"
+export MUSE_RENDER_CONCURRENCY="${MUSE_RENDER_CONCURRENCY:-1}"
+export VIDZEO_TEMP_DIR="${VIDZEO_TEMP_DIR:-${VIDZEO_RUNTIME_ROOT:-$HOME/workspace/vidnets-runtime}/temp}"
+export TMPDIR="${TMPDIR:-$VIDZEO_TEMP_DIR}"
 mkdir -p "$TMPDIR"
 
 # /tmp hygiene: /tmp is a 512 MB tmpfs and it has filled up before (stale

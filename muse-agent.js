@@ -296,9 +296,15 @@ async function doctorCommand() {
   add('Python 3', py.ok ? 'pass' : 'warn',
     py.ok ? `${py.binary}${py.version ? ' (v' + py.version + ')' : ''}` : 'Not found. Install python3 (e.g. sudo apt install python3) or set VIDNETS_PYTHON.');
 
-  add('Script adapter', 'pass',
-    String(process.env.MUSE_SCRIPT_COMMAND || '').trim()
-    || 'Default ScriptIT CLI in agent-bridge mode (Muse inference compulsory; template fallback is opt-in only).');
+  const scriptCommand = String(process.env.MUSE_SCRIPT_COMMAND || '').trim();
+  if (scriptCommand) {
+    add('Script adapter', 'pass', 'Custom script command configured');
+  } else {
+    const scriptCheck = require('./lib/scriptReadiness').checkScriptReadiness();
+    add('Script adapter', scriptCheck.ok ? 'pass' : 'fail', scriptCheck.ok
+      ? 'ScriptIT CLI and runtime dependencies available'
+      : `Missing ${scriptCheck.missing.join(', ')}. Run npm ci --omit=dev in the scriptit directory or rebuild the Docker image.`);
+  }
 
   const renderCommand = String(process.env.MUSE_RENDER_COMMAND || '').trim();
   if (renderCommand) {

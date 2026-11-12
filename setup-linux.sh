@@ -98,14 +98,18 @@ if [ -f "$DIR/scriptit/scripts/yt_transcript.py" ]; then
 fi
 echo "[PASS] Set executable permissions on all shell scripts and binaries"
 
-# 7. Install Node dependencies (Remotion documentary engine and React)
-echo "[Info] Installing npm dependencies for Remotion documentary engine..."
-(cd "$DIR" && npm install --no-audit --no-fund) || true
+# 7. Install dependencies for both the worker and its separate ScriptIT app.
+echo "[Info] Installing worker and ScriptIT runtime dependencies..."
+(cd "$DIR" && npm ci --no-audit --no-fund)
+(cd "$DIR/scriptit" && npm ci --omit=dev --no-audit --no-fund)
+(cd "$DIR/vidnets" && npm ci --omit=dev --no-audit --no-fund)
+(cd "$DIR/remotion-linux" && npm ci --no-audit --no-fund)
+node -e "require.resolve('rss-parser', { paths: [process.argv[1]] }); require.resolve('sql.js', { paths: [process.argv[1]] })" "$DIR/scriptit"
 
 # 8. Run doctor
 echo ""
 echo "=== Running Muse Doctor ==="
-node "$DIR/muse-agent.js" doctor || true
+node "$DIR/muse-agent.js" doctor || echo "[WARN] Setup installed dependencies, but doctor reported checks that still need attention."
 
 echo ""
 echo "Setup complete! To start the worker, run: ./start.sh"
