@@ -2974,6 +2974,26 @@ def _scene_finalist_limit() -> int:
         return 3
 
 
+def _finalists_for_storyboard(rows, configured):
+    """Avoid checking several candidates per scene for a short video.
+
+    Unusable or missing duration data keeps the configured limit. Rejected
+    candidates still use the existing bounded expansion/recovery path.
+    """
+    try:
+        durations = []
+        for row in rows:
+            value = row.get("duration")
+            if value is None and row.get("start_seconds") is not None and row.get("end_seconds") is not None:
+                value = float(row["end_seconds"]) - float(row["start_seconds"])
+            durations.append(float(value or 0))
+        if durations and all(0 < value < 600 for value in durations) and sum(durations) <= 120:
+            return min(configured, 1)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return configured
+
+
 def _visual_gate_workers(primary_count: int) -> int:
     """Parallel vision checks in the primary gate (default 12, cap 24).
 
@@ -3655,7 +3675,7 @@ def resolve_storyboard_media_v2(
         # cross-source recovery below.
         finalists, top_pool = _select_scene_finalists(
             viable,
-            finalist_limit=_scene_finalist_limit(),
+            finalist_limit=_finalists_for_storyboard(rows, _scene_finalist_limit()),
             top_candidates=_scene_top_candidates_limit(),
         )
         primary_top_pool_keys[index] = {
