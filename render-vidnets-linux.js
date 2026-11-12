@@ -371,42 +371,37 @@ async function main() {
   let lastProgress = -1;
   let lastDetail = '';
   let lastPendingCheck = 0;
+  let pendingCheck = null;
+  let statusFailures = 0;
 
   while (true) {
     if (Date.now() > deadline) {
       fail(`Vidnets render exceeded the configured budget for job ${vidnetsJobId}`);
     }
 
-    // Visibility only: how many inbox requests are still unanswered, so the
-    // daemon log shows whether the hook worker is actually answering.
-    if (Date.now() - lastPendingCheck > 60000) {
-      lastPendingCheck = Date.now();
-      try {
-        const pending = await vidnets(['pending'], MINUTE);
-        const rows = Array.isArray(pending.requests) ? pending.requests : [];
-        const mine = rows.filter(r => String(r.job_id || '') === String(vidnetsJobId));
-        if (mine.length) log(`Inbox: ${mine.length} request(s) still pending for this job (hook worker answers these)`);
-      } catch (err) { log('Inbox pending check failed (non-fatal): ' + err.message); }
+    // A lost status response does not establish that the renderer stopped.
+    let snapshot;
+    try {
+      snapshot = await vidnets(['job', vidnetsJobId], MINUTE);
+      if (!snapshot.item?.status) throw new Error('Vidnets returned no job status');
+      statusFailures = 0;
+    } catch (error) {
+      statusFailures += 1;
+      const delayMs = Math.min(30000, pollMs * 2 ** Math.min(statusFailures - 1, 5));
+      log(`Vidnets status unavailable for ${vidnetsJobId}; will recheck the same render in ${Math.round(delayMs / 1000)}s: ${error.message}`);
+      await sleep(delayMs);
+      continue;
     }
 
-    // The status fetch is a read, not a render step: one transient failure
-    // (busy server, queue lock, a slow `job` call timing out at 60s) must
-    // not kill a healthy render. BNSF attempt 5 died exactly this way —
-    // the wrapper exited while Vidnets job 23d01670 was still processing
-    // at 55%, and the CMS job was failed for nothing. Retry the fetch up
-    // to 3 times, then fail with the real reason.
-    let snapshot;
-    for (let statusAttempt = 1; ; statusAttempt += 1) {
-      try {
-        snapshot = await vidnets(['job', vidnetsJobId], MINUTE);
-        break;
-      } catch (err) {
-        if (statusAttempt >= 3) {
-          fail(`Vidnets status check failed ${statusAttempt} times in a row for job ${vidnetsJobId} (the Vidnets job may still be running): ${err.message}`);
-        }
-        log(`Vidnets status check failed (attempt ${statusAttempt}/3, non-fatal): ${err.message}`);
-        await sleep(pollMs);
-      }
+    // Inbox diagnostics must not delay progress polling.
+    if (!pendingCheck && Date.now() - lastPendingCheck > MINUTE) {
+      lastPendingCheck = Date.now();
+      pendingCheck = vidnets(['pending'], 8000).then(pending => {
+        const rows = Array.isArray(pending.requests) ? pending.requests : [];
+        const mine = rows.filter(row => String(row.job_id || '') === vidnetsJobId);
+        if (mine.length) log(`Inbox: ${mine.length} request(s) still pending for this job (hook worker answers these)`);
+      }).catch(error => log('Inbox pending check failed (non-fatal): ' + error.message))
+        .finally(() => { pendingCheck = null; });
     }
     const item = snapshot.item || {};
     const progress = Math.max(0, Math.min(100, Number(item.progress) || 0));

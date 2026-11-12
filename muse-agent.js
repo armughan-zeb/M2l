@@ -572,7 +572,13 @@ async function startCommand(args) {
     try {
       // `current` is kept fresh by executeJob's onBusy on every report(),
       // so the heartbeat carries the live stage/%/detail to the CMS.
-      const response = await client.heartbeat(heartbeatInfo(current?.jobId || '', current));
+      const active = config.readActiveJob();
+      const jobId = current?.jobId || active?.jobId || '';
+      const progress = current?.stage ? current : jobId
+        ? jobRunner.readProgressCheckpoint(config.workDir(jobId))
+        : null;
+      const response = await client.heartbeat(heartbeatInfo(jobId, progress));
+      if (response.syncRequest) await jobRunner.syncSavedProgress(client, response.syncRequest, active);
       if (response.active === false) {
         log.warn('This worker is paired but not the Active Worker. Select it in Muse agents to receive jobs.');
       }
@@ -610,35 +616,6 @@ async function startCommand(args) {
   log.info(`Muse worker ${VERSION} starting for "${saved.agentName || 'Muse agent'}" at ${config.cmsUrl(saved)}`);
   await heartbeat();
   if (fatal) throw fatal;
-
-  // A deferred resume means the CMS was unreachable while probing the
-  // saved job: the marker is kept and the poll loop below re-attempts
-  // the resume (single probe per iteration, backing off) instead of
-  // claiming a new job or exiting. See lib/jobRunner.js resumeActiveJob.
-  // The initial probe is guarded like the loop's: only a 401 is fatal —
-  // any other throw defers instead of killing the daemon on boot.
-  let resumed = null;
-  try {
-    resumed = await jobRunner.resumeActiveJob({
-      client,
-      signal: abort.signal,
-      onBusy: (jobId, stage, progress, detail) => { current = { jobId, stage, progress, detail }; }
-    });
-  } catch (error) {
-    if (error.status === 401) {
-      fatal = new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
-      throw fatal;
-    }
-    const savedJob = config.readActiveJob();
-    log.warn(`Saved-job resume probe failed at startup (${error.message}); daemon keeps polling and will resume it when the CMS answers`);
-    resumed = { deferred: true, jobId: savedJob?.jobId };
-  }
-  if (resumed?.deferred) {
-    log.warn(`Resume of saved job ${resumed.jobId} deferred (CMS unavailable); daemon keeps polling and will resume it when the CMS answers`);
-  } else if (resumed) {
-    log.info(`Saved job ${resumed.ok ? 'delivered' : 'settled without delivery'}`);
-    current = null;
-  }
 
   timer = setInterval(() => { heartbeat(); }, heartbeatMs);
   timer.unref?.();
@@ -697,7 +674,7 @@ async function startCommand(args) {
 
     let claim;
     try {
-      claim = await client.nextJob();
+      claim = await client.nextJob({ recoverClaim: true });
       pollFailures = 0;
     } catch (error) {
       if (error.status === 401) throw new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
@@ -742,10 +719,18 @@ async function startCommand(args) {
       if (abort.signal.aborted) break;
       log.error(`Job ${job.jobId} failed: ${error.message}`);
       try {
-        await client.fail(job.jobId, error.message);
-        config.clearActiveJob();
+        const outcome = await jobRunner.reportExecutionFailure(client, job.jobId, claim.attempt || 1, error, abort.signal);
+        if (outcome.deferred) {
+          log.warn('CMS delivery or failure report deferred; saved work retained: ' + outcome.error);
+          await sleep(pollMs, abort.signal);
+        }
       } catch (failError) {
-        log.warn('Could not report the job failure; saved work is retained: ' + failError.message);
+        if (failError.status === 401) {
+          fatal = new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
+          abort.abort();
+          break;
+        }
+        throw failError;
       }
     } finally {
       current = null;
@@ -754,6 +739,7 @@ async function startCommand(args) {
   }
 
   if (fatal) {
+    clearInterval(timer);
     releaseLock();
     throw fatal;
   }

@@ -154,6 +154,71 @@ test('a successful probe with no local checkpoint clears the marker without runn
   assert.equal(config.readActiveJob(), null);
 });
 
+test('an interrupted delivery keeps the checkpoint and a completed CMS receipt clears it', async () => {
+  const jobId = writeActiveJob();
+  const delivery = await jobRunner.reportExecutionFailure({
+    async fail() { assert.fail('A CMS outage must not fail the render'); }
+  }, jobId, 1, cmsError(502));
+  assert.equal(delivery.deferred, true);
+  assert.equal(config.readActiveJob().jobId, jobId);
+  const resumed = await jobRunner.resumeActiveJob({
+    client: { async progress(id, stage, progress, detail, advancing, extra) {
+      assert.equal(id, jobId);
+      assert.equal(extra.attempt, 1);
+      return { ok: true, completed: true };
+    } },
+    maxAttempts: 1
+  });
+  assert.deepEqual(resumed, { ok: true, alreadyDelivered: true });
+  assert.equal(config.readActiveJob(), null);
+});
+
+test('a CMS sync request receives the saved progress history for its attempt', async () => {
+  const jobId = writeActiveJob();
+  const directory = config.workDir(jobId);
+  jobRunner.writeProgressCheckpoint(directory, jobId, { stage: 'script', progress: 100, detail: 'Narration saved' });
+  jobRunner.writeProgressCheckpoint(directory, jobId, { stage: 'video', progress: 62, detail: 'Checking media relevance 20/42' });
+  const client = { async sync(id, snapshot) {
+    assert.equal(id, jobId);
+    assert.equal(snapshot.requestId, 'request-one');
+    assert.equal(snapshot.attempt, 1);
+    assert.deepEqual(snapshot.logs.map(item => item.stage), ['script', 'video']);
+    assert.equal(snapshot.latest.eventId, snapshot.logs[1].eventId);
+  } };
+  await jobRunner.syncSavedProgress(client, { id: 'request-one', jobId }, config.readActiveJob());
+  config.clearActiveJob();
+});
+
+test('completion retries a lost response without another artifact upload', async () => {
+  const http = require('node:http');
+  const { createClient } = require('../lib/cms');
+  const attempts = [];
+  const server = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    attempts.push({ url: request.url, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+    if (attempts.length === 1) {
+      response.destroy();
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: true, duplicate: true }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = createClient({ baseUrl: 'http://127.0.0.1:' + server.address().port, token: 'fixture-token' });
+    const body = { scriptText: 'Saved narration for the receipt test.', meta: { attempt: 2 } };
+    assert.deepEqual(await client.complete('r_receipt', body), { ok: true, duplicate: true });
+    assert.deepEqual(attempts, [
+      { url: '/api/muse/agent/jobs/r_receipt/complete', body },
+      { url: '/api/muse/agent/jobs/r_receipt/complete', body }
+    ]);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('health monitor dry-run detects a dead daemon and a stale inbox request without acting', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-monitor-'));
   const repo = path.join(dir, 'repo');
