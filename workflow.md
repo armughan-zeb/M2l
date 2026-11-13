@@ -71,7 +71,7 @@ script + video, uploads to the CMS, marks completed (thumbnails are generated lo
 | Script (once) | ScriptIT CLI, agent-bridge mode, at most `MUSE_SCRIPT_MAX_DRAFTS` calls (default 2: draft 1 + ONE fix pass) | Publishable script, words ≈ minutes × 150 (floor minutes × 135), external claims ≥ 1, 0 synthetic | Draft still fails the gate → CLI exits 2, job fails loudly. No more drafts |
 | Vidnets mixed-media | LLM writes queries from the scenes → search YouTube clips + web images → FILTER THE BEST (rank, keep the best real media; reject only clearly-wrong footage) → vision ranks (scores) → Remotion edits | Most scenes real, most of them clips where clips exist | See §5. One bounded media re-plan per job, before a 0-real fail only |
 | Render | Remotion renders the 1080p master (6 h CMS hard limit per attempt; 20 min inactivity limit) | Video ≥ 1920×1080, ≥ target minutes, h264+aac, ≥ 1 MB, audio stream present | Render stalls: check memory admission (`:5010` status) and the wrapper log — do not restart mid-render |
-| Validate | Wrapper checks the edit plan: real-media count, video size, decode | `Edit plan: N/total scenes real media` with N ≥ 1 | N = 0 → wrapper fails the job (after the one bounded re-plan). Never deliver a graphics-only video |
+| Validate | Wrapper checks the edit plan and the worker validates the master | `Edit plan: N/total scenes real media` with N equal to total | Incomplete coverage can trigger one bounded re-plan before delivery is blocked |
 | Deliver | Worker uploads video + script to the CMS (--skip-thumbnail), marks completed | CMS shows the job completed (Pikgen handles thumbnails locally) | Delivery validation fails → fix the artifact, do not weaken the checks |
 
 ## 3. How filter-best works (the architecture, in one paragraph)
@@ -92,7 +92,7 @@ it without a reason recorded in the commit message. The render wrapper
 (`render-vidnets-linux.js:countRealScenes`) counts a scene as real when
 Vidnets' own adapter accepted it (`media.verified` in the edit plan, or
 a Muse-verified verdict) — an explicit Muse rejection always wins.
-The ONLY hard rule is delivery: 0 real-media scenes fails the job.
+Delivery requires accepted real media in every scene.
 
 ## 4. Settings
 

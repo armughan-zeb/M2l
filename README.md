@@ -20,17 +20,16 @@ observed running, no
 OpenRouter key in the environment — see `lib/museInference.js`), and
 `MUSE_AUTO_LOOP=1` never exempts that check. `node muse-agent.js doctor`
 checks the same bridge and FAILS when it is absent. A job whose inference
-goes unanswered fails closed; a job with 0 real-media scenes is never
-delivered as graphics. Before failing for 0 real-media scenes the
-render wrapper attempts one bounded media re-plan with fresh queries (see
+goes unanswered fails closed. Every scene must have accepted real media.
+If a completed edit has incomplete coverage, the render wrapper can attempt
+one bounded media re-plan with fresh queries (see
 `render-vidnets-linux.js`).
 
 **Filter-best (Nov 9, 2026).** Vidnets' native mixed-media flow is used
 as built: LLM writes queries from the scenes → search YouTube clips +
 web images → filter the BEST (rank, keep the best real media; reject
 only clearly-wrong footage) → Remotion edits. Vision is advisory by
-default (`MUSE_MEDIA_STRICT=0`); the only hard rule is the delivery
-rule above. See `rules.md`, `workflow.md`, and `HYBRID_WIRING.md`
+default (`MUSE_MEDIA_STRICT=0`). See `rules.md`, `workflow.md`, and `HYBRID_WIRING.md`
 ("Filter-best").
 
 **Simplified pipeline (Nov 9, 2026).** One data pass (all research

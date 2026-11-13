@@ -16,8 +16,7 @@
  *   - Vidnets job ends error / cancelled / shutdown_timeout -> throw.
  *   - Vidnets job stays paused after 3 retries -> throw.
  *   - No video file, or video < 1 MB -> throw.
- *   - The finished edit plan has 0 real-media scenes (all graphic
- *     fallbacks) -> throw instead of delivering a graphics-only video.
+ *   - Every scene in the finished edit plan must have accepted real media.
  *   - No fallback to the native Remotion engine or the solid-colour
  *     ffmpeg placeholder: those are what made live jobs graphics-only.
  *
@@ -48,14 +47,11 @@ const REPLAN_MIN_REMAINING_MS = 10 * MINUTE;
 
 /**
  * Pure decision: may the wrapper spend its one bounded media re-plan?
- * Only a finished plan with 0 Muse-verified real-media scenes earns one,
- * only once per wrapper run, and only when enough render budget remains.
- * Anything else (a broken render, a missing edit plan, a too-small video)
- * fails immediately instead — retrying those would just repeat the failure.
+ * An incomplete plan earns at most one re-plan when enough budget remains.
  */
-function shouldAttemptReplan({ real, replanAttempted, msRemaining, minRemainingMs = REPLAN_MIN_REMAINING_MS }) {
+function shouldAttemptReplan({ real, total = 1, replanAttempted, msRemaining, minRemainingMs = REPLAN_MIN_REMAINING_MS }) {
   if (replanAttempted) return false;
-  if (real !== 0) return false;
+  if (real >= total) return false;
   return Number(msRemaining) >= Number(minRemainingMs);
 }
 
@@ -243,11 +239,10 @@ function resultVideoPath(item) {
  * Muse rejection (accepted === false, fatal_mismatch, rejected status)
  * always beats the flag: a rejected asset is never real. `verified`
  * still counts Muse-verified scenes separately, for reporting.
- * The delivery rule is the ONLY hard rule: real === 0 fails the job.
  */
-function countRealScenes(packageDir) {
+function countRealScenes(packageDir, planPath) {
   if (!packageDir || !fs.existsSync(packageDir)) return null;
-  const plans = fs.readdirSync(packageDir)
+  const plans = planPath ? [planPath] : fs.readdirSync(packageDir)
     .filter(name => name.endsWith('_remotion_edit_plan.json'))
     .map(name => path.join(packageDir, name));
   if (!plans.length) return null;
@@ -258,9 +253,10 @@ function countRealScenes(packageDir) {
   for (const planFile of plans) {
     let plan;
     try { plan = JSON.parse(fs.readFileSync(planFile, 'utf8')); } catch { continue; }
-    for (const scene of plan.scenes || []) {
+    if (!Array.isArray(plan?.scenes)) continue;
+    for (const scene of plan.scenes) {
       total += 1;
-      const media = scene.media || {};
+      const media = scene?.media || {};
       const src = String(media.src || '');
       const decision = media.visual_decision || {};
       const museVerified = decision.visual_checked === true && decision.accepted === true;
@@ -269,12 +265,18 @@ function countRealScenes(packageDir) {
         || decision.fatal_mismatch === true
         || String(decision.status || '').trim().toLowerCase() === 'rejected';
       const adapterAccepted = media.verified === true || museVerified;
-      if (media.type === 'graphic' || /graphic_fallback|emergency/i.test(src)) graphic += 1;
+      if (media.type === 'graphic' || media.is_graphic_fallback || /graphic_fallback|emergency|[\\/]placeholders?[\\/]/i.test(src)) graphic += 1;
       else if ((media.type === 'image' || media.type === 'video') && src && adapterAccepted && !explicitlyRejected) real += 1;
       else graphic += 1;
     }
   }
   return total ? { real, graphic, total, verified } : null;
+}
+
+function completedMediaCount(item, videoPath) {
+  const planPath = item.result?.render_metadata?.edit_plan_path
+    || videoPath.replace(/\.mp4$/i, '_remotion_edit_plan.json');
+  return countRealScenes(path.dirname(videoPath), planPath);
 }
 
 function readStdin() {
@@ -412,7 +414,7 @@ async function main() {
       if (!videoPath) fail('Vidnets completed the job without a readable video_path');
       const size = fs.statSync(videoPath).size;
       if (size < 1024 * 1024) fail(`Vidnets video is too small to be a real master (${size} bytes)`);
-      const mediaCount = countRealScenes(path.dirname(videoPath));
+      const mediaCount = completedMediaCount(item, videoPath);
       if (!mediaCount) {
         // No edit plan next to the video means the real-media mix cannot
         // be verified at all — fail closed instead of accepting on file
@@ -420,32 +422,16 @@ async function main() {
         fail('Vidnets completed without an edit plan next to the video — the real-media mix cannot be verified. Failing instead of delivering an unverified video.');
       }
       log(`Edit plan: ${mediaCount.real}/${mediaCount.total} scenes real media (${mediaCount.verified} Muse-verified), ${mediaCount.graphic} graphic fallback(s)`);
-      if (mediaCount.real === 0) {
-        // The ONLY hard delivery rule: never deliver a video with 0
-        // real-media scenes. Filter-best means a scene can be real via
-        // the adapter's own acceptance (verified flag) even when Muse
-        // never answered a vision request for it — so there is no
-        // separate "no Muse verdicts at all" failure any more. The
-        // compulsory-inference gate still applies at STARTUP (the job
-        // must have the bridge available), but a missing verdict on a
-        // scene the adapter accepted on download/metadata is not a
-        // reason to throw the video away.
-        const reason = 'Vidnets completed with 0 real-media scenes (all graphic fallbacks) — no media was accepted. Failing instead of delivering a graphics-only video.';
-        // Bounded media re-plan: one fresh submit with fresh queries, inside
-        // the same overall render budget. The first attempt delivered
-        // nothing (this branch only runs when the plan is 0-real, so the
-        // wrapper has returned no success), and the job file is overwritten
-        // with the new id, so a later resume re-attaches to the re-plan —
-        // never to the dead attempt — and a delivery can only happen once,
-        // from the single success output at the end of this run.
+      if (mediaCount.real < mediaCount.total) {
+        const reason = `Vidnets accepted real media in ${mediaCount.real}/${mediaCount.total} scenes. Every scene needs accepted real media.`;
         const msRemaining = deadline - Date.now();
         const minRemainingMs = Math.max(0, Number(process.env.MUSE_REPLAN_MIN_REMAINING_MS) || REPLAN_MIN_REMAINING_MS);
-        if (shouldAttemptReplan({ real: mediaCount.real, replanAttempted, msRemaining, minRemainingMs })) {
+        if (shouldAttemptReplan({ ...mediaCount, replanAttempted, msRemaining, minRemainingMs })) {
           replanAttempted = true;
           const previousId = vidnetsJobId;
           const retryRequest = buildRetryRequest(request);
           const retryRequestFile = path.join(workDir, 'vidnets-request-replan.json');
-          log(`0 real-media scenes — attempting the one bounded media re-plan (fresh queries, plan cache bypassed) with ${Math.round(msRemaining / 60000)} min left in the render budget`);
+          log(`${reason} Attempting one re-plan with fresh queries and ${Math.round(msRemaining / 60000)} min left in the render budget`);
           vidnetsJobId = await submitRender({ jobId: job.jobId, filePath: retryRequestFile, request: retryRequest, submit });
           saveReceipt({
             cmsAttempt, pausedRetries: 0, submittedAt: new Date().toISOString(),
@@ -548,4 +534,4 @@ if (require.main === module) {
   main().catch(err => fail(err && err.message ? err.message : String(err)));
 }
 
-module.exports = { countRealScenes, checkTempSpace, TEMP_MIN_FREE_MB, TMP_MIN_FREE_MB, shouldAttemptReplan, buildRetryRequest, replanAlreadyUsed, REPLAN_MIN_REMAINING_MS, writeVidnetsProgressFile };
+module.exports = { countRealScenes, completedMediaCount, checkTempSpace, TEMP_MIN_FREE_MB, TMP_MIN_FREE_MB, shouldAttemptReplan, buildRetryRequest, replanAlreadyUsed, REPLAN_MIN_REMAINING_MS, writeVidnetsProgressFile };

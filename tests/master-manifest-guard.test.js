@@ -185,6 +185,15 @@ test('guard delivers the good f04c6b9f manifest: 15/15 real media, own temp dir'
   assert.deepEqual(check.foreignJobs, []);
 });
 
+test('saved master delivery rejects a missing scene even when other scenes have real media', () => {
+  const manifest = goodManifest();
+  manifest.media_paths[4] = '';
+  const check = guard.decideManifestDelivery(manifest, { vidnetsJobId: 'f04c6b9f' });
+  assert.equal(check.ok, false);
+  assert.equal(check.realCount, 14);
+  assert.match(check.reason, /14\/15 scenes/);
+});
+
 test('guard refuses a manifest whose stamped job id disagrees with the claiming job', () => {
   const manifest = goodManifest();
   manifest.job_id = '876f0e84';

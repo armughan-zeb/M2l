@@ -384,9 +384,15 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     if (item.status === 'completed') {
       const videoPath = resultVideoPath(item);
       if (!videoPath) throw new Error('Vidnets completed the job without a readable video_path');
+      const mediaCount = require('../render-vidnets-linux').completedMediaCount(item, videoPath);
+      if (!mediaCount || mediaCount.real !== mediaCount.total) {
+        throw new Error('Vidnets completed without evidence of accepted real media in every scene');
+      }
       if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(() => {});
       onProgress?.(100, 'Vidnets render complete');
-      return { videoPath, vidnetsJobId, packageDir, meta: { engine: 'vidnets', vidnetsJobId } };
+      return { videoPath, vidnetsJobId, packageDir, meta: {
+        engine: 'vidnets', vidnetsJobId, realScenes: mediaCount.real, totalScenes: mediaCount.total
+      } };
     }
     if (['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
       if (item.status !== 'cancelled' && cmsAttempt > Number(receipt.cmsAttempt || 1)) {

@@ -53,25 +53,35 @@ def validate_documentary_coverage(media_plan, durations=(), config=None):
     # the gate here in Vidnets instead of only warning and letting the outer
     # render wrapper catch it later.
     guarantee = bool(config.get('global_media_guarantee', True))
+    real_only = config.get('media_fallback_policy') == 'real_media_only'
     all_emergency = bool(paths) and len(emergency_indices) == len(paths)
-    passed = bool(paths) and not missing_indices and not (guarantee and all_emergency)
+    scene_count_mismatch = real_only and len(durations) > 0 and len(paths) != len(durations)
+    passed = bool(paths) and not missing_indices and not scene_count_mismatch and not (
+        (real_only and emergency_indices) or (guarantee and all_emergency)
+    )
     warnings = ([f'Emergency graphics used in {len(emergency_indices)}/{len(paths)} scenes '
                  f'({scene_ratio:.1%} of scenes, {duration_ratio:.1%} of runtime); '
                  'real-media retrieval remains preferred.'] if emergency_indices else [])
     if guarantee and all_emergency:
         warnings.append('Media guarantee failed: every scene fell back to emergency graphics; no real media was retrieved.')
+    if scene_count_mismatch:
+        warnings.append(f'Media plan has {len(paths)} slots for {len(durations)} narration scenes.')
     summary = {
         'passed': passed, 'scene_count': len(paths), 'source_counts': dict(counts),
+        'scene_count_mismatch': scene_count_mismatch,
         'emergency_scene_indices': emergency_indices, 'missing_scene_indices': missing_indices,
         'emergency_scene_ratio': round(scene_ratio, 4), 'emergency_duration_ratio': round(duration_ratio, 4),
-        'max_emergency_visual_ratio': None, 'advisory_only': True, 'warnings': warnings,
+        'max_emergency_visual_ratio': 0 if real_only else None,
+        'advisory_only': not real_only, 'warnings': warnings,
     }
     media_plan.setdefault('metadata', {})['documentary_coverage'] = summary
     if not passed:
+        slot_message = f'Expected {len(durations)} media slots, found {len(paths)}. ' if scene_count_mismatch else ''
         raise MediaContractError(
             f'Documentary media coverage failed: {len(missing_indices)} missing scene(s); '
             f'{len(emergency_indices)}/{len(paths)} emergency scenes '
             f'({scene_ratio:.1%} of scenes, {duration_ratio:.1%} of runtime). '
+            f'{slot_message}'
             'Retrieval checkpoints are saved; repair empty or missing media slots before rendering or uploading.',
             summary,
         )

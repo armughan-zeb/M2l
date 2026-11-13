@@ -19889,6 +19889,13 @@ def _render_video_with_semantic_editing(
         path = media_paths[index] if index < len(media_paths) else None
         resolved_path = str(Path(path).resolve()) if path else ""
         resolution_row = resolution_rows[index] if index < len(resolution_rows) and isinstance(resolution_rows[index], dict) else {}
+        decision = resolution_row.get('visual_decision') or {}
+        accepted_media = (
+            bool(resolved_path)
+            and str(resolution_row.get('status') or '').casefold() in {'accepted', 'downloaded'}
+            and str(resolution_row.get('verification_status') or '').casefold() not in {'rejected', 'failed', 'blocked'}
+            and decision.get('accepted') is not False and decision.get('fatal_mismatch') is not True
+        )
         media_items.append({
             "path": resolved_path,
             "src": resolved_path,
@@ -19909,7 +19916,8 @@ def _render_video_with_semantic_editing(
             if isinstance(resolution_row.get('graphic_fallback'), Mapping) else {},
             "source_url": resolution_row.get('source_url') or '',
             "rights_status": resolution_row.get('rights_status') or 'unknown',
-            "visual_decision": resolution_row.get('visual_decision') or {},
+            "visual_decision": decision,
+            "verified": accepted_media,
             "resolution": resolution_row,
             "render_clip_start": resolution_row.get('render_clip_start'),
             "visual_requirement": (
@@ -22767,6 +22775,7 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
         'status': 'complete',
         'selected_backend': 'remotion',
         'output_path': str(final_path),
+        'edit_plan_path': str(job_config.get('_remotion_plan_path') or ''),
         'quality': str(job_config.get('quality') or 'standard'),
         'output_package_dir': str(job_config.get('_output_package_dir') or ''),
         'checkpoint_dir': str(Path(job_config.get('_output_package_dir') or OUTPUT_DIR) / 'checkpoints'),
@@ -23221,7 +23230,16 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
 
     pre_render = _read_json(checkpoint_dir / 'pre_render.json')
     from services.media_asset_policy import excess_media_reuse_indices
-    if excess_media_reuse_indices(_read_json(checkpoint_dir / 'media_plan.json')):
+    saved_media_plan = _read_json(checkpoint_dir / 'media_plan.json')
+    if config.get('media_fallback_policy') == 'real_media_only':
+        from services.media_delivery_gate import validate_documentary_coverage
+        try:
+            saved_durations = _read_json(checkpoint_dir / 'audio_plan.json').get('scene_durations') or []
+            validate_documentary_coverage(saved_media_plan, saved_durations, config)
+        except MediaContractError as error:
+            print(f'   [retry] saved media requires repair: {error}', flush=True)
+            return None
+    if excess_media_reuse_indices(saved_media_plan):
         print('   [retry] saved media exceeds physical reuse limits; repairing affected scenes before rendering', flush=True)
         return None
     if str(pre_render.get('backend') or '').strip().lower() not in {'remotion', 'react'}:
