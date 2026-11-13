@@ -32,11 +32,11 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
         preselected = bool(settings.get('_youtube_quota_preselected'))
         try:
             coverage = 1.0 if preselected else float(settings.get('youtube_accepted_coverage_target',
-                                                                    settings.get('youtube_coverage_target', 0.30)))
+                                                                    settings.get('youtube_coverage_target', 0.8)))
             if not math.isfinite(coverage):
-                coverage = 1.0 if preselected else 0.30
+                coverage = 1.0 if preselected else 0.8
         except (TypeError, ValueError):
-            coverage = 1.0 if preselected else 0.30
+            coverage = 1.0 if preselected else 0.8
         coverage = max(0.0, min(1.0, coverage))
         target_scenes = max(1, math.ceil(scene_count * coverage))
         waves = math.ceil(target_scenes / max(1, int(download_workers)))

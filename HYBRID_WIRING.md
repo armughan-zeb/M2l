@@ -46,7 +46,7 @@ and capped or removed:
    retry is the coordinator's bounded late-vision lane (already
    downloaded clips only, ≤60s past the wall) — part of the one pass,
    not a re-plan.
-4. **ONE monitor.** `vidnets-health-monitor` (every 5 min) is the only
+   4. **ONE monitor.** `vidnets-health-monitor` (every minute) is the only
    monitor — the old `vidnets-recovery-watch` self-removed on Nov 9
    and no longer exists. It checks daemon alive + connected, Vidnets
    :5010 healthy + memory admission, CMS reachable + outage duration,
@@ -159,7 +159,7 @@ active, Vidnets renders, and Muse answers every inference request.
 2. **Vidnets server** — already running on :5010, local mode, auth off
    (`vidnets/.venv/bin/python3 main.py`, PID 5268). Do NOT restart it with
    the daemon; `VIDNETS_AGENT.sh start` reuses it (`reused: true`).
-3. **Inbox-watch hook** — `vidnets-inbox-watch`, poll 60s, re-wake 120s.
+3. **Inbox-watch hook** - `vidnets-inbox-watch`, poll 20s, re-wake 120s. When `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` is configured, the resident dispatcher polls every second and handles up to 8 requests; the hook then acts as its alert-only fallback. Without that resident transport, the hook is the primary answerer.
    Watches `~/workspace/vidnets-runtime/temp/agent-bridge/*/request.json`
    and wakes a Muse operator in side chat
    `38c7bbce-a978-43e6-bf4d-3f6d227d474c` to answer. This is the ONLY
@@ -167,7 +167,7 @@ active, Vidnets renders, and Muse answers every inference request.
 
 ## Render path — why the wrapper, not adapters/vidnets.js
 
-`MUSE_RENDER_COMMAND=node render-vidnets-linux.js` (in `.env`).
+`MUSE_RENDER_COMMAND=node <absolute-repo-path>/render-vidnets-linux.js` (in `.env`).
 The wrapper:
 - reuses `adapters/vidnets.js:buildRequest` — same job as the built-in
   path: `llm_provider=external_agent`, Mixed Media, priority
@@ -386,8 +386,8 @@ path in front of it did not. Fixed:
 - **Today, the permanent monitor cron below.** The overnight
   recovery watch (`vidnets-recovery-watch`, every 10 min) SELF-REMOVED
   once the pipeline recovered (~06:44 PKT Nov 9). The monitor cron
-  `vidnets-health-monitor` (every 5 min, created Nov 9, 2026) replaces
-  it permanently — a VM reboot is picked up at the next 5-minute tick.
+  `vidnets-health-monitor` (every minute, installed by setup) replaces
+  it permanently - a VM reboot is picked up at the next one-minute tick.
 - **systemd is NOT the answer here, even though PID 1 is systemd 255
   and `systemctl is-system-running` says `running`.** A system unit
   CAN start in this boot (`systemd-run --scope /bin/true` works), but
@@ -404,50 +404,40 @@ path in front of it did not. Fixed:
 - **`start-daemon.sh` is not a supervisor** and says so in its header:
   if the daemon exits, nothing in that script restarts it.
 
-## Health monitor — `~/hooks/scripts/vidnets-health-monitor.sh`, every 5 min
+## Health monitor - `~/hooks/scripts/vidnets-health-monitor.sh`, every minute
 
-Replaces the self-removed recovery watch (same job, permanent, wider).
-Cron definition to create (coordinator applies it via the cron tools):
+`setup.sh` installs this monitor and replaces its single cron row on each
+rerun. Existing hosts must rerun setup to install the current monitor. The
+one-minute cadence is required by the 60-second answer SLO; five minutes can
+miss a whole 120-second request lifetime. The monitor keeps a bounded
+500-line run log at `~/hooks/state/vidnets-health-monitor/monitor.log` and
+uses `flock` to avoid overlapping runs.
 
-- id `vidnets-health-monitor`, owner `goal:documentary-video-render-pipeline`,
-  mode `task`, enabled, schedule interval every `5m`, body: run
-  `bash ~/hooks/scripts/vidnets-health-monitor.sh`, silent when the
-  summary says `result=ok`; when it says `result=needs_user`, message
-  the user with the exact ALERT lines and what was already tried/fixed.
-  Never claim, deliver, or restart a job; never edit the hook
-  definition or `.muse-agent.json`.
+It checks disk/tmp headroom; parses Vidnets `/api/status` (including memory
+admission); checks the hook's `last-run` proof is no older than 120 seconds;
+measures CMS reachability/outage duration; obtains paired-worker
+connection/active-worker status with an 8-second bound; and scans bridge
+requests for pending ages and per-operation totals, approximate response-file
+latency percentiles, unknown operations, and expired counts. Requests older
+than 60 seconds are logged as WARN; an expiry is an operator alert. CMS
+outages are notes until 30 minutes, or 5 minutes with an active job, then
+alert once per outage.
 
-Checks, in fix order (Vidnets before the daemon — the daemon's start
-gate refuses to start while Vidnets is down): disk/tmp space; Vidnets
-:5010 healthy + memory admission state; inbox-watch hook enabled; CMS
-reachable + outage duration; daemon alive + connected
-(`node muse-agent.js status`); agent-bridge inbox stale / past-half-TTL
-requests; Vidnets queue-job stage while a render is in progress.
+The monitor restarts a dead daemon or Vidnets only when no active-job marker
+exists. During an active render it reports Vidnets failure or a memory hold
+without restarting the work. Expiry updates use the same per-request lock as
+the bridge writer, so a late response cannot be overwritten by the monitor.
+It never composes inference, claims/delivers jobs, edits credentials, or
+restarts a job mid-render. `VIDMON_DRY_RUN=1` leaves state unchanged and
+prints the proposed checks. A healthy monitor run is silent.
 
-Fix-vs-report rules (also in the script header): it FIXES a dead
-daemon (`start-daemon.sh`, detached) and a dead Vidnets server
-(`VIDNETS_AGENT.sh start` — reuses the live :5010 server when healthy,
-verified `reused: true` Nov 9) and marks inbox requests past
-`expires_at` as expired on disk (the same state the Vidnets server
-itself writes when a waiter gives up). It NEVER restarts Vidnets while
-a render is in progress (active job + `work/<job>/vidnets-job.json`
-exists) — it only reports — and never claims, delivers, restarts a job
-mid-render, edits the hook definition, or touches credentials. It
-REPORTS (ALERT, exit 2) when a fix failed, Vidnets is down during a
-possible render, the hook is disabled, the daemon is up but not
-connected while the CMS is up, the CMS is down > 30 min (or > 5 min
-with a job active, alerted once per outage), disk is critically low,
-or a render is held for memory (`admission_state=waiting`) with a job
-active. NOTE lines (low_memory admission — the steady state on this
-7.7 GB VM, currently ~466–719 MB available; a transient CMS blip; a
-request past half its TTL the hook may still answer) never wake the
-user. Silent when healthy except one summary line; runs are logged to
-`~/hooks/state/vidnets-health-monitor/monitor.log` (last 500 lines)
-and overlap is prevented with `flock`. Dry-run: `VIDMON_DRY_RUN=1`
-prints `WOULD …` instead of acting; paths/endpoints are overridable
-via `VIDMON_*` env vars for fixtures (see the test). Live dry-run
-Nov 9: exit 0, all OK, one NOTE (low_memory).
-
+The default hook still depends on the host Muse runtime. Its definition being
+enabled is not proof it fired: setup installs the repository script, then
+waits up to 120 seconds for `~/hooks/state/vidnets-inbox-watch/last-run`.
+The worker container mounts that proof read-only and refuses production
+claims if it is missing or stale. The repo cannot start or supervise Muse's
+own subagents; the installed hook or a configured resident Muse transport is
+still the answerer.
 ## Memory-admission visibility
 
 `/api/status` already reports it — `memory.admission_state` is

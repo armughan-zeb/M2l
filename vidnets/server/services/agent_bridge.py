@@ -211,7 +211,7 @@ def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
             if reply_path.exists():
                 reply = json.loads(reply_path.read_text(encoding='utf-8'))
                 if reply.get('error'):
-                    raise AgentBridgeError('External agent could not answer: ' + reply['error'])
+                    raise AgentBridgeError(f'Muse request {request_id} ({operation or kind}) failed: ' + str(reply['error']))
                 value = {'id': 'agent-' + request_id, 'model': AGENT_MODEL,
                          'provider': 'external_agent', 'billing': 'external_agent_runtime',
                          'choices': [{'message': {'content': reply['content']}, 'finish_reason': 'stop'}], 'usage': {}}

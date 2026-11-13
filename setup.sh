@@ -77,7 +77,7 @@ MUSE_INFERENCE_COMPULSORY=1
 MUSE_CMS_URL=$CMS_URL
 MUSE_LOG_LEVEL=info
 # Nov 10, 2026 standing decisions — do not "fix" these back.
-MUSE_YOUTUBE_COVERAGE_TARGET=0.30
+MUSE_YOUTUBE_COVERAGE_TARGET=0.8
 MUSE_MEDIA_STRICT=0
 VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE=12
 VIDZEO_VISUAL_FINALIST_LIMIT=3
@@ -99,7 +99,7 @@ else
   fi
   # Refresh the standing-decision vars in an old .env (compose env wins
   # anyway, but a stale 0.8 here would confuse the next reader).
-  for kv in MUSE_YOUTUBE_COVERAGE_TARGET=0.30 VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE=12 VIDZEO_VISUAL_FINALIST_LIMIT=3 VIDZEO_VISUAL_GATE_WORKERS=12 VIDZEO_VISUAL_RELATIVE_FLOOR=0.5 VIDZEO_YT_VISUAL_GATE_FRAMES=2 VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY=4 VIDZEO_YT_DOWNLOAD_CONCURRENCY=4 VIDZEO_SKIP_THUMBNAILS=1; do
+  for kv in MUSE_YOUTUBE_COVERAGE_TARGET=0.8 VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE=12 VIDZEO_VISUAL_FINALIST_LIMIT=3 VIDZEO_VISUAL_GATE_WORKERS=12 VIDZEO_VISUAL_RELATIVE_FLOOR=0.5 VIDZEO_YT_VISUAL_GATE_FRAMES=2 VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY=4 VIDZEO_YT_DOWNLOAD_CONCURRENCY=4 VIDZEO_SKIP_THUMBNAILS=1; do
     key="${kv%%=*}"
     if grep -q "^${key}=" .env; then
       sed -i "s|^${key}=.*|${kv}|" .env
@@ -112,18 +112,51 @@ fi
 
 # --- 4. Host Muse hook (inbox operator) --------------------------------------
 HOOK_FILE="${MUSE_INBOX_HOOK_DEFINITION:-${HOST_HOOKS_DIR:-$HOME/hooks/definitions}/vidnets-inbox-watch.json}"
+HOOK_STATE_DIR="${HOST_HOOK_STATE_DIR:-$HOME/hooks/state/vidnets-inbox-watch}"
+if [ -f "scripts/install-inbox-hook.sh" ]; then
+  bash "scripts/install-inbox-hook.sh"
+fi
 if [ ! -f "$HOOK_FILE" ]; then
   warn "vidnets-inbox-watch hook definition not found at $HOOK_FILE."
   warn "The daemon start gate will refuse to run until the host Muse VM has"
   warn "the vidnets-inbox-watch hook enabled (it is the only thing that"
   warn "answers Vidnets inference requests). Pairing below can still succeed;"
-  warn "fix the hook, then start the worker. See docker/SETUP.md (\"Host Muse hook\"):"
-  warn "copy docker/hooks/vidnets-inbox-watch.json.template to"
-  warn "\$HOME/hooks/definitions/vidnets-inbox-watch.json, replace the"
-  warn "<PLACEHOLDERS>, copy docker/hooks/vidnets-inbox-watch.sh to"
-  warn "\$HOME/hooks/scripts/, and enable the hook on the host Muse VM."
+  warn "create docker/hooks/vidnets-inbox-watch.json.template at the host hook"
+  warn "definition path with a real delivery target, enable it, then rerun setup."
+  warn "setup installs the repository script and verifies its last-run proof."
 else
   say "[PASS] Found vidnets-inbox-watch hook definition at $HOOK_FILE"
+  hook_enabled="$(python3 -c 'import json,sys; print("true" if json.load(open(sys.argv[1])).get("enabled") is True else "false")' "$HOOK_FILE" 2>/dev/null || printf 'unknown')"
+  [ "$hook_enabled" = true ] || die "The inbox hook definition is not enabled (state: $hook_enabled). Enable vidnets-inbox-watch on the host Muse VM before pairing or starting jobs."
+  hook_configured="$(python3 - "$HOOK_FILE" <<'PY'
+import json, sys
+row=json.load(open(sys.argv[1], encoding='utf-8'))
+delivery=row.get('delivery') or {}
+target=str(delivery.get('to') or delivery.get('target') or '').strip()
+script=str(row.get('script_path') or '').strip()
+print('true' if target and '<' not in target and script and '<' not in script else 'false')
+PY
+  )"
+  [ "$hook_configured" = true ] || die "The enabled hook still contains a delivery/script placeholder. Set a real Muse chat target and install path before pairing."
+  say "Waiting up to 120 seconds for the host Muse runtime to prove the hook actually runs..."
+  hook_seen=0
+  deadline=$(( $(date +%s) + 120 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    last_run="$(cat "$HOOK_STATE_DIR/last-run" 2>/dev/null || true)"
+    if [[ "$last_run" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - last_run )) -le 120 ]; then
+      hook_seen=1
+      break
+    fi
+    sleep 2
+  done
+  [ "$hook_seen" = 1 ] || die "The hook definition is enabled but no run was observed in $HOOK_STATE_DIR/last-run within 120 seconds. The worker will not be paired to an unproven inbox path."
+  say "[PASS] Host hook execution proved by $HOOK_STATE_DIR/last-run"
+fi
+
+# Install monitoring before the idempotent already-paired exit below. This
+# makes rerunning setup useful for an existing worker without re-pairing it.
+if [ -f "scripts/install-health-monitor.sh" ]; then
+  bash "scripts/install-health-monitor.sh"
 fi
 
 # --- 5. Already paired? Ask BEFORE the (slow) build -------------------------

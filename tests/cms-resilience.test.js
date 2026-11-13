@@ -13,7 +13,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const { test } = require('node:test');
 
 // Point the worker state at a scratch dir BEFORE requiring jobRunner:
@@ -219,7 +219,10 @@ test('completion retries a lost response without another artifact upload', async
   }
 });
 
-test('health monitor dry-run detects a dead daemon and a stale inbox request without acting', async () => {
+const healthMonitor = path.join(__dirname, '..', 'scripts', 'vidnets-health-monitor.sh');
+test('health monitor dry-run detects a dead daemon and a stale inbox request without acting', {
+  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash' : false
+}, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-monitor-'));
   const repo = path.join(dir, 'repo');
   const runtime = path.join(dir, 'runtime');
@@ -248,9 +251,8 @@ test('health monitor dry-run detects a dead daemon and a stale inbox request wit
     created_at: now - 400, expires_at: now + 400, kind: 'text', operation: 'plan', job_id: ''
   }));
 
-  const script = path.join(os.homedir(), 'hooks', 'scripts', 'vidnets-health-monitor.sh');
   const output = await new Promise((resolve, reject) => {
-    execFile('bash', [script], {
+    execFile('bash', [healthMonitor], {
       timeout: 60000,
       env: {
         ...process.env,
@@ -271,13 +273,186 @@ test('health monitor dry-run detects a dead daemon and a stale inbox request wit
   });
 
   assert.equal(output.code, 2, 'fixture faults must make the monitor report needs_user');
-  assert.match(output.stdout, /vidnets: :5010 DOWN; WOULD restart/);
+  assert.match(output.stdout, /vidnets: DOWN; WOULD restart/);
   assert.match(output.stdout, /daemon: NOT RUNNING and Vidnets is down/);
   assert.match(output.stdout, /hook: vidnets-inbox-watch is DISABLED/);
   assert.match(output.stdout, /inbox: request stale00000000000000000000000001 expired.*WOULD mark expired/);
-  assert.match(output.stdout, /past half their TTL still pending: half000000000000000000000000002/);
+  assert.match(output.stdout, /half000000000000000000000000002.*operator SLO is 60s/);
   assert.match(output.stdout, /HEALTH_MONITOR result=needs_user/);
   // Dry-run must not have changed the fixture: the stale request is untouched.
   const staleAfter = JSON.parse(fs.readFileSync(path.join(stale, 'request.json'), 'utf8'));
   assert.equal(staleAfter.state, 'pending', 'dry-run must not mark requests expired');
+});
+
+test('health monitor permits checkpoint-safe daemon recovery when Vidnets is healthy', {
+  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash' : false
+}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-checkpoint-monitor-'));
+  const repo = path.join(dir, 'repo');
+  const runtime = path.join(dir, 'runtime');
+  const bridge = path.join(runtime, 'temp', 'agent-bridge');
+  const stateDir = path.join(dir, 'state');
+  const hookStateDir = path.join(dir, 'hook-state');
+  const binDir = path.join(dir, 'bin');
+  fs.mkdirSync(path.join(repo, 'work'), { recursive: true });
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(hookStateDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(repo, 'work', 'active-job.json'), JSON.stringify({
+    jobId: 'r_checkpoint_resume', payload: { jobId: 'r_checkpoint_resume' }
+  }));
+  const hookDef = path.join(dir, 'hook.json');
+  fs.writeFileSync(hookDef, JSON.stringify({ enabled: true, id: 'vidnets-inbox-watch' }));
+  fs.writeFileSync(path.join(hookStateDir, 'last-run'), String(Math.floor(Date.now() / 1000)));
+
+  const fakeCurl = path.join(binDir, 'curl');
+  fs.writeFileSync(fakeCurl, [
+    '#!/bin/sh',
+    'case "$*" in',
+    '  */api/status*) printf \'%s\\n\' \'{"ready":true,"memory":{"admission_state":"normal","available_mb":2048,"minimum_available_mb":384}}\' ;;',
+    '  *http_code*) printf 200 ;;',
+    '  *) exit 22 ;;',
+    'esac',
+    ''
+  ].join('\n'));
+  fs.chmodSync(fakeCurl, 0o755);
+
+  const output = await new Promise((resolve, reject) => {
+    execFile('bash', [healthMonitor], {
+      timeout: 60000,
+      env: {
+        ...process.env,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+        VIDMON_DRY_RUN: '1',
+        VIDMON_REPO: repo,
+        VIDMON_RUNTIME_ROOT: runtime,
+        VIDMON_BRIDGE_DIR: bridge,
+        VIDMON_VIDNETS_URL: 'http://vidnets.test',
+        VIDMON_CMS_URL: 'https://cms.test',
+        VIDMON_HOOK_DEF: hookDef,
+        VIDMON_HOOK_STATE_DIR: hookStateDir,
+        VIDMON_STATE_DIR: stateDir,
+        VIDMON_DAEMON_PATTERN: 'definitely-no-such-daemon-checkpoint-xyz'
+      }
+    }, (error, stdout, stderr) => {
+      if (error && error.code !== 2) return reject(new Error(`monitor failed: ${error.message}\n${stdout}\n${stderr}`));
+      resolve({ code: error ? error.code : 0, stdout: String(stdout) });
+    });
+  });
+
+  assert.equal(output.code, 2, 'a missing daemon is an actionable monitor finding');
+  assert.match(output.stdout, /daemon: NOT RUNNING; WOULD restart and resume the saved job checkpoint/);
+  assert.doesNotMatch(output.stdout, /restart withheld to avoid duplicate work/);
+});
+
+test('health monitor restarts Vidnets for a checkpoint only after proving its server process is gone', {
+  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash and /proc' : false
+}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-dead-server-monitor-'));
+  const repo = path.join(dir, 'repo');
+  const runtime = path.join(dir, 'runtime');
+  const bridge = path.join(runtime, 'temp', 'agent-bridge');
+  const stateDir = path.join(dir, 'state');
+  const binDir = path.join(dir, 'bin');
+  fs.mkdirSync(path.join(repo, 'work'), { recursive: true });
+  fs.mkdirSync(path.join(runtime, 'secure'), { recursive: true });
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(repo, 'work', 'active-job.json'), JSON.stringify({
+    jobId: 'r_server_recovery', payload: { jobId: 'r_server_recovery' }
+  }));
+  fs.writeFileSync(path.join(runtime, 'secure', 'agent-service.json'), JSON.stringify({
+    pid: 2147483647, port: 5010, resource_root: path.join(repo, 'vidnets')
+  }));
+  const fakeCurl = path.join(binDir, 'curl');
+  fs.writeFileSync(fakeCurl, '#!/bin/sh\nexit 22\n');
+  fs.chmodSync(fakeCurl, 0o755);
+
+  const output = await new Promise((resolve, reject) => {
+    execFile('bash', [healthMonitor], {
+      timeout: 60000,
+      env: {
+        ...process.env,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+        VIDMON_DRY_RUN: '1',
+        VIDMON_REPO: repo,
+        VIDMON_RUNTIME_ROOT: runtime,
+        VIDMON_BRIDGE_DIR: bridge,
+        VIDMON_VIDNETS_URL: 'http://vidnets.test',
+        VIDMON_CMS_URL: 'https://cms.test',
+        VIDMON_HOOK_DEF: path.join(dir, 'missing-hook.json'),
+        VIDMON_STATE_DIR: stateDir,
+        VIDMON_DAEMON_PATTERN: 'definitely-no-such-daemon-server-xyz'
+      }
+    }, (error, stdout, stderr) => {
+      if (error && error.code !== 2) return reject(new Error(`monitor failed: ${error.message}\n${stdout}\n${stderr}`));
+      resolve({ code: error ? error.code : 0, stdout: String(stdout) });
+    });
+  });
+
+  assert.equal(output.code, 2, 'an unavailable Vidnets server is an actionable monitor finding');
+  assert.match(output.stdout, /Vidnets DOWN; service process is confirmed dead; WOULD restart and reattach the saved Vidnets job/);
+});
+
+test('health monitor withholds Vidnets restart when the active server process is still alive', {
+  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash and /proc' : false
+}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-live-server-monitor-'));
+  const repo = path.join(dir, 'repo');
+  const runtime = path.join(dir, 'runtime');
+  const bridge = path.join(runtime, 'temp', 'agent-bridge');
+  const stateDir = path.join(dir, 'state');
+  const binDir = path.join(dir, 'bin');
+  const resourceRoot = path.join(repo, 'vidnets');
+  fs.mkdirSync(path.join(repo, 'work'), { recursive: true });
+  fs.mkdirSync(path.join(runtime, 'secure'), { recursive: true });
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(resourceRoot, { recursive: true });
+  fs.writeFileSync(path.join(repo, 'work', 'active-job.json'), JSON.stringify({
+    jobId: 'r_server_still_alive', payload: { jobId: 'r_server_still_alive' }
+  }));
+  const serverMain = path.join(resourceRoot, 'main.py');
+  fs.writeFileSync(serverMain, 'import time\ntime.sleep(60)\n');
+  const server = spawn('python3', ['-u', serverMain], { stdio: 'ignore' });
+  const fakeCurl = path.join(binDir, 'curl');
+  fs.writeFileSync(fakeCurl, '#!/bin/sh\nexit 22\n');
+  fs.chmodSync(fakeCurl, 0o755);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 150));
+    fs.writeFileSync(path.join(runtime, 'secure', 'agent-service.json'), JSON.stringify({
+      pid: server.pid, port: 5010, resource_root: resourceRoot
+    }));
+
+    const output = await new Promise((resolve, reject) => {
+      execFile('bash', [healthMonitor], {
+        timeout: 60000,
+        env: {
+          ...process.env,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+          VIDMON_DRY_RUN: '1',
+          VIDMON_REPO: repo,
+          VIDMON_RUNTIME_ROOT: runtime,
+          VIDMON_BRIDGE_DIR: bridge,
+          VIDMON_VIDNETS_URL: 'http://vidnets.test',
+          VIDMON_CMS_URL: 'https://cms.test',
+          VIDMON_HOOK_DEF: path.join(dir, 'missing-hook.json'),
+          VIDMON_STATE_DIR: stateDir,
+          VIDMON_DAEMON_PATTERN: 'definitely-no-such-daemon-live-xyz'
+        }
+      }, (error, stdout, stderr) => {
+        if (error && error.code !== 2) return reject(new Error(`monitor failed: ${error.message}\n${stdout}\n${stderr}`));
+        resolve({ code: error ? error.code : 0, stdout: String(stdout) });
+      });
+    });
+
+    assert.equal(output.code, 2, 'the unhealthy API remains an actionable monitor finding');
+    assert.match(output.stdout, /service process state is alive; restart withheld because a live render cannot be ruled out/);
+    assert.doesNotMatch(output.stdout, /WOULD restart and reattach the saved Vidnets job/);
+  } finally {
+    server.kill('SIGTERM');
+  }
 });

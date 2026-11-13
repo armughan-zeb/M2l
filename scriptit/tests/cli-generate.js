@@ -44,9 +44,16 @@ const HOOK_JSON = JSON.stringify({
 function runCli({ stdin, env, cwd, preload, timeoutMs = 300000 }) {
   return new Promise((resolve, reject) => {
     const args = preload ? ['--require', preload, CLI] : [CLI];
+    const childEnv = { ...process.env, ...env, MUSE_INFERENCE_COMPULSORY: '1', SCRIPTIT_LIVE_RESEARCH_TEST: '0' };
+    // This integration test uses a fake Muse inbox operator and a fixed
+    // research fixture. Never inherit a developer's provider credentials;
+    // the compulsory guard then makes accidental provider selection fail closed.
+    for (const key of ['OPENROUTER_API_KEY', 'VIDZEO_OPENROUTER_API_KEY', 'SCRIPTIT_API_KEY', 'SCRIPTIT_OPENROUTER_API_KEY']) {
+      delete childEnv[key];
+    }
     const child = spawn(process.execPath, args, {
       cwd,
-      env: { ...process.env, ...env },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -160,6 +167,8 @@ async function main() {
     // belong on stderr, so a second line here is a contract break.
     assert.equal(run.stdout.trim().split('\n').length, 1, 'stdout must be exactly one JSON line, got: ' + run.stdout.slice(0, 500));
     const out = JSON.parse(run.stdout.trim());
+    assert.match(run.stderr, /mode=agent-bridge/, 'integration fixture must use the local Muse inbox');
+    assert.doesNotMatch(run.stderr, /mode=openrouter/, 'integration fixture must never select a provider');
     assert.ok(out.scriptText && out.scriptText.length > 500, 'script text present');
     assert.equal(out.meta.publishable, true, 'script must be publishable, issues: ' + JSON.stringify(out.meta.quality?.issues) + '\n' + run.stderr.slice(-3000));
     assert.ok(out.meta.quality.words >= 136, 'meets 1-minute minimum words, got ' + out.meta.quality.words);

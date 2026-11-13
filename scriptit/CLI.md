@@ -86,8 +86,8 @@ never publishable.
 `adapters/script.js` (M2l root):
 
 - No `MUSE_SCRIPT_COMMAND` → runs `node scriptit/cli/generate.js`
-  (45-minute budget for agent-bridge round-trips; override with
-  `MUSE_SCRIPT_TIMEOUT_MS`).
+  (45-minute overall workflow deadline; every Muse inbox request is capped
+  at 120 seconds with a 60-second answer target).
 - `MUSE_SCRIPT_COMMAND` set → that command wins (unchanged behaviour).
 - `MUSE_SCRIPT_ALLOW_TEMPLATE_FALLBACK=1` → the old template synthesizer
   runs, labelled `template-synthesizer-generic`. It is opt-in only and never

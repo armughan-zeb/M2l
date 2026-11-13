@@ -23,7 +23,7 @@ test('a failed script command reports its JSON error rather than only progress',
       generateScript({ jobId: 'report-error-test', targetDurationMinutes: 1 }, workDir, {
         onDetail: detail => updates.push(detail)
       }),
-      /Muse script command failed: Research source unavailable/
+      /Muse script command failed for job report-error-test \(script stage\): Research source unavailable/
     );
     assert.deepEqual(updates, ['Research sources checked']);
     const failure = JSON.parse(fs.readFileSync(path.join(workDir, 'script-error.json'), 'utf8'));

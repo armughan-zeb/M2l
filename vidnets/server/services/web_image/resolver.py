@@ -42,6 +42,41 @@ def _bounded_worker_drain_seconds(stage_seconds: float) -> float:
         requested = 0.5
     return min(max(0.0, requested), 0.5, max(0.0, stage_seconds) * .1)
 
+
+_WEB_STAGE_HARD_CAP_SECONDS = 180.0
+_WEB_SCENE_HARD_CAP_SECONDS = 90.0
+
+
+def _bounded_web_seconds(value, default: float, hard_cap: float, floor: float = 1.0) -> float:
+    """Parse an operator budget without allowing an unbounded provider wait."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if not math.isfinite(parsed):
+        parsed = float(default)
+    return min(float(hard_cap), max(float(floor), parsed))
+
+
+def _scene_deadline(stage_deadline_at: Optional[float], now: Optional[float] = None) -> float:
+    """Give each scene a bounded wall while respecting the enclosing stage."""
+    started = time.monotonic() if now is None else float(now)
+    scene_seconds = _bounded_web_seconds(
+        os.environ.get("VIDZEO_WEB_SCENE_DEADLINE_SECONDS", "90"),
+        90.0,
+        _WEB_SCENE_HARD_CAP_SECONDS,
+        floor=0.1,
+    )
+    deadline = started + scene_seconds
+    if stage_deadline_at is not None:
+        try:
+            stage_deadline = float(stage_deadline_at)
+            if math.isfinite(stage_deadline):
+                deadline = min(deadline, stage_deadline)
+        except (TypeError, ValueError):
+            pass
+    return deadline
+
 try:
     from config import TEMP_DIR
 except ImportError:
@@ -1434,11 +1469,9 @@ def _warm_shared_discovery_pool(
     # Keep lower operator limits, but cap this non-authoritative substage.
     if scene_count >= 8:
         batch_seconds = min(batch_seconds, 12.0)
-    batch_deadline = (
-        float("inf")
-        if wait_until_complete
-        else min(stage_deadline_at, time.monotonic() + batch_seconds)
-    )
+    # Wait mode collects all providers that finish within this batch wall;
+    # it must not turn one slow provider into an unbounded stage wait.
+    batch_deadline = min(stage_deadline_at, time.monotonic() + batch_seconds)
     sources = []
     # Source *names* are unique; the transport kind is not. Treating every
     # ``api`` provider as the same kind used to warm only Yandex plus one
@@ -1474,7 +1507,7 @@ def _warm_shared_discovery_pool(
             wait_until_complete=wait_until_complete,
         )
         if discovery_cache is not None:
-            remaining = None if wait_until_complete else max(0.25, batch_deadline - time.monotonic())
+            remaining = max(0.25, batch_deadline - time.monotonic())
             return discovery_cache.get_or_fetch(
                 name,
                 query,
@@ -1491,11 +1524,11 @@ def _warm_shared_discovery_pool(
     futures = {pool.submit(fetch, name, kind): name for name, kind in sources}
     pending = set(futures)
     try:
-        while pending and (wait_until_complete or time.monotonic() < batch_deadline):
-            remaining = float("inf") if wait_until_complete else max(0.0, batch_deadline - time.monotonic())
+        while pending and time.monotonic() < batch_deadline:
+            remaining = max(0.0, batch_deadline - time.monotonic())
             done, pending = wait(
                 pending,
-                timeout=(0.25 if wait_until_complete else min(0.25, remaining)),
+                timeout=min(0.25, remaining),
                 return_when=FIRST_COMPLETED,
             )
             if not done:
@@ -1561,13 +1594,11 @@ def _warm_shared_discovery_pool(
                 break
     finally:
         for future in pending:
-            if not wait_until_complete:
-                future.cancel()
-        # In wait mode every provider future is drained before handoff. The
-        # normal bounded mode keeps its historical non-blocking shutdown.
+            future.cancel()
+        # In-flight provider calls remain bounded by their own network timeout.
         pool.shutdown(
-            wait=wait_until_complete,
-            cancel_futures=not wait_until_complete,
+            wait=not pending,
+            cancel_futures=bool(pending),
         )
 
     _web_log(
@@ -2854,6 +2885,10 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     prioritize_director_query: bool = False) -> Optional[Dict]:
     if source_health is None:
         source_health = _ACTIVE_PROVIDER_HEALTH
+    # Start the per-scene budget when a worker begins, not when it is queued.
+    # Otherwise later scenes can lose most of their deadline waiting for a
+    # worker slot while one unhealthy provider owns the retrieval wall.
+    deadline_at = _scene_deadline(deadline_at)
     try:
         from .query import _extract_visual_keywords as _scene_visual_keywords
     except Exception:
@@ -3535,9 +3570,12 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         rows = None
         try:
             if discovery_cache is not None:
-                remaining = None if wait_until_complete else 15.0
-                if deadline_at and not wait_until_complete:
-                    remaining = max(0.1, min(15.0, float(deadline_at) - time.monotonic()))
+                remaining = 15.0
+                if deadline_at:
+                    remaining = max(
+                        0.1,
+                        min(15.0, float(deadline_at) - time.monotonic()),
+                    )
                 rows = discovery_cache.get_or_fetch(
                     source_name,
                     q_str,
@@ -3920,24 +3958,21 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 return 0.0
 
         try:
-            if wait_until_complete:
-                # The web branch has no stage/query wall in production mode.
-                # Provider HTTP calls still carry their own transport timeout,
-                # so a dead socket cannot strand a worker forever.
-                query_seconds = float("inf")
-            else:
-                query_seconds = max(
-                    0.25,
-                    float(
-                        query_seconds_override
-                        if query_seconds_override is not None
-                        else os.environ.get(
-                            "VIDZEO_WEB_QUERY_DEADLINE_SECONDS",
-                            "10" if fast_mode else "15",
-                        )
-                        or (10 if fast_mode else 15)
-                    ),
+            default_query_seconds = (
+                90.0 if wait_until_complete else (10.0 if fast_mode else 15.0)
+            )
+            query_seconds = _bounded_web_seconds(
+                query_seconds_override
+                if query_seconds_override is not None
+                else os.environ.get(
+                    "VIDZEO_WEB_QUERY_DEADLINE_SECONDS",
+                    str(default_query_seconds),
                 )
+                or default_query_seconds,
+                default_query_seconds,
+                90.0,
+                floor=0.25,
+            )
         except Exception:
             query_seconds = 10.0 if fast_mode else 15.0
         query_deadline = time.monotonic() + query_seconds
@@ -4076,11 +4111,10 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     break
         finally:
             for future in pending:
-                if not wait_until_complete:
-                    future.cancel()
+                future.cancel()
             pool.shutdown(
-                wait=wait_until_complete,
-                cancel_futures=not wait_until_complete,
+                wait=not pending,
+                cancel_futures=bool(pending),
             )
         # Free last-resort metasearch recovery. Keep it out of the normal
         # stampede, but give a completely empty scene one additional source
@@ -4139,13 +4173,9 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         }
         pending = set(futures)
         slow_seconds = 12.0 if gdl else 5.0
-        slow_deadline = (
-            float("inf")
-            if wait_until_complete
-            else min(
-                float(deadline_at) if deadline_at else time.monotonic() + 5.0,
-                time.monotonic() + slow_seconds,
-            )
+        slow_deadline = min(
+            float(deadline_at) if deadline_at else time.monotonic() + 5.0,
+            time.monotonic() + slow_seconds,
         )
         try:
             while pending and time.monotonic() < slow_deadline:
@@ -6192,10 +6222,9 @@ def resolve_web_images_for_video_fast(
     wait_until_complete: bool = False,
 ) -> Dict:
     exhaustive_fallback = bool(exhaustive_fallback)
-    # A production web lane must not abandon scenes merely because one
-    # provider is slower than an arbitrary stage wall.  Keep transport-level
-    # request timeouts inside each scraper, but let the branch itself drain all
-    # scene/provider workers before handing media to the editor.
+    # Wait mode gathers all providers that finish within the same hard stage
+    # budget. It is not permission for a slow or wedged provider to keep the
+    # production job open indefinitely.
     wait_until_complete = bool(wait_until_complete)
     # Every invocation owns a DiscoveryCache below. Do not clear the optional
     # process cache here: one concurrent job must never invalidate another.
@@ -6239,23 +6268,21 @@ def resolve_web_images_for_video_fast(
     max_scene_workers = max(1, min(16, int(max_scene_workers)))
     api_worker_limit = max(1, min(12, int(api_worker_limit)))
     stage_started_at = time.monotonic()
-    # Keep the finite legacy wall for direct/test callers.  The application
-    # sets ``wait_until_complete`` so the web branch waits for all provider
-    # workers and never silently converts a slow scene into stock/neutral.
-    default_stage_deadline = max(45.0, min(300.0, len(scene_texts) * 12.0))
+    # The 3-minute ceiling is part of the production stall contract. Smaller
+    # explicit delivery budgets still win, but configuration cannot disable
+    # the wall and recreate the reported 20+ minute image stage.
+    default_stage_deadline = max(45.0, min(_WEB_STAGE_HARD_CAP_SECONDS, len(scene_texts) * 12.0))
     try:
-        stage_deadline_seconds = max(
-            1.0,
-            float(
-                stage_deadline_seconds
-                if stage_deadline_seconds is not None
-                else os.environ.get(
-                    "VIDZEO_WEB_STAGE_DEADLINE_SECONDS", ""
-                ) or (360.0 if wait_until_complete else default_stage_deadline)
-            ),
+        stage_deadline_seconds = _bounded_web_seconds(
+            stage_deadline_seconds
+            if stage_deadline_seconds is not None
+            else os.environ.get("VIDZEO_WEB_STAGE_DEADLINE_SECONDS", "")
+            or default_stage_deadline,
+            default_stage_deadline,
+            _WEB_STAGE_HARD_CAP_SECONDS,
         )
     except Exception:
-        stage_deadline_seconds = 360.0 if wait_until_complete else default_stage_deadline
+        stage_deadline_seconds = default_stage_deadline
     if delivery_budget is not None:
         try:
             budget_stage_seconds = delivery_budget.allowance(
@@ -6274,7 +6301,10 @@ def resolve_web_images_for_video_fast(
     _web_log("=== WEB IMAGE PIPELINE START ===")
     _web_log(f"scenes: {len(scene_texts)}, title: {title[:60]}")
     if wait_until_complete:
-        _web_log("web branch wait mode: enabled; draining all provider workers before handoff")
+        _web_log(
+            "web branch wait mode: enabled; collecting all provider results "
+            f"within {stage_deadline_seconds:.0f}s hard stage budget"
+        )
     if exhaustive_fallback:
         _web_log(
             "pre-stock exhaustive recovery enabled: fast="
@@ -7120,11 +7150,11 @@ def resolve_web_images_for_video_fast(
     try:
         while pending and not scene_cancel_event.is_set():
             remaining = stage_deadline_at - time.monotonic()
-            if remaining <= 0 and not wait_until_complete:
+            if remaining <= 0:
                 break
             done, pending = wait(
                 pending,
-                timeout=(0.5 if wait_until_complete else min(0.5, remaining)),
+                timeout=min(0.5, remaining),
                 return_when=FIRST_COMPLETED,
             )
             for future in done:
@@ -7153,15 +7183,19 @@ def resolve_web_images_for_video_fast(
         # detach unfinished cooperative workers instead of turning 120s into
         # an unbounded wait.
         if pending and wait_until_complete:
-            # This path is reachable only on explicit cancellation.  Drain
-            # completed futures for a clean audit, then let the workers observe
-            # the shared event and finish cooperatively.
+            # Preserve partial results on deadline or cancellation. Wait mode
+            # is still bounded; a slow scene cannot pin the stage forever.
+            timed_out_scene_indexes.update(futures[future] for future in pending)
             scene_cancel_event.set()
             _web_log(
-                f"web branch cancelled: retaining {completed}/{n} completed scene(s); "
+                f"web branch deadline/cancel: retaining {completed}/{n} completed scene(s); "
                 f"draining {len(pending)} worker(s)"
             )
-            done, pending = wait(pending, timeout=5.0, return_when=FIRST_COMPLETED)
+            done, pending = wait(
+                pending,
+                timeout=_bounded_worker_drain_seconds(stage_deadline_seconds),
+                return_when=FIRST_COMPLETED,
+            )
             for future in done:
                 idx = futures[future]
                 try:
@@ -8030,8 +8064,8 @@ def resolve_web_images_for_video_fast(
         "exhaustive_fallback": bool(exhaustive_fallback),
         "gallery_enabled": bool(gdl),
         "elapsed_seconds": round(time.monotonic() - stage_started_at, 2),
-        "stage_deadline_seconds": None if wait_until_complete else stage_deadline_seconds,
-        "deadline_reached": False if wait_until_complete else time.monotonic() >= stage_deadline_at,
+        "stage_deadline_seconds": stage_deadline_seconds,
+        "deadline_reached": time.monotonic() >= stage_deadline_at,
         "worker_errors": worker_errors[:32],
         "worker_error_count": len(worker_errors),
         "visual_budget": {

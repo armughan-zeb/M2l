@@ -202,12 +202,16 @@ async function main() {
 
   // Model selection: an explicit OpenRouter key wins; otherwise the
   // agent-bridge handle (no key, Muse answers through the Vidnets inbox).
-  const openRouterKey = String(flags['api-key'] || process.env.SCRIPTIT_API_KEY
-    || process.env.SCRIPTIT_OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY || '').trim();
+  const openRouterKeys = [
+    flags['api-key'], process.env.SCRIPTIT_API_KEY, process.env.SCRIPTIT_OPENROUTER_API_KEY,
+    process.env.OPENROUTER_API_KEY
+  ].map(value => String(value || '').trim()).filter(Boolean);
+  const openRouterKey = openRouterKeys[0] || '';
   // Muse inference is compulsory on the production worker: refuse to run
   // with an OpenRouter key when MUSE_INFERENCE_COMPULSORY=1 is set, rather
   // than silently writing a script with another provider.
-  if (openRouterKey && String(process.env.MUSE_INFERENCE_COMPULSORY || '').trim() === '1') {
+  const compulsory = String(process.env.MUSE_INFERENCE_COMPULSORY || '').trim() === '1';
+  if (compulsory && (openRouterKey || String(process.env.VIDZEO_OPENROUTER_API_KEY || '').trim())) {
     fail('Muse inference is compulsory (MUSE_INFERENCE_COMPULSORY=1): an OpenRouter key is present in the environment. Remove it — ScriptIT must use the agent-bridge inbox, answered by Muse.');
     return;
   }
@@ -226,8 +230,9 @@ async function main() {
   const totalDeadlineMs = bridgeMode
     ? Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 2700000)
     : Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 600000);
-  // The caller budget allows bounded retries. Each posted request expires in at most 120s.
-  const timeoutMs = bridgeMode ? 600000 : 120000;
+  // Each Muse inbox request has a 120s hard wall (60s answer SLO). The
+  // separate total deadline bounds the complete research + narration run.
+  const timeoutMs = 120000;
 
   let result;
   try {

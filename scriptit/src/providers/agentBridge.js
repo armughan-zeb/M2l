@@ -136,13 +136,13 @@ async function postOnce({ owner, jobId, operation, kind, messages, responseForma
       if (signal?.aborted) throw Object.assign(new Error('Agent bridge request cancelled'), { name: 'AbortError' });
       const reply = readJson(replyPath);
       if (reply) {
-        if (reply.error) throw new AgentBridgeError('External agent could not answer: ' + String(reply.error).slice(0, 300));
+        if (reply.error) throw new AgentBridgeError(`Muse request ${requestId} (${row.operation}) failed: ` + String(reply.error).slice(0, 300));
         if (typeof reply.content === 'string' && reply.content.trim()) return { content: reply.content, requestId };
         // Some agents write a parsed object as content instead of a JSON
         // string. Preserve it as JSON for structured callers; narration is
         // unwrapped later, only in the script-writing path.
         if (reply.content && typeof reply.content === 'object') return { content: JSON.stringify(reply.content), requestId };
-        throw new AgentBridgeError('External agent returned an empty completion');
+        throw new AgentBridgeError(`Muse request ${requestId} (${row.operation}) returned an empty completion`);
       }
       if (Date.now() >= deadline) {
         throw new AgentBridgeError(`Muse request ${requestId} (${row.operation}) did not answer within this request budget.`);

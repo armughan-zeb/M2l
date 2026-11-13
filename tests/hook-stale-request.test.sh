@@ -44,6 +44,9 @@ printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee %s\nffffffffffffffffffffffffffffffff %s
 
 out=$(bash "$HOOK_SCRIPT")
 echo "$out" | grep -q 'HOOK_WAKE' || fail "expected a wake, got: $out"
+last_run=$(cat "$HOME/hooks/state/vidnets-inbox-watch/last-run" 2>/dev/null || true)
+[[ "$last_run" =~ ^[0-9]+$ ]] || fail "hook did not write its last-run execution proof"
+(( now - last_run <= 2 )) || fail "hook execution proof is stale: $last_run"
 echo "$out" | grep -q 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' || fail "live request was not woken: $out"
 echo "$out" | grep -q 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' || fail "legacy re-wake after 120s did not fire: $out"
 echo "$out" | grep -q 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' && fail "expired request woke the hook: $out"

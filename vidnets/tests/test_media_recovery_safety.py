@@ -18,10 +18,10 @@ def test_memory_cleanup_never_enumerates_or_closes_user_apps(monkeypatch):
 
 def test_recovery_budget_scales_by_concurrent_waves_and_stays_bounded():
     assert _web_recovery_stage_seconds(1, 12) == 90
-    assert _web_recovery_stage_seconds(48, 12) == 252
-    assert _web_recovery_stage_seconds(48, 6) == 300
-    assert _web_recovery_stage_seconds(1000, 1) == 300
+    assert _web_recovery_stage_seconds(48, 12) == 180
+    assert _web_recovery_stage_seconds(48, 6) == 180
+    assert _web_recovery_stage_seconds(1000, 1) == 180
     assert _web_recovery_stage_seconds(48, 12, 90) == 90
-    assert _web_recovery_stage_seconds(48, 12, 9999) == 300
-    assert _web_recovery_stage_seconds(48, 12, "invalid") == 252
-    assert _web_recovery_stage_seconds(48, 12, 0) == 252
+    assert _web_recovery_stage_seconds(48, 12, 9999) == 180
+    assert _web_recovery_stage_seconds(48, 12, "invalid") == 180
+    assert _web_recovery_stage_seconds(48, 12, 0) == 180

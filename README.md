@@ -15,7 +15,8 @@ and performs objective media checks.
 Vidnets brain / LLM call must go through Muse via the `external_agent`
 agent-bridge inbox, answered by the `vidnets-inbox-watch` hook operator.
 `node muse-agent.js start` refuses to run unless the bridge is verified
-(Vidnets server healthy, agent-bridge inbox writable, hook enabled, no
+(Vidnets server healthy, agent-bridge inbox writable, hook enabled and recently
+observed running, no
 OpenRouter key in the environment — see `lib/museInference.js`), and
 `MUSE_AUTO_LOOP=1` never exempts that check. `node muse-agent.js doctor`
 checks the same bridge and FAILS when it is absent. A job whose inference
@@ -43,15 +44,17 @@ before a 0-real-media fail), one monitor. All knobs live in
 `.env` / `.env.example`. Full flow and settings:
 `HYBRID_WIRING.md` ("Simplified pipeline").
 
-**Health monitor.** The `vidnets-health-monitor` cron runs
-`~/hooks/scripts/vidnets-health-monitor.sh` every 5 minutes: it checks
+**Health monitor.** Running `setup.sh` installs the `vidnets-health-monitor`
+cron at `~/hooks/scripts/vidnets-health-monitor.sh` and schedules it every
+minute, so inbox age is checked within the 60-second operator SLO. It checks
 the daemon (alive + connected), Vidnets `:5010` (healthy + memory
 admission), the CMS (reachable + outage duration), the inbox-watch hook
 (enabled), stale/past-half-TTL inbox requests, and disk/tmp space. It
 fixes what it can itself (restart a dead daemon via `start-daemon.sh`,
 restart a dead Vidnets server, mark expired inbox requests) and only
 messages the user when it cannot fix something or a job is affected.
-It never claims, delivers, or restarts a job mid-render. It is the
+It never claims, delivers, or restarts a job mid-render. Existing installs
+must rerun setup to install or refresh the monitor. It is the
 only monitor — the old `vidnets-recovery-watch` self-removed on Nov 9.
 Full rules: `HYBRID_WIRING.md` ("CMS-outage resilience + health monitor").
 

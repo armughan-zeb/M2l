@@ -17,6 +17,9 @@ mkdir -p "$STATE_DIR"
 touch "$SEEN_FILE"
 
 now=$(date +%s)
+run_tmp="$STATE_DIR/.last-run.$$"
+printf '%s\n' "$now" > "$run_tmp"
+mv -f "$run_tmp" "$STATE_DIR/last-run"
 resident=$(jq -r '.updatedAt // 0 | floor' "$BRIDGE/resident-status.json" 2>/dev/null || true)
 if [[ "$resident" =~ ^[0-9]+$ ]] && [ "$((now - resident / 1000))" -le 15 ]; then
   silent "resident Muse dispatcher is handling the inbox" "{}"

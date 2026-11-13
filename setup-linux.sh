@@ -111,5 +111,9 @@ echo ""
 echo "=== Running Muse Doctor ==="
 node "$DIR/muse-agent.js" doctor || echo "[WARN] Setup installed dependencies, but doctor reported checks that still need attention."
 
+if [ -f "$DIR/scripts/install-health-monitor.sh" ]; then
+    bash "$DIR/scripts/install-health-monitor.sh"
+fi
+
 echo ""
 echo "Setup complete! To start the worker, run: ./start.sh"

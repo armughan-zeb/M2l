@@ -75,7 +75,7 @@ docker compose down -v                     # DANGER: also deletes ./data? No —
   OpenRouter key (`OPENROUTER_API_KEY`, `VIDZEO_OPENROUTER_API_KEY`,
   `SCRIPTIT_API_KEY`, `SCRIPTIT_OPENROUTER_API_KEY`) is set, and the
   daemon start gate re-checks. **Never add an OpenRouter key.**
-- **Filter-best media** (`MUSE_MEDIA_STRICT=0`, `MUSE_YOUTUBE_COVERAGE_TARGET=0.30`):
+- **Filter-best media** (`MUSE_MEDIA_STRICT=0`, `MUSE_YOUTUBE_COVERAGE_TARGET=0.8`):
   Vidnets ranks candidates and keeps the best real media per scene. Web
   pool 12/scene, finalists 3, vision pool 12, relative floor 0.5, YT
   vision frames 2/clip at the transcript moment, YT downloads 4,

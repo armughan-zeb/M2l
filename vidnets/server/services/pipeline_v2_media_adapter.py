@@ -584,20 +584,14 @@ def _mixed_web_scene_worker_limit(config: Mapping[str, Any] | None = None) -> in
 
 
 def _web_recovery_stage_seconds(scene_count: int, workers: int, configured: Any = None) -> float:
-    """Budget bounded query waves so later scenes reach retrieval too.
-
-    An explicitly configured value may run up to 3600s: agent jobs pass
-    their remaining delivery budget here so recovery is bounded by the
-    shared job deadline instead of a fixed 300s cap. The default path
-    stays 90-300s.
-    """
+    """Keep the final web-recovery wave inside the 3-minute stall ceiling."""
     if configured not in (None, "", 0, "0"):
         try:
-            return max(60.0, min(3600.0, float(configured)))
+            return max(1.0, min(180.0, float(configured)))
         except (TypeError, ValueError):
             pass
     waves = math.ceil(max(1, scene_count) / max(1, workers))
-    return min(300.0, max(90.0, 12.0 + waves * 60.0))
+    return min(180.0, max(90.0, 12.0 + waves * 60.0))
 
 
 def _score(value: Any) -> float:
@@ -5603,8 +5597,8 @@ def resolve_existing_provider_branches_v2(
                 and str(config.get("llm_provider") or "") == "external_agent"
             ):
                 # Agent jobs: recovery is bounded by the shared delivery
-                # budget, not a fixed 300s cap, so long-form jobs keep
-                # rescuing rejected scenes instead of giving up on them.
+                # budget and then hard-capped at 180s so a final web retry
+                # cannot repeat the multi-minute image-stage stall.
                 try:
                     from .delivery_budget import get_delivery_budget
 
@@ -5704,7 +5698,7 @@ def resolve_existing_provider_branches_v2(
                 web_wall_cap = max(
                     web_wall_floor,
                     min(
-                        300.0,
+                        180.0,
                         float(
                             lane_config.get("mixed_web_max_wall_seconds")
                             or os.environ.get("VIDZEO_MIXED_WEB_MAX_WALL_SECONDS", "180")
@@ -5715,20 +5709,14 @@ def resolve_existing_provider_branches_v2(
             except (TypeError, ValueError):
                 web_wall_cap = max(web_wall_floor, 180.0)
             if str(config.get("llm_provider") or "") == "external_agent":
-                # Agent-driven jobs answer through the local inbox and the
-                # user requires quality over speed: no fixed wall here. The
-                # shared delivery budget already scales with the job (long
-                # jobs get up to 7200s), so it is the only bound — a fixed
-                # 600s cap would starve long-form discovery that legitimately
-                # needs longer. Fall back to the agent wall when no budget
-                # is installed yet.
+                # Agent-driven jobs can gather slower complementary results,
+                # but the web stage still has the same 180s stall ceiling as
+                # every other provider path. Delivery-budget exhaustion may
+                # shorten this further in the resolver.
                 try:
-                    agent_wall = max(
-                        60.0,
-                        120.0,
-                    )
+                    agent_wall = 120.0
                 except (TypeError, ValueError):
-                    agent_wall = 600.0
+                    agent_wall = 120.0
                 try:
                     from .delivery_budget import get_delivery_budget
 
@@ -5744,22 +5732,22 @@ def resolve_existing_provider_branches_v2(
                     except (TypeError, ValueError):
                         _reserve = float(_budget.render_reserve_seconds)
                     agent_wall = max(
-                        agent_wall,
-                        _budget.allowance(None, reserve_after_seconds=_reserve),
+                        60.0,
+                        min(
+                            180.0,
+                            _budget.allowance(None, reserve_after_seconds=_reserve),
+                        ),
                     )
                 web_wall_floor = agent_wall
-                web_wall_cap = max(web_wall_cap, agent_wall)
-            # Ultra-long documentaries need a larger aggregate web window,
-            # but short/medium jobs should keep the fast 120s cap.  Scale the
-            # cap only once the storyboard is large enough to amortize the
-            # extra provider waves; an explicit long-form override remains
-            # available for very slow connections.
+                web_wall_cap = min(180.0, max(web_wall_cap, agent_wall))
+            # Larger storyboards can use more of the same hard 180s retrieval
+            # ceiling, but no long-form override can extend it.
             if len(active_indices) >= 32 and web_wall_cap <= 120.0:
                 try:
                     long_form_cap = max(
                         web_wall_cap,
                         min(
-                            360.0,
+                            180.0,
                             float(
                                 lane_config.get("mixed_web_long_form_max_wall_seconds")
                                 or os.environ.get("VIDZEO_MIXED_WEB_LONG_FORM_MAX_WALL_SECONDS", "240")
@@ -5768,11 +5756,11 @@ def resolve_existing_provider_branches_v2(
                         ),
                     )
                 except (TypeError, ValueError):
-                    long_form_cap = max(web_wall_cap, 240.0)
+                    long_form_cap = max(web_wall_cap, 180.0)
                 web_wall_cap = long_form_cap
             # Scale gently with the number of scenes.  A 24-scene job gets the
-            # default 120s cap instead of the old 150s tail; ultra-long jobs
-            # can raise the cap explicitly without changing the fast default.
+            # default 120s cap instead of the old 150s tail; the hard cap is
+            # shared by short and long jobs.
             scaled_web_wall = max(
                 web_wall_floor,
                 min(web_wall_cap, max(1, len(active_indices)) * 6.0),
@@ -5788,15 +5776,12 @@ def resolve_existing_provider_branches_v2(
             )
         elif lane_policy.get("mode") == "Mixed Media":
             print(
-                "   [budget] mixed web wall: disabled; waiting for all provider workers",
+                "   [budget] mixed web soft wall: disabled; the resolver's 180s hard ceiling remains",
                 flush=True,
             )
         if str(config.get("llm_provider") or "") == "external_agent":
-            # Agent jobs wait for every provider. The per-query 15s wall
-            # discarded real results under proxy load (Bing/Yandex return
-            # in ~50s); with wait_until_complete the resolver sets no
-            # stage/query wall and transport timeouts (300s) plus the
-            # delivery budget still bound the stage.
+            # Agent jobs collect all provider results within the bounded
+            # per-scene (90s) and per-stage (180s) walls.
             lane_config["web_wait_until_complete"] = True
         try:
             bundle = web_runner(

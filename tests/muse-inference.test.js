@@ -15,6 +15,16 @@ const {
   verifyMuseInferenceBridge
 } = require('../lib/museInference');
 
+const PROVIDER_KEY_NAMES = ['OPENROUTER_API_KEY', 'VIDZEO_OPENROUTER_API_KEY', 'SCRIPTIT_API_KEY', 'SCRIPTIT_OPENROUTER_API_KEY'];
+const savedProviderKeys = Object.fromEntries(PROVIDER_KEY_NAMES.map(name => [name, process.env[name]]));
+test.before(() => { for (const name of PROVIDER_KEY_NAMES) delete process.env[name]; });
+test.after(() => {
+  for (const [name, value] of Object.entries(savedProviderKeys)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+});
+
 function bridgeFixture({ hookEnabled = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-inference-'));
   const bridgeRoot = path.join(dir, 'agent-bridge');
@@ -24,14 +34,21 @@ function bridgeFixture({ hookEnabled = true } = {}) {
   fs.writeFileSync(path.join(vidnetsRoot, 'VIDNETS_AGENT.sh'), '#!/bin/sh\n');
   fs.writeFileSync(path.join(dir, 'render-vidnets-linux.js'), '');
   const hookPath = path.join(dir, 'hook.json');
-  fs.writeFileSync(hookPath, JSON.stringify({ enabled: hookEnabled, id: 'vidnets-inbox-watch' }));
+  fs.writeFileSync(hookPath, JSON.stringify({
+    enabled: hookEnabled, id: 'vidnets-inbox-watch',
+    delivery: { surface: 'side_chat', to: 'fixture-chat' }, script_path: '/fixture/vidnets-inbox-watch.sh'
+  }));
+  const hookStatePath = path.join(dir, 'hook-state');
+  fs.mkdirSync(hookStatePath, { recursive: true });
+  fs.writeFileSync(path.join(hookStatePath, 'last-run'), `${Math.floor(Date.now() / 1000)}\n`);
   return {
     dir,
     env: {
-      MUSE_RENDER_COMMAND: 'node render-vidnets-linux.js',
+      MUSE_RENDER_COMMAND: `node "${path.join(dir, 'render-vidnets-linux.js')}"`,
       MUSE_REPO_ROOT: dir,
       MUSE_VIDNETS_ROOT: vidnetsRoot,
       MUSE_INBOX_HOOK_DEFINITION: hookPath,
+      MUSE_INBOX_HOOK_STATE_DIR: hookStatePath,
       VIDZEO_BRIDGE_ROOT: bridgeRoot
     }
   };
@@ -67,6 +84,34 @@ test('bridge check passes for the production wiring and fails without it', () =>
   assert.ok(keySet.failures.some(failure => /OpenRouter/i.test(failure)));
 });
 
+test('doctor rejects a relative Vidnets renderer because jobs execute from their work directory', () => {
+  const { env } = bridgeFixture();
+  const result = checkMuseInferenceBridge({ ...env, MUSE_RENDER_COMMAND: 'node render-vidnets-linux.js' });
+  assert.equal(result.ok, false);
+  assert.ok(result.failures.some(failure => /absolute path/i.test(failure)));
+});
+
+test('enabled hook without a recent execution proof blocks production startup', () => {
+  const { env } = bridgeFixture();
+  fs.writeFileSync(path.join(env.MUSE_INBOX_HOOK_STATE_DIR, 'last-run'), `${Math.floor(Date.now() / 1000) - 180}\n`);
+  const result = checkMuseInferenceBridge(env);
+  assert.equal(result.ok, false);
+  assert.ok(result.failures.some(failure => /no recent execution proof/i.test(failure)));
+});
+
+test('hook placeholders are rejected even when enabled and recently observed', () => {
+  const { env } = bridgeFixture();
+  fs.writeFileSync(env.MUSE_INBOX_HOOK_DEFINITION, JSON.stringify({
+    id: 'vidnets-inbox-watch', enabled: true,
+    delivery: { surface: 'side_chat', to: '<YOUR_SIDE_CHAT_ID>' },
+    script_path: '<EXTRACTED_DIR>/docker/hooks/vidnets-inbox-watch.sh'
+  }));
+  const result = checkMuseInferenceBridge(env);
+  assert.equal(result.ok, false);
+  assert.ok(result.failures.some(failure => /real Muse delivery target/i.test(failure)));
+  assert.ok(result.failures.some(failure => /script_path/i.test(failure)));
+});
+
 test('bridge verification probes the live Vidnets server', async () => {
   const { env } = bridgeFixture();
   const server = http.createServer((req, res) => {
@@ -97,9 +142,18 @@ test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key
     if (previous === undefined) delete process.env.OPENROUTER_API_KEY;
     else process.env.OPENROUTER_API_KEY = previous;
   }
-  const request = buildRequest(job, 'Some narration.', '/tmp');
+  const previousCoverage = process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
+  let request;
+  try {
+    delete process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
+    request = buildRequest(job, 'Some narration.', '/tmp');
+  } finally {
+    if (previousCoverage === undefined) delete process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
+    else process.env.MUSE_YOUTUBE_COVERAGE_TARGET = previousCoverage;
+  }
   assert.equal(request.llm_provider, 'external_agent');
   assert.equal(request.openrouter_api_key, '');
+  assert.equal(request.youtube_accepted_coverage_target, 0.8);
   // Filter-best (Nov 9, 2026): vision is advisory by default — the two
   // strict flags are OFF, so an uncertain verdict never blocks delivery.
   // Named-entity scenes still require a live verdict inside the server
@@ -202,7 +256,10 @@ test('ScriptIT CLI refuses OpenRouter when Muse inference is compulsory', async 
       env: {
         ...process.env,
         MUSE_INFERENCE_COMPULSORY: '1',
-        OPENROUTER_API_KEY: 'sk-or-test-key'
+        SCRIPTIT_API_KEY: ' ',
+        SCRIPTIT_OPENROUTER_API_KEY: ' ',
+        OPENROUTER_API_KEY: ' ',
+        VIDZEO_OPENROUTER_API_KEY: 'sk-or-test-key'
       }
     });
     let stdout = '';

@@ -98,11 +98,9 @@ function buildRequest(job, scriptText, packageDir) {
   // (vidnets/scripts/render-remotion-manifest.js adaptiveConcurrency).
   const concurrency = readRequestedWorkers(process.env);
   const coverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET);
-  // Floor 0.3, not 0.4: the Nov 10, 2026 media-speedups decision set the
-  // YouTube accepted-coverage target to 0.30 (web is the main source now;
-  // 0.8 was per-job values from before). The server default is 0.30 when
-  // no explicit target is sent, so the adapter must not clamp above it.
-  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.3, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.6;
+  // Use the documented 0.8 production target consistently. An explicit
+  // lower value remains available for constrained media experiments.
+  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.3, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.8;
   // FILTER-BEST (Nov 9, 2026): Vidnets' native mixed-media design ranks
   // candidates and keeps the best real media per scene — vision is ADVISORY
   // by default ("an uncertain verdict must not prevent video delivery",

@@ -376,15 +376,11 @@ function buildPartialResearchScript(topic, evidence) {
 
 async function safeWriteDraft(options) {
   const hardTimeoutMs = Number(options?.hardTimeoutMs) || 0;
-  // Agent transports answer at inbox/human speed, so they get the longer
-  // bound. Both 'external-agent' and 'agent-bridge' are Muse; only a real
-  // OpenRouter model id takes the shorter provider bound.
-  // Agent cap was 300000: the writer request expired at 5 minutes while
-  // the 600s bridge wall still allowed the operator to answer. Now 600000
-  // so the writer gets the full bridge window. The total job deadline
-  // (2700000, set by the CLI) is unchanged and still bounds the run.
+  // Each Muse request has a 120s hard wall and a 60s answer target. The
+  // whole ScriptIT run has its own deadline; it must not enlarge an inbox
+  // request and create long-lived pending work.
   const writerTimeoutMs = ['external-agent', 'agent-bridge'].includes(String(options?.model || '').trim().toLowerCase())
-    ? Math.min(600000, Math.max(30000, Number(options.timeoutMs) || 180000))
+    ? Math.min(120000, Math.max(30000, Number(options.timeoutMs) || 120000))
     : Math.min(240000, Math.max(30000, Number(options?.timeoutMs) || 120000));
   let timer;
   try {
@@ -924,24 +920,28 @@ async function runScriptGeneration({
       hardTimeoutMs: quickMode ? Math.max(25, remainingQuickMs) : 0,
     });
     if (draft && typeof draft.content === 'string') draft.content = normalizeNarration(draft.content);
+    if (draft?.content?.trim() && !draft.truncated) generationCheckpoint.phase = 'editorial';
     await saveDraft(draft?.content);
     return draft;
   };
   if (modelAvailable) {
-    const preservedDraft = generationCheckpoint.phase !== 'drafting' && generationCheckpoint.draft ? generationCheckpoint.draft : initialDraft;
-    const preservedWords = String(preservedDraft || '').replace(/<\/?evidence(?::[^>]+)?>/gi, '').trim().split(/\s+/).filter(Boolean).length;
-    const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
-    const minRequired = Math.max(80, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance));
-    // A legacy short draft cannot be expanded reliably by repeated whole-story
-    // rewrites. Use the same budgeted beats as a new long script instead.
-    if ((quickMode || currentCheckpoint) && preservedWords >= (quickMode || wordTarget < 700 ? 80 : minRequired) && (!generationCheckpoint.sectionCheckpoint || generationCheckpoint.phase !== 'drafting')) {
-      result = { content: String(preservedDraft), modelUsed: initialDraftModel || model };
+    const completedDraft = currentCheckpoint && generationCheckpoint.phase === 'editorial'
+      ? String(generationCheckpoint.draft || '').trim() : '';
+    const previewDraft = quickMode && String(initialDraft || '').trim().split(/\s+/).length >= 80
+      ? String(initialDraft).trim() : '';
+    if (completedDraft || previewDraft) {
+      result = { content: completedDraft || previewDraft, modelUsed: initialDraftModel || model };
       generationCheckpoint.phase = 'editorial';
       notify(80, 'Restoring the preserved narration checkpoint');
       await saveDraft(result.content);
-    } else result = await callDraft({
-      apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, chatCompletionFn,
-    });
+    } else {
+      const avoid = initialDraft
+        ? 'Build on this saved narration. Preserve supported facts and the opening promise. Develop only distinct supported material and deliver the complete narration. SAVED NARRATION:\n' + String(initialDraft).slice(0, 30000)
+        : '';
+      result = await callDraft({
+        apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, avoid, chatCompletionFn,
+      });
+    }
     console.error('[ScriptIT DEBUG] callDraft 1 result:', Boolean(result), 'words:', result && result.content && result.content.split(/\s+/).filter(Boolean).length);
     if (!result) {
       result = await callDraft({

@@ -984,7 +984,26 @@ def test_edit_plan_preflight_rejects_missing_remotion_font(monkeypatch):
 
 
 def test_remotion_runtime_bundle_fonts_maps_and_icons_are_present():
-    assert server_app._remotion_runtime_asset_errors() == []
+    errors = server_app._remotion_runtime_asset_errors()
+    bundled_runtime_prefixes = (
+        "tools/node/node",
+        "node_modules/@remotion/renderer/",
+        "node_modules/@remotion/bundler/",
+        "node_modules/playwright-core/",
+        "node_modules/.remotion/chrome-headless-shell/",
+    )
+    normalized_errors = [str(Path(error)).replace("\\", "/") for error in errors]
+    missing_source_assets = [
+        error for error in normalized_errors
+        if not error.startswith(bundled_runtime_prefixes)
+    ]
+    assert missing_source_assets == []
+
+    packaged = os.environ.get("VIDZEO_PACKAGED", "").strip().lower() in {"1", "true", "yes"}
+    if packaged:
+        assert errors == []
+    elif errors:
+        pytest.skip("Packaged Node, Remotion, and Chromium assets are checked by the Windows release build")
 
 
 def test_person_profile_uses_only_supplied_alpha_cutouts_for_isolated_portrait_motion():
@@ -1136,7 +1155,9 @@ def test_verified_document_capture_routes_to_screenshot_highlight_renderer():
     assert "const imageSrc = capture.image_path || capture.image_url || '';" in document_highlight
 
 
-def test_render_plan_rejects_unverified_map_endpoints_and_accepts_catalogued_route():
+def test_render_plan_rejects_unverified_map_endpoints_and_accepts_catalogued_route(monkeypatch):
+    monkeypatch.setattr(server_app, "_remotion_runtime_asset_errors", lambda: [])
+
     def manifest_for(props):
         return {
             "edit_plan_schema_version": 3,
@@ -1215,6 +1236,7 @@ def test_verified_source_highlight_requires_existing_capture_file(tmp_path):
 def test_editor_manifest_export_is_remotion_and_reports_quality_checks(tmp_path, monkeypatch):
     monkeypatch.setenv('VIDZEO_AUTH_MODE', 'local')
     monkeypatch.setenv('VIDZEO_PACKAGED', '0')
+    monkeypatch.setattr(server_app, "_remotion_runtime_asset_errors", lambda: [])
     image = tmp_path / "editor-frame.png"
     image.write_bytes(b"test media placeholder")
     output_dir = tmp_path / "output"

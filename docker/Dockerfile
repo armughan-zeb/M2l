@@ -28,8 +28,8 @@
 # only. Build it on a host with Docker before trusting it for production.
 # See docker/README.md + docker/SETUP.md.
 #
-# Defaults in this image are the Nov 10, 2026 standing decisions — do not
-# "fix" them back: YT coverage target 0.30 (web is the main source),
+# Defaults in this image align with the production workflow and incident
+# report: YouTube coverage target 0.8,
 # web pool 12/scene, finalists 3, vision pool 12, relative floor 0.5,
 # YT vision frames 2/clip, YT downloads 4, ScriptIT standard mode for
 # <=2min videos (the CLI default), pool reuse on, thumbnails SKIPPED.
@@ -49,9 +49,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MUSE_VIDNETS_ROOT=/app/vidnets \
     MUSE_REPO_ROOT=/app \
     MUSE_RENDER_CONCURRENCY=1 \
-    # Nov 10, 2026 standing decisions (see AGENT_TRAINING.md). YT coverage
-    # 0.30: web images are the main source; the old 0.8 was per-job values.
-    MUSE_YOUTUBE_COVERAGE_TARGET=0.30 \
+    MUSE_YOUTUBE_COVERAGE_TARGET=0.8 \
     MUSE_MEDIA_STRICT=0 \
     VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE=12 \
     VIDZEO_VISUAL_FINALIST_LIMIT=3 \
@@ -73,6 +71,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MUSE_CONFIG_FILE=/data/.muse-agent.json \
     VIDZEO_BRIDGE_ROOT=/data/runtime/temp/agent-bridge \
     MUSE_INBOX_HOOK_DEFINITION=/host-hooks/vidnets-inbox-watch.json \
+    MUSE_INBOX_HOOK_STATE_DIR=/host-hook-state \
     VIDNETS_PYTHON=python3
 
 # --- System packages: ffmpeg, Python 3.12, Chrome/Remotion shared libs ------

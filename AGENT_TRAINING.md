@@ -53,10 +53,13 @@ deliver — without asking for go-ahead. Report what you did, with numbers.
 8. **CMS down (502/530/1033) = his PC tunnel is down.** Do nothing — the
    daemon retries in-process, work is never lost. Delivery waits for the
    tunnel to come back. Never restart the container for a CMS outage.
-9. **Inference is slow and that is normal.** Each agent-bridge round trip
-   takes ~4.5 min (hook wake latency). A 1-min video realistically takes
-   ~30–45 min end to end. 2–5 min needs direct inference + pre-ready media
-   + a faster host — none of those exist. Say so plainly; never pad it.
+9. **Inference waits are bounded, not normalized as multi-minute.** The
+   historical hook path took ~4.5 min per round trip and caused the reported
+   stalls. New requests have a 120 s hard wall and a 60 s answer target;
+   `doctor` and the claim loop probe the actual answer path. If an answer
+   exceeds 60 s, log it as a breach and investigate the host Muse scheduler.
+   Do not describe the old latency as normal or promise an end-to-end video
+   duration until a timed job on the target PC proves it.
 10. **Scoped instructions are literal.** A validation-only run stops before
     rendering. A bare Stop/Wait halts first, questions later. A named stop
     covers exactly what was named.
@@ -65,7 +68,7 @@ deliver — without asking for go-ahead. Report what you did, with numbers.
 
 | Setting | Value | Where |
 |---|---|---|
-| YT accepted-coverage target | 0.30 | `MUSE_YOUTUBE_COVERAGE_TARGET` |
+| YT accepted-coverage target | 0.8 | `MUSE_YOUTUBE_COVERAGE_TARGET` |
 | Web pool per scene | 12 | `VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE` |
 | Vision finalists per scene | 3 | `VIDZEO_VISUAL_FINALIST_LIMIT` |
 | Vision gate workers | 12 | `VIDZEO_VISUAL_GATE_WORKERS` |

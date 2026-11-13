@@ -9,19 +9,11 @@ require.cache[clientPath].exports = {
   async agentChat(request) {
     requests.push(request);
     if (fail) throw Object.assign(new Error('Agent session ended'), { code: 'AGENT_SESSION_ENDED' });
-    let content = Array(225).fill('Apollo').join(' ');
-    const schema = request.responseFormat?.json_schema;
-    if (schema) {
-      assert.equal(schema.name, 'narration_beats', 'No reviewer requests in production');
-      const id = schema.schema.properties.beats.items.properties.sourceIds.items.enum[0];
-      content = JSON.stringify({ beats: Array.from({ length: 5 }, (_, i) => ({ purpose: 'Distinct development ' + i, sourceIds: [id] })) });
-    } else if (JSON.stringify(request.messages || []).includes('OPENING HOOK')) {
-      content = JSON.stringify({ variants: [
-        { type: 'result-first', validateClick: 'Two men landed on the Moon.', raiseStakes: 'A third waited alone above.', openCuriosityLoop: 'How did they get home?' },
-        { type: 'bold-claim', validateClick: 'Apollo 11 almost ran out of fuel.', raiseStakes: 'Seconds decided everything that day.', openCuriosityLoop: 'What saved the landing?' },
-        { type: 'relatable-problem', validateClick: 'Imagine landing with no margin.', raiseStakes: 'Apollo 11 did exactly that.', openCuriosityLoop: 'Why did it still work?' },
-      ] });
-    } else if (request.messages[1]?.content.includes('Write ONLY beat')) content = beatText(Number(request.messages[1].content.match(/Write ONLY beat (\d+)/)?.[1] || 1));
+    const writesNarration = request.messages[0]?.content.includes('WRITING CONTRACT');
+    if (writesNarration) assert.equal(request.responseFormat, undefined);
+    const content = writesNarration
+      ? Array.from({ length: 5 }, (_, index) => beatText(index + 1)).join('\n\n')
+      : '{"ok":true}';
     return { content, raw: { choices: [{ message: { role: 'assistant', content }, finish_reason: 'stop' }] }, modelUsed: 'external-agent', attempts: 1 };
   }
 };
@@ -77,8 +69,10 @@ async function main() {
       snippet: 'The crew splashed down in the Pacific Ocean on July 24, 1969.',
       articleText: 'Armstrong stepped onto the lunar surface first, followed by Aldrin, during the Apollo mission. The crew splashed down in the Pacific Ocean on July 24, 1969, eight days after launch.' }] },
     useCache: false, recordHistory: false, onDraft: draft => { checkpoint = draft.meta.generationCheckpoint; } };
+  const beforeWriting = requests.length;
   const script = await generateScript(options);
-  assert.ok(requests.some(request => request.timeoutMs > 90000), 'Long-form external-agent requests must not inherit the old 90-second cutoff');
+  assert.equal(requests.length, beforeWriting + 1, 'one complete narration request');
+  assert.ok(requests.at(-1).timeoutMs > 90000, 'The narration request keeps the configured writing budget');
   assert.equal(script.meta.model, 'external-agent');
   assert.equal(script.meta.modelUsed, 'external-agent');
   assert.equal(script.meta.publishable, true);

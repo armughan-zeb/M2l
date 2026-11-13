@@ -88,11 +88,8 @@ Provide at least 8 specific factual claims and at least 3 dated timeline entries
       ],
       responseFormat: { type: 'json_object' },
       maxTokens: 2500,
-      // Was 180000: the caller expired the request while the 600s bridge
-      // wall (Vidnets agent_post floor) still allowed the operator to
-      // answer. Match the bridge wall so one synthesis attempt gets the
-      // full window instead of dying at 3 minutes.
-      timeoutMs: 600000,
+      // Per-request inbox hard wall: 120s; the resident answer target is 60s.
+      timeoutMs: 120000,
       operation: 'scriptit.research-synthesis',
       kind: 'text',
       signal
@@ -107,11 +104,10 @@ Provide at least 8 specific factual claims and at least 3 dated timeline entries
       ],
       responseFormat: { type: 'json_object' },
       maxTokens: 2500,
-      // Same synthesis request via the other Muse handle (external-agent):
-      // same 180s -> 600s alignment with the bridge wall. The OpenRouter
-      // branch below (60000) is a real model API, not the bridge, and is
-      // intentionally left alone.
-      timeoutMs: 600000,
+      // Same hard wall for the other Muse handle. The provider branch below
+      // is a separate non-production configuration and remains independently
+      // bounded.
+      timeoutMs: 120000,
       operation: 'scriptit.research-synthesis',
       kind: 'text',
       signal

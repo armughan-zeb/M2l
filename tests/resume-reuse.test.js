@@ -28,6 +28,18 @@ const jobRunner = require('../lib/jobRunner');
 const ffmpeg = require('../lib/ffmpeg');
 const { afterEach } = require('node:test');
 
+// Integration fixtures never call an inference provider. Keep ambient host
+// keys out so the production fail-closed guard cannot preempt their scope.
+const PROVIDER_KEY_NAMES = ['OPENROUTER_API_KEY', 'VIDZEO_OPENROUTER_API_KEY', 'SCRIPTIT_API_KEY', 'SCRIPTIT_OPENROUTER_API_KEY'];
+const savedProviderKeys = Object.fromEntries(PROVIDER_KEY_NAMES.map(name => [name, process.env[name]]));
+test.before(() => { for (const name of PROVIDER_KEY_NAMES) delete process.env[name]; });
+test.after(() => {
+  for (const [name, value] of Object.entries(savedProviderKeys)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+});
+
 // A failed executeJob leaves the active-job marker behind (only a settled
 // job clears it) — exactly what production wants, but the shared scratch
 // root would then make the NEXT test hit the serial guard instead of the

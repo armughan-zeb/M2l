@@ -75,8 +75,13 @@ def test_failed_cdn_is_not_hammered_by_each_scene_and_cooldown_expires(tmp_path,
 
 
 def test_preview_success_publishes_under_original_url(tmp_path, monkeypatch):
+    from services.web_image import host_allowlist
+
     cache = {}
     item = {'url': 'https://example.com/full.jpg', 'preview_url': 'https://example.com/preview.jpg'}
+    seen_hosts = tmp_path / 'seen_hosts.json'
+    monkeypatch.setenv('VIDZEO_SEEN_HOSTS_PATH', str(seen_hosts))
+    host_allowlist.record_hosts(['example.com'], source='test', path=seen_hosts)
     def download(urls, output_dir, **kwargs):
         if urls == [item['url']]:
             return [(item['url'], None, 'HTTP 403')]
@@ -150,6 +155,8 @@ def test_literal_phrase_lookup_matches_previous_regex_for_unicode_and_boundaries
     phrases = ['Citroen', 'Royal Warrant', 'warrant', 'war', 'foo bar', '', '!!!', 'Haagen Dazs', 'strasse']
     for text in texts:
         for phrase in phrases:
-            expected = bool(phrase and re.search(r'(?<![a-z0-9])' + re.escape(documentary_subject.search_key(phrase))
-                                                + r'(?![a-z0-9])', documentary_subject.search_key(text)))
+            normalized_phrase = documentary_subject.search_key(phrase)
+            expected = bool(normalized_phrase and re.search(r'(?<![a-z0-9])' + re.escape(normalized_phrase)
+                                                            + r'(?![a-z0-9])', documentary_subject.search_key(text)))
             assert requirements._contains_phrase(text, phrase) == expected
+    assert requirements._contains_phrase('any content', '!!!') is False

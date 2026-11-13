@@ -10,6 +10,7 @@ const {
 const { runCommand } = require('../lib/command');
 
 const JOB = 'test-stage-cleanup-job';
+const linuxOnly = { skip: process.platform !== 'linux' ? 'requires Linux process groups and /proc' : false };
 
 function spawnDetachedGroup(command, args = []) {
   const child = spawn(command, args, { detached: true, stdio: 'ignore' });
@@ -17,7 +18,7 @@ function spawnDetachedGroup(command, args = []) {
   return child;
 }
 
-test('cleanupStage reaps a stage group and verifies it is gone', async () => {
+test('cleanupStage reaps a stage group and verifies it is gone', linuxOnly, async () => {
   // A detached `bash -c 'sleep 300'` leaves bash + sleep in the new group.
   const child = spawnDetachedGroup('bash', ['-c', 'sleep 300']);
   const startedAtMs = Date.now();
@@ -34,7 +35,7 @@ test('cleanupStage reaps a stage group and verifies it is gone', async () => {
   for (const pid of members) assert.equal(isAlive(pid), false, `pid ${pid} should be gone`);
 });
 
-test('cleanupStage SIGKILLs a member that ignores SIGTERM', async () => {
+test('cleanupStage SIGKILLs a member that ignores SIGTERM', linuxOnly, async () => {
   const child = spawnDetachedGroup('bash', ['-c', 'trap "" TERM; sleep 300']);
   const startedAtMs = Date.now();
   assert.equal(registerStageProcess(JOB, 'render', { pid: child.pid, pgid: child.pid, startedAtMs }), true);
@@ -45,7 +46,7 @@ test('cleanupStage SIGKILLs a member that ignores SIGTERM', async () => {
   assert.equal(isAlive(child.pid), false);
 });
 
-test('cleanupStage reaps a non-detached grandchild left behind by an exited stage', async () => {
+test('cleanupStage reaps a non-detached grandchild left behind by an exited stage', linuxOnly, async () => {
   // The real scenario: the stage command exits, but a child it spawned
   // (in its group, not detached) lingers. runCommand reports the spawn;
   // the stage registers it; cleanup reaps the leftover.
@@ -67,7 +68,7 @@ test('cleanupStage reaps a non-detached grandchild left behind by an exited stag
   assert.deepEqual(registeredStages(JOB), []);
 });
 
-test('registerStageProcess refuses the own group, PID 1, and the daemon PID', () => {
+test('registerStageProcess refuses the own group, PID 1, and the daemon PID', linuxOnly, () => {
   const { execFileSync } = require('node:child_process');
   const ownPgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim());
   assert.ok(Number.isFinite(ownPgid) && ownPgid > 1, 'own pgid must be readable');
@@ -77,13 +78,20 @@ test('registerStageProcess refuses the own group, PID 1, and the daemon PID', ()
   assert.deepEqual(registeredStages(JOB), []);
 });
 
+test('a leader PID without a POSIX group follows the platform cleanup contract', () => {
+  const tracked = registerStageProcess(JOB, 'render', { pid: 12345, pgid: null });
+  assert.equal(tracked, process.platform === 'win32');
+  if (tracked) assert.equal(registeredStages(JOB)[0].pgid, 12345);
+  else assert.deepEqual(registeredStages(JOB), []);
+});
+
 test('cleanupStage with no record is a verified no-op', async () => {
   const report = await cleanupStage(JOB, 'never-registered');
   assert.equal(report.skipped, 'no-record');
   assert.equal(report.verifiedGone, true);
 });
 
-test('cleanupStage spares a group member that predates the stage (PID reuse)', async () => {
+test('cleanupStage spares a group member that predates the stage (PID reuse)', linuxOnly, async () => {
   const child = spawnDetachedGroup('bash', ['-c', 'sleep 300']);
   await new Promise(resolve => setTimeout(resolve, 300));
   // Register with a start time 10 minutes in the FUTURE: every real
@@ -100,7 +108,7 @@ test('cleanupStage spares a group member that predates the stage (PID reuse)', a
   try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
 });
 
-test('cleanupAllStagesForJob sweeps every registered stage', async () => {
+test('cleanupAllStagesForJob sweeps every registered stage', linuxOnly, async () => {
   const a = spawnDetachedGroup('bash', ['-c', 'sleep 300']);
   const b = spawnDetachedGroup('bash', ['-c', 'sleep 300']);
   const now = Date.now();
@@ -114,7 +122,7 @@ test('cleanupAllStagesForJob sweeps every registered stage', async () => {
   assert.equal(isAlive(b.pid), false);
 });
 
-test('processStartMs reads a live process start near now', () => {
+test('processStartMs reads a live process start near now', linuxOnly, () => {
   const started = processStartMs(process.pid);
   assert.ok(Number.isFinite(started), 'start time must be readable');
   assert.ok(Math.abs(Date.now() - started) < 24 * 60 * 60 * 1000, 'start time must be recent');

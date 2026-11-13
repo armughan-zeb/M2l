@@ -8,10 +8,12 @@ function baseUrl() {
   if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Agent inference requires a localhost CMS URL');
   return url.origin;
 }
-async function agentChat({ apiKey, messages, responseFormat, maxTokens, tools, toolChoice, signal, timeoutMs = 600000, operation = 'tool-completion', kind = 'text' }) {
+const REQUEST_WALL_MS = 120000;
+
+async function agentChat({ apiKey, messages, responseFormat, maxTokens, tools, toolChoice, signal, timeoutMs = REQUEST_WALL_MS, operation = 'tool-completion', kind = 'text' }) {
   if (!isAgentHandle(apiKey) || !String(apiKey).slice(PREFIX.length).trim()) throw new Error('A paired external agent is required');
   // The CMS transport has its own budget. Direct Muse inbox calls use agentBridge.js.
-  const budget = Math.max(100, Math.min(600000, Number(timeoutMs) || 600000));
+  const budget = Math.max(100, Math.min(REQUEST_WALL_MS, Number(timeoutMs) || REQUEST_WALL_MS));
   const deadline = AbortSignal.timeout(budget + 1000);
   const response = await fetch(baseUrl() + '/api/agent/inference', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Vidzeo-Agent-Key': String(apiKey).slice(PREFIX.length) },
@@ -29,4 +31,4 @@ async function agentChat({ apiKey, messages, responseFormat, maxTokens, tools, t
     choices: [{ message, finish_reason: reply.tool_calls ? 'tool_calls' : 'stop' }], usage: {} };
   return { content: message.content, raw, modelUsed: 'external-agent', attempts: 1 };
 }
-module.exports = { PREFIX, isAgentHandle, agentChat, baseUrl };
+module.exports = { PREFIX, REQUEST_WALL_MS, isAgentHandle, agentChat, baseUrl };

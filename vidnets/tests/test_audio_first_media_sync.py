@@ -130,7 +130,7 @@ class AudioFirstMediaSyncTests(unittest.TestCase):
         self.assertEqual(sum(plan.final_counts.values()), 7)
 
     @mock.patch("services.web_image.resolver._resolve_scene")
-    @mock.patch("services.web_image.query.generate_web_image_queries")
+    @mock.patch("services.web_image_service.generate_web_image_queries")
     def test_web_resolver_returns_audit_and_freshness_mode(self, mock_queries, mock_resolve):
         mock_queries.return_value = [
             {
@@ -164,8 +164,9 @@ class AudioFirstMediaSyncTests(unittest.TestCase):
             title="Video",
             scene_texts=["Scene 1"],
             scene_durations=[3.0],
-            api_key="test-key",
+            api_key="",
             gallery_cmd=["gallery-dl"],
+            stage_deadline_seconds=4,
         )
 
         self.assertEqual(result["audit"]["freshness_mode"], "streaming-live-search")
@@ -175,7 +176,7 @@ class AudioFirstMediaSyncTests(unittest.TestCase):
 
     @mock.patch("services.web_image.resolver.resolve_gallery_dl", return_value=None)
     @mock.patch("services.web_image.resolver._resolve_scene")
-    @mock.patch("services.web_image.query.generate_web_image_queries")
+    @mock.patch("services.web_image_service.generate_web_image_queries")
     def test_web_resolver_keeps_running_without_gallery_dl(
         self,
         mock_queries,

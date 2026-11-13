@@ -10,6 +10,16 @@ const {
 } = require('../lib/remotionWorkers');
 const { buildRequest } = require('../adapters/vidnets');
 
+const PROVIDER_KEY_NAMES = ['OPENROUTER_API_KEY', 'VIDZEO_OPENROUTER_API_KEY', 'SCRIPTIT_API_KEY', 'SCRIPTIT_OPENROUTER_API_KEY'];
+const savedProviderKeys = Object.fromEntries(PROVIDER_KEY_NAMES.map(name => [name, process.env[name]]));
+test.before(() => { for (const name of PROVIDER_KEY_NAMES) delete process.env[name]; });
+test.after(() => {
+  for (const [name, value] of Object.entries(savedProviderKeys)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+});
+
 const SYS_ROOMY = { totalMb: 7934, availableMb: 6000, cpuCount: 8 };
 const SYS_THIS_VM = { totalMb: 7934, availableMb: 750, cpuCount: 4 };
 const SYS_LIVE_JOB = { totalMb: 7934, availableMb: 916, cpuCount: 4 };

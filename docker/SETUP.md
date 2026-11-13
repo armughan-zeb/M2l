@@ -45,30 +45,28 @@ docker compose exec worker curl -s http://127.0.0.1:5010/   # Vidnets answers in
 No ports are published to the host by default. To inspect Vidnets from the
 host, uncomment the `ports:` block in `docker-compose.yml` and re-up.
 
-## Host Muse hook (manual step — do this before the first job)
+## Host Muse hook (setup installs and proves the script)
 
-The daemon's start gate fails closed without it: the **vidnets-inbox-watch
-hook** on the **host Muse VM** is the only thing that answers Vidnets
-inference requests (vision, scene queries, ScriptIT drafts). The container
-cannot answer them itself.
+`setup.sh` installs the repository hook script on the host Muse VM, updates the
+existing definition's script path while preserving its delivery and prompt
+settings, and replaces the documentation placeholders with the extracted repo
+and runtime paths. Keep the existing definition enabled and set a real
+`delivery.to` chat target; setup refuses unresolved placeholders. It then waits
+up to 120 seconds for `~/hooks/state/vidnets-inbox-watch/last-run` to prove the
+host scheduler actually executed the hook. The worker mounts that proof
+read-only and refuses to claim jobs if it is absent or older than 120 seconds.
 
-1. Copy `docker/hooks/vidnets-inbox-watch.json.template` to
-   `$HOME/hooks/definitions/vidnets-inbox-watch.json` on the host Muse VM
-   and replace the placeholders:
-   - `<EXTRACTED_DIR>` — the dir you unzipped this repo into.
-   - `<DATA_RUNTIME_DIR>` — `<EXTRACTED_DIR>/data/runtime`.
-   - `<YOUR_SIDE_CHAT_ID>` — the chat the hook should answer in.
-2. Copy `docker/hooks/vidnets-inbox-watch.sh` to
-   `$HOME/hooks/scripts/vidnets-inbox-watch.sh`, edit the `BRIDGE` line to
-   `<EXTRACTED_DIR>/data/runtime/temp/agent-bridge`, `chmod +x` it.
-3. Enable the hook on the host Muse VM. `HOST_HOOKS_DIR` (default
-   `$HOME/hooks/definitions`) is mounted read-only at `/host-hooks` so the
-   gate can verify it.
+If no definition exists, create it from
+`docker/hooks/vidnets-inbox-watch.json.template`, set a real chat target, enable
+it, then rerun `setup.sh`. The hook polls every 20 seconds and has a 120-second
+hard script budget. The worker also runs a harmless end-to-end Muse inbox probe
+before its first claim and at regular intervals; each answer is targeted under
+60 seconds. The repo cannot create or supervise Muse-side subagents: the host
+Muse runtime still provides the reasoning and answers.
 
-**Expect ~4.5 min per inference round trip** (hook wake latency). That is
-normal, not a failure. A 1-min video needs dozens of round trips; the
-realistic floor is ~30–45 min, not 2–5 min.
-
+The 120 seconds is a failure ceiling, not an expected wait. If answers are
+regularly over 60 seconds, inspect the host hook schedule and operator response
+path before running a production job.
 ## What this worker does (and does not do)
 
 - **Script + video only. Thumbnails are skipped** (`VIDZEO_SKIP_THUMBNAILS=1`).
@@ -96,7 +94,7 @@ realistic floor is ~30–45 min, not 2–5 min.
 | `401` / credential revoked | Re-run `./setup.sh` and re-pair with a fresh key from the CMS. |
 | Container stopped / VM rebooted | `docker compose up -d`. State lives in `./data`; the daemon resumes the saved job from its checkpoint. Never delete `./data` while a job runs. |
 | Out of disk | `./data/runtime/temp` accumulates render scratch; prune it by hand. Never delete `./data/runtime/temp/agent-bridge` while a job runs. |
-| Slow job / "stuck" scene | Normal: inference round trips are ~4.5 min each. The server's debugger reuses already-downloaded vision-checked media first, then same-job approved media, graphic last. Do not kill it. |
+| Slow job / "stuck" scene | The historical hook path took ~4.5 min per inference request; that is a failure, not normal. New requests target <60s and expire at 120s. Check `doctor`, hook `last-run`, bridge metrics, and the stage-specific progress logs before retrying. |
 | Low-memory test/build failures | The reference box has 4 vCPU / 7.7 GB and render concurrency is pinned to 1. Do not raise it. |
 
 ## Updating

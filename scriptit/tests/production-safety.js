@@ -458,7 +458,7 @@ async function main() {
     const { buildUserPrompt } = require('../src/prompts/scriptPrompts');
     const shortPrompt = buildUserPrompt({ topic: 'Mini Cooper', title: 'Mini Cooper', duration: '1min' });
     assert.ok(!shortPrompt.includes('at least 1000'), 'short runtime must never demand a thousand words');
-    assert.match(shortPrompt, /at least 136 words/i);
+    assert.match(shortPrompt, /at least 178 words/i);
     assert.match(shortPrompt, /longer.*(?:acceptable|advisory)/i);
     const { buildDeterministicHooks } = require('../src/engine/agents/hookAgent');
     const safeHooks = buildDeterministicHooks('Mini Cooper', 'A small car changed this particular race.');

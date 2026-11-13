@@ -21,14 +21,21 @@ function bridgeFixture({ hookEnabled = true } = {}) {
   fs.writeFileSync(path.join(vidnetsRoot, 'VIDNETS_AGENT.sh'), '#!/bin/sh\n');
   fs.writeFileSync(path.join(dir, 'render-vidnets-linux.js'), '');
   const hookPath = path.join(dir, 'hook.json');
-  fs.writeFileSync(hookPath, JSON.stringify({ enabled: hookEnabled, id: 'vidnets-inbox-watch' }));
+  fs.writeFileSync(hookPath, JSON.stringify({
+    enabled: hookEnabled, id: 'vidnets-inbox-watch',
+    delivery: { surface: 'side_chat', to: 'fixture-chat' }, script_path: '/fixture/vidnets-inbox-watch.sh'
+  }));
+  const hookStatePath = path.join(dir, 'hook-state');
+  fs.mkdirSync(hookStatePath, { recursive: true });
+  fs.writeFileSync(path.join(hookStatePath, 'last-run'), `${Math.floor(Date.now() / 1000)}\n`);
   return {
     dir,
     env: {
-      MUSE_RENDER_COMMAND: 'node render-vidnets-linux.js',
+      MUSE_RENDER_COMMAND: `node "${path.join(dir, 'render-vidnets-linux.js')}"`,
       MUSE_REPO_ROOT: dir,
       MUSE_VIDNETS_ROOT: vidnetsRoot,
       MUSE_INBOX_HOOK_DEFINITION: hookPath,
+      MUSE_INBOX_HOOK_STATE_DIR: hookStatePath,
       VIDZEO_BRIDGE_ROOT: bridgeRoot
     }
   };

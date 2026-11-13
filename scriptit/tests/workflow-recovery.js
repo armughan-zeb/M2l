@@ -208,35 +208,32 @@ async function main() {
   assert.equal(researchSignal.aborted, true);
   assert.equal(lateDrafts, 0);
 
-  // Exercise the production routing with a saved short long-form draft.
-  // Guard the provider too: a regression must never make a live test request.
-  const writerPath = require.resolve('../src/agents/scriptWriter');
-  const sectionModule = require('../src/agents/sectionWriter');
-  const providerModule = require('../src/providers/openrouter');
-  const savedSections = sectionModule.writeSections, savedProvider = providerModule.chatCompletion;
-  const savedWriter = require.cache[writerPath];
-  let recoveredBeats = 0, wholeRewrites = 0;
+  // Explicit expansion gives one complete writing request the saved draft.
   const priorDraft = Array(975).fill('historical').join(' ');
-  try {
-    sectionModule.writeSections = async options => {
-      recoveredBeats++;
-      assert.equal(options.wordTarget, 1600);
-      assert.equal(options.previousDraft, priorDraft);
-      throw new Error('Budgeted recovery reached');
-    };
-    providerModule.chatCompletion = async () => { wholeRewrites++; throw new Error('Unexpected whole-story rewrite'); };
-    delete require.cache[writerPath];
-    await assert.rejects(require(writerPath).generateScript({ topic: 'Historical subject', duration: '10min', apiKey: 'fixture', researchMode: 'thorough', useCache: false, recordHistory: false,
-      research: { query: 'Historical subject', official: [] } }), /research is insufficient/i);
-    assert.equal(wholeRewrites, 0, 'an empty source set must stop before planning or narration calls');
-    await assert.rejects(require(writerPath).generateScript({ topic: 'Historical subject', duration: '10min', apiKey: 'fixture', researchMode: 'thorough', useCache: false, recordHistory: false,
-      initialDraft: priorDraft, research: { query: 'Historical subject', gatheredAt: new Date().toISOString(), official: [{ title: 'Historical subject archive', articleText: 'This institutional archive documents the historical subject and its verified timeline in an attributable record.', url: 'https://www.nationalarchives.gov.uk/example-record', source: 'The National Archives', hasArticleBody: true }] } }), /Budgeted recovery reached/);
-    assert.equal(recoveredBeats, 1);
-    assert.equal(wholeRewrites, 0, 'a preserved short draft must enter bounded beats instead of another shrinking whole rewrite');
-  } finally {
-    sectionModule.writeSections = savedSections; providerModule.chatCompletion = savedProvider;
-    require.cache[writerPath] = savedWriter;
-  }
+  let writingCalls = 0;
+  const options = {
+    topic: 'Historical subject', duration: '10min', apiKey: 'fixture',
+    researchMode: 'thorough', useCache: false, recordHistory: false,
+    initialDraft: priorDraft,
+    chatCompletionFn: async request => {
+      writingCalls++;
+      assert.ok(request.messages[1].content.includes(priorDraft));
+      return { content: priorDraft };
+    }
+  };
+  await assert.rejects(generateScript({ ...options,
+    research: { query: 'Historical subject', official: [] }
+  }), /research is insufficient/i);
+  assert.equal(writingCalls, 0);
+  await generateScript({ ...options, research: {
+    query: 'Historical subject', gatheredAt: new Date().toISOString(), official: [{
+      title: 'Historical subject archive',
+      articleText: 'This institutional archive documents the historical subject and its verified timeline in an attributable record.',
+      url: 'https://www.nationalarchives.gov.uk/example-record',
+      source: 'The National Archives', hasArticleBody: true
+    }]
+  } });
+  assert.equal(writingCalls, 1);
 
   const rejectedDraft = { script: 'Preserve this rejected narration exactly.', meta: { publishable: false, quality: { passes: false, issues: ['Specific factual rejection'] } } };
   let syntheses = 0;

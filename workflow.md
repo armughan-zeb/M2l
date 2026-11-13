@@ -17,7 +17,7 @@ cp .env.example .env   # then fill in the values below; .env is gitignored
 ```
 
 Settings that must be in `.env` (see `.env.example` for the full list):
-`MUSE_RENDER_COMMAND=node <repo>/render-vidnets-linux.js`,
+`MUSE_RENDER_COMMAND=node <absolute-repo-path>/render-vidnets-linux.js`,
 `MUSE_VIDNETS_ROOT=<repo>/vidnets`,
 `MUSE_YOUTUBE_COVERAGE_TARGET=0.8`,
 `MUSE_MEDIA_STRICT=0` (filter-best; see §3),
@@ -36,8 +36,11 @@ curl -s http://127.0.0.1:5010/api/status | python3 -m json.tool
 # Expected: healthy, ffmpeg true, can_start_render true.
 ```
 
-Enable the inbox-watch hook (`vidnets-inbox-watch`, poll 60s) — it is
-the ONLY inference path. Its definition lives at
+Enable the inbox-watch hook (`vidnets-inbox-watch`, poll 20s). If a
+resident transport is configured with `MUSE_INFERENCE_COMMAND` or
+`MUSE_INFERENCE_URL`, the dispatcher polls every second and answers in
+parallel (up to eight), while the hook is the alert-only fallback. Without
+that transport, the hook is the primary answerer. Its definition lives at
 `~/hooks/definitions/vidnets-inbox-watch.json` (`"enabled": true`).
 It wakes a Muse operator in the side chat to answer every inbox request
 (script, scene queries, direction, vision) via
@@ -49,7 +52,7 @@ dies with the shell):
 ```bash
 node muse-agent.js doctor
 # Expected: all checks PASS — Vidnets :5010 healthy, inbox writable,
-# hook enabled, no OpenRouter key. Doctor FAILS without a verified
+# hook enabled and recently observed running, no OpenRouter key. Doctor FAILS without a verified
 # bridge; do not run jobs until it passes.
 nohup ./start-daemon.sh >> daemon.log 2>&1 &
 node muse-agent.js status
@@ -97,7 +100,7 @@ Every knob lives in `.env` / `.env.example`. Defaults are production.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MUSE_YOUTUBE_COVERAGE_TARGET` | 0.8 | Fraction of scenes the planner tries to fill with accepted YouTube clips (code default 0.6) |
+| `MUSE_YOUTUBE_COVERAGE_TARGET` | 0.8 | Fraction of scenes the planner tries to fill with accepted YouTube clips |
 | `MUSE_MEDIA_STRICT` | 0 | 0 = filter-best (vision advisory); 1 = hard-required (strict retrieval + visual required) |
 | `MUSE_SCRIPT_MAX_DRAFTS` | 2 | Script model calls max (draft 1 + one fix pass) |
 | `MUSE_RESEARCH_TIMEOUT_MS` | 180000 | One shared research deadline for all providers |
@@ -110,11 +113,14 @@ Every knob lives in `.env` / `.env.example`. Defaults are production.
 
 ## 5. Monitoring
 
-The `vidnets-health-monitor` cron runs
-`~/hooks/scripts/vidnets-health-monitor.sh` every 5 minutes. It checks:
+`setup.sh` installs the `vidnets-health-monitor` cron at
+`~/hooks/scripts/vidnets-health-monitor.sh` and schedules it every minute,
+so inbox age is checked within the 60-second operator SLO. Existing installs
+must rerun setup to install or refresh it. It checks:
 daemon alive + connected, Vidnets `:5010` healthy + memory admission,
-CMS reachable + outage duration, inbox-watch hook enabled, no inbox
-request sitting pending past half its TTL, disk/tmp space. It FIXES what
+CMS reachable + outage duration, inbox-watch hook enabled and recently run, no inbox
+request sitting pending past half its TTL, disk/tmp space, and Vidnets memory
+admission. It FIXES what
 it can itself — restart a dead daemon via `start-daemon.sh`, restart a
 dead Vidnets server, mark expired inbox requests — and is SILENT when
 healthy. It only messages the user when it cannot fix something or a

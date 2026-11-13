@@ -27,11 +27,11 @@ services:
       MUSE_VIDNETS_COMMAND: "bash /app/vidnets/VIDNETS_AGENT.sh --runtime-root /data/runtime"
       MUSE_REPO_ROOT: "/app"
       MUSE_RENDER_CONCURRENCY: "1"
-      # Nov 10, 2026 standing decisions — do not "fix" these back.
-      # YT coverage 0.30 (web is the main source; the old 0.8 was stale),
+      # Production defaults aligned with workflow.md and the incident report.
+      # YouTube coverage 0.8, web pool 12/scene, finalists 3, vision pool 12,
       # web pool 12/scene, finalists 3, vision pool 12, relative floor 0.5,
       # YT vision frames 2/clip, YT downloads 4.
-      MUSE_YOUTUBE_COVERAGE_TARGET: "0.30"
+      MUSE_YOUTUBE_COVERAGE_TARGET: "0.8"
       MUSE_MEDIA_STRICT: "0"
       VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE: "12"
       VIDZEO_VISUAL_FINALIST_LIMIT: "3"
@@ -52,6 +52,7 @@ services:
       MUSE_CONFIG_FILE: "/data/.muse-agent.json"
       VIDZEO_BRIDGE_ROOT: "/data/runtime/temp/agent-bridge"
       MUSE_INBOX_HOOK_DEFINITION: "/host-hooks/vidnets-inbox-watch.json"
+      MUSE_INBOX_HOOK_STATE_DIR: "/host-hook-state"
       VIDNETS_PYTHON: "python3"
       # No OpenRouter key may ever be set here. Muse inference is compulsory.
     volumes:
@@ -66,6 +67,9 @@ services:
       # file) avoids compose creating a directory when the file is absent.
       # Override with HOST_HOOKS_DIR if your Muse VM keeps hooks elsewhere.
       - ${HOST_HOOKS_DIR:-${HOME}/hooks/definitions}:/host-hooks:ro
+      # The hook writes last-run on every invocation. This is mounted read-only
+      # so the worker can refuse claims when an enabled hook has never fired.
+      - ${HOST_HOOK_STATE_DIR:-${HOME}/hooks/state/vidnets-inbox-watch}:/host-hook-state:ro
     # Vidnets binds 127.0.0.1:5010-5110 inside the container; nothing is
     # published to the host by default. Uncomment to inspect it locally:
     # ports:
