@@ -3168,11 +3168,15 @@ def _pick_spare_candidate(
         # uses the same identity the final ledger records.
         probe = SceneResolution(
             scene_index=int(scene.get("scene_index", scene_index)),
+            final_scene_context=dict(rows[origin_index]),
+            visual_decision=dict(qwen or {}),
             provider=str(candidate.get("source") or candidate.get("provider") or ""),
             selected_path=local_path,
             asset_fingerprint=str(candidate.get("asset_fingerprint") or candidate.get("fingerprint") or ""),
             source_url=str(candidate.get("origin_url") or candidate.get("source_url") or candidate.get("url") or ""),
         )
+        if not _semantic_reuse_compatible(scene, probe) or not _strict_reuse_identity_compatible(scene, probe):
+            continue
         identity = _resolution_asset_identity(probe)
         if not identity:
             continue
@@ -3219,6 +3223,7 @@ def resolve_storyboard_media_v2(
     max_workers: int = 6,
     web_wait_until_complete: bool = False,
     external_cancel_event: Optional[threading.Event] = None,
+    adaptive_media_review: bool = False,
 ) -> Dict[int, SceneResolution]:
     """Resolve immutable storyboard scenes through the V2 fallback machine.
 
@@ -3300,8 +3305,12 @@ def resolve_storyboard_media_v2(
             daemon=True,
         )
         worker.start()
-        if not done.wait(timeout=max(0.01, float(timeout))):
-            return False, None, None
+        deadline = time.monotonic() + max(0.01, float(timeout))
+        while not done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or event.is_set():
+                return False, None, None
+            done.wait(timeout=min(0.25, remaining))
         error = box.get("error")
         if error is not None:
             return True, None, error
@@ -3355,70 +3364,6 @@ def resolve_storyboard_media_v2(
                 "stage": "discovery",
                 "elapsed_ms": round((time.monotonic() - started) * 1000.0, 2),
             })
-
-    # A shared batch lane has one in-flight loader but every scene still needs
-    # a waiter future.  Limiting the pool to the normal six per-scene workers
-    # leaves most waiters queued behind the slow batch request; when the
-    # deadline expires those queued scenes are incorrectly terminalized as
-    # neutral.  Give shared batches enough slots for both primary lanes and all
-    # scene waiters, while retaining the small pool for true per-scene lanes.
-    worker_limit = (
-        max(2, min(64, 2 * len(rows)))
-        if shared_batch_mode
-        else max(2, min(6, int(max_workers)))
-    )
-    executor = ThreadPoolExecutor(max_workers=worker_limit, thread_name_prefix="media-v2-primary")
-    try:
-        waves = [list(range(len(rows)))] if shared_batch_mode else _container_waves(rows)
-        for wave_number, wave in enumerate(waves, start=1):
-            if not web_wait_until_complete and time.monotonic() >= deadline_at:
-                cancel_event.set()
-                break
-            futures = {
-                executor.submit(discover, index, source, lane): (index, source)
-                for index in wave
-                for source, lane in (("youtube", youtube_lane), ("web", web_lane))
-            }
-            pending = set(futures)
-            while pending and not cancel_event.is_set() and (web_wait_until_complete or time.monotonic() < deadline_at):
-                done, pending = wait(
-                    pending,
-                    timeout=min(0.25, max(0.0, deadline_at - time.monotonic())),
-                    return_when=FIRST_COMPLETED,
-                )
-                for future in done:
-                    index, source, candidates, status = future.result()
-                    attempts[index].append({
-                        "source": source, "stage": "discovery_result",
-                        "wave": wave_number, "status": status, "candidate_count": len(candidates),
-                    })
-                    discovered[index].extend(candidates)
-            if pending and shared_batch_mode and not cancel_event.is_set():
-                # If a shared batch provider (e.g. web image lane or youtube lane)
-                # is still completing its network/transcode work, give the scene waiters
-                # a realistic grace period to drain their results before cancelling them.
-                drain_timeout = max(
-                    15.0,
-                    min(45.0, float(os.environ.get("VIDZEO_SHARED_BATCH_DRAIN_TIMEOUT", "30") or 30)),
-                )
-                done, pending = wait(pending, timeout=drain_timeout, return_when=ALL_COMPLETED)
-                for future in done:
-                    try:
-                        index, source, candidates, status = future.result()
-                        attempts[index].append({
-                            "source": source, "stage": "discovery_result",
-                            "wave": wave_number, "status": status, "candidate_count": len(candidates),
-                        })
-                        discovered[index].extend(candidates)
-                    except Exception:
-                        pass
-            for future in pending:
-                future.cancel()
-            if pending:
-                cancel_event.set()
-                break
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
     resolutions: Dict[int, SceneResolution] = {}
     multi_container_job = _multi_container_job(rows)
@@ -3500,7 +3445,6 @@ def resolve_storyboard_media_v2(
     # Ensure any candidates that completed in shared batch lanes (YouTube, Web)
     # during or after the discovery loop drain are promoted into discovered[index]
     # rather than discarded.
-    _promote_completed_batch_lanes("batch_lane_promotion", timeout=0.0)
 
     def _candidate_ledger(index: int, selected_path: str = "") -> list[dict[str, Any]]:
         ledger: list[dict[str, Any]] = []
@@ -3612,7 +3556,6 @@ def resolve_storyboard_media_v2(
     )
     if verification_delivery_deadline is not None:
         web_recovery_visual_deadline_at = min(web_recovery_visual_deadline_at, verification_delivery_deadline)
-    _promote_completed_batch_lanes("pre_gate_batch_promotion", timeout=1.0)
 
     # Keep the bounded finalist contract explicit. The parallel gate only
     # sends the bounded top-K candidates per scene to the verifier; selection must
@@ -3625,18 +3568,23 @@ def resolve_storyboard_media_v2(
     primary_top_pool_keys: Dict[int, set[str]] = {index: set() for index in range(len(rows))}
     gate_lock = threading.Lock()
     primary_work: List[tuple] = []
-    for index, scene in enumerate(rows):
+    finalist_limit = (_scene_finalist_limit() if adaptive_media_review
+                      else _finalists_for_storyboard(rows, _scene_finalist_limit()))
+
+    def rank_scene(index, *, record=True):
+        scene = rows[index]
         preference_rank = preference_ranks[index]
         viable: List[tuple[float, float, int, Dict[str, Any], str]] = []
         for candidate in discovered[index]:
             source = _normalize_candidate_source(candidate)
             passed, reason = _candidate_hard_gate(scene, candidate)
-            attempts[index].append({
-                "source": source,
-                "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or ""),
-                "stage": "hard_gate",
-                "status": reason,
-            })
+            if record:
+                attempts[index].append({
+                    "source": source,
+                    "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or ""),
+                    "stage": "hard_gate",
+                    "status": reason,
+                })
             if not passed:
                 continue
             metadata_score = float(
@@ -3675,114 +3623,191 @@ def resolve_storyboard_media_v2(
         # cross-source recovery below.
         finalists, top_pool = _select_scene_finalists(
             viable,
-            finalist_limit=_finalists_for_storyboard(rows, _scene_finalist_limit()),
+            finalist_limit=finalist_limit,
             top_candidates=_scene_top_candidates_limit(),
         )
-        primary_top_pool_keys[index] = {
-            str(item[3].get("path") or "") for item in top_pool
-        }
-        for _identity_proof, metadata_score, source_tie, candidate, source in finalists:
-            primary_finalist_keys[index].add(str(candidate.get("path") or ""))
-            primary_work.append((index, source_tie, candidate, source, metadata_score))
+        if record:
+            primary_top_pool_keys[index] = {str(item[3]["path"]) for item in top_pool}
+        if adaptive_media_review and _source_policy_value(scene, "youtube_quota", False):
+            finalists.sort(key=lambda item: not _is_moving_youtube_source(item[3]))
+        return [(index, tie, candidate, source, score)
+                for _proof, score, tie, candidate, source in finalists]
 
-    # Verify requested footage before optional still alternatives can occupy
-    # every client slot. This changes scheduling, not acceptance standards.
-    primary_work.sort(key=lambda item: (
-        not (item[3] == 'youtube' and _source_policy_value(rows[item[0]], 'youtube_quota', False)),
-        item[0], item[3] != 'youtube'))
+    gate_stop = threading.Event()
+    workers = _visual_gate_workers(len(rows) * finalist_limit)
+    gate_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="media-v2-gate")
+    pending_reviews = set()
+    early_checks = {}
+    review_started = set()
+    finished_sources = {index: set() for index in range(len(rows))}
+    visual_context = getattr(visual_verifier, "visual_context", None)
 
-    def _gate_one_primary(item) -> None:
-        index, source_tie, candidate, source, metadata_score = item
-        # Futures are submitted as one batch, so a queued live verifier can
-        # start after the coordinator wall has elapsed.  Keep that configured
-        # verifier deadline-bound.  With no verifier, however, the decision is
-        # a cheap deterministic metadata/safety promotion; rejecting it here
-        # would turn already downloaded real assets into neutral placeholders
-        # and trigger the slow stock rescue.
+    def verify_primary(item):
+        index, tie, candidate, _source, score = item
+        if gate_stop.is_set() or (external_cancel_event is not None and external_cancel_event.is_set()):
+            return None
         if visual_verifier is not None and time.monotonic() >= visual_gate_deadline_at:
-            attempts[index].append({
-                "source": source,
-                "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or ""),
-                "stage": "visual_gate",
-                "status": "skipped_after_media_deadline",
-            })
-            outcome = (
-                metadata_score,
-                source_tie,
-                False,
-                "skipped_after_media_deadline",
-                0.0,
-                {"accepted": False, "status": "deadline_exceeded"},
-            )
-            with gate_lock:
-                gated_outcomes[(index, str(candidate.get("path") or ""))] = outcome
-            return
-        scene = rows[index]
-        verified, verify_reason, visual_score, qwen = _verification_result(
-            scene, candidate, visual_verifier,
-        )
-        attempts[index].append({
-            "source": source,
-            "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or ""),
-            "stage": "visual_gate",
-            "status": verify_reason,
-        })
-        outcome = (metadata_score, source_tie, verified, verify_reason, visual_score, qwen or {})
-        with gate_lock:
-            gated_outcomes[(index, str(candidate.get("path") or ""))] = outcome
-            checked_count = len(gated_outcomes)
-        if callable(progress_callback):
-            try:
-                progress_callback(.45 + .10 * min(1.0, checked_count / max(1, len(primary_work))),
-                                  f'Checking media relevance {checked_count}/{len(primary_work)}')
-            except Exception:
-                pass
+            return None
+        accepted, reason, visual_score, verdict = _verification_result(rows[index], dict(candidate), visual_verifier)
+        return score, tie, accepted, reason, visual_score, verdict or {}
 
-    if primary_work:
-        if callable(progress_callback):
+    def review_scene(items):
+        index = items[0][0]
+        early = early_checks.get(index)
+        for position, item in enumerate(items):
+            _index, _tie, candidate, source, _score = item
+            path = str(candidate["path"])
             try:
-                progress_callback(.45, f'Checking media relevance 0/{len(primary_work)}')
+                outcome = (
+                    early[1].result(timeout=max(0, visual_gate_deadline_at - time.monotonic()))
+                    if early and path == early[0] else verify_primary(item)
+                )
             except Exception:
-                pass
-        if hasattr(visual_verifier, "visual_context") and getattr(visual_verifier, "visual_context", None) is not None:
-            try:
-                visual_verifier.visual_context.refresh_deadline(deadline_at=visual_gate_deadline_at)
-            except Exception:
-                pass
-        # The verifier is already bounded by VisualDecisionContext's shared
-        # semaphore. Twelve workers keep a large storyboard's independent
-        # vision checks from forming a long serial tail (each inbox round
-        # trip costs ~4.5 minutes, so the wave's wall time is roughly
-        # ceil(work / workers) round trips); the vision deadline still
-        # bounds the whole gate. Env VIDZEO_VISUAL_GATE_WORKERS wins.
-        gate_workers = _visual_gate_workers(len(primary_work))
-        gate_started = time.monotonic()
-        gate_pool = ThreadPoolExecutor(max_workers=gate_workers, thread_name_prefix="media-v2-gate")
-        gate_futures = {gate_pool.submit(_gate_one_primary, item): item for item in primary_work}
-        try:
-            for future, item in gate_futures.items():
-                if time.monotonic() >= visual_gate_deadline_at:
+                continue
+            if outcome is None or gate_stop.is_set():
+                break
+            with gate_lock:
+                if gate_stop.is_set():
                     break
-                remaining = max(0.05, visual_gate_deadline_at - time.monotonic())
-                try:
-                    if math.isinf(visual_gate_deadline_at) or math.isinf(remaining):
-                        future.result()
-                    else:
-                        future.result(timeout=remaining)
-                except Exception:
-                    # A deadline/budget failure inside one scene's verification
-                    # must not abort the rest of the batch; consumers see the
-                    # missing outcome and re-verify inline with current state.
-                    pass
-        finally:
-            gate_pool.shutdown(wait=False, cancel_futures=True)
-        print(
-            "   [v2] primary visual gate: "
-            f"work={len(primary_work)}, outcomes={len(gated_outcomes)}, "
-            f"workers={gate_workers}, elapsed={time.monotonic() - gate_started:.1f}s, "
-            f"deadline_remaining={max(0.0, visual_gate_deadline_at - time.monotonic()):.1f}s",
-            flush=True,
+                primary_finalist_keys[index].add(path)
+                gated_outcomes[index, path] = outcome
+                attempts[index].append({
+                    "source": source, "stage": "visual_gate", "status": outcome[3],
+                    "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or ""),
+                })
+            verdict = outcome[5]
+            motion_needed = (
+                _source_policy_value(rows[index], "youtube_quota", False)
+                or any(_is_moving_youtube_source(option[2]) for option in items[position + 1:])
+            )
+            if (adaptive_media_review and outcome[2] and outcome[3] == "visual_pass" and outcome[4] >= 80
+                    and verdict.get("visual_checked") is True
+                    and (verdict.get("visual_available") is True or verdict.get("vision_available") is True)
+                    and verdict.get("status") != "soft_visual_pass" and not verdict.get("promotion_reason")
+                    and (not motion_needed or _is_moving_youtube_source(candidate))):
+                break
+
+    def queue_review(index):
+        if index in review_started:
+            return
+        items = rank_scene(index)
+        if not items:
+            return
+        review_started.add(index)
+        primary_work.extend(items)
+        if adaptive_media_review:
+            pending_reviews.add(gate_pool.submit(review_scene, items))
+        else:
+            for item in items:
+                primary_finalist_keys[index].add(str(item[2]["path"]))
+                pending_reviews.add(gate_pool.submit(review_scene, [item]))
+
+    def consume_discovery(future, wave_number):
+        try:
+            index, source, candidates, status = future.result()
+        except Exception:
+            return
+        attempts[index].append({
+            "source": source, "stage": "discovery_result",
+            "wave": wave_number, "status": status, "candidate_count": len(candidates),
+        })
+        discovered[index].extend(candidates)
+        finished_sources[index].add(source)
+        if not adaptive_media_review:
+            return
+        if len(finished_sources[index]) == 2:
+            queue_review(index)
+        elif candidates and visual_verifier is not None and sum(
+            not future.done() for _, future in early_checks.values()
+        ) < 2:
+            # Let an already-local image use an idle vision slot while the
+            # same scene is still waiting on the footage provider.
+            items = rank_scene(index, record=False)
+            if items:
+                item = items[0]
+                early_checks[index] = str(item[2]["path"]), gate_pool.submit(verify_primary, item)
+
+    try:
+        if callable(getattr(visual_context, "refresh_deadline", None)):
+            try:
+                visual_context.refresh_deadline(deadline_at=visual_gate_deadline_at)
+            except Exception:
+                pass
+        # A shared batch lane has one in-flight loader but every scene still needs
+        # a waiter future.  Limiting the pool to the normal six per-scene workers
+        # leaves most waiters queued behind the slow batch request; when the
+        # deadline expires those queued scenes are incorrectly terminalized as
+        # neutral.  Give shared batches enough slots for both primary lanes and all
+        # scene waiters, while retaining the small pool for true per-scene lanes.
+        worker_limit = (
+            max(2, min(64, 2 * len(rows)))
+            if shared_batch_mode
+            else max(2, min(6, int(max_workers)))
         )
+        executor = ThreadPoolExecutor(max_workers=worker_limit, thread_name_prefix="media-v2-primary")
+        try:
+            waves = [list(range(len(rows)))] if shared_batch_mode else _container_waves(rows)
+            for wave_number, wave in enumerate(waves, start=1):
+                if not web_wait_until_complete and time.monotonic() >= deadline_at:
+                    cancel_event.set()
+                    break
+                futures = {
+                    executor.submit(discover, index, source, lane): (index, source)
+                    for index in wave
+                    for source, lane in (("youtube", youtube_lane), ("web", web_lane))
+                }
+                pending = set(futures)
+                while pending and not cancel_event.is_set() and (web_wait_until_complete or time.monotonic() < deadline_at):
+                    done, pending = wait(
+                        pending,
+                        timeout=min(0.25, max(0.0, deadline_at - time.monotonic())),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        consume_discovery(future, wave_number)
+                if pending and shared_batch_mode and not cancel_event.is_set():
+                    # If a shared batch provider (e.g. web image lane or youtube lane)
+                    # is still completing its network/transcode work, give the scene waiters
+                    # a realistic grace period to drain their results before cancelling them.
+                    drain_timeout = max(
+                        15.0,
+                        min(45.0, float(os.environ.get("VIDZEO_SHARED_BATCH_DRAIN_TIMEOUT", "30") or 30)),
+                    )
+                    done, pending = wait(pending, timeout=drain_timeout, return_when=ALL_COMPLETED)
+                    for future in done:
+                        consume_discovery(future, wave_number)
+                for future in pending:
+                    future.cancel()
+                if pending:
+                    cancel_event.set()
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        _promote_completed_batch_lanes("pre_gate_batch_promotion", timeout=0.0)
+        for index in range(len(rows)):
+            queue_review(index)
+        last_count = -1
+        while pending_reviews:
+            remaining = max(0, visual_gate_deadline_at - time.monotonic())
+            _, pending_reviews = wait(pending_reviews, timeout=min(.25, remaining), return_when=FIRST_COMPLETED)
+            with gate_lock:
+                count = len(gated_outcomes)
+            if count != last_count and callable(progress_callback):
+                try:
+                    progress_callback(.45 + .10 * min(1, count / max(1, len(primary_work))),
+                                      f"Checking media relevance: {count} reviewed")
+                except Exception:
+                    pass
+                last_count = count
+            if remaining <= 0 or (external_cancel_event is not None and external_cancel_event.is_set()):
+                break
+    finally:
+        with gate_lock:
+            gate_stop.set()
+        gate_pool.shutdown(wait=False, cancel_futures=True)
+    print(f"   [v2] primary media review: {len(gated_outcomes)}/{len(primary_work)} candidates checked, "
+          f"{len(early_checks)} checks started during discovery, adaptive={adaptive_media_review}", flush=True)
 
     # A completed download can fail identity/era verification even while a
     # web image passes. That is a content miss, not an exhausted transport.
@@ -3847,39 +3872,26 @@ def resolve_storyboard_media_v2(
             return (("youtube", yt_fallback), ("web", web_fallback_lane))
         return default_specs
 
-    def _run_cross_lane_prefetch(idx: int):
-        scene_row = rows[idx]
-        specs = _compute_cross_lane_specs(idx)
-        prefetch_results = []
-        for fb_source, fb_lane in specs:
-            if fb_lane is None:
-                continue
-            is_w = fb_source == "web"
-            l_deadline = web_fallback_deadline_at if is_w else deadline_at
-            l_cancel = web_recovery_cancel_event if is_w else cancel_event
-            if l_cancel.is_set() or time.monotonic() >= l_deadline:
-                continue
-            t0 = time.monotonic()
-            try:
-                completed, val, l_err = _bounded_lane_call(
-                    fb_lane,
-                    scene_row,
-                    l_cancel,
-                    max(0.05, l_deadline - time.monotonic()),
-                )
-                if not completed:
-                    l_cancel.set()
-                    prefetch_results.append((fb_source, [], time.monotonic() - t0, "timeout", l_err))
-                elif l_err is not None:
-                    prefetch_results.append((fb_source, [], time.monotonic() - t0, f"error:{type(l_err).__name__}", l_err))
-                else:
-                    cands = _candidate_rows(val, fb_source)
-                    prefetch_results.append((fb_source, cands, time.monotonic() - t0, None, None))
-                    if cands:
-                        break
-            except Exception as exc:
-                prefetch_results.append((fb_source, [], time.monotonic() - t0, f"error:{type(exc).__name__}", exc))
-        return prefetch_results
+    recovery_events = {
+        "youtube": _LinkedCancellationEvent(cancel_event),
+        "web": _LinkedCancellationEvent(web_recovery_cancel_event),
+    }
+
+    def fetch_recovery(index, source, lane):
+        event = _LinkedCancellationEvent(recovery_events[source])
+        deadline = web_fallback_deadline_at if source == "web" else deadline_at
+        started = time.monotonic()
+        if event.is_set() or started >= deadline:
+            return [], "skipped_after_media_deadline", 0.0
+        finished, result, error = _bounded_lane_call(lane, rows[index], event, deadline - started)
+        elapsed = time.monotonic() - started
+        if not finished:
+            event.set()
+            return [], "timeout", elapsed
+        if error is not None:
+            return [], f"error:{type(error).__name__}", elapsed
+        candidates = _candidate_rows(result, source)
+        return candidates, "candidates" if candidates else "empty", elapsed
 
     # Pre-launch cross-lane fallback for scenes that have no accepted primary finalists
     _promote_completed_batch_lanes("pre_prefetch_promotion", timeout=0.0)
@@ -3905,21 +3917,20 @@ def resolve_storyboard_media_v2(
                                     if any(source == "youtube" and lane is not None
                                            for source, lane in _compute_cross_lane_specs(idx))]
             prepare_recovery(recovery_indices)
-    cross_lane_prefetch_futures: Dict[int, Future] = {}
-    cross_lane_prefetch_pool: Optional[ThreadPoolExecutor] = None
-    if scenes_likely_needing_fallback and (web_fallback_lane is not None or youtube_fallback_lane is not None):
-        prefetch_workers = max(1, min(4, len(scenes_likely_needing_fallback)))
-        cross_lane_prefetch_pool = ThreadPoolExecutor(
-            max_workers=prefetch_workers,
-            thread_name_prefix="media-v2-prefetch-fallback",
-        )
-        for idx in scenes_likely_needing_fallback:
-            cross_lane_prefetch_futures[idx] = cross_lane_prefetch_pool.submit(_run_cross_lane_prefetch, idx)
-        print(
-            f"   [v2] parallel cross-lane recovery prefetch: "
-            f"{len(scenes_likely_needing_fallback)} scene(s), {prefetch_workers} workers",
-            flush=True,
-        )
+    recovery_futures: Dict[tuple[int, str], Future] = {}
+    recovery_pools = []
+    for source in ("youtube", "web"):
+        tasks = [(index, lane) for index in scenes_likely_needing_fallback
+                 for name, lane in _compute_cross_lane_specs(index) if name == source and lane is not None
+                 and (source == "youtube" or index not in scenes_with_verified_primary)]
+        if not tasks:
+            continue
+        pool = ThreadPoolExecutor(max_workers=min(4, len(tasks)), thread_name_prefix=f"media-v2-recovery-{source}")
+        recovery_pools.append(pool)
+        for index, lane in tasks:
+            recovery_futures[index, source] = pool.submit(fetch_recovery, index, source, lane)
+    if recovery_futures:
+        print(f"   [v2] parallel media recovery: {len(recovery_futures)} scene/provider pairs", flush=True)
 
     for index, scene in enumerate(rows):
         preference_rank = preference_ranks[index]
@@ -3989,8 +4000,7 @@ def resolve_storyboard_media_v2(
             """
             is_web = source == "web"
             stage_deadline = web_recovery_visual_deadline_at if is_web else visual_gate_deadline_at
-            stage_cancelled = web_recovery_cancel_event.is_set() if is_web else cancel_event.is_set()
-            if not stage_cancelled and time.monotonic() < stage_deadline:
+            if not (external_cancel_event is not None and external_cancel_event.is_set()) and time.monotonic() < stage_deadline:
                 return True
             attempts[index].append({
                 "source": source,
@@ -4427,27 +4437,38 @@ def resolve_storyboard_media_v2(
             primary_rows.append((candidate, _normalize_candidate_source(candidate)))
         consider_finalists(primary_rows, pre_verified=True)
 
-        # Recover intended footage even when a usable still image is already
-        # accepted. Keep the image unless the new clip passes the same gate.
-        if (accepted and index in rejected_youtube_indices
-                and bool(_source_policy_value(scene, "youtube_quota", False))
-                and index in cross_lane_prefetch_futures
-                and recovery_budget_open("youtube_content_recovery", "youtube")):
-            remaining = max(0.05, deadline_at - time.monotonic())
+        def consider_recovery(source, lane, stage):
+            future = recovery_futures.get((index, source))
+            deadline = web_fallback_deadline_at if source == "web" else deadline_at
             try:
-                recovery_items = cross_lane_prefetch_futures[index].result(
-                    timeout=None if math.isinf(remaining) else remaining
+                candidates, status, elapsed = (
+                    future.result(timeout=max(0.0, deadline - time.monotonic()))
+                    if future is not None else fetch_recovery(index, source, lane)
                 )
-            except Exception:
-                recovery_items = []
-            for source, candidates, elapsed, status, _error in recovery_items:
-                if source != "youtube":
-                    continue
-                attempts[index].append({"source": source, "stage": "youtube_content_recovery",
-                                        "status": status or ("candidates" if candidates else "empty"),
-                                        "candidate_count": len(candidates), "elapsed_ms": round(elapsed * 1000, 2)})
-                discovered[index].extend(candidates)
-                consider_finalists([(candidate, source) for candidate in candidates])
+            except TimeoutError:
+                candidates, status, elapsed = [], "timeout", 0.0
+            except Exception as exc:
+                candidates, status, elapsed = [], f"error:{type(exc).__name__}", 0.0
+            attempts[index].append({
+                "source": source, "stage": stage, "status": status,
+                "candidate_count": len(candidates), "elapsed_ms": round(elapsed * 1000, 2),
+            })
+            for candidate in candidates:
+                candidate["fallback_layer"] = f"cross_lane_{source}"
+                candidate.setdefault("resolution_kind", f"cross_lane_{source}_fallback")
+            discovered[index].extend(candidates)
+            if candidates:
+                consider_finalists(
+                    [(candidate, _normalize_candidate_source(candidate)) for candidate in candidates],
+                    skip_recovery_vision=not adaptive_media_review and stage == "cross_lane_fallback",
+                )
+
+        # Keep an approved still while a rejected quota clip looks for a
+        # different source. A rejected replacement cannot displace the still.
+        if (accepted and index in rejected_youtube_indices
+                and _source_policy_value(scene, "youtube_quota", False)
+                and (index, "youtube") in recovery_futures):
+            consider_recovery("youtube", youtube_fallback_lane, "youtube_content_recovery")
 
         # A large job starts with a compact parallel shortlist, but the web
         # resolver deliberately retains several unique results from the same
@@ -4456,7 +4477,7 @@ def resolve_storyboard_media_v2(
         # leaving the source lane.  This prevents a valid lower-ranked image
         # from being discarded merely because three visually weak results
         # sorted ahead of it on identical metadata scores.
-        if not accepted and primary_rows and recovery_budget_open("primary_finalist_expansion"):
+        if not accepted and primary_rows:
             primary_keys = primary_finalist_keys.get(index, set())
             top_pool_keys = primary_top_pool_keys.get(index, set())
             expansion_rows = [
@@ -4504,140 +4525,22 @@ def resolve_storyboard_media_v2(
                 })
                 consider_finalists(expansion_rows, pre_verified=False)
 
-        # Cross-lane factual recovery. The primary source preference is an
-        # allocation decision, not permission to stop searching. If every
-        # primary finalist fails, ask the opposite real-media lane for a
-        # candidate before considering stock or any reuse. The fallback lane
-        # is intentionally opt-in so single-source jobs keep their contract.
-        if not accepted and recovery_budget_open("cross_lane_fallback"):
-            cross_lane_specs = _compute_cross_lane_specs(index)
-            primary_sources = {
-                _normalize_candidate_source(candidate)
-                for candidate in discovered[index]
-            }
-            attempts[index].append({
-                "source": "mixed",
-                "stage": "cross_lane_fallback",
-                "status": "order_selected",
-                "primary_sources": sorted(primary_sources),
-                "order": [source for source, _lane in cross_lane_specs],
-            })
-
-            prefetched_items = None
-            if index in cross_lane_prefetch_futures:
-                fut = cross_lane_prefetch_futures[index]
-                rem_time = max(0.05, web_fallback_deadline_at - time.monotonic())
-                try:
-                    if math.isinf(web_fallback_deadline_at) or math.isinf(rem_time):
-                        prefetched_items = fut.result()
-                    else:
-                        prefetched_items = fut.result(timeout=rem_time)
-                except Exception:
-                    prefetched_items = None
-
-            sources_handled: set[str] = set()
-            if prefetched_items:
-                for fb_source, fb_candidates, elap_s, err_status, _l_err in prefetched_items:
-                    sources_handled.add(fb_source)
-                    for candidate in fb_candidates:
-                        candidate["fallback_layer"] = f"cross_lane_{fb_source}"
-                        candidate.setdefault(
-                            "resolution_kind",
-                            f"cross_lane_{fb_source}_fallback",
-                        )
-                    attempts[index].append({
-                        "source": fb_source,
-                        "stage": "cross_lane_fallback",
-                        "status": "candidates" if fb_candidates else (
-                            "timeout_after_web_recovery_deadline" if err_status == "timeout" and fb_source == "web"
-                            else (err_status or "empty")
-                        ),
-                        "candidate_count": len(fb_candidates),
-                        "elapsed_ms": round(elap_s * 1000.0, 2),
-                    })
-                    if fb_candidates:
-                        discovered[index].extend(fb_candidates)
-                        consider_finalists([
-                            (candidate, _normalize_candidate_source(candidate))
-                            for candidate in fb_candidates
-                        ], skip_recovery_vision=True)
-                    if accepted:
-                        break
-
-            if not accepted:
-                for fallback_source, fallback_lane in cross_lane_specs:
-                    if fallback_source in sources_handled or fallback_lane is None:
-                        continue
-                    if not recovery_budget_open(f"cross_lane_{fallback_source}", source=fallback_source):
-                        # YouTube keeps its original media wall; a remaining web
-                        # rescue tail must still get its turn after that cutoff.
-                        continue
-                    started = time.monotonic()
-                    lane_cancel_event = (
-                        web_recovery_cancel_event if fallback_source == "web" else cancel_event
-                    )
-                    lane_deadline = (
-                        web_fallback_deadline_at if fallback_source == "web" else deadline_at
-                    )
-                    try:
-                        # Scene-scoped recovery callbacks may perform their own
-                        # network search/download. Run them behind the same
-                        # coordinator wall so a provider that ignores the
-                        # cancellation event cannot strand the selector.
-                        completed, value, lane_error = _bounded_lane_call(
-                            fallback_lane,
-                            scene,
-                            lane_cancel_event,
-                            max(0.05, lane_deadline - time.monotonic()),
-                        )
-                        if not completed:
-                            lane_cancel_event.set()
-                            fallback_candidates = []
-                            attempts[index].append({
-                                "source": fallback_source,
-                                "stage": "cross_lane_fallback",
-                                "status": "timeout_after_web_recovery_deadline" if fallback_source == "web" else "timeout_after_media_deadline",
-                            })
-                        elif lane_error is not None:
-                            raise lane_error
-                        else:
-                            fallback_candidates = _candidate_rows(value, fallback_source)
-                    except TimeoutError:
-                        lane_cancel_event.set()
-                        fallback_candidates = []
-                        attempts[index].append({
-                            "source": fallback_source,
-                            "stage": "cross_lane_fallback",
-                            "status": "timeout_after_web_recovery_deadline" if fallback_source == "web" else "timeout_after_media_deadline",
-                        })
-                    except Exception as exc:
-                        fallback_candidates = []
-                        attempts[index].append({
-                            "source": fallback_source,
-                            "stage": "cross_lane_fallback",
-                            "status": f"error:{type(exc).__name__}",
-                        })
-                    for candidate in fallback_candidates:
-                        candidate["fallback_layer"] = f"cross_lane_{fallback_source}"
-                        candidate.setdefault(
-                            "resolution_kind",
-                            f"cross_lane_{fallback_source}_fallback",
-                        )
-                    attempts[index].append({
-                        "source": fallback_source,
-                        "stage": "cross_lane_fallback",
-                        "status": "candidates" if fallback_candidates else "empty",
-                        "candidate_count": len(fallback_candidates),
-                        "elapsed_ms": round((time.monotonic() - started) * 1000.0, 2),
-                    })
-                    if fallback_candidates:
-                        discovered[index].extend(fallback_candidates)
-                        consider_finalists([
-                            (candidate, _normalize_candidate_source(candidate))
-                            for candidate in fallback_candidates
-                        ], skip_recovery_vision=True)
-                    if accepted:
-                        break
+        if not accepted:
+            specs = [(source, lane) for source, lane in _compute_cross_lane_specs(index) if lane is not None]
+            # Preserve quota preference. Other scenes can use whichever real
+            # provider has already returned a candidate without waiting twice.
+            if adaptive_media_review and not _source_policy_value(scene, "youtube_quota", False):
+                futures = {recovery_futures[index, source]: source for source, _ in specs
+                           if (index, source) in recovery_futures}
+                if futures and not any(future.done() for future in futures):
+                    wait(futures, timeout=max(0.0, web_fallback_deadline_at - time.monotonic()),
+                         return_when=FIRST_COMPLETED)
+                ready = {source for future, source in futures.items() if future.done()}
+                specs.sort(key=lambda spec: spec[0] not in ready)
+            for source, lane in specs:
+                consider_recovery(source, lane, "cross_lane_fallback")
+                if accepted:
+                    break
 
         # Spare-pool reuse (Nov 10, 2026): fallback tier (a). When a scene's
         # own lanes found nothing usable, reuse an already-downloaded,
@@ -5501,8 +5404,10 @@ def resolve_storyboard_media_v2(
         )
         resolutions[index].final_scene_context["graphic_fallback"] = fallback_graphic
 
-    if cross_lane_prefetch_pool is not None:
-        cross_lane_prefetch_pool.shutdown(wait=False, cancel_futures=True)
+    for event in recovery_events.values():
+        event.set()
+    for pool in recovery_pools:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     def _final_stock_resolution(
         index: int, scene: Mapping[str, Any], stock_deadline: Optional[float] = None,

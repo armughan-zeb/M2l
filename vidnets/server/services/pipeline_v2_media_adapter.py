@@ -2694,6 +2694,7 @@ def resolve_and_build_media_plan(
     guarantee_enabled: bool | None = None,
     web_wait_until_complete: bool = False,
     external_cancel_event: threading.Event | None = None,
+    adaptive_media_review: bool = False,
 ) -> tuple[dict[str, Any], dict[int, SceneResolution]]:
     resolutions = resolve_storyboard_media_v2(
         scenes,
@@ -2710,6 +2711,7 @@ def resolve_and_build_media_plan(
         max_workers=max_workers,
         web_wait_until_complete=bool(web_wait_until_complete),
         external_cancel_event=external_cancel_event,
+        adaptive_media_review=adaptive_media_review,
     )
     paths: list[str | None] = []
     labels: list[str] = []
@@ -6719,6 +6721,10 @@ def resolve_existing_provider_branches_v2(
         guarantee_enabled=_as_bool(config.get("global_media_guarantee"), True),
         web_wait_until_complete=bool(config.get("web_wait_until_complete", False)),
         external_cancel_event=getattr(cancellation, "event", None),
+        adaptive_media_review=(
+            str(config.get("llm_provider") or "").strip().lower() == "external_agent"
+            and _as_bool(os.environ.get("VIDZEO_MUSE_ADAPTIVE_MEDIA"), True)
+        ),
     )
     print(
         "   [v2] coordinator resolution summary: "

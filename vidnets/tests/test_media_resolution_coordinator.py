@@ -17,6 +17,35 @@ from services.media_resolution_coordinator import (
 import app as server_app
 
 
+def test_adaptive_review_starts_while_other_provider_is_searching():
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    checked = threading.Event()
+    overlap = []
+
+    def slow_youtube(_scene, _cancel):
+        overlap.append(checked.wait(2))
+        return []
+
+    def verify(_scene, _candidate):
+        checked.set()
+        return {"accepted": True, "status": "visual_pass", "score": 95,
+                "visual_checked": True, "visual_available": True}
+
+    result = resolve_storyboard_media_v2(
+        [{"scene_index": 0, "scene_id": "car", "text": "Jaguar E-Type automobile"}],
+        youtube_lane=slow_youtube,
+        web_lane=lambda *_args: {"path": "car.jpg", "source": "web",
+                                 "title": "Jaguar E-Type automobile", "score": 95},
+        visual_verifier=verify,
+        neutral_factory=lambda _scene: None,
+        deadline_seconds=5,
+        adaptive_media_review=True,
+    )
+    assert overlap == [True]
+    assert result[0].selected_path == "car.jpg"
+
+
 def test_external_job_cancellation_interrupts_media_discovery_promptly():
     from services.media_resolution_coordinator import resolve_storyboard_media_v2
 
