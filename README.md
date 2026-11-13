@@ -189,6 +189,19 @@ Use this when the Muse environment exposes commands. Configure the adapters in
 | Thumbnail | `MUSE_THUMBNAIL_COMMAND` | JSON on stdin (`job`, `scriptText`, `videoPath`, `workDir`); print `{"thumbnailPath":"..."}` |
 | Vidnets inference | `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` | One Vidnets request JSON on stdin (or POSTed); return the exact text/JSON answer |
 
+With either inference transport configured, the daemon owns one resident dispatcher for
+the shared ScriptIT and Vidnets inbox. It polls every second, uses up to eight concurrent
+calls (`MUSE_INBOX_CONCURRENCY` can lower that), and gives each call up to 60 seconds
+within the 120-second request lifetime. Run `node muse-agent.js doctor` with the worker
+running to verify that the configured Muse transport actually answers a probe.
+Unanswered probes pause new claims. Saved jobs still reconnect and report progress.
+
+Set `VIDNETS_AGENT_BRIDGE_DIR` to the same shared directory for the worker and Vidnets
+server when they run in different processes. For a hook-only installation, update the host
+hook script and definition from `docker/hooks/` so it can answer the probe. The hook
+uses its legacy wake-up flow when no resident dispatcher is active; its wake latency
+still counts against the request lifetime.
+
 **Narration defaults to ScriptIT** (`scriptit/cli/generate.js`, see
 `scriptit/CLI.md`): it researches the title, writes narration through an
 editorial gate (hook, pacing, topic fit, evidence support, concrete-entity

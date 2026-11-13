@@ -30,6 +30,7 @@ const { retryDelayMs, cmsRetryOptions } = require('./lib/cmsRetry');
 const ffmpeg = require('./lib/ffmpeg');
 const python = require('./lib/python');
 const vidnets = require('./adapters/vidnets');
+const { startResidentInbox, probeInbox } = require('./lib/museInbox');
 
 const VERSION = require('./package.json').version;
 const MIN_NODE = [18, 17];
@@ -323,10 +324,13 @@ async function doctorCommand() {
   {
     const { verifyMuseInferenceBridge } = require('./lib/museInference');
     const inference = await verifyMuseInferenceBridge(process.env);
-    add('Muse inference (compulsory)', inference.ok ? 'pass' : 'fail',
-      inference.ok
-        ? 'Vidnets server healthy; agent-bridge inbox writable; vidnets-inbox-watch hook enabled; no OpenRouter key'
-        : inference.failures.join('; '));
+    let probe;
+    if (inference.ok) {
+      try { probe = await probeInbox(); }
+      catch (error) { inference.failures.push(error.message); }
+    }
+    add('Muse inference (compulsory)', probe ? 'pass' : 'fail',
+      probe ? `Muse answered the inbox probe in ${probe.elapsedMs}ms` : inference.failures.join('; '));
   }
 
   if (!renderCommand) {
@@ -519,9 +523,8 @@ function alive(pid) {
   catch (error) { return error.code === 'EPERM'; }
 }
 
-function acquireLock() {
-  fs.mkdirSync(config.WORK_ROOT, { recursive: true });
-  const file = path.join(config.WORK_ROOT, 'worker.lock');
+function acquireLock(file = path.join(config.WORK_ROOT, 'worker.lock')) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const descriptor = fs.openSync(file, 'wx', 0o600);
@@ -550,13 +553,58 @@ async function startCommand(args) {
   if (args.auto === true || args.autonomous === true || args['auto-loop'] === true) {
     process.env.MUSE_AUTO_LOOP = '1';
   }
+  const { saved, client } = requireClient();
+  const { bridgeRoot } = require('./lib/museInference');
+  const inboxRoot = path.resolve(bridgeRoot());
+  fs.mkdirSync(inboxRoot, { recursive: true });
   const blockers = require('./lib/runtimePolicy').automatedRuntimeBlockers();
   if (blockers.length) {
     throw new Error('Automated Muse worker was not started, so it cannot claim and fail production jobs. ' + blockers.join(' '));
   }
-  const { saved, client } = requireClient();
+  process.env.VIDNETS_AGENT_BRIDGE_DIR = inboxRoot;
+  process.env.SCRIPTIT_AGENT_BRIDGE_DIR = inboxRoot;
+  const transport = vidnets.inferenceTransport();
   const releaseLock = acquireLock();
   const abort = new AbortController();
+  let stopInbox;
+  if (transport) {
+    let releaseInboxLock;
+    try {
+      releaseInboxLock = acquireLock(path.join(inboxRoot, 'resident.lock'));
+      const stop = startResidentInbox({
+        root: inboxRoot,
+        concurrency: Math.max(1, Math.min(8, Math.floor(Number(process.env.MUSE_INBOX_CONCURRENCY) || 8))),
+        logger: log,
+        answer: (request, options) => transport.kind === 'command'
+          ? vidnets.runInferenceCommand(transport.command, request, config.WORK_ROOT, options)
+          : vidnets.runInferenceHttp(transport.url, request, options)
+      });
+      process.env.MUSE_RESIDENT_INBOX = '1';
+      stopInbox = () => {
+        stop();
+        releaseInboxLock();
+      };
+    } catch (error) {
+      releaseInboxLock?.();
+      releaseLock();
+      throw error;
+    }
+  }
+  let nextInboxProbe = 0;
+  let lastScriptBlocker = '';
+  const refreshInboxHealth = async () => {
+    if (abort.signal.aborted) return false;
+    if (Date.now() < nextInboxProbe) return true;
+    try {
+      const proof = await probeInbox(process.env, { signal: abort.signal });
+      nextInboxProbe = Date.now() + 60000;
+      log.info(`Muse inbox probe answered in ${proof.elapsedMs}ms`);
+      return true;
+    } catch (error) {
+      log.warn('Muse claims paused: ' + error.message);
+      return false;
+    }
+  };
   let current = null;
   let stopping = false;
   let fatal = null;
@@ -594,11 +642,12 @@ async function startCommand(args) {
     }
   };
 
-  const shutdown = async (code = 0) => {
+  const shutdown = () => {
     if (stopping) return;
     stopping = true;
     clearInterval(timer);
     abort.abort();
+    stopInbox?.();
     if (current?.jobId) {
       // Never fail the job or clear the resume marker on shutdown: a SIGTERM
       // from a VM reboot (or an operator restart) must leave the job
@@ -607,15 +656,17 @@ async function startCommand(args) {
       log.info(`Worker stopping with job ${current.jobId} in flight; saved work retained for resume`);
     }
     releaseLock();
-    process.exit(code);
   };
 
-  process.on('SIGINT', () => { shutdown(0); });
-  process.on('SIGTERM', () => { shutdown(0); });
+  const interrupt = () => {
+    shutdown();
+    process.exit(0);
+  };
+  process.once('SIGINT', interrupt);
+  process.once('SIGTERM', interrupt);
 
   log.info(`Muse worker ${VERSION} starting for "${saved.agentName || 'Muse agent'}" at ${config.cmsUrl(saved)}`);
   await heartbeat();
-  if (fatal) throw fatal;
 
   timer = setInterval(() => { heartbeat(); }, heartbeatMs);
   timer.unref?.();
@@ -672,12 +723,37 @@ async function startCommand(args) {
       // fall through to normal queue polling below.
     }
 
+    if (!String(process.env.MUSE_SCRIPT_COMMAND || '').trim()) {
+      const readiness = require('./lib/scriptReadiness').checkScriptReadiness();
+      if (!readiness.ok) {
+        const missing = readiness.missing.join(', ');
+        if (lastScriptBlocker !== missing) {
+          log.warn(`Muse claims paused: ScriptIT is missing ${missing}. Run npm ci --omit=dev in scriptit or rebuild the worker image.`);
+          lastScriptBlocker = missing;
+        }
+        if (once) break;
+        await sleep(pollMs, abort.signal);
+        continue;
+      }
+      lastScriptBlocker = '';
+    }
+
+    if (!await refreshInboxHealth()) {
+      if (once) break;
+      await sleep(pollMs, abort.signal);
+      continue;
+    }
+    if (abort.signal.aborted) break;
     let claim;
     try {
       claim = await client.nextJob({ recoverClaim: true });
       pollFailures = 0;
     } catch (error) {
-      if (error.status === 401) throw new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
+      if (error.status === 401) {
+        fatal = new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
+        abort.abort();
+        break;
+      }
       pollFailures += 1;
       const delay = retryDelayMs(pollFailures - 1, { baseMs: pollMs, maxMs: retryOptions.maxMs });
       log.warn(`Muse job poll failed (attempt ${pollFailures}, ${error.message}); retrying in ${Math.round(delay / 1000)}s`);
@@ -738,12 +814,10 @@ async function startCommand(args) {
     if (once) break;
   }
 
-  if (fatal) {
-    clearInterval(timer);
-    releaseLock();
-    throw fatal;
-  }
-  await shutdown(0);
+  shutdown();
+  process.removeListener('SIGINT', interrupt);
+  process.removeListener('SIGTERM', interrupt);
+  if (fatal) throw fatal;
 }
 
 async function unpairCommand() {
@@ -810,5 +884,5 @@ async function main() {
 main().catch(error => {
   log.error(error.message);
   if (String(process.env.MUSE_LOG_LEVEL).toLowerCase() === 'debug' && error.stack) console.error(log.redact(error.stack));
-  process.exit(1);
+  process.exitCode = 1;
 });

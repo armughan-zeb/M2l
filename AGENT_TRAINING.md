@@ -72,7 +72,7 @@ deliver — without asking for go-ahead. Report what you did, with numbers.
 | Relative pre-filter floor | 0.5× best | `VIDZEO_VISUAL_RELATIVE_FLOOR` |
 | YT vision frames per clip | 2, at transcript moment | `VIDZEO_YT_VISUAL_GATE_FRAMES` |
 | YT download workers | 4 | `VIDZEO_YT_DOWNLOAD_CONCURRENCY` |
-| Agent min wall | 1200s | `VIDZEO_AGENT_MIN_WALL_SECONDS` |
+| Agent request lifetime | Up to 120s | Resident Muse dispatcher targets answers within 60s |
 | Filter-best | on | `MUSE_MEDIA_STRICT=0` |
 | Render concurrency | 1 (tested safe) | `MUSE_RENDER_CONCURRENCY` |
 | Skip thumbnails | on | `VIDZEO_SKIP_THUMBNAILS=1` |

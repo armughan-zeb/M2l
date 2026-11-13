@@ -4,18 +4,8 @@
 /**
  * render-vidnets-linux.js — MUSE_RENDER_COMMAND wrapper (Linux hybrid path).
  *
- * The CMS daemon stays active and Vidnets does the rendering, but every
- * reasoning / scene / query / vision decision is answered by a Muse operator
- * through the Vidnets agent-bridge inbox (see the vidnets-inbox-watch hook).
- *
- * This wrapper deliberately does NOT use adapters/vidnets.js serviceInbox:
- * that path would call MUSE_INFERENCE_COMMAND for every pending request
- * while the hook worker is already answering the same requests directly
- * via `VIDNETS_AGENT.sh answer` — the second answer would fail with
- * "already answered". The pattern used here is the one proven by test jobs
- * 0bb3f900 and ff377408: submit via the Vidnets launcher, poll job status,
- * and let the hook worker answer the inbox. This wrapper only submits,
- * polls, and validates.
+ * The CMS daemon stays active while Vidnets renders. Muse answers the
+ * inference inbox through the daemon's resident dispatcher or the host hook.
  *
  * Contract (adapters/video.js runRenderCommand):
  *   stdin:  JSON { job, scriptText, scriptPath, workDir, outputPath }
@@ -38,7 +28,8 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { checkMuseInferenceBridge } = require('./lib/museInference');
+const { bridgeRoot, checkMuseInferenceBridge } = require('./lib/museInference');
+const { pendingRequests } = require('./lib/museInbox');
 const { writeJsonAtomic } = require('./lib/config');
 const { readRenderReceipt, submitRender } = require('./lib/vidnetsSubmission');
 
@@ -362,7 +353,6 @@ async function main() {
   let lastProgress = -1;
   let lastDetail = '';
   let lastPendingCheck = 0;
-  let pendingCheck = null;
   let statusFailures = 0;
 
   while (true) {
@@ -386,12 +376,16 @@ async function main() {
     }
 
     // Inbox diagnostics must not delay progress polling.
-    if (!pendingCheck && Date.now() - lastPendingCheck > MINUTE) {
+    if (!pendingCheck && Date.now() - lastPendingCheck >= Math.max(pollMs, 10000)) {
       lastPendingCheck = Date.now();
+      const polledJob = vidnetsJobId;
       pendingCheck = vidnets(['pending'], 8000).then(pending => {
         const rows = Array.isArray(pending.requests) ? pending.requests : [];
-        const mine = rows.filter(row => String(row.job_id || '') === vidnetsJobId);
-        if (mine.length) log(`Inbox: ${mine.length} request(s) still pending for this job (hook worker answers these)`);
+        const mine = rows.filter(row => String(row.job_id || '') === polledJob);
+        if (mine.length && polledJob === vidnetsJobId) {
+          const oldest = mine.reduce((age, row) => Math.max(age, Date.now() / 1000 - (Number(row.created_at) || Date.now() / 1000)), 0);
+          log(`Waiting for Muse: ${mine.length} pending request(s), oldest ${Math.floor(oldest)}s (${mine[0].operation || mine[0].kind || 'inference'})`);
+        }
       }).catch(error => log('Inbox pending check failed (non-fatal): ' + error.message))
         .finally(() => { pendingCheck = null; });
     }

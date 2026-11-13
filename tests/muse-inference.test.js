@@ -22,12 +22,14 @@ function bridgeFixture({ hookEnabled = true } = {}) {
   const vidnetsRoot = path.join(dir, 'vidnets');
   fs.mkdirSync(vidnetsRoot, { recursive: true });
   fs.writeFileSync(path.join(vidnetsRoot, 'VIDNETS_AGENT.sh'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(dir, 'render-vidnets-linux.js'), '');
   const hookPath = path.join(dir, 'hook.json');
   fs.writeFileSync(hookPath, JSON.stringify({ enabled: hookEnabled, id: 'vidnets-inbox-watch' }));
   return {
     dir,
     env: {
-      MUSE_RENDER_COMMAND: 'node /home/hatch/workspace/M2l/render-vidnets-linux.js',
+      MUSE_RENDER_COMMAND: 'node render-vidnets-linux.js',
+      MUSE_REPO_ROOT: dir,
       MUSE_VIDNETS_ROOT: vidnetsRoot,
       MUSE_INBOX_HOOK_DEFINITION: hookPath,
       VIDZEO_BRIDGE_ROOT: bridgeRoot

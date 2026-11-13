@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -45,6 +46,43 @@ class AudioFirstMediaSyncTests(unittest.TestCase):
         policy = transcription_service.get_whisper_parallel_policy(chunk_count=3, cpu_count=16)
         self.assertEqual(policy["worker_count"], 3)
         self.assertEqual(policy["cpu_tier_workers"], 4)
+
+    def test_whisper_cold_load_wait_is_bounded_and_shared(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def load(_device):
+            with transcription_service._whisper_init_lock:
+                started.set()
+                return release.wait(2)
+
+        with mock.patch.object(transcription_service, "_available", False), \
+                mock.patch.object(transcription_service, "_whisper_start", None), \
+                mock.patch.object(transcription_service, "init_whisper", side_effect=load) as init:
+            try:
+                start = time.monotonic()
+                self.assertFalse(transcription_service._init_whisper_with_timeout(timeout=0.05))
+                self.assertLess(time.monotonic() - start, 0.5)
+                self.assertTrue(started.is_set())
+                self.assertFalse(transcription_service._init_whisper_with_timeout(timeout=0.05))
+                cleanup_started = time.monotonic()
+                self.assertFalse(transcription_service.unload_whisper_model())
+                self.assertLess(time.monotonic() - cleanup_started, 0.5)
+                init.assert_called_once()
+            finally:
+                release.set()
+                transcription_service._whisper_start.result(timeout=2)
+
+    def test_low_memory_prewarm_does_not_start_duplicate_models(self):
+        with mock.patch.object(transcription_service, "get_whisper_parallel_policy", return_value={
+            "worker_count": 1, "threads_per_worker": 2
+        }), mock.patch.object(transcription_service, "_init_whisper_with_timeout", return_value=False), \
+                mock.patch.object(transcription_service, "_load_worker_model") as worker:
+            handle = transcription_service.start_whisper_job_warmup(worker_count=8)
+            self.assertTrue(handle["event"].wait(2))
+            self.assertEqual(handle["state"]["target_workers"], 0)
+            self.assertFalse(handle["state"]["base_model_ready"])
+            worker.assert_not_called()
 
     def test_whisper_prewarm_sync_defaults_to_immediate_dispatch(self):
         self.assertEqual(transcription_service.WHISPER_PREWARM_SYNC_SECONDS, 0.0)

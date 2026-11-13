@@ -232,15 +232,9 @@ test('generateScript with zero web claims asks Muse to synthesize and still fail
   }
 });
 
-test('agent-bridge round-trip wall is 600s, matching the Vidnets server floor', async () => {
-  // Regression: the file-based bridge gave each request a 300s wall while
-  // the Vidnets server floors its agent requests at 600s
-  // (VIDZEO_AGENT_MIN_WALL_SECONDS). The hook polls every 60s and a
-  // grounded draft takes minutes, so the shorter wall expired
-  // mid-composition and wasted the operator's answer. The request row
-  // written to disk must carry the full 600s window.
+test('agent-bridge request wall is capped at 120s even with a larger caller budget', async () => {
   const { agentBridgeChat, MAX_WALL_MS } = require('../scriptit/src/providers/agentBridge');
-  assert.equal(MAX_WALL_MS, 600000, 'per-request wall must be 600s');
+  assert.equal(MAX_WALL_MS, 120000, 'per-request wall must be 120s');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptit-bridge-wall-'));
   const bridgeRoot = path.join(dir, 'agent-bridge');
   fs.mkdirSync(bridgeRoot, { recursive: true });
@@ -261,8 +255,8 @@ test('agent-bridge round-trip wall is 600s, matching the Vidnets server floor', 
     const row = seen[0];
     const wallSeconds = row.expires_at - row.created_at;
     assert.ok(
-      wallSeconds >= 599 && wallSeconds <= 601,
-      `expected a ~600s window, got ${wallSeconds}s`,
+      wallSeconds >= 119 && wallSeconds <= 121,
+      `expected a ~120s window, got ${wallSeconds}s`,
     );
   } finally {
     clearInterval(operator);

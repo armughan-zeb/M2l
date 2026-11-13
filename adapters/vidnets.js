@@ -190,7 +190,7 @@ function requestId(value) {
   return id;
 }
 
-async function runInferenceCommand(command, request, workDir) {
+async function runInferenceCommand(command, request, workDir, { timeoutMs = 120000, signal } = {}) {
   const input = JSON.stringify({
     type: 'inference',
     request,
@@ -200,7 +200,8 @@ async function runInferenceCommand(command, request, workDir) {
   const result = await runCommand(command, {
     input,
     cwd: workDir,
-    timeoutMs: Number(process.env.MUSE_INFERENCE_TIMEOUT_MS) || 10 * MINUTE,
+    timeoutMs,
+    signal,
     label: 'Muse inference command',
     env: {
       MUSE_INFERENCE_REQUEST_ID: request.id,
@@ -208,35 +209,38 @@ async function runInferenceCommand(command, request, workDir) {
       MUSE_INFERENCE_OPERATION: String(request.operation || '')
     }
   });
-  const text = String(result.stdout || '').trim();
-  if (!text) throw new Error('The Muse inference command returned an empty answer');
-  return text;
+  return parseInferenceAnswer(result.stdout, request);
 }
 
-async function runInferenceHttp(url, request) {
+function parseInferenceAnswer(text, request) {
+  let data = text;
+  try { data = JSON.parse(text); } catch { /* plain text answer */ }
+  const structured = Boolean(request.response_format?.type || request.response_format?.json_schema);
+  if (data?.error && !structured) throw new Error('The Muse inference transport reported an error');
+  const content = structured
+    ? data?.content ?? data
+    : data?.content ?? data?.text ?? data?.answer ?? data;
+  if (content === undefined || content === null || String(content).trim() === '') {
+    throw new Error('The Muse inference transport returned no content');
+  }
+  return typeof content === 'string' ? content : JSON.stringify(content);
+}
+
+async function runInferenceHttp(url, request, { timeoutMs = 120000, signal } = {}) {
   let response;
   try {
     response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ type: 'inference', request, instructions: request.instructions || '', responseFormat: request.response_format || {} }),
-      signal: AbortSignal.timeout(Number(process.env.MUSE_INFERENCE_TIMEOUT_MS) || 10 * MINUTE),
+      signal: signal || AbortSignal.timeout(timeoutMs),
       redirect: 'error'
     });
   } catch (error) {
     throw new Error('The Muse inference endpoint could not be reached: ' + error.message);
   }
-  const text = await response.text();
-  if (!response.ok) throw new Error(`The Muse inference endpoint returned HTTP ${response.status}: ${text.slice(0, 400)}`);
-  let data = text;
-  try { data = JSON.parse(text); } catch { /* plain text answer */ }
-  const content = data && typeof data === 'object'
-    ? data.content ?? data.text ?? data.answer
-    : data;
-  if (content === undefined || content === null || String(content).trim() === '') {
-    throw new Error('The Muse inference endpoint returned no content');
-  }
-  return typeof content === 'string' ? content : JSON.stringify(content);
+  if (!response.ok) throw new Error(`The Muse inference endpoint returned HTTP ${response.status}`);
+  return parseInferenceAnswer(await response.text(), request);
 }
 
 function inferenceTransport() {
@@ -351,7 +355,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     if (signal?.aborted) throw new Error('Render cancelled by operator');
     if (Date.now() > deadline) throw new Error('Vidnets render exceeded the configured Muse render budget');
 
-    await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(error => {
+    if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(error => {
       if (signal?.aborted) throw error;
       log.warn('Vidnets inbox poll failed; retrying: ' + error.message);
     });
@@ -380,7 +384,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     if (item.status === 'completed') {
       const videoPath = resultVideoPath(item);
       if (!videoPath) throw new Error('Vidnets completed the job without a readable video_path');
-      await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(() => {});
+      if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(() => {});
       onProgress?.(100, 'Vidnets render complete');
       return { videoPath, vidnetsJobId, packageDir, meta: { engine: 'vidnets', vidnetsJobId } };
     }
@@ -405,4 +409,4 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   }
 }
 
-module.exports = { render, buildRequest, ensureReady, agentCommand };
+module.exports = { render, buildRequest, ensureReady, agentCommand, inferenceTransport, runInferenceCommand, runInferenceHttp };

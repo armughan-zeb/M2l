@@ -3701,17 +3701,9 @@ def director_planning_budget(scene_count: int) -> Dict[str, float]:
     from ..job_context import current_job
     agent_wall = 0.0
     if current_job().get('llm_provider') == 'external_agent':
-        # A tool-driven host needs time to read and answer the inbox. Keep
-        # every request bounded while preserving adaptive parallel chunks.
-        # Each call must last at least the agent answer floor
-        # (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s): the phase scope
-        # caps the request wall, so a shorter call budget expires the
-        # answer mid-composition — the inbox watcher alone needs ~4.5 min
-        # to wake a worker.
-        try:
-            agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
-        except (TypeError, ValueError):
-            agent_wall = 600.0
+        # Allocate a full inbox window per phase within the job budget.
+        from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
+        agent_wall = AGENT_REQUEST_WALL_SECONDS
         art, scene_call, composition, repair = agent_wall, agent_wall, agent_wall, agent_wall
         batch_size, workers = 4, 2
         waves = max(1, (max(1, int(scene_count)) + batch_size * workers - 1) // (batch_size * workers))
@@ -3740,12 +3732,8 @@ def director_planning_budget(scene_count: int) -> Dict[str, float]:
 def _min_director_call_budget(agent_wall_seconds):
     """Smallest director call budget that can ever be answered on this job.
 
-    Plain API calls need only a few seconds, but an external-agent call is
-    answered by a polling inbox watcher that needs minutes to wake a worker
-    (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s). A director call issued
-    with less than that wall is guaranteed to expire before its answer
-    arrives (job 75fa1baa: a scene-72 composition repair issued with 77s
-    and a scene-direction call with 38s both expired unanswered). Callers
+    External-agent calls can use the inbox deadline when the job has
+    enough time remaining. Callers
     must skip the call instead of issuing it when the remaining budget is
     below this floor; the scene degrades gracefully either way.
     """

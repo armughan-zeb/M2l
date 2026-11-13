@@ -16,23 +16,23 @@ const { checkTempSpace, TEMP_MIN_FREE_MB, TMP_MIN_FREE_MB } = require('../render
 test('temp preflight passes on this machine and reports both dirs', () => {
   assert.ok(TEMP_MIN_FREE_MB >= 512, 'runtime temp floor must be at least 512 MB');
   assert.ok(TMP_MIN_FREE_MB >= 128, 'tmpfs floor must be at least 128 MB');
-  const space = checkTempSpace();
+  const space = checkTempSpace({ tempDir: os.tmpdir(), tmpDir: os.tmpdir() });
   assert.ok(space.tempDir.length > 0, 'temp dir reported');
-  assert.equal(space.tmpDir, '/tmp');
+  assert.equal(space.tmpDir, os.tmpdir());
   assert.ok(space.tempFreeMb >= TEMP_MIN_FREE_MB, `runtime temp free: ${space.tempFreeMb} MB`);
   assert.ok(space.tmpFreeMb >= TMP_MIN_FREE_MB, `/tmp free: ${space.tmpFreeMb} MB`);
 });
 
 test('temp preflight fails clearly when runtime temp is (simulated) full', () => {
   assert.throws(
-    () => checkTempSpace({ tempMinMb: 99999999 }),
+    () => checkTempSpace({ tempDir: os.tmpdir(), tmpDir: os.tmpdir(), tempMinMb: 99999999 }),
     /Temp space too low to render: .* has \d+ MB free, need at least 99999999 MB/,
   );
 });
 
 test('temp preflight fails clearly when /tmp is (simulated) full', () => {
   assert.throws(
-    () => checkTempSpace({ tmpMinMb: 99999999 }),
+    () => checkTempSpace({ tempDir: os.tmpdir(), tmpDir: os.tmpdir(), tmpMinMb: 99999999 }),
     /Temp space too low to render: \/tmp has \d+ MB free, need at least 99999999 MB/,
   );
 });

@@ -22,14 +22,7 @@
  * not fail the whole script generation. Throws AgentBridgeError (retryable)
  * only when the budget is exhausted or the operator returns an error.
  *
- * Per-request wall: 600s (MAX_WALL_MS), matching the Vidnets server floor
- * (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s, in
- * vidnets/server/services/agent_bridge.py). The hook polls every 60s and
- * composing a grounded draft takes minutes, so a 300s wall expired while
- * the operator was still writing. NOTE: the wall is only as long as the
- * caller's budget — scriptWriter caps agent-model calls at 300s, the
- * encyclopedic synthesizer passes 180s, and the ScriptIT CLI passes 300s,
- * so those caps still dominate until they are raised to 600s too.
+ * Per-request wall: 120s or the remaining caller budget.
  *
  * Handle format: `agent-bridge:<owner-id>` (owner is `local-user` in
  * sign-in-free local mode). Never a model provider key.
@@ -42,11 +35,7 @@ const crypto = require('crypto');
 
 const PREFIX = 'agent-bridge:';
 const DEFAULT_OWNER = 'local-user';
-// One inbox round-trip gets the same 600s the Vidnets server floors its
-// agent requests at (VIDZEO_AGENT_MIN_WALL_SECONDS, default 600s): the
-// hook polls every 60s and a grounded draft takes minutes to compose.
-// A 300s wall expired mid-composition and wasted the operator's answer.
-const MAX_WALL_MS = 600000; // 10 minutes per single inbox request
+const MAX_WALL_MS = 120000;
 const POLL_MS = 250;
 
 function isBridgeHandle(value) {
@@ -61,8 +50,10 @@ function bridgeOwner(apiKey) {
 function bridgeRoot() {
   const fromEnv = process.env.SCRIPTIT_AGENT_BRIDGE_DIR
     || process.env.VIDNETS_AGENT_BRIDGE_DIR
+    || process.env.VIDZEO_BRIDGE_ROOT || process.env.MUSE_BRIDGE_ROOT || process.env.SCRIPTIT_BRIDGE_ROOT
     || (process.env.VIDZEO_TEMP_DIR ? path.join(process.env.VIDZEO_TEMP_DIR, 'agent-bridge') : '');
   if (fromEnv) return fromEnv;
+  if (process.env.VIDZEO_RUNTIME_ROOT) return path.join(process.env.VIDZEO_RUNTIME_ROOT, 'temp', 'agent-bridge');
   return path.join(os.homedir(), 'workspace', 'vidnets-runtime', 'temp', 'agent-bridge');
 }
 
@@ -91,13 +82,15 @@ function sleep(ms, signal) {
       reject(Object.assign(new Error('Agent bridge request cancelled'), { name: 'AbortError' }));
       return;
     }
-    const timer = setTimeout(resolve, ms);
-    if (signal) {
-      signal.addEventListener('abort', () => {
-        clearTimeout(timer);
-        reject(Object.assign(new Error('Agent bridge request cancelled'), { name: 'AbortError' }));
-      }, { once: true });
-    }
+    const abort = () => {
+      clearTimeout(timer);
+      reject(Object.assign(new Error('Agent bridge request cancelled'), { name: 'AbortError' }));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', abort, { once: true });
   });
 }
 
@@ -114,7 +107,7 @@ class AgentBridgeError extends Error {
  * One inbox round-trip: write request.json, poll for response.json.
  * Returns the operator's content string, or throws AgentBridgeError.
  */
-async function postOnce({ owner, jobId, operation, messages, responseFormat, maxTokens, wallMs, signal }) {
+async function postOnce({ owner, jobId, operation, kind, messages, responseFormat, maxTokens, wallMs, signal }) {
   const root = bridgeRoot();
   const requestId = crypto.randomBytes(16).toString('hex');
   const dir = path.join(root, requestId);
@@ -126,7 +119,7 @@ async function postOnce({ owner, jobId, operation, messages, responseFormat, max
     owner_id: owner,
     job_id: jobId || '',
     attempt_id: '',
-    kind: 'text',
+    kind: kind === 'vision' ? 'vision' : 'text',
     operation: operation || 'scriptit.completion',
     state: 'pending',
     created_at: now / 1000,
@@ -137,7 +130,7 @@ async function postOnce({ owner, jobId, operation, messages, responseFormat, max
     instructions: 'Use your own reasoning. Ground facts in the supplied context. Return the requested schema. Never call OpenRouter for this request.',
   };
   atomicWriteJson(requestPath, row);
-  const deadline = Date.now() + wallMs;
+  const deadline = now + wallMs;
   try {
     for (;;) {
       if (signal?.aborted) throw Object.assign(new Error('Agent bridge request cancelled'), { name: 'AbortError' });
@@ -152,14 +145,7 @@ async function postOnce({ owner, jobId, operation, messages, responseFormat, max
         throw new AgentBridgeError('External agent returned an empty completion');
       }
       if (Date.now() >= deadline) {
-        try {
-          const current = readJson(requestPath);
-          if (current && current.state === 'pending') {
-            current.state = 'expired';
-            atomicWriteJson(requestPath, current);
-          }
-        } catch { /* best effort */ }
-        throw new AgentBridgeError('The external agent did not answer within this request budget. Reconnect the agent and retry saved work.');
+        throw new AgentBridgeError(`Muse request ${requestId} (${row.operation}) did not answer within this request budget.`);
       }
       await sleep(Math.min(POLL_MS, Math.max(10, deadline - Date.now())), signal);
     }
@@ -167,6 +153,13 @@ async function postOnce({ owner, jobId, operation, messages, responseFormat, max
     if (err instanceof AgentBridgeError) throw err;
     if (err && err.name === 'AbortError') throw err;
     throw new AgentBridgeError(err.message || String(err));
+  } finally {
+    if (!fs.existsSync(replyPath)) {
+      try {
+        const current = readJson(requestPath);
+        if (current?.state === 'pending') atomicWriteJson(requestPath, { ...current, state: 'expired' });
+      } catch { /* the original expiry still bounds abandoned requests */ }
+    }
   }
 }
 
@@ -180,7 +173,7 @@ async function agentBridgeChat({
   responseFormat,
   maxTokens,
   signal,
-  timeoutMs = 600000,
+  timeoutMs = MAX_WALL_MS,
   operation = 'scriptit.completion',
   kind = 'text',
   jobId = '',
@@ -189,14 +182,11 @@ async function agentBridgeChat({
   const owner = bridgeOwner(apiKey);
   // Correlate inbox requests with the calling job when the worker sets it.
   jobId = jobId || process.env.SCRIPTIT_JOB_ID || '';
-  // Default budget is one full 600s wall, matching the Vidnets server
-  // floor; callers that pass a smaller timeoutMs still dominate (see the
-  // header note — the ScriptIT writer/CLI caps must be raised to match).
-  const budget = Math.max(1000, Math.min(1800000, Number(timeoutMs) || 600000));
+  const budget = Math.max(1000, Math.min(1800000, Number(timeoutMs) || MAX_WALL_MS));
   const startedAt = Date.now();
   let attempts = 0;
   let lastError = null;
-  while (Date.now() - startedAt < budget) {
+  while (attempts < 2 && Date.now() - startedAt < budget) {
     if (signal?.aborted) throw Object.assign(new Error('Agent bridge request cancelled'), { name: 'AbortError' });
     const remaining = budget - (Date.now() - startedAt);
     if (remaining < 1000) break;
@@ -204,7 +194,7 @@ async function agentBridgeChat({
     const wallMs = Math.min(MAX_WALL_MS, remaining);
     try {
       const { content, requestId } = await postOnce({
-        owner, jobId, operation, messages, responseFormat, maxTokens, wallMs, signal,
+        owner, jobId, operation, kind, messages, responseFormat, maxTokens, wallMs, signal,
       });
       const raw = {
         id: 'agent-' + requestId,

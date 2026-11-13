@@ -62,9 +62,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VIDZEO_YT_DOWNLOAD_CONCURRENCY=4 \
     # Thumbnails are SKIPPED: this worker delivers script + video only.
     VIDZEO_SKIP_THUMBNAILS=1 \
-    # Director/media wall floor (Nov 10): 1200s, not 600 — long-form jobs
-    # need the room; the budget math still caps the total per job.
-    VIDZEO_AGENT_MIN_WALL_SECONDS=1200 \
     # TLS: the image's own CA bundle (never a host path — none exists
     # inside the image). Node + Python both trust it.
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \

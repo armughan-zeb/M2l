@@ -201,3 +201,55 @@ def test_download_bulk_enforces_byte_cap_before_buffering(tmp_path):
     assert result[0][1] is None
     assert "too large" in result[0][2]
     assert not list(tmp_path.iterdir())
+
+
+def test_denied_origin_opens_circuit_without_blocking_healthy_download(tmp_path, monkeypatch):
+    from services.web_image import hybrid_search
+
+    hits = [0, 0]
+    body = b"fixture image" * 1024
+
+    class Denied(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits[0] += 1
+            self.send_response(403)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    class Healthy(Denied):
+        def do_GET(self):
+            hits[1] += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    limiter = hybrid_search.DownloadLimiter(total=2, per_host=1)
+    monkeypatch.setattr(hybrid_search, "_DOWNLOAD_LIMITER", limiter)
+    servers = [http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) for handler in (Denied, Healthy)]
+    threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+    for thread in threads:
+        thread.start()
+    blocked, healthy = [f"http://127.0.0.1:{server.server_port}" for server in servers]
+    urls = [f"{blocked}/{index}.jpg" for index in range(5)] + [f"{healthy}/valid.jpg"]
+    try:
+        rows = hybrid_search.download_bulk(urls, tmp_path, max_concurrent=1, timeout_seconds=2)
+        assert hits == [3, 1]
+        assert [row[2] for row in rows[:3]] == ["HTTP 403"] * 3
+        assert all("circuit open" in row[2] for row in rows[3:5])
+        assert rows[5][1] is not None, rows[5][2]
+        assert rows[5][1].read_bytes() == body
+        host = blocked.split("://")[1]
+        limiter.cooldowns[host] = time.monotonic() - 1
+        recovered = hybrid_search.download_bulk(urls[:2], tmp_path, max_concurrent=2, timeout_seconds=2)
+        assert hits == [4, 1]
+        assert recovered[0][2] == "HTTP 403"
+        assert "circuit open" in recovered[1][2]
+    finally:
+        for server, thread in zip(servers, threads):
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()

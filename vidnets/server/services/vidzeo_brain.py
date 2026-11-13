@@ -1072,10 +1072,8 @@ Return one container row for every scene in order."""
                 # chunk was filled with mechanical word-salad queries.
                 per_wave = None
                 if getattr(getattr(self, "_client", None), "provider", "") == "external_agent":
-                    try:
-                        per_wave = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
-                    except (TypeError, ValueError):
-                        per_wave = 600.0
+                    from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
+                    per_wave = AGENT_REQUEST_WALL_SECONDS
                 deadline_monotonic = time.monotonic() + query_planning_budget(len(chunks), worker_limit, per_wave_seconds=per_wave)
 
             def _plan_scene_chunk(chunk):

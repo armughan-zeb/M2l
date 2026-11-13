@@ -361,13 +361,11 @@ def test_external_agent_director_calls_last_at_least_the_agent_wall(monkeypatch)
     monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
     with job_scope({"llm_provider": "external_agent"}):
         budget = director_planning_budget(15)
-    # The phase scope caps the agent request wall, so a shorter director
-    # call budget expires the answer mid-composition (the inbox watcher
-    # alone needs ~4.5 min to wake a worker).
-    assert budget["scene_call_seconds"] >= 600
-    assert budget["art_seconds"] >= 600
-    assert budget["composition_seconds"] >= 600
-    assert budget["repair_seconds"] >= 600
+    # The phase scope must allow a full inbox request.
+    assert budget["scene_call_seconds"] >= 120
+    assert budget["art_seconds"] >= 120
+    assert budget["composition_seconds"] >= 120
+    assert budget["repair_seconds"] >= 120
 
 
 def test_director_budget_exposes_agent_wall_seconds(monkeypatch):
@@ -378,7 +376,7 @@ def test_director_budget_exposes_agent_wall_seconds(monkeypatch):
 
     with job_scope({"llm_provider": "external_agent"}):
         budget = director_planning_budget(15)
-    assert budget["agent_wall_seconds"] == 600.0
+    assert budget["agent_wall_seconds"] == 120.0
 
 
 def test_director_call_budget_floor_is_the_agent_wall():

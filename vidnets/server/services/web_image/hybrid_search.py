@@ -27,6 +27,14 @@ import requests
 from requests.adapters import HTTPAdapter
 
 
+class HostCircuitOpen(RuntimeError):
+    pass
+
+
+class DownloadSlotTimeout(TimeoutError):
+    pass
+
+
 class DownloadLimiter:
     """One budget across scene threads and their independent asyncio loops."""
 
@@ -36,11 +44,26 @@ class DownloadLimiter:
         self.active = 0
         self.hosts = {}
         self.cooldowns = {}
+        self.failures = {}
         self.lock = threading.Lock()
 
     def defer(self, host, seconds=30):
         with self.lock:
-            self.cooldowns[host] = time.monotonic() + seconds
+            self.cooldowns[host] = max(self.cooldowns.get(host, 0), time.monotonic() + seconds)
+
+    def record_outcome(self, host, failed):
+        with self.lock:
+            if not failed:
+                self.failures.pop(host, None)
+                if self.cooldowns.get(host, 0) <= time.monotonic():
+                    self.cooldowns.pop(host, None)
+                return
+            count = self.failures.get(host, 0) + 1
+            self.failures[host] = count
+            if count >= 3 or host in self.cooldowns:
+                self.cooldowns[host] = time.monotonic() + 60
+                self.failures.pop(host, None)
+                LOGGER.warning("Web image host circuit opened for %s (60s)", host)
 
     @asynccontextmanager
     async def slot(self, host, deadline):
@@ -49,8 +72,9 @@ class DownloadLimiter:
             while time.monotonic() < deadline:
                 with self.lock:
                     if self.cooldowns.get(host, 0) > time.monotonic():
-                        raise RuntimeError("host cooling down after HTTP 429")
-                    if self.active < self.total and self.hosts.get(host, 0) < self.per_host:
+                        raise HostCircuitOpen("host circuit open after 403, 429 or timeout")
+                    host_limit = 1 if host in self.cooldowns else self.per_host
+                    if self.active < self.total and self.hosts.get(host, 0) < host_limit:
                         self.active += 1
                         self.hosts[host] = self.hosts.get(host, 0) + 1
                         acquired = True
@@ -58,7 +82,7 @@ class DownloadLimiter:
                     break
                 await asyncio.sleep(0.05)
             if not acquired:
-                raise asyncio.TimeoutError()
+                raise DownloadSlotTimeout("web download capacity wait timed out")
             yield
         finally:
             if acquired:
@@ -203,61 +227,6 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
-def _requests_image_fallback(
-    url: str,
-    path: Path,
-    headers: Optional[Dict[str, str]],
-    timeout_seconds: float,
-    min_size: int,
-    max_bytes: int,
-) -> Tuple[Optional[Path], str]:
-    """Retry a hotlink with the requests transport after an aiohttp 403.
-
-    A few otherwise reliable image hosts (notably Wikimedia's upload CDN)
-    reject aiohttp's TLS/client fingerprint while returning the same URL to a
-    normal browser or requests.  This is a narrow transport fallback, only
-    used for 403/406 responses; it does not weaken relevance or safety gates.
-    """
-    request_headers = dict(SEARCH_HEADERS)
-    if headers:
-        request_headers.update(headers)
-    try:
-        response = requests.get(
-            url,
-            headers=request_headers,
-            timeout=max(2.0, min(20.0, float(timeout_seconds))),
-            stream=True,
-        )
-        if response.status_code != 200:
-            return None, f"HTTP {response.status_code}"
-        content_type = str(response.headers.get("Content-Type") or "").lower()
-        if content_type and "image" not in content_type and "octet" not in content_type:
-            return None, f"not image: {content_type}"
-        declared = response.headers.get("Content-Length")
-        try:
-            if declared and int(declared) > max_bytes:
-                return None, f"too large ({declared}B > {max_bytes}B)"
-        except (TypeError, ValueError):
-            pass
-        chunks: List[bytes] = []
-        total = 0
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > max_bytes:
-                return None, f"too large ({total}B > {max_bytes}B)"
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        if len(data) < min_size:
-            return None, f"too small ({len(data)}B)"
-        path.write_bytes(data)
-        return path, ""
-    except Exception as exc:
-        return None, str(exc)[:80]
-
-
-# ── URL DISCOVERY: Bing (requests — reliable, bypasses bot detection) ──
 def _parse_bing_html(html_text: str, limit: int) -> List[Dict]:
     results = []
     matches = list(_BING_PARSE_PATTERN.finditer(html_text))
@@ -691,6 +660,8 @@ async def _download_bulk_async(
 ) -> List[Tuple[str, Optional[Path], str]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(max_concurrent)
+    batch_deadline = time.monotonic() + min(90.0, max(0.1, timeout_seconds) * 3)
+    max_attempts = min(2, _net_retries())
 
     # Keep the transport cap aligned with resolver validation.  Enforce it
     # while reading the response so a hostile or accidentally huge publisher
@@ -716,6 +687,7 @@ async def _download_bulk_async(
         headers=dict(SEARCH_HEADERS),
         timeout=timeout,
         connector=connector,
+        trust_env=True,
     ) as session:
 
         async def _dl_one(url: str) -> Tuple[str, Optional[Path], str]:
@@ -733,41 +705,35 @@ async def _download_bulk_async(
                 path = output_dir / f"img_{uh}_{ts}{ext}"
                 last_error = ""
                 retry_statuses = {408, 425, 429, 500, 502, 503, 504}
-                deadline = time.monotonic() + timeout_seconds
-                for attempt in range(_net_retries()):
+                deadline = min(batch_deadline, time.monotonic() + timeout_seconds)
+                host = urlparse(url).netloc.lower()
+                if deadline <= time.monotonic():
+                    return url, None, "web download batch budget exhausted"
+                for attempt in range(max_attempts):
                     try:
-                        async with _DOWNLOAD_LIMITER.slot(urlparse(url).netloc.lower(), deadline), session.get(
+                        async with _DOWNLOAD_LIMITER.slot(host, deadline), session.get(
                             url, headers=(headers_by_url or {}).get(url),
                             timeout=aiohttp.ClientTimeout(total=max(0.01, deadline - time.monotonic())),
                         ) as resp:
                             if resp.status != 200:
                                 last_error = f"HTTP {resp.status}"
                                 if resp.status == 429:
-                                    _DOWNLOAD_LIMITER.defer(urlparse(url).netloc.lower())
+                                    try:
+                                        retry_after = max(1, min(60, int(resp.headers.get("Retry-After", "30"))))
+                                    except ValueError:
+                                        retry_after = 30
+                                    _DOWNLOAD_LIMITER.defer(host, retry_after)
                                     return url, None, last_error
-                                if resp.status in {403, 406}:
-                                    # Some CDNs fingerprint aiohttp and return
-                                    # 403 while accepting the same request via
-                                    # the requests transport. Keep this retry
-                                    # bounded and only invoke it for these
-                                    # hotlink responses.
-                                    fallback_path, fallback_error = await asyncio.to_thread(
-                                        _requests_image_fallback,
-                                        url,
-                                        path,
-                                        (headers_by_url or {}).get(url),
-                                        max(2.0, deadline - time.monotonic()),
-                                        min_size,
-                                        max_bytes,
-                                    )
-                                    if fallback_path:
-                                        return url, fallback_path, ""
-                                    last_error = fallback_error or last_error
+                                if resp.status == 403:
+                                    _DOWNLOAD_LIMITER.record_outcome(host, failed=True)
+                                    return url, None, last_error
+                                _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                 if resp.status not in retry_statuses:
                                     return url, None, last_error
                             else:
                                 ct = resp.headers.get("Content-Type", "").lower()
                                 if ct and "image" not in ct and "octet" not in ct:
+                                    _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                     return url, None, f"not image: {ct}"
                                 content_length = resp.headers.get("Content-Length")
                                 try:
@@ -775,6 +741,7 @@ async def _download_bulk_async(
                                 except (TypeError, ValueError):
                                     declared_length = 0
                                 if declared_length > max_bytes:
+                                    _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                     return url, None, f"too large ({declared_length}B > {max_bytes}B)"
 
                                 chunks = []
@@ -785,18 +752,23 @@ async def _download_bulk_async(
                                 async for chunk in resp.content.iter_chunked(64 * 1024):
                                     total_bytes += len(chunk)
                                     if total_bytes > max_bytes:
+                                        _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                         return url, None, f"too large ({total_bytes}B > {max_bytes}B)"
                                     chunks.append(chunk)
+                                _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                 data = b"".join(chunks)
                                 if len(data) < min_size:
                                     return url, None, f"too small ({len(data)}B)"
                                 path.write_bytes(data)
                                 return url, path, ""
+                    except (HostCircuitOpen, DownloadSlotTimeout) as exc:
+                        return url, None, str(exc)
                     except asyncio.TimeoutError:
+                        _DOWNLOAD_LIMITER.record_outcome(host, failed=True)
                         last_error = "timeout"
                     except Exception as e:
                         last_error = str(e)[:80]
-                    if attempt < _net_retries() - 1:
+                    if attempt < max_attempts - 1:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break

@@ -32,7 +32,6 @@ export VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY="${VIDZEO_MIXED_YT_DOWNLOAD_CONCURRE
 export VIDZEO_YT_DOWNLOAD_CONCURRENCY="${VIDZEO_YT_DOWNLOAD_CONCURRENCY:-4}"
 # Thumbnails are SKIPPED: this worker delivers script + video only.
 export VIDZEO_SKIP_THUMBNAILS="${VIDZEO_SKIP_THUMBNAILS:-1}"
-export VIDZEO_AGENT_MIN_WALL_SECONDS="${VIDZEO_AGENT_MIN_WALL_SECONDS:-1200}"
 export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-/etc/ssl/certs/ca-certificates.crt}"
 export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
 export VIDZEO_RUNTIME_ROOT="${VIDZEO_RUNTIME_ROOT:-/data/runtime}"
@@ -57,7 +56,7 @@ done
 
 # --- Warn (do not fail here: the daemon start gate fails with the detail) ---
 HOOK_DEF="${MUSE_INBOX_HOOK_DEFINITION:-/host-hooks/vidnets-inbox-watch.json}"
-if [ ! -f "$HOOK_DEF" ]; then
+if [ -z "${MUSE_INFERENCE_COMMAND:-}${MUSE_INFERENCE_URL:-}" ] && [ ! -f "$HOOK_DEF" ]; then
   echo "[vidzeo] WARNING: vidnets-inbox-watch hook definition not found at $HOOK_DEF." >&2
   echo "[vidzeo] WARNING: the host Muse VM must have the vidnets-inbox-watch hook enabled and its definitions dir mounted (see docker-compose.yml). The daemon start gate will refuse to run until then." >&2
   echo "[vidzeo] HOW TO INSTALL IT:" >&2

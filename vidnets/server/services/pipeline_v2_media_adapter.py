@@ -3326,10 +3326,8 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
     # silently produces a footage-free video. The delivery budget is a soft
     # target; real footage matters more than the clock.
     if str(config.get('llm_provider') or '') == 'external_agent':
-        try:
-            media_floor = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
-        except (TypeError, ValueError):
-            media_floor = 600.0
+        from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
+        media_floor = AGENT_REQUEST_WALL_SECONDS
     else:
         media_floor = 300.0
     if delivery_budget is not None:
@@ -5727,7 +5725,7 @@ def resolve_existing_provider_branches_v2(
                 try:
                     agent_wall = max(
                         60.0,
-                        float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600),
+                        120.0,
                     )
                 except (TypeError, ValueError):
                     agent_wall = 600.0

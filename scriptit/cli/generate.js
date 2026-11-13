@@ -55,12 +55,13 @@ function log(...args) {
   process.stderr.write('[scriptit-cli] ' + args.join(' ') + '\n');
 }
 
+function finish(payload, code = 0) {
+  // Flush the contract before terminating the long-lived research handles.
+  process.stdout.write(JSON.stringify(payload) + '\n', () => process.exit(code));
+}
+
 function fail(message, code = 1) {
-  process.stdout.write(JSON.stringify({ error: String(message) }) + '\n');
-  // Exit explicitly: generateScript leaves long-lived timers/handles behind
-  // (its 45-minute total-deadline timer, the research store), so returning
-  // from main would leave this one-shot CLI hanging for up to 45 minutes.
-  process.exit(code);
+  return finish({ error: String(message) }, code);
 }
 
 function parseArgs(argv) {
@@ -225,10 +226,7 @@ async function main() {
   const totalDeadlineMs = bridgeMode
     ? Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 2700000)
     : Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 600000);
-  // Was 300000 in bridge mode: the CLI's per-request cap expired the
-  // writer/synthesis requests at 5 minutes while the 600s bridge wall
-  // still allowed the operator to answer. Now 600000 to match the wall.
-  // Total job deadline above (2700000) is unchanged.
+  // The caller budget allows bounded retries. Each posted request expires in at most 120s.
   const timeoutMs = bridgeMode ? 600000 : 120000;
 
   let result;
@@ -282,20 +280,15 @@ async function main() {
     // Keep the explicit quality verdict and issues in the result, but let the
     // worker use a nonempty draft rather than discard the Muse response.
     log('Continuing with the saved draft; editorial warnings remain attached.');
-    process.stdout.write(JSON.stringify({
-      scriptText,
-      meta: { ...meta, publishable: false },
-    }) + '\n');
-    process.exit(0);
+    return finish({ scriptText, meta: { ...meta, publishable: false } });
   }
   log(`done: ${meta.quality?.words || scriptText.split(/\s+/).length} words, quality score ${meta.quality?.score ?? 'n/a'}, hook=${meta.quality?.hook === true}`);
-  process.stdout.write(JSON.stringify({ scriptText, meta }) + '\n');
-  process.exit(0);
+  finish({ scriptText, meta });
 }
 
 if (require.main === module) {
   main().catch((err) => {
-    fail(`ScriptIT CLI crashed: ${err && err.message ? err.message : err}`);
+    fail('ScriptIT CLI crashed: ' + (err?.message || String(err)));
   });
 }
 

@@ -7255,10 +7255,8 @@ def _source_query_stage_seconds(config, scene_count, fast_lane=False):
             reserve_after_seconds=reserve_after,
         )))
     if str(config.get('llm_provider') or '') == 'external_agent':
-        try:
-            agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
-        except (TypeError, ValueError):
-            agent_wall = 600.0
+        from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
+        agent_wall = AGENT_REQUEST_WALL_SECONDS
         if delivery_budget is not None:
             try:
                 reserve_after = float(
@@ -8871,8 +8869,8 @@ def _build_audio_scene_plan(config, report_progress, expected_scene_plan=None, w
         memory = psutil.virtual_memory()
         if memory.total < 12 * 1024 ** 3 or memory.available < 1536 * 1024 ** 2:
             from services.transcription_service import unload_whisper_model
-            unload_whisper_model()
-            print("   [flow] audio: idle ASR cache released before media verification")
+            if unload_whisper_model():
+                print("   [flow] audio: idle ASR cache released before media verification")
     except (ImportError, OSError, AttributeError):
         pass
 

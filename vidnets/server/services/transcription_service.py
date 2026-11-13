@@ -8,12 +8,12 @@ import re
 import subprocess
 import time
 from difflib import SequenceMatcher
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError, as_completed
 from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
 from pathlib import Path
 import sys
 import threading
-from .job_context import JobThread
+from .job_context import JobThread, remaining_seconds
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -28,6 +28,8 @@ _whisper_backend = ""
 _resolved_whisper_model_name = ""
 _worker_local = threading.local()
 _whisper_init_lock = threading.Lock()
+_whisper_start_lock = threading.Lock()
+_whisper_start = None
 
 
 def init_whisper(device: str = "cpu"):
@@ -154,16 +156,23 @@ def whisper_runtime_status() -> dict:
 def unload_whisper_model():
     """Release Whisper model from memory."""
     global _whisper_model, _available, _resolved_whisper_model_name
-    with _whisper_init_lock:
+    # A caption caller may already have fallen back while the shared model
+    # is still loading. Cleanup must never join that same slow load.
+    if not _whisper_init_lock.acquire(blocking=False):
+        return False
+    try:
         previous = _whisper_model
         _whisper_model = None
         _available = False
         _resolved_whisper_model_name = ""
+    finally:
+        _whisper_init_lock.release()
     if previous is not None:
         import gc
         del previous
         gc.collect()
         print("   [whisper] model released from memory")
+    return previous is not None
 
 
 WHISPER_MODEL_NAME = (os.environ.get("VIDZEO_WHISPER_MODEL", "base") or "base").strip()
@@ -537,11 +546,12 @@ def start_whisper_job_warmup(device="cpu", preload_workers=True, worker_count=No
     policy = get_whisper_parallel_policy(8, cpu_count)
     if worker_count is None:
         worker_count = policy["worker_count"]
+    preload_workers = preload_workers and worker_count > 1 and policy["worker_count"] > 1
     threads_per_worker = policy.get("threads_per_worker", 2)
     state = {
         "base_model_ready": False,
         "ready_workers": 0,
-        "target_workers": worker_count,
+        "target_workers": worker_count if preload_workers else 0,
         "error": None
     }
 
@@ -554,8 +564,7 @@ def start_whisper_job_warmup(device="cpu", preload_workers=True, worker_count=No
 
     def load_base():
         try:
-            init_whisper(device)
-            state["base_model_ready"] = True
+            state["base_model_ready"] = _init_whisper_with_timeout(device=device)
         except Exception as e:
             state["error"] = str(e)
         finally:
@@ -602,8 +611,35 @@ def shutdown_whisper_job_warmup(handle: dict):
 def prewarm_whisper_workers():
     init_whisper()
 
-def _init_whisper_with_timeout(timeout: float = 30.0) -> bool:
-    return init_whisper()
+def _init_whisper_with_timeout(timeout: float = 30.0, device: str = "cpu") -> bool:
+    """Bound the caller's wait and share a single model load across attempts."""
+    global _whisper_start
+    if _available:
+        return True
+    budget = max(0.0, min(timeout, remaining_seconds(timeout)))
+    if budget <= 0:
+        return False
+    with _whisper_start_lock:
+        if _available:
+            return True
+        if _whisper_start is None or _whisper_start.done():
+            pending = Future()
+            _whisper_start = pending
+
+            def load():
+                try:
+                    pending.set_result(init_whisper(device))
+                except Exception as exc:
+                    pending.set_exception(exc)
+
+            # The shared model can finish loading even if one job times out.
+            threading.Thread(target=load, name="whisper-model-load", daemon=True).start()
+        active = _whisper_start
+    try:
+        return active.result(timeout=budget)
+    except FutureTimeoutError:
+        print(f"   [whisper] model loading exceeded the {budget:.1f}s wait budget")
+        return False
 
 def _transcribe_with_model(model, audio_path: str, backend: str = "", offset: float = 0.0,
                            language: str | None = None) -> tuple:
@@ -674,7 +710,7 @@ def transcribe_audio(audio_path: str, warmup_handle: dict = None,
     global _available
     if not _available and not _init_whisper_with_timeout():
         return [], []
-    if warmup_handle:
+    if warmup_handle and warmup_handle.get("state", {}).get("target_workers", 1):
         return transcribe_audio_parallel(audio_path, warmup_handle, language=language)
     return _transcribe_audio_local(audio_path, language=language)
 
@@ -771,6 +807,8 @@ def transcribe_audio_parallel(
     target_chunks = max(2, min(16, int(round(duration / max(6.0, WHISPER_TARGET_CHUNK_SECONDS)))))
     policy = get_whisper_parallel_policy(target_chunks, os.cpu_count() or 2)
     worker_count = max(1, int(policy.get("worker_count") or 1))
+    if worker_count == 1:
+        return _transcribe_audio_local(audio_path, language=language)
     threads_per_worker = int(policy.get("threads_per_worker", 2))
     chunks = _build_chunk_plan(duration, target_chunks)
     print(f"   Whisper chunk transcription: {len(chunks)} overlapping chunks x {worker_count} workers (threads/worker={threads_per_worker}, overlap={WHISPER_CHUNK_OVERLAP_SECONDS:.2f}s)")
@@ -782,12 +820,13 @@ def transcribe_audio_parallel(
     owns_executor = executor is None
     if executor is None:
         executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="whisper-chunk")
+    future_map = {}
     try:
         future_map = {
             executor.submit(_transcribe_chunk, audio_path, chunk, "cpu", language, threads_per_worker): chunk
             for chunk in chunks
         }
-        for future in as_completed(future_map):
+        for future in as_completed(future_map, timeout=remaining_seconds(None)):
             chunk = future_map[future]
             try:
                 index, words, segments = future.result()
@@ -796,10 +835,16 @@ def transcribe_audio_parallel(
                 print(f"   Whisper chunk {index + 1}/{len(chunks)} done ({len(words)} words)")
             except Exception as exc:
                 failures.append(f"chunk {int(chunk.get('index', 0)) + 1}: {exc}")
+    except FutureTimeoutError:
+        print("   [whisper] parallel transcription exhausted its job budget")
     finally:
+        for future in future_map:
+            future.cancel()
         if owns_executor:
-            executor.shutdown(wait=False, cancel_futures=False)
+            executor.shutdown(wait=False, cancel_futures=True)
 
+    if not words_by_chunk and remaining_seconds(1) <= 0:
+        return [], []
     if failures and not words_by_chunk:
         print(f"   Whisper chunk transcription failed; falling back to full audio: {'; '.join(failures)}")
         return _transcribe_audio_local(audio_path, language=language)

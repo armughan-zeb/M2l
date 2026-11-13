@@ -18,6 +18,7 @@ from .job_context import current_job, check_job_active, remaining_seconds
 
 AGENT_HANDLE = 'external-agent:'
 AGENT_MODEL = 'external-agent'
+AGENT_REQUEST_WALL_SECONDS = 120.0
 
 
 class AgentBridgeError(RuntimeError):
@@ -26,8 +27,11 @@ class AgentBridgeError(RuntimeError):
 
 
 def bridge_root():
-    return Path(os.environ.get('VIDNETS_AGENT_BRIDGE_DIR') or
-                Path(os.environ.get('VIDZEO_TEMP_DIR') or Path(__file__).resolve().parents[2] / 'temp') / 'agent-bridge')
+    runtime = Path(os.environ.get('VIDZEO_RUNTIME_ROOT') or Path.home() / 'workspace' / 'vidnets-runtime')
+    temp = Path(os.environ.get('VIDZEO_TEMP_DIR') or runtime / 'temp')
+    return Path(os.environ.get('VIDNETS_AGENT_BRIDGE_DIR') or os.environ.get('SCRIPTIT_AGENT_BRIDGE_DIR') or
+                os.environ.get('VIDZEO_BRIDGE_ROOT') or os.environ.get('MUSE_BRIDGE_ROOT') or
+                os.environ.get('SCRIPTIT_BRIDGE_ROOT') or temp / 'agent-bridge')
 
 
 def atomic_json(path, value):
@@ -117,7 +121,7 @@ def complete_request(request_id, owner_id, content, error=''):
         raise ValueError('Agent request was not found.')
     with _request_lock(path):
         row = read_request(request_id, owner_id)
-        if row['state'] != 'pending':
+        if row['state'] != 'pending' or path.with_name('response.json').exists():
             raise ValueError('This request expired or was already answered.')
         if error:
             reply = {'error': str(error)[:500]}
@@ -183,25 +187,18 @@ def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
     owner = str(context.get('agent_owner_id') or (handle[len(AGENT_HANDLE):] if handle.startswith(AGENT_HANDLE) else ''))
     if not owner:
         raise AgentBridgeError('Pair a local agent before starting an agent-powered job.')
-    # An external agent answers through a polling inbox: the watcher polls
-    # every 60s and reading the prompt plus composing a schema-valid answer
-    # takes minutes, so the fast-API timeouts callers pass (20-300s) expire
-    # before the answer can arrive. Floor the wall for agent requests; the
-    # job's remaining budget still caps it. VIDZEO_AGENT_MIN_WALL_SECONDS
-    # tunes the floor (default 600s).
-    try:
-        min_wall = max(0.0, float(os.environ.get('VIDZEO_AGENT_MIN_WALL_SECONDS', '600') or 600))
-    except (TypeError, ValueError):
-        min_wall = 600.0
-    effective_timeout = max(float(timeout), min_wall)
-    wall = min(effective_timeout, remaining_seconds(effective_timeout))
+    # The resident answerer targets 60s. Preserve the enclosing job budget.
+    wall = max(0.0, min(AGENT_REQUEST_WALL_SECONDS, remaining_seconds(AGENT_REQUEST_WALL_SECONDS)))
+    if wall <= 0:
+        raise AgentBridgeError(f'Job budget exhausted before posting Muse request ({operation or kind}).')
     request_id = secrets.token_hex(16)
     path = _request_path(request_id)
     path.parent.mkdir(parents=True)
     deadline = time.monotonic() + wall
+    created_at = time.time()
     row = {'id': request_id, 'owner_id': owner, 'job_id': context.get('job_id', ''),
            'attempt_id': context.get('attempt_id', ''), 'kind': kind, 'operation': operation,
-           'state': 'pending', 'created_at': time.time(), 'expires_at': time.time() + wall,
+           'state': 'pending', 'created_at': created_at, 'expires_at': created_at + wall,
            'messages': _messages_with_local_images(payload.get('messages', []), path.parent),
            'response_format': payload.get('response_format') or {},
            'max_tokens_hint': payload.get('max_tokens'),
@@ -223,7 +220,7 @@ def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
                 response._content = json.dumps(value).encode('utf-8')
                 return response
             time.sleep(min(.1, max(.001, deadline - time.monotonic())))
-        raise AgentBridgeError('The external agent did not answer within this request budget. Reconnect the agent and retry saved work.')
+        raise AgentBridgeError(f'Muse request {request_id} ({operation or kind}) expired after {wall:.1f}s.')
     finally:
         with _request_lock(path):
             saved = json.loads(path.read_text(encoding='utf-8'))

@@ -873,10 +873,8 @@ class QwenVisionClient:
         # before the answer arrives.
         timeout_seconds = self.timeout_seconds
         if current_job().get('llm_provider') == 'external_agent':
-            try:
-                agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "600") or 600))
-            except (TypeError, ValueError):
-                agent_wall = 600.0
+            from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
+            agent_wall = AGENT_REQUEST_WALL_SECONDS
             timeout_seconds = max(timeout_seconds, agent_wall)
         verdict_deadline = time.monotonic() + max(0.1, timeout_seconds * max(2, request_budget) + 10.0)
         for attempt in range(request_budget):
