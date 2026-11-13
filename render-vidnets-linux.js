@@ -30,7 +30,7 @@ const { spawn } = require('child_process');
 const { bridgeRoot, checkMuseInferenceBridge } = require('./lib/museInference');
 const { pendingRequests } = require('./lib/museInbox');
 const { writeJsonAtomic } = require('./lib/config');
-const { readRenderReceipt, submitRender } = require('./lib/vidnetsSubmission');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry } = require('./lib/vidnetsSubmission');
 
 const VIDNETS_ROOT = String(process.env.MUSE_VIDNETS_ROOT || '').trim()
   || path.join(__dirname, 'vidnets');
@@ -337,10 +337,9 @@ async function main() {
   };
   if (vidnetsJobId) log(`Re-attaching to existing Vidnets job ${vidnetsJobId} for ${job.jobId}`);
 
-  log('Ensuring Vidnets service is ready');
-  await vidnets(['start'], 2 * MINUTE);
-
   if (!vidnetsJobId) {
+    log('Ensuring Vidnets service is ready');
+    await vidnets(['start'], 2 * MINUTE);
     vidnetsJobId = await submitRender({ jobId: job.jobId, filePath: requestFile, request, submit });
     saveReceipt({ cmsAttempt, submittedAt: new Date().toISOString() });
     log(`Vidnets job ${vidnetsJobId} submitted for "${job.title}"`);
@@ -372,6 +371,14 @@ async function main() {
     } catch (error) {
       if (/returned (400|401|403|404)\b/i.test(error.message)) throw error;
       statusFailures += 1;
+      if (shouldRecoverService(error, statusFailures)) {
+        log(`Checking whether the local Vidnets service can recover job ${vidnetsJobId}`);
+        try {
+          await vidnets(['start', '--recover'], 2 * MINUTE);
+        } catch (recoveryError) {
+          log(`Vidnets service recovery deferred: ${recoveryError.message}`);
+        }
+      }
       const delayMs = Math.min(30000, pollMs * 2 ** Math.min(statusFailures - 1, 5));
       log(`Vidnets status unavailable for ${vidnetsJobId}; will recheck the same render in ${Math.round(delayMs / 1000)}s: ${error.message}`);
       await sleep(delayMs);
@@ -467,7 +474,8 @@ async function main() {
       }) + '\n');
       return;
     }
-    if (['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
+    const cleanupPending = item.status === 'shutdown_timeout' && item.retryable === true && !item.cancel_requested;
+    if (!cleanupPending && ['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
       if (item.status !== 'cancelled' && cmsAttempt > Number(receipt.cmsAttempt || 1)) {
         log(`CMS attempt ${cmsAttempt}: resuming failed Vidnets job ${vidnetsJobId} from its checkpoint`);
         await vidnets(['retry', vidnetsJobId], 2 * MINUTE);
@@ -477,7 +485,7 @@ async function main() {
       }
       fail('Vidnets render failed: ' + String(item.error || item.paused_reason || item.progress_text || `status ${item.status}`).slice(0, 700));
     }
-    if (item.status === 'paused') {
+    if (cleanupPending || item.status === 'paused') {
       retries += 1;
       if (retries > 3) {
         // Name the cause instead of blaming inference: a memory hold
@@ -522,8 +530,18 @@ async function main() {
       } else {
         log(`Vidnets job paused (attempt ${retries}/3); retrying`);
       }
+      try {
+        await vidnets(['retry', vidnetsJobId], 2 * MINUTE);
+      } catch (error) {
+        if (!shouldRecheckRetry(error)) throw error;
+        if (cleanupPending && /returned 409\b/i.test(error.message)) {
+          retries -= 1;
+          await sleep(Math.max(pollMs, 15000));
+          continue;
+        }
+        log(`Vidnets retry response is uncertain; rechecking job ${vidnetsJobId}: ${error.message}`);
+      }
       saveReceipt({ cmsAttempt, pausedRetries: retries });
-      await vidnets(['retry', vidnetsJobId], 2 * MINUTE);
     }
 
     await sleep(pollMs);

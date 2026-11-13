@@ -102,7 +102,7 @@ def service_url(root):
     return f'http://127.0.0.1:{port}'
 
 
-def start(resources, root, env):
+def start(resources, root, env, *, recover=False):
     from services.agent_access import _read
     from services.agent_bridge import atomic_json, _request_lock
     # A paired credential is optional here. The service boots without any
@@ -123,6 +123,15 @@ def start(resources, root, env):
                 return {'ready': True, 'url': url, 'reused': True}
         except (OSError, ValueError, RuntimeError, urllib.error.URLError):
             pass
+        if recover:
+            # An unresponsive status endpoint can still have a live queue owner.
+            import psutil
+            descriptor = json.loads((secure / 'agent-service.json').read_text(encoding='utf-8'))
+            pid = int(descriptor.get('pid') or 0)
+            if pid <= 1 or Path(descriptor.get('resource_root') or '').resolve() != resources:
+                raise RuntimeError('Cannot establish ownership of the previous Vidnets service.')
+            if psutil.pid_exists(pid):
+                raise RuntimeError('The previous Vidnets process still exists; waiting for it to respond.')
         port = None
         for candidate in range(5010, 5110):
             with socket.socket() as probe:
@@ -139,6 +148,8 @@ def start(resources, root, env):
         if port is None:
             raise RuntimeError('No free local service port was found.')
         env['VIDZEO_PORT'] = str(port)
+        if recover:
+            env['VIDZEO_AGENT_RECOVER_QUEUE'] = '1'
         logs = root / 'logs'
         logs.mkdir(parents=True, exist_ok=True)
         logfile = logs / 'agent-service.log'
@@ -184,7 +195,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Vidnets service for an external agent\'s own reasoning and vision.')
     parser.add_argument('--runtime-root', help='Writable Vidnets data folder; normally discovered from Settings pairing.')
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('start')
+    commands.add_parser('start').add_argument('--recover', action='store_true')
     commands.add_parser('capabilities')
     commands.add_parser('pending')
     for name in ('request', 'job', 'retry'):
@@ -196,7 +207,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     resources, root, env = configure(args.runtime_root)
     if args.command == 'start':
-        result = start(resources, root, env)
+        result = start(resources, root, env, recover=args.recover)
     else:
         from services.agent_access import _read
         try:

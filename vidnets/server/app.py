@@ -373,18 +373,18 @@ check_ffmpeg()
 def run_startup_maintenance():
     """Heavy init deferred here, light init done at import time."""
     auto_requeue = str(os.environ.get("VIDZEO_AUTO_REQUEUE_INTERRUPTED", "0")).strip().lower() in {"1", "true", "yes", "on"}
-    if auto_requeue:
+    if auto_requeue or os.environ.get('VIDZEO_AGENT_RECOVER_QUEUE') == '1':
         try:
             qm = get_queue_manager()
             # Jobs paused by a backend restart (not by the user) resume
             # automatically, so a rebooted machine picks up where it left off
             # instead of leaving jobs parked until someone clicks Resume.
             for item in list(qm.queue):
-                if item.get("status") == "paused" and item.get("paused_reason") in {"backend_restart", "cancellation_cleanup_timeout"}:
+                if auto_requeue and item.get("status") == "paused" and item.get("paused_reason") in {"backend_restart", "cancellation_cleanup_timeout"}:
                     qm.resume_item(item.get("id"))
             has_queued = any(item.get("status") == "queued" for item in qm.queue)
             if has_queued and not qm.worker_running:
-                print("[Startup] Auto-requeue enabled; auto-starting queue worker for queued job...")
+                print("[Startup] Starting queue worker for saved queued jobs...")
                 qm.start_worker(_queue_generation_callback)
         except Exception as e:
             print(f"[Startup] Failed to auto-start queue worker: {e}")
@@ -20825,6 +20825,7 @@ def _render_video_with_semantic_editing(
             "semantic_render_crf": job_config.get('semantic_render_crf'),
             "semantic_render_required": True,
             "semantic_variation_required": False,
+            "llm_provider": job_config.get('llm_provider'),
             "openrouter_api_key": job_config.get('openrouter_api_key') or '',
             "semantic_render_timeout_seconds": semantic_budget,
             "semantic_render_budget_seconds": semantic_budget,
@@ -23614,6 +23615,7 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
     render_config.update({
         'render_backend': 'remotion',
         'semantic_render_required': True,
+        'llm_provider': config.get('llm_provider'),
         'job_type': str(config.get('type') or 'long'),
         '_creative_media_repair': lambda film, findings, budget: _repair_creative_media(
             film, findings, budget, config, cancellation

@@ -17,7 +17,7 @@ const { minimumVideoDurationSeconds } = require('../lib/mediaRules');
 const { sleep } = require('../lib/sleep');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { readRequestedWorkers } = require('../lib/remotionWorkers');
-const { readRenderReceipt, submitRender } = require('../lib/vidnetsSubmission');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry } = require('../lib/vidnetsSubmission');
 
 const MINUTE = 60 * 1000;
 
@@ -177,6 +177,7 @@ function buildRequest(job, scriptText, packageDir) {
     semantic_render_concurrency: concurrency,
     concurrency,
     continue_render_while_active: true,
+    preparation_stall_seconds: 300,
     output_package_dir: packageDir,
     delivery_budget_seconds: deliveryBudget,
     delivery_budget_max_cap_seconds: deliveryBudget
@@ -320,9 +321,6 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
 
   const packageDir = path.join(workDir, 'vidnets');
   fs.mkdirSync(packageDir, { recursive: true });
-  await ensureReady({ signal });
-  onProgress?.(2, 'Vidnets service ready');
-
   const requestFile = path.join(workDir, 'vidnets-request.json');
   const jobFile = path.join(workDir, 'vidnets-job.json');
   let receipt = readRenderReceipt(jobFile, job.jobId);
@@ -333,6 +331,8 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     config.writeJsonAtomic(jobFile, receipt);
   };
   if (!vidnetsJobId) {
+    await ensureReady({ signal });
+    onProgress?.(2, 'Vidnets service ready');
     vidnetsJobId = await submitRender({
       jobId: job.jobId,
       filePath: requestFile,
@@ -369,6 +369,14 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     } catch (error) {
       if (signal?.aborted || /returned (400|401|403|404)\b/i.test(error.message)) throw error;
       statusFailures += 1;
+      if (shouldRecoverService(error, statusFailures)) {
+        try {
+          await vidnets('start --recover', { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets service recovery' });
+        } catch (recoveryError) {
+          if (signal?.aborted) throw recoveryError;
+          log.warn(`Vidnets service recovery deferred: ${recoveryError.message}`);
+        }
+      }
       log.warn(`Vidnets status unavailable for ${vidnetsJobId}: ${error.message}`);
       await sleep(Math.min(30000, pollMs * 2 ** Math.min(statusFailures - 1, 5)), signal);
       continue;
@@ -394,7 +402,8 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
         engine: 'vidnets', vidnetsJobId, realScenes: mediaCount.real, totalScenes: mediaCount.total
       } };
     }
-    if (['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
+    const cleanupPending = item.status === 'shutdown_timeout' && item.retryable === true && !item.cancel_requested;
+    if (!cleanupPending && ['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
       if (item.status !== 'cancelled' && cmsAttempt > Number(receipt.cmsAttempt || 1)) {
         await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
         saveReceipt({ cmsAttempt, pausedRetries: 0 });
@@ -403,12 +412,21 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
       const reason = item.error || item.paused_reason || item.progress_text || `status ${item.status}`;
       throw new Error('Vidnets render failed: ' + String(reason).slice(0, 700));
     }
-    if (item.status === 'paused') {
+    if (cleanupPending || item.status === 'paused') {
       const pausedRetries = Number(receipt.cmsAttempt) === cmsAttempt ? Number(receipt.pausedRetries) || 0 : 0;
       if (pausedRetries >= 3) throw new Error(`Vidnets job ${vidnetsJobId} remained paused after three retries: ${detail}`);
+      try {
+        await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
+        log.info(`Resumed saved Vidnets job ${vidnetsJobId}`);
+      } catch (error) {
+        if (signal?.aborted || !shouldRecheckRetry(error)) throw error;
+        if (cleanupPending && /returned 409\b/i.test(error.message)) {
+          await sleep(Math.max(pollMs, 15000), signal);
+          continue;
+        }
+        log.warn(`Vidnets retry response is uncertain; rechecking job ${vidnetsJobId}: ${error.message}`);
+      }
       saveReceipt({ cmsAttempt, pausedRetries: pausedRetries + 1 });
-      await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
-      log.info(`Resumed saved Vidnets job ${vidnetsJobId}`);
     }
 
     await sleep(pollMs, signal);

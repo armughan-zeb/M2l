@@ -3,7 +3,8 @@ import json
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import pytest
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
@@ -131,6 +132,26 @@ def test_parent_cancellation_propagates_to_nested_stage_reason():
     assert child.cancelled()
     assert grandchild.cancelled()
     assert grandchild.reason == "aggregate YouTube wall reached"
+
+
+def test_recovery_waits_for_nested_worker_before_retrying_same_job(tmp_path):
+    manager, original = _manager(tmp_path)
+    try:
+        item = manager.add_item({'script': 'Saved script.'})
+        parent = CancellationContext(job_id=item['id'])
+        nested = parent.child().child()
+        future = Future()
+        assert future.set_running_or_notify_cancel()
+        nested.register_future(future)
+        parent.cancel('Preparation stalled')
+        manager.get_item(item['id'])['status'] = JobStatus.SHUTDOWN_TIMEOUT
+        manager.active_jobs[item['id']] = {'cleanup_status': 'shutdown_timeout', 'context': parent}
+        assert not manager.resume_item(item['id'])
+        future.set_result(None)
+        assert manager.resume_item(item['id'])
+        assert manager.get_item(item['id'])['status'] == JobStatus.QUEUED
+    finally:
+        _restore(original)
 
 
 def test_partial_queue_edits_keep_content_title_and_output_name_independent(tmp_path):
@@ -563,6 +584,56 @@ def test_delivery_deadline_stops_active_job_and_leaves_retryable_pause(tmp_path,
             "Processing time limit reached" in event["text"]
             for event in paused["progress_events"]
         )
+    finally:
+        manager.stop_worker()
+        _restore(original)
+
+
+@pytest.mark.parametrize('render_started', [False, True])
+def test_preparation_watchdog_resumes_same_job_without_interrupting_render(tmp_path, monkeypatch, render_started):
+    manager, original = _manager(tmp_path)
+    manager._progress_heartbeat_poll_seconds = 0.02
+    manager._progress_heartbeat_idle_seconds = 0.02
+    manager._progress_heartbeat_emit_seconds = 0.02
+    attempts = []
+    retained = tmp_path / 'saved-media'
+    budget = DeliveryBudget.create(total_seconds=20)
+    monkeypatch.setattr(queue_module, 'install_delivery_budget', lambda _config: budget)
+
+    def generate(config, progress, check_cancelled, cancellation):
+        attempts.append(config['_queue_job_id'])
+        if len(attempts) == 2:
+            assert retained.read_text() == 'ready'
+            return {'success': True}
+        retained.write_text('ready')
+        progress(60, 'Preparing media')
+        if render_started:
+            budget.begin_render_phase()
+        end = time.monotonic() + 0.4
+        while time.monotonic() < end and not check_cancelled():
+            progress(60, 'Preparing media')
+            time.sleep(0.01)
+        cancellation.raise_if_cancelled()
+        return {'success': True}
+
+    try:
+        item = manager.add_item({'script': 'An offline test.', 'preparation_stall_seconds': 0.12})
+        manager.start_worker(generate)
+        expected = JobStatus.COMPLETED if render_started else JobStatus.PAUSED
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if manager.get_item(item['id'])['status'] == expected and not manager.active_jobs:
+                break
+            time.sleep(0.01)
+        assert manager.get_item(item['id'])['status'] == expected
+        if not render_started:
+            assert manager.get_item(item['id'])['paused_reason'] == 'preparation_stall'
+            assert manager.resume_item(item['id'])
+            deadline = time.monotonic() + 5
+            while manager.get_item(item['id'])['status'] != JobStatus.COMPLETED and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert manager.get_item(item['id'])['status'] == JobStatus.COMPLETED
+            assert attempts == [item['id'], item['id']]
     finally:
         manager.stop_worker()
         _restore(original)

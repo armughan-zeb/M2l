@@ -87,12 +87,19 @@ class CancellationContext:
     def wait_for_quiescence(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
         while True:
-            self._prune_completed()
-            if self.active_process_count() == 0 and self.active_future_count() == 0:
+            if self._quiescent():
                 return True
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.05)
+
+    def _quiescent(self) -> bool:
+        self._prune_completed()
+        with self._lock:
+            if self._processes or self._futures:
+                return False
+            children = tuple(self._children.values())
+        return all(child._quiescent() for child in children)
 
     def unregister_future(self, future: Optional[Future]) -> None:
         if future is None:
