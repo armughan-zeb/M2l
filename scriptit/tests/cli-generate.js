@@ -5,15 +5,16 @@
  *
  * 1. No title -> exit 1 with an {"error": ...} object on stdout.
  * 2. Full worker-contract run in agent-bridge mode with a fake operator:
- *    a job JSON on stdin (topic "Apollo 11 Moon landing", 1 minute), live
- *    web research, and every inference request answered from the bridge dir.
+ *    a job JSON on stdin (topic "Apollo 11 Moon landing", 1 minute), a
+ *    recorded research fixture, and inference answered from the bridge dir.
+ *    Set SCRIPTIT_LIVE_RESEARCH_TEST=1 to exercise external sources.
  *    Asserts exit 0, a publishable script with a real hook, concrete
  *    entities, and honest meta (external claims > 0, no synthetic claims).
  *
  * The fake operator returns one fixed, researched Apollo 11 narration for
  * draft calls and hook JSON for hook calls. The narration paraphrases the
  * Apollo 11 Wikipedia record so the evidence-support gate can verify it
- * against the live research ledger.
+ * against the research ledger.
  */
 
 const assert = require('node:assert/strict');
@@ -28,7 +29,8 @@ const CANNED_SCRIPT = [
   'On July 20, 1969, two men stood on the Moon while a third circled above them alone, and the whole landing depended on a computer with less processing power than a pocket calculator.',
   'Apollo 11 launched from Kennedy Space Center on July 16, 1969, on a Saturn V rocket. Neil Armstrong commanded the mission, Buzz Aldrin piloted the Lunar Module Eagle, and Michael Collins stayed aboard the Command Module Columbia in lunar orbit.',
   'Armstrong and Aldrin descended to the Sea of Tranquility while Collins orbited the Moon alone. Armstrong stepped onto the surface first, Aldrin followed nineteen minutes later, and the two collected rock samples and set up scientific instruments before returning to Eagle.',
-  'The crew splashed down in the Pacific Ocean on July 24, 1969, eight days after launch. Apollo 11 was the first crewed mission to land humans on the Moon, and its landing site in the Sea of Tranquility remains one of the most visited places in the history of spaceflight.',
+  'Their way home depended on a rendezvous. The upper stage of Eagle lifted off from the Sea of Tranquility with Armstrong and Aldrin inside. Collins brought Columbia together with Eagle in lunar orbit, and the two moonwalkers climbed back into the command module.',
+  'The crew splashed down in the Pacific Ocean on July 24, 1969, eight days after launch. Apollo 11 was the first crewed mission to land humans on the Moon. The lunar rocks the astronauts carried home gave scientists physical samples from the Sea of Tranquility.',
 ].join('\n\n');
 
 const HOOK_JSON = JSON.stringify({
@@ -39,9 +41,10 @@ const HOOK_JSON = JSON.stringify({
   ],
 });
 
-function runCli({ stdin, env, cwd, timeoutMs = 300000 }) {
+function runCli({ stdin, env, cwd, preload, timeoutMs = 300000 }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI], {
+    const args = preload ? ['--require', preload, CLI] : [CLI];
+    const child = spawn(process.execPath, args, {
       cwd,
       env: { ...process.env, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -124,8 +127,30 @@ async function main() {
       scriptPath: path.join(work, 'job', 'script.txt'),
       requirements: {},
     };
+    let preload;
+    if (process.env.SCRIPTIT_LIVE_RESEARCH_TEST !== '1') {
+      preload = path.join(work, 'research-fixture.cjs');
+      const research = {
+        query: job.job.title,
+        gatheredAt: new Date().toISOString(),
+        official: [{
+          title: 'Apollo 11 mission overview',
+          url: 'https://www.nasa.gov/mission/apollo-11/',
+          source: 'NASA',
+          articleText: CANNED_SCRIPT,
+          snippet: CANNED_SCRIPT.split('\n\n')[1],
+          hasArticleBody: true,
+        }],
+        errors: [],
+      };
+      fs.writeFileSync(preload, [
+        'const pipeline = require(' + JSON.stringify(require.resolve('../src/research/pipeline')) + ');',
+        'pipeline.runResearchJob = async () => ({ research: ' + JSON.stringify(research) + ' });',
+      ].join('\n'));
+    }
     const run = await runCli({
       stdin: JSON.stringify(job),
+      preload,
       env: { SCRIPTIT_AGENT_BRIDGE_DIR: bridgeRoot },
       cwd: work,
       timeoutMs: 300000,
@@ -136,7 +161,7 @@ async function main() {
     assert.equal(run.stdout.trim().split('\n').length, 1, 'stdout must be exactly one JSON line, got: ' + run.stdout.slice(0, 500));
     const out = JSON.parse(run.stdout.trim());
     assert.ok(out.scriptText && out.scriptText.length > 500, 'script text present');
-    assert.equal(out.meta.publishable, true, 'script must be publishable, issues: ' + JSON.stringify(out.meta.quality?.issues));
+    assert.equal(out.meta.publishable, true, 'script must be publishable, issues: ' + JSON.stringify(out.meta.quality?.issues) + '\n' + run.stderr.slice(-3000));
     assert.ok(out.meta.quality.words >= 136, 'meets 1-minute minimum words, got ' + out.meta.quality.words);
     assert.equal(out.meta.quality.hook, true, 'opening hooks the viewer');
     assert.ok((out.meta.quality.specificity?.count || 0) >= 4, 'names concrete entities: ' + JSON.stringify(out.meta.quality.specificity));
