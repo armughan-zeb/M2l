@@ -220,8 +220,12 @@ test('completion retries a lost response without another artifact upload', async
 });
 
 const healthMonitor = path.join(__dirname, '..', 'scripts', 'vidnets-health-monitor.sh');
+test('health monitor and its bridge helper are included in the checkout', () => {
+  assert.ok(fs.statSync(healthMonitor).isFile());
+  assert.ok(fs.statSync(path.join(path.dirname(healthMonitor), 'bridge-health.py')).isFile());
+});
 test('health monitor dry-run detects a dead daemon and a stale inbox request without acting', {
-  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash' : false
+  skip: process.platform !== 'linux' ? 'requires Linux bash' : false
 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-monitor-'));
   const repo = path.join(dir, 'repo');
@@ -285,7 +289,7 @@ test('health monitor dry-run detects a dead daemon and a stale inbox request wit
 });
 
 test('health monitor permits checkpoint-safe daemon recovery when Vidnets is healthy', {
-  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash' : false
+  skip: process.platform !== 'linux' ? 'requires Linux bash' : false
 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-checkpoint-monitor-'));
   const repo = path.join(dir, 'repo');
@@ -347,7 +351,7 @@ test('health monitor permits checkpoint-safe daemon recovery when Vidnets is hea
 });
 
 test('health monitor restarts Vidnets for a checkpoint only after proving its server process is gone', {
-  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash and /proc' : false
+  skip: process.platform !== 'linux' ? 'requires Linux bash and /proc' : false
 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-dead-server-monitor-'));
   const repo = path.join(dir, 'repo');
@@ -397,7 +401,7 @@ test('health monitor restarts Vidnets for a checkpoint only after proving its se
 });
 
 test('health monitor withholds Vidnets restart when the active server process is still alive', {
-  skip: process.platform !== 'linux' || !fs.existsSync(healthMonitor) ? 'requires Linux bash and /proc' : false
+  skip: process.platform !== 'linux' ? 'requires Linux bash and /proc' : false
 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vidnets-live-server-monitor-'));
   const repo = path.join(dir, 'repo');

@@ -58,6 +58,7 @@ has_active_job() {
 }
 
 docker_worker_managed() {
+  [ "${VIDMON_INSTALL_MODE:-auto}" != native ] || return 1
   [ -f "$REPO/docker-compose.yml" ] && command -v docker >/dev/null 2>&1 \
     && docker compose version >/dev/null 2>&1
 }
@@ -324,16 +325,23 @@ if [ "$vidnets_ok" = 1 ] && [[ "$cms_code" =~ ^[23][0-9][0-9]$ ]] && command -v 
   fi
 fi
 
-if [ -f "$HOOK_DEF" ]; then
+resident_ready=0
+if [ -f "$BRIDGE/resident-status.json" ]; then
+  if python3 -c 'import json, sys, time; age = time.time() - json.load(open(sys.argv[1]))["updatedAt"] / 1000; sys.exit(0 if -5 <= age <= 15 else 1)' "$BRIDGE/resident-status.json" 2>/dev/null; then
+    resident_ready=1
+    report 'NOTE inbox: resident dispatcher is running'
+  fi
+fi
+if [ "$resident_ready" = 0 ] && [ -f "$HOOK_DEF" ]; then
   hook_enabled="$(python3 -c 'import json,sys; print("true" if json.load(open(sys.argv[1])).get("enabled") is True else "false")' "$HOOK_DEF" 2>/dev/null || printf 'unknown')"
   if [ "$hook_enabled" != true ]; then
     if [ "$hook_enabled" = false ]; then hook_state=DISABLED; else hook_state=UNKNOWN; fi
     mark_problem "hook: vidnets-inbox-watch is $hook_state"
   fi
-else
+elif [ "$resident_ready" = 0 ]; then
   mark_problem 'hook: vidnets-inbox-watch definition is missing'
 fi
-if [ -f "$HOOK_DEF" ] && [ "${hook_enabled:-unknown}" = true ]; then
+if [ "$resident_ready" = 0 ] && [ "${hook_enabled:-unknown}" = true ]; then
   last_run="$(cat "$HOOK_STATE_DIR/last-run" 2>/dev/null || true)"
   if [[ "$last_run" =~ ^[0-9]+$ ]]; then
     hook_age=$(( $(date +%s) - last_run ))

@@ -1,0 +1,42 @@
+name: Muse worker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            scriptit/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq
+          python -m pip install requests
+          npm ci --no-audit --no-fund
+          npm ci --prefix scriptit --omit=dev --no-audit --no-fund
+      - name: Verify worker, host hook and ScriptIT
+        run: |
+          for script in setup.sh setup-linux.sh scripts/install-inbox-hook.sh scripts/install-health-monitor.sh scripts/vidnets-health-monitor.sh docker/entrypoint.sh; do
+            bash -n "$script"
+          done
+          bash tests/hook-stale-request.test.sh
+          npm test
+          npm --prefix scriptit test

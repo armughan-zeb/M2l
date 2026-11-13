@@ -17,10 +17,9 @@
 // resumes mid-job (script reused, render re-attached) instead of
 // restarting from scratch.
 //
-// The end-to-end tests (executeJob + kill/resume) are gated behind
-// MUSE_RUN_E2E_PROGRESS_TEST=1: they generate a real 61s 1080p fixture
-// with ffmpeg (~10s) and run a full local job against a stub CMS.
-// Run: MUSE_RUN_E2E_PROGRESS_TEST=1 node --test tests/daemon-progress-checkpoints.test.js
+// The end-to-end tests use FFmpeg to generate 61s 1080p fixtures and run
+// the local worker against a stub CMS. Set MUSE_RUN_E2E_PROGRESS_TEST=0
+// to omit them when running a short diagnostic.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -38,6 +37,7 @@ process.env.MUSE_CMS_RETRY_BASE_MS = '10';
 process.env.MUSE_CMS_RETRY_MAX_MS = '50';
 
 const { runCommand, commandLine } = require('../lib/command');
+const { availability: pythonAvailability } = require('../lib/python');
 const log = require('../lib/log');
 const config = require('../lib/config');
 const { createClient } = require('../lib/cms');
@@ -45,7 +45,7 @@ const { parseRenderProgressLine, render: renderVideo } = require('../adapters/vi
 const jobRunner = require('../lib/jobRunner');
 const { writeVidnetsProgressFile } = require('../render-vidnets-linux');
 
-const RUN_E2E = process.env.MUSE_RUN_E2E_PROGRESS_TEST === '1';
+const RUN_E2E = process.env.MUSE_RUN_E2E_PROGRESS_TEST !== '0';
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -60,28 +60,29 @@ function noTempFilesLeft(dir) {
 test('runCommand streams stderr lines to onStderrLine while the command runs', async () => {
   const dir = tmpDir('daemon-progress-stream-');
   const script = path.join(dir, 'emit-lines.js');
+  const acknowledgement = path.join(dir, 'first-line-seen');
   fs.writeFileSync(script, [
-    'let i = 0;',
-    'const timer = setInterval(() => {',
-    '  i += 1;',
-    "  process.stderr.write(`line ${i}\\n`);",
-    "  if (i >= 3) { clearInterval(timer); console.log(JSON.stringify({ ok: true })); }",
-    '}, 50);',
+    "const fs = require('node:fs');",
+    "process.stderr.write('line 1\\n');",
+    `const timer = setInterval(() => { if (!fs.existsSync(${JSON.stringify(acknowledgement)})) return;`,
+    '  clearInterval(timer);',
+    "  process.stderr.write('line 2\\nline 3\\n');",
+    '  console.log(JSON.stringify({ ok: true }));',
+    '}, 10);',
     ''
   ].join('\n'));
   const seen = [];
-  const startedAt = Date.now();
   const result = await runCommand(commandLine(process.execPath, [script]), {
     label: 'stderr stream test',
-    onStderrLine: line => seen.push({ line, atMs: Date.now() - startedAt })
+    timeoutMs: 5000,
+    onStderrLine: line => {
+      seen.push(line);
+      if (line === 'line 1') fs.writeFileSync(acknowledgement, 'ready');
+    }
   });
   assert.equal(JSON.parse(result.stdout).ok, true);
-  assert.deepEqual(seen.map(entry => entry.line), ['line 1', 'line 2', 'line 3']);
-  // The lines arrived while the command was still running, not all at exit.
-  // (Threshold includes node spawn time on a loaded VM — the spread check
-  // below is the real streaming proof; this one only bounds gross delay.)
-  assert.ok(seen[0].atMs < 1500, `first line arrived at ${seen[0].atMs}ms`);
-  assert.ok(seen[2].atMs - seen[0].atMs >= 80, 'lines were spread over time, not dumped at exit');
+  // The child cannot exit until the callback observes line 1 and releases it.
+  assert.deepEqual(seen, ['line 1', 'line 2', 'line 3']);
   assert.match(result.stderr, /line 3/);
 });
 
@@ -296,15 +297,13 @@ test('wrapper progress file is written atomically and parses', () => {
   assert.ok(noTempFilesLeft(dir));
 });
 
-test('vidnets state.json is written atomically (exact server code, extracted)', async () => {
+test('vidnets state.json is written atomically (exact server code, extracted)', async t => {
   // The Vidnets server is too heavy to import in a unit test, so this
   // extracts _write_generation_checkpoint + its _checkpoint_safe helper
   // from server/app.py verbatim and runs them against a scratch package.
-  const python = await new Promise(resolve => {
-    execFile('python3', ['--version'], error => resolve(!error));
-  });
-  if (!python) {
-    test.skip('python3 is not available');
+  const python = await pythonAvailability();
+  if (!python.ok) {
+    t.skip('Python 3 is not available');
     return;
   }
   const appSource = fs.readFileSync(path.join(__dirname, '..', 'vidnets', 'server', 'app.py'), 'utf8');
@@ -338,7 +337,7 @@ test('vidnets state.json is written atomically (exact server code, extracted)', 
     ''
   ].join('\n'));
   const output = await new Promise((resolve, reject) => {
-    execFile('python3', [driver], { timeout: 60000 }, (error, stdout, stderr) => {
+    execFile(python.binary, [driver], { timeout: 60000 }, (error, stdout, stderr) => {
       if (error) reject(new Error(`state.json atomic check failed: ${stderr || error.message}`));
       else resolve(stdout);
     });
@@ -456,9 +455,9 @@ function writeStubRender(dir, { fixture, jobId, slowMs = 0, reattachId = '' }) {
   return stub;
 }
 
-test('e2e: executeJob reports live Vidnets progress with log lines to the CMS', { skip: !RUN_E2E }, async () => {
+test('e2e: executeJob reports live Vidnets progress with log lines to the CMS', { skip: !RUN_E2E }, async t => {
   if (!(await ffmpegAvailable())) {
-    test.skip('ffmpeg is not available');
+    t.skip('FFmpeg is not available');
     return;
   }
   const dir = tmpDir('daemon-progress-e2e-');
@@ -500,9 +499,9 @@ test('e2e: executeJob reports live Vidnets progress with log lines to the CMS', 
   }
 });
 
-test('e2e: daemon killed mid-render resumes mid-job instead of restarting', { skip: !RUN_E2E }, async () => {
+test('e2e: daemon killed mid-render resumes mid-job instead of restarting', { skip: !RUN_E2E }, async t => {
   if (!(await ffmpegAvailable())) {
-    test.skip('ffmpeg is not available');
+    t.skip('FFmpeg is not available');
     return;
   }
   const dir = tmpDir('daemon-progress-kill-');

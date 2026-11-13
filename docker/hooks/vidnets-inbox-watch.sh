@@ -21,7 +21,7 @@ run_tmp="$STATE_DIR/.last-run.$$"
 printf '%s\n' "$now" > "$run_tmp"
 mv -f "$run_tmp" "$STATE_DIR/last-run"
 resident=$(jq -r '.updatedAt // 0 | floor' "$BRIDGE/resident-status.json" 2>/dev/null || true)
-if [[ "$resident" =~ ^[0-9]+$ ]] && [ "$((now - resident / 1000))" -le 15 ]; then
+if [[ "$resident" =~ ^[0-9]+$ ]] && [ "$((now - resident / 1000))" -le 15 ] && [ "$((now - resident / 1000))" -ge -5 ]; then
   silent "resident Muse dispatcher is handling the inbox" "{}"
   exit 0
 fi

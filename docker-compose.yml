@@ -67,8 +67,7 @@ services:
       # file) avoids compose creating a directory when the file is absent.
       # Override with HOST_HOOKS_DIR if your Muse VM keeps hooks elsewhere.
       - ${HOST_HOOKS_DIR:-${HOME}/hooks/definitions}:/host-hooks:ro
-      # The hook writes last-run on every invocation. This is mounted read-only
-      # so the worker can refuse claims when an enabled hook has never fired.
+      # The hook writes last-run on every invocation for host diagnostics.
       - ${HOST_HOOK_STATE_DIR:-${HOME}/hooks/state/vidnets-inbox-watch}:/host-hook-state:ro
     # Vidnets binds 127.0.0.1:5010-5110 inside the container; nothing is
     # published to the host by default. Uncomment to inspect it locally:

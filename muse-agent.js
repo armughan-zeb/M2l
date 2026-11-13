@@ -30,7 +30,7 @@ const { retryDelayMs, cmsRetryOptions } = require('./lib/cmsRetry');
 const ffmpeg = require('./lib/ffmpeg');
 const python = require('./lib/python');
 const vidnets = require('./adapters/vidnets');
-const { startResidentInbox, probeInbox } = require('./lib/museInbox');
+const { startResidentInbox, probeInbox, createInboxReadiness } = require('./lib/museInbox');
 
 const VERSION = require('./package.json').version;
 const MIN_NODE = [18, 17];
@@ -590,21 +590,14 @@ async function startCommand(args) {
       throw error;
     }
   }
-  let nextInboxProbe = 0;
   let lastScriptBlocker = '';
-  const refreshInboxHealth = async () => {
-    if (abort.signal.aborted) return false;
-    if (Date.now() < nextInboxProbe) return true;
-    try {
-      const proof = await probeInbox(process.env, { signal: abort.signal });
-      nextInboxProbe = Date.now() + 60000;
-      log.info(`Muse inbox probe answered in ${proof.elapsedMs}ms`);
-      return true;
-    } catch (error) {
-      log.warn('Muse claims paused: ' + error.message);
-      return false;
+  const refreshInboxHealth = createInboxReadiness({
+    probe: () => probeInbox(process.env, { signal: abort.signal }),
+    onReady: proof => log.info(`Muse inbox probe answered in ${proof.elapsedMs}ms`),
+    onFailure: error => {
+      if (!abort.signal.aborted) log.warn('Muse claims paused: ' + error.message);
     }
-  };
+  });
   let current = null;
   let stopping = false;
   let fatal = null;

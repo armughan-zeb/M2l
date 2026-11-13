@@ -6,7 +6,7 @@
 #        nohup ./start-daemon.sh >> daemon.log 2>&1 &
 # This script is NOT a supervisor: if the daemon exits, nothing here
 # restarts it. Post-reboot / crash recovery is the health monitor
-# (~/hooks/scripts/vidnets-health-monitor.sh, every 5 min via the
+# (~/hooks/scripts/vidnets-health-monitor.sh, every minute via the
 # vidnets-health-monitor cron) — a systemd unit was ruled out because
 # /etc does not survive a VM reboot here, while the cron + this script
 # live under $HOME, which does. The daemon itself now survives CMS

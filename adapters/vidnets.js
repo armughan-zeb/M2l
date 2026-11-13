@@ -225,13 +225,14 @@ function parseInferenceAnswer(text, request) {
 }
 
 async function runInferenceHttp(url, request, { timeoutMs = 120000, signal } = {}) {
+  const timeout = AbortSignal.timeout(timeoutMs);
   let response;
   try {
     response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ type: 'inference', request, instructions: request.instructions || '', responseFormat: request.response_format || {} }),
-      signal: signal || AbortSignal.timeout(timeoutMs),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       redirect: 'error'
     });
   } catch (error) {

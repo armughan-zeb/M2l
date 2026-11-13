@@ -51,9 +51,15 @@ fi
 if ! command -v pkill >/dev/null 2>&1; then
     PKGS_TO_INSTALL+=("procps")
 fi
+if ! command -v flock >/dev/null 2>&1; then
+    PKGS_TO_INSTALL+=("util-linux")
+fi
+if ! command -v jq >/dev/null 2>&1; then
+    PKGS_TO_INSTALL+=("jq")
+fi
 
 if [ ${#PKGS_TO_INSTALL[@]} -eq 0 ]; then
-    echo "[PASS] FFmpeg, FFprobe, and procps installed"
+    echo "[PASS] FFmpeg, FFprobe, procps, flock, and jq installed"
 else
     echo "[WARN] Missing packages: ${PKGS_TO_INSTALL[*]}. Installing via apt if available:"
     if command -v apt-get >/dev/null 2>&1; then
@@ -106,14 +112,14 @@ echo "[Info] Installing worker and ScriptIT runtime dependencies..."
 (cd "$DIR/remotion-linux" && npm ci --no-audit --no-fund)
 node -e "require.resolve('rss-parser', { paths: [process.argv[1]] }); require.resolve('sql.js', { paths: [process.argv[1]] })" "$DIR/scriptit"
 
-# 8. Run doctor
+# 8. Install the host hook and monitor before running doctor.
+VIDMON_INSTALL_MODE=native bash "$DIR/scripts/install-inbox-hook.sh"
+VIDMON_INSTALL_MODE=native bash "$DIR/scripts/install-health-monitor.sh"
+
+# 9. Run doctor
 echo ""
 echo "=== Running Muse Doctor ==="
 node "$DIR/muse-agent.js" doctor || echo "[WARN] Setup installed dependencies, but doctor reported checks that still need attention."
-
-if [ -f "$DIR/scripts/install-health-monitor.sh" ]; then
-    bash "$DIR/scripts/install-health-monitor.sh"
-fi
 
 echo ""
 echo "Setup complete! To start the worker, run: ./start.sh"

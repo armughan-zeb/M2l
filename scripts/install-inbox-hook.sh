@@ -6,10 +6,12 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SCRIPT_DIR="${HOST_HOOK_SCRIPTS_DIR:-$HOME/hooks/scripts}"
 HOOK_DIR="${HOST_HOOKS_DIR:-$HOME/hooks/definitions}"
-STATE_DIR="${HOST_HOOK_STATE_DIR:-$HOME/hooks/state/vidnets-inbox-watch}"
+STATE_DIR="${MUSE_INBOX_HOOK_STATE_DIR:-${HOST_HOOK_STATE_DIR:-$HOME/hooks/state/vidnets-inbox-watch}}"
 HOOK_FILE="${MUSE_INBOX_HOOK_DEFINITION:-$HOOK_DIR/vidnets-inbox-watch.json}"
-RUNTIME="${VIDZEO_RUNTIME_ROOT:-$REPO/data/runtime}"
-BRIDGE="${VIDNETS_AGENT_BRIDGE_DIR:-${VIDZEO_BRIDGE_ROOT:-$RUNTIME/temp/agent-bridge}}"
+DEFAULT_RUNTIME="$REPO/data/runtime"
+[ "${VIDMON_INSTALL_MODE:-auto}" != native ] || DEFAULT_RUNTIME="$HOME/workspace/vidnets-runtime"
+RUNTIME="${VIDZEO_RUNTIME_ROOT:-$DEFAULT_RUNTIME}"
+BRIDGE="${VIDNETS_AGENT_BRIDGE_DIR:-${SCRIPTIT_AGENT_BRIDGE_DIR:-${VIDZEO_BRIDGE_ROOT:-${MUSE_BRIDGE_ROOT:-${SCRIPTIT_BRIDGE_ROOT:-${VIDZEO_TEMP_DIR:-$RUNTIME/temp}/agent-bridge}}}}}"
 DEST="$SCRIPT_DIR/vidnets-inbox-watch.sh"
 
 mkdir -p "$SCRIPT_DIR" "$STATE_DIR"
@@ -45,7 +47,7 @@ with open(definition_path, encoding='utf-8') as stream:
     definition = json.load(stream)
 definition['script_path'] = script_path
 definition['script_timeout_secs'] = 120
-definition['poll_interval_secs'] = 20
+definition.setdefault('poll_interval_secs', 60)
 definition['prompt'] = str(definition.get('prompt', '')).replace('<EXTRACTED_DIR>', repo).replace('<DATA_RUNTIME_DIR>', runtime)
 fd, temporary = tempfile.mkstemp(prefix='.vidnets-hook-definition-', dir=os.path.dirname(definition_path))
 try:
@@ -60,4 +62,4 @@ finally:
 PY
 
 printf '[PASS] Installed hook implementation: %s\n' "$DEST"
-printf '[PASS] Preserved delivery and prompt settings; set script path, 20s poll, and 120s cap.\n'
+printf '[PASS] Preserved delivery, prompt, and scheduling settings; set script path and 120s cap.\n'

@@ -10,10 +10,13 @@ LOG_DIR="$HOME/hooks/logs"
 STATE_DIR="$HOME/hooks/state/vidnets-health-monitor"
 DEST="$SCRIPT_DIR/vidnets-health-monitor.sh"
 RUNNER="$SCRIPT_DIR/vidnets-health-monitor-run.sh"
-RUNTIME="${VIDMON_RUNTIME_ROOT:-${VIDZEO_RUNTIME_ROOT:-$REPO/data/runtime}}"
-BRIDGE="${VIDMON_BRIDGE_DIR:-${VIDNETS_AGENT_BRIDGE_DIR:-${VIDZEO_BRIDGE_ROOT:-$RUNTIME/temp/agent-bridge}}}"
+INSTALL_MODE="${VIDMON_INSTALL_MODE:-auto}"
+DEFAULT_RUNTIME="$REPO/data/runtime"
+[ "$INSTALL_MODE" != native ] || DEFAULT_RUNTIME="$HOME/workspace/vidnets-runtime"
+RUNTIME="${VIDMON_RUNTIME_ROOT:-${VIDZEO_RUNTIME_ROOT:-$DEFAULT_RUNTIME}}"
+BRIDGE="${VIDMON_BRIDGE_DIR:-${VIDNETS_AGENT_BRIDGE_DIR:-${SCRIPTIT_AGENT_BRIDGE_DIR:-${VIDZEO_BRIDGE_ROOT:-${MUSE_BRIDGE_ROOT:-${SCRIPTIT_BRIDGE_ROOT:-${VIDZEO_TEMP_DIR:-$RUNTIME/temp}/agent-bridge}}}}}}"
 HOOK_DEF="${VIDMON_HOOK_DEF:-${MUSE_INBOX_HOOK_DEFINITION:-$HOME/hooks/definitions/vidnets-inbox-watch.json}}"
-HOOK_STATE_DIR="${HOST_HOOK_STATE_DIR:-$HOME/hooks/state/vidnets-inbox-watch}"
+HOOK_STATE_DIR="${VIDMON_HOOK_STATE_DIR:-${MUSE_INBOX_HOOK_STATE_DIR:-${HOST_HOOK_STATE_DIR:-$HOME/hooks/state/vidnets-inbox-watch}}}"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -26,9 +29,11 @@ fi
 
 mkdir -p "$SCRIPT_DIR" "$LOG_DIR" "$STATE_DIR"
 install -m 0755 "$REPO/scripts/vidnets-health-monitor.sh" "$DEST"
+install -m 0644 "$REPO/scripts/bridge-health.py" "$SCRIPT_DIR/bridge-health.py"
 cat > "$RUNNER" <<EOF
 #!/usr/bin/env bash
 export VIDMON_REPO=$(quote_for_bash "$REPO")
+export VIDMON_INSTALL_MODE=$(quote_for_bash "$INSTALL_MODE")
 export VIDMON_RUNTIME_ROOT=$(quote_for_bash "$RUNTIME")
 export VIDMON_BRIDGE_DIR=$(quote_for_bash "$BRIDGE")
 export VIDMON_HOOK_DEF=$(quote_for_bash "$HOOK_DEF")

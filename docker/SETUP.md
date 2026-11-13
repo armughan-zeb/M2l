@@ -45,24 +45,25 @@ docker compose exec worker curl -s http://127.0.0.1:5010/   # Vidnets answers in
 No ports are published to the host by default. To inspect Vidnets from the
 host, uncomment the `ports:` block in `docker-compose.yml` and re-up.
 
-## Host Muse hook (setup installs and proves the script)
+## Host Muse hook (setup installs the script)
 
 `setup.sh` installs the repository hook script on the host Muse VM, updates the
 existing definition's script path while preserving its delivery and prompt
 settings, and replaces the documentation placeholders with the extracted repo
 and runtime paths. Keep the existing definition enabled and set a real
-`delivery.to` chat target; setup refuses unresolved placeholders. It then waits
-up to 120 seconds for `~/hooks/state/vidnets-inbox-watch/last-run` to prove the
-host scheduler actually executed the hook. The worker mounts that proof
-read-only and refuses to claim jobs if it is absent or older than 120 seconds.
+`delivery.to` chat target; setup refuses unresolved placeholders. The worker
+requires a real answer to its inbox probe before claiming a new job. The
+health monitor reports stale hook execution separately. A long-lived
+`MUSE_INBOX_HOOK_MAX_AGE_MS` override is unnecessary.
 
 If no definition exists, create it from
 `docker/hooks/vidnets-inbox-watch.json.template`, set a real chat target, enable
-it, then rerun `setup.sh`. The hook polls every 20 seconds and has a 120-second
-hard script budget. The worker also runs a harmless end-to-end Muse inbox probe
-before its first claim and at regular intervals; each answer is targeted under
-60 seconds. The repo cannot create or supervise Muse-side subagents: the host
-Muse runtime still provides the reasoning and answers.
+it, then rerun `setup.sh`. Setup preserves the configured poll interval and
+defaults to 60 seconds when it is unset. The worker runs an inbox probe before
+its first claim and refreshes readiness in the background while the last
+successful probe is recent. To avoid waiting for the host scheduler on each
+inference request, configure a Muse-owned command or HTTP answer service with
+`MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL`.
 
 The 120 seconds is a failure ceiling, not an expected wait. If answers are
 regularly over 60 seconds, inspect the host hook schedule and operator response

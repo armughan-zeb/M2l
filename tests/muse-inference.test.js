@@ -11,6 +11,7 @@ const path = require('node:path');
 const { test } = require('node:test');
 const {
   openRouterKeysPresent,
+  vidnetsStatusUrl,
   checkMuseInferenceBridge,
   verifyMuseInferenceBridge
 } = require('../lib/museInference');
@@ -91,12 +92,11 @@ test('doctor rejects a relative Vidnets renderer because jobs execute from their
   assert.ok(result.failures.some(failure => /absolute path/i.test(failure)));
 });
 
-test('enabled hook without a recent execution proof blocks production startup', () => {
+test('stale hook execution proof defers to the live inbox probe', () => {
   const { env } = bridgeFixture();
   fs.writeFileSync(path.join(env.MUSE_INBOX_HOOK_STATE_DIR, 'last-run'), `${Math.floor(Date.now() / 1000) - 180}\n`);
   const result = checkMuseInferenceBridge(env);
-  assert.equal(result.ok, false);
-  assert.ok(result.failures.some(failure => /no recent execution proof/i.test(failure)));
+  assert.equal(result.ok, true, JSON.stringify(result.failures));
 });
 
 test('hook placeholders are rejected even when enabled and recently observed', () => {
@@ -129,6 +129,15 @@ test('bridge verification probes the live Vidnets server', async () => {
   const down = await verifyMuseInferenceBridge({ ...env, MUSE_VIDNETS_URL: 'http://127.0.0.1:1' });
   assert.equal(down.ok, false);
   assert.ok(down.failures.some(failure => /unreachable/i.test(failure)));
+});
+
+test('doctor uses the Vidnets launcher port unless an explicit URL is configured', () => {
+  const { dir } = bridgeFixture();
+  const secure = path.join(dir, 'secure');
+  fs.mkdirSync(secure);
+  fs.writeFileSync(path.join(secure, 'agent-service.json'), '{"port":5017}');
+  assert.equal(vidnetsStatusUrl({ VIDZEO_RUNTIME_ROOT: dir }), 'http://127.0.0.1:5017');
+  assert.equal(vidnetsStatusUrl({ VIDZEO_RUNTIME_ROOT: dir, MUSE_VIDNETS_URL: 'http://localhost:5019/' }), 'http://localhost:5019');
 });
 
 test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key', () => {

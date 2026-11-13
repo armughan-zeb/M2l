@@ -59,11 +59,11 @@ done
 HOOK_DEF="${MUSE_INBOX_HOOK_DEFINITION:-/host-hooks/vidnets-inbox-watch.json}"
 if [ -z "${MUSE_INFERENCE_COMMAND:-}${MUSE_INFERENCE_URL:-}" ] && [ ! -f "$HOOK_DEF" ]; then
   echo "[vidzeo] WARNING: vidnets-inbox-watch hook definition not found at $HOOK_DEF." >&2
-  echo "[vidzeo] WARNING: the host Muse VM must have the vidnets-inbox-watch definition and execution-state directory mounted (see docker-compose.yml). The daemon start gate will refuse to run until the hook is enabled and recently observed running." >&2
+  echo "[vidzeo] WARNING: the host Muse VM must have the vidnets-inbox-watch definition mounted (see docker-compose.yml). The worker probes a real inbox answer before claiming jobs." >&2
   echo "[vidzeo] HOW TO INSTALL IT:" >&2
   echo "[vidzeo]   1. Create the hook definition from docker/hooks/vidnets-inbox-watch.json.template." >&2
   echo "[vidzeo]   2. Set a real delivery target and enable the hook on the host Muse VM." >&2
-  echo "[vidzeo]   3. Run ./setup.sh to install the script and verify its last-run proof." >&2
+  echo "[vidzeo]   3. Run ./setup.sh to install the script, then run doctor to check live answers." >&2
   echo "[vidzeo]   Full steps: docker/SETUP.md (\"Host Muse hook\")." >&2
   echo "[vidzeo]   Target is <60s per answer; the hard request expiry is 120s. Multi-minute waits are a fault." >&2
 fi

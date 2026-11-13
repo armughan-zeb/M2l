@@ -9,7 +9,7 @@ const { once } = require('node:events');
 const { spawn } = require('node:child_process');
 const { test } = require('node:test');
 const { writeJsonAtomic } = require('../lib/config');
-const { startResidentInbox, probeInbox, pendingRequests, completeLocally } = require('../lib/museInbox');
+const { startResidentInbox, probeInbox, pendingRequests, completeLocally, createInboxReadiness } = require('../lib/museInbox');
 const { runInferenceHttp } = require('../adapters/vidnets');
 const { sleep } = require('../lib/sleep');
 
@@ -70,6 +70,43 @@ test('an enabled hook without an answer fails the readiness probe', async t => {
     VIDNETS_AGENT_BRIDGE_DIR: root, MUSE_INBOX_HOOK_DEFINITION: hook
   }, { timeoutMs: 60, pollMs: 10 }), /did not receive an answer/);
   assert.equal(pendingRequests(root).length, 0);
+});
+
+test('readiness requires a first answer, refreshes without blocking claims, and backs off after failure', async () => {
+  let time = 1;
+  let probes = 0;
+  let finish;
+  const ready = createInboxReadiness({
+    now: () => time,
+    probe: () => {
+      probes += 1;
+      return new Promise(resolve => { finish = resolve; });
+    },
+    onReady() {},
+    onFailure() {}
+  });
+  const startup = ready();
+  const anotherCaller = ready();
+  await Promise.resolve();
+  assert.equal(probes, 1);
+  finish({ elapsedMs: 10 });
+  assert.deepEqual(await Promise.all([startup, anotherCaller]), [true, true]);
+
+  time += 4 * 60000;
+  assert.equal(await ready(), true);
+  assert.equal(probes, 2);
+  assert.equal(await ready(), true);
+  finish(Promise.reject(new Error('Muse is down')));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(await ready(), false);
+  assert.equal(probes, 2);
+
+  time += 5000;
+  const retry = ready();
+  await Promise.resolve();
+  assert.equal(probes, 3);
+  finish({ elapsedMs: 10 });
+  assert.equal(await retry, true);
 });
 
 test('concurrent dispatch handles unknown kinds, skips expired and foreign rows and never dispatches twice', async t => {
@@ -160,6 +197,25 @@ test('HTTP transport preserves a structured verdict and unwraps a multiline narr
     response_format: { type: 'json_object' }
   })), { answer: 'approved', approved: true });
   assert.equal(await runInferenceHttp(root + '/script', {}), script);
+});
+
+test('HTTP transport enforces its deadline when a caller also supplies a cancellation signal', async t => {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.flushHeaders();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const controller = new AbortController();
+  const safetyTimer = setTimeout(() => controller.abort(new Error('fixture safety deadline')), 2000);
+  try {
+    await assert.rejects(runInferenceHttp('http://127.0.0.1:' + server.address().port, {}, {
+      timeoutMs: 250, signal: controller.signal
+    }));
+    assert.equal(controller.signal.aborted, false);
+  } finally { clearTimeout(safetyTimer); }
 });
 
 test('daemon start proves the configured transport before its first CMS claim', async t => {
