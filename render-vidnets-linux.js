@@ -353,6 +353,7 @@ async function main() {
   let lastProgress = -1;
   let lastDetail = '';
   let lastPendingCheck = 0;
+  let pendingCheck = null;
   let statusFailures = 0;
 
   while (true) {
