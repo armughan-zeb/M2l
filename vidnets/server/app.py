@@ -6383,7 +6383,12 @@ def _subject_safe_scene_brain_query(value, fallback, active_subject, domain_anch
         query_terms = {token.rstrip('s') for token in _scene_brain_query_tokens(query)}
         if core & query_terms:
             domain = ''
-            if active.casefold() in {str(domain_anchor).casefold(), collection.casefold()}:
+            if active.casefold() in {str(domain_anchor).casefold(), collection.casefold()} or (
+                not local_section and re.match(
+                    rf"^{re.escape(collection)}\s+(?:from|in|across|around|during)\b",
+                    active, re.IGNORECASE,
+                )
+            ):
                 active = ''
     if not query:
         return query

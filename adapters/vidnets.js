@@ -113,9 +113,9 @@ function buildRequest(job, scriptText, packageDir) {
   // hard-reject. With both flags false, vision still RUNS (visual_
   // understanding + final_visual_gate_mode) and still RANKS (final_score);
   // only named-entity scenes (strict_identity) still require a live
-  // verdict, per scene_requires_visual_verification. The ONE hard rule
-  // lives in the render wrapper, not here: never DELIVER a video with 0
-  // real-media scenes. MUSE_MEDIA_STRICT=1 restores the old strict flags.
+  // verdict, per scene_requires_visual_verification. If real-media recovery
+  // is exhausted, Vidnets keeps the checkpoint for retry. MUSE_MEDIA_STRICT=1
+  // requires visual verification for every scene.
   const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
   const deliveryBudget = Math.max(600, Math.round((Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE) / 1000));
 
@@ -145,7 +145,7 @@ function buildRequest(job, scriptText, packageDir) {
     allow_relevant_stock: true,
     allow_stock_last_resort: true,
     stock_last_resort_in_coordinator: true,
-    stock_video_only: true,
+    stock_video_only: false,
     visual_understanding: true,
     visual_required: strictMedia,
     final_visual_gate_mode: 'run',
@@ -158,7 +158,8 @@ function buildRequest(job, scriptText, packageDir) {
     openrouter_api_key: '',
     strict_retrieval_accuracy: strictMedia,
     fail_on_unresolved_media: true,
-    allow_emergency_media: true,
+    allow_emergency_media: false,
+    media_fallback_policy: 'real_media_only',
     scene_mode: 'Every Beat',
     captions_enabled: options.captionsEnabled !== false,
     font: 'Montserrat-Bold',

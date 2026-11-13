@@ -6387,7 +6387,8 @@ def get_youtube_clips(
                 })
                 if (retryable_cut and len(options) > 1
                         and attempt_audit[idx][-1].get('rejection_reason') in {
-                            'static_image_or_pan', 'still_or_slideshow', 'static_frame_hold',
+                            'static_image_or_pan', 'still_or_slideshow', 'still_or_slideshow_frame',
+                            'static_frame_hold',
                         }):
                     # Explore a fresh master before spending another transfer
                     # on a static guide/slideshow. Intro overlays still get

@@ -497,6 +497,10 @@ async function main() {
         // Name the cause instead of blaming inference: a memory hold
         // (waiting_for_memory / HELD) looks identical in the job item.
         const reasonText = String(item.paused_reason || item.progress_text || 'no reason given');
+        if (reasonText === 'media_contract') {
+          const detail = String(item.error || item.progress_text || 'Real media is missing for one or more scenes.').slice(0, 500);
+          fail(`Vidnets media recovery exhausted for job ${vidnetsJobId}. Saved media and narration are available for retry. ${detail}`);
+        }
         let memoryNote = '';
         if (/memory|held|waiting_for_memory/i.test(reasonText)) {
           try {

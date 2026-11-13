@@ -553,11 +553,12 @@ def test_strict_scene_rejects_unverified_terminal_stock_identity():
             validate_media_plan_for_render_v2(
                 media_plan, scenes, render_resolution=(1280, 720), title="Test",
                 neutral_asset_factory=lambda *_args, **_kwargs: None,
+                allow_emergency_media=False,
             )
 
 
 def test_strict_scene_still_rejects_ordinary_unverified_stock_identity():
-    """The no-vision exception is limited to the explicit terminal rescue lane."""
+    """An ordinary stock candidate also needs verification for a named subject."""
     media_plan = {
         "media_paths": ["ordinary-stock.jpg"],
         "source_labels": ["Stock Media"],
@@ -585,6 +586,7 @@ def test_strict_scene_still_rejects_ordinary_unverified_stock_identity():
             validate_media_plan_for_render_v2(
                 media_plan, scenes, render_resolution=(1280, 720), title="Test",
                 neutral_asset_factory=lambda *_args, **_kwargs: None,
+                allow_emergency_media=False,
             )
 
 
@@ -682,7 +684,7 @@ def test_web_fallback_gets_bounded_tail_before_stock_and_can_be_disabled():
         ) == 0.0
 
 
-def test_mixed_media_youtube_default_target_is_60_percent():
+def test_mixed_media_youtube_default_target_is_30_percent():
     config = {
         "_niche_media_policy": {
             "niche": "science",
@@ -693,14 +695,15 @@ def test_mixed_media_youtube_default_target_is_60_percent():
             },
         },
     }
-    assert _mixed_media_youtube_target_ratio(config) == 0.60
-    indices = _automatic_youtube_scene_indices(
-        config,
-        [f"science scene {index}" for index in range(8)],
-        title="Science",
-        script="A science documentary.",
-    )
-    assert len(indices) == 5
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert _mixed_media_youtube_target_ratio(config) == 0.30
+        indices = _automatic_youtube_scene_indices(
+            config,
+            [f"science scene {index}" for index in range(8)],
+            title="Science",
+            script="A science documentary.",
+        )
+    assert len(indices) == 3
 
 
 def test_oversized_prebuilt_youtube_group_is_capped_and_spread_across_timeline():
@@ -2337,8 +2340,9 @@ def test_youtube_fallback_retries_rejected_quota_candidates(monkeypatch, tmp_pat
 def test_media_stage_never_collapses_to_a_one_second_wall_when_budget_is_spent():
     """An exhausted delivery budget used to hand the media stage a 1s wall,
     terminalising every scene as a graphic fallback. The stage now keeps at
-    least one agent round-trip (600s) for agent jobs and 300s otherwise."""
+    least one agent round-trip for agent jobs and 300s otherwise."""
     import time
+    from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
     from services.delivery_budget import DeliveryBudget
     from services.pipeline_v2_media_adapter import _media_stage_deadline_seconds
 
@@ -2348,6 +2352,6 @@ def test_media_stage_never_collapses_to_a_one_second_wall_when_budget_is_spent()
         return budget
 
     agent_config = {"llm_provider": "external_agent", "_delivery_budget": exhausted_budget()}
-    assert _media_stage_deadline_seconds(agent_config, "Mixed Media") == 600.0
+    assert _media_stage_deadline_seconds(agent_config, "Mixed Media") == AGENT_REQUEST_WALL_SECONDS
     plain_config = {"_delivery_budget": exhausted_budget()}
     assert _media_stage_deadline_seconds(plain_config, "Mixed Media") == 300.0

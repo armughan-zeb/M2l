@@ -170,6 +170,9 @@ test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key
   assert.equal(request.visual_required, false);
   assert.equal(request.strict_retrieval_accuracy, false);
   assert.equal(request.visual_understanding, true);
+  assert.equal(request.stock_video_only, false);
+  assert.equal(request.allow_emergency_media, false);
+  assert.equal(request.media_fallback_policy, 'real_media_only');
   // MUSE_MEDIA_STRICT=1 restores the old hard-required flags.
   const savedStrict = process.env.MUSE_MEDIA_STRICT;
   try {
