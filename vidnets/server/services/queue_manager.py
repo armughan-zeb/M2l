@@ -39,6 +39,8 @@ from config import normalize_generation_config
 from services.cancellation import CancellationContext, JobCancelled
 from services.pipeline_contracts import MediaContractError
 from services.delivery_budget import install_delivery_budget
+from services.pipeline_activity import last_activity as _pipeline_last_activity
+from services.pipeline_activity import reset_activity as _reset_pipeline_activity
 
 # Queue file location
 QUEUE_FILE = Path(
@@ -1040,6 +1042,10 @@ class QueueManager:
                     reset_web_runtime_state(f"queue job {job_id} start")
                 except Exception as reset_exc:
                     print(f"⚠️ Web runtime reset skipped: {reset_exc}")
+                # A new attempt starts from a clean activity clock: work
+                # recorded by the previous attempt must not mask a stall
+                # in this one.
+                _reset_pipeline_activity(f"queue job {job_id} start")
 
                 # Define progress callback
                 _last_progress_save = 0.0
@@ -1124,6 +1130,14 @@ class QueueManager:
                             now = time.monotonic()
                             with heartbeat_lock:
                                 idle_for = now - heartbeat_last_activity
+                            # Lanes record raw activity (web collection,
+                            # downloads, vision rounds) that display
+                            # progress may filter out. A working lane must
+                            # not look idle just because the displayed
+                            # count stands still while it collects.
+                            lane_activity = _pipeline_last_activity()
+                            if lane_activity is not None:
+                                idle_for = min(idle_for, now - lane_activity)
                             if (preparation_stall_seconds > 0 and not delivery_budget.render_started
                                     and idle_for >= preparation_stall_seconds):
                                 stop_for_recovery('preparation_stall', 'Preparation stopped advancing; saving work for retry.')

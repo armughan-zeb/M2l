@@ -2135,7 +2135,13 @@ def _sanitize_user_progress_message_base(fraction, raw_msg):
     # Its count is still a scene-asset phase and must not be mislabeled as a
     # rendered video merely because another worker has advanced the fraction.
     if any(k in msg_lower for k in ['youtube', 'yt-v2', 'yt clips', 'web', 'image', 'stock']):
-        if count_match:
+        # A "retrying N/M unresolved" count is work still to do, not
+        # scenes already checked. Presenting it as "Finding scene N/M"
+        # faked a completed count and poisoned the reporter's per-wave
+        # baseline with a number no wave had reached. (Guarded on
+        # "unresolved" only: a plain "retrying" label keeps its count
+        # per test_progress_does_not_label_failed_image_searches_ready.)
+        if count_match and 'unresolved' not in msg_lower:
             return f"Finding scene {count_match.group(1)}/{count_match.group(2)}"
         return "Finding YouTube footage" if any(k in msg_lower for k in ['youtube', 'yt-v2', 'yt clips']) else ("Finding stock media" if 'stock' in msg_lower else "Finding web images")
     if f >= 0.70 or any(k in msg_lower for k in ['rendering video', 'ffmpeg assembly', 'final mux', 'encoding final', 'finaliz']):
@@ -2237,22 +2243,37 @@ def _make_progress_reporter(raw_callback=None):
         with state_lock:
             stage, detail = _stage_detail(clean_msg)
             if stage and detail:
-                previous = last_stage_detail.get(stage)
-                # Shadow/fallback branches report their own subset counts.
-                # Ignore stale scene counts while allowing a different active
-                # phase (such as captions) to remain visible.
-                if previous and (
-                    detail[0] < previous[0]
-                    or detail[2] < previous[2]
-                ):
-                    return
-                if previous:
+                # A wave is one run of a scene-counting stage, identified
+                # by its scene total. The primary web wave and a later
+                # recovery wave have different totals (121 vs 120 scenes),
+                # and a recovery wave restarts its counter at 1. The old
+                # single-max filter read every report from the new wave
+                # as a stale subset count and dropped it for the whole
+                # wave, so a working 1,440s collection looked idle.
+                # Key the baseline per wave so a new wave reports from 1.
+                key = (stage, detail[1])
+                previous = last_stage_detail.get(key)
+                if previous and (detail[0] < previous[0] or detail[2] < previous[2]):
+                    # A wave that already ran to its total has finished;
+                    # a smaller count after that is the next wave, not a
+                    # shadow branch of the finished one.
+                    if previous[0] >= previous[1]:
+                        last_stage_detail[key] = detail
+                    else:
+                        # Shadow/fallback branches report their own subset
+                        # counts. Ignore stale scene counts while allowing
+                        # a different active phase (such as captions) to
+                        # remain visible.
+                        return
+                elif previous:
                     detail = (
                         max(detail[0], previous[0]),
                         max(detail[1], previous[1]),
                         max(detail[2], previous[2]),
                     )
-                last_stage_detail[stage] = detail
+                    last_stage_detail[key] = detail
+                else:
+                    last_stage_detail[key] = detail
 
             # Never discard a real phase update just because another parallel
             # branch has a larger local fraction. Preserve a monotonic public

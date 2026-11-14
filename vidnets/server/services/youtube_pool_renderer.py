@@ -161,6 +161,7 @@ def _scene_offsets_grid(shift: float) -> tuple:
     """
     return tuple(round(offset + shift, 2) for offset in _SCENE_OFFSET_BASE)
 from .youtube_overlay_policy import preserve_source_overlays
+from .pipeline_activity import record_activity
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
@@ -2692,6 +2693,7 @@ def resolve_pool_first(
         flush=True,
     )
     report_progress(0.40, f"YouTube pool: downloading {len(source_candidates)} shared sources")
+    record_activity("youtube")
 
     for source_id in selected_source_ids:
         candidate = source_candidates[source_id]
@@ -2853,6 +2855,10 @@ def resolve_pool_first(
                 source_paths[completed_source_id] = path
                 ready_sources += 1
             completed_sources += 1
+            # Ground-truth activity for the preparation-stall detector:
+            # a finished download is real work even if the display
+            # pipeline de-duplicates the progress label.
+            record_activity("youtube")
             report_progress(
                 0.40 + 0.12 * (completed_sources / max(1, len(future_sources))),
                 f"YouTube pool: source {completed_sources}/{len(future_sources)} "

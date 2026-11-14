@@ -289,6 +289,30 @@ function readStdin() {
   });
 }
 
+// Name the real paused_reason when retries are exhausted. The old
+// fallthrough blamed every non-memory pause on unanswered inference
+// requests; preparation_stall fired twice on Broken Rail with an empty
+// inbox, and backend_restart fired while the server was still in
+// startup recovery. No pause reason may blame inference unless the
+// wrapper actually saw pending requests go unanswered.
+function describePausedFailure({ vidnetsJobId, reasonText, detail, memoryNote }) {
+  const reason = String(reasonText || 'no reason given');
+  if (reason === 'media_contract') {
+    const text = String(detail || 'Real media is missing for one or more scenes.').slice(0, 500);
+    return `Vidnets media recovery exhausted for job ${vidnetsJobId}. Saved media and narration are available for retry. ${text}`;
+  }
+  if (/memory|held|waiting_for_memory/i.test(reason)) {
+    return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (${reason}) — render held for memory.${memoryNote || ''}`;
+  }
+  if (reason === 'preparation_stall') {
+    return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (preparation_stall) — the preparation-stall detector paused the job after 300s without reported progress. This is a pipeline progress-reporting stall: check the Vidnets server log for the stage that was collecting when it fired.`;
+  }
+  if (reason === 'backend_restart') {
+    return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (backend_restart) — the Vidnets server restarted the job backend and the retries were exhausted before it resumed. Check the server log; this is not an inference problem.`;
+  }
+  return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (${reason}) — see the Vidnets server log for the stage that stopped advancing.`;
+}
+
 async function main() {
   const input = JSON.parse(await readStdin());
   const job = input.job || {};
@@ -492,12 +516,11 @@ async function main() {
       retries += 1;
       if (retries > 3) {
         // Name the cause instead of blaming inference: a memory hold
-        // (waiting_for_memory / HELD) looks identical in the job item.
+        // (waiting_for_memory / HELD) looks identical in the job item,
+        // and so do preparation_stall and backend_restart — both fired
+        // on Broken Rail with an empty inbox.
         const reasonText = String(item.paused_reason || item.progress_text || 'no reason given');
-        if (reasonText === 'media_contract') {
-          const detail = String(item.error || item.progress_text || 'Real media is missing for one or more scenes.').slice(0, 500);
-          fail(`Vidnets media recovery exhausted for job ${vidnetsJobId}. Saved media and narration are available for retry. ${detail}`);
-        }
+        const detail = String(item.error || item.progress_text || 'Real media is missing for one or more scenes.').slice(0, 500);
         let memoryNote = '';
         if (/memory|held|waiting_for_memory/i.test(reasonText)) {
           try {
@@ -506,9 +529,8 @@ async function main() {
             const mem = status?.memory || {};
             memoryNote = ` Vidnets memory: ${mem.admission_state || 'unknown'} (${mem.available_mb ?? '?'} MB available, render needs ~${mem.estimated_worker_mb ?? 384} MB). Free memory or wait for the hold to clear; it is not an inference problem.`;
           } catch { /* memory note stays empty; the reason still names it */ }
-          fail(`Vidnets job ${vidnetsJobId} stayed paused after 3 retries (${reasonText}) — render held for memory.${memoryNote}`);
         }
-        fail(`Vidnets job ${vidnetsJobId} stayed paused after 3 retries (${reasonText}) — likely unanswered inference requests. Check the inbox-watch hook.`);
+        fail(describePausedFailure({ vidnetsJobId, reasonText, detail, memoryNote }));
       }
       // A memory pause is not an inference failure and must not be
       // retried immediately: the server-side memory wait only pauses
@@ -555,4 +577,4 @@ if (require.main === module) {
   main().catch(err => fail(err && err.message ? err.message : String(err)));
 }
 
-module.exports = { countRealScenes, completedMediaCount, checkTempSpace, TEMP_MIN_FREE_MB, TMP_MIN_FREE_MB, shouldAttemptReplan, buildRetryRequest, replanAlreadyUsed, REPLAN_MIN_REMAINING_MS, writeVidnetsProgressFile };
+module.exports = { countRealScenes, completedMediaCount, checkTempSpace, TEMP_MIN_FREE_MB, TMP_MIN_FREE_MB, shouldAttemptReplan, buildRetryRequest, replanAlreadyUsed, REPLAN_MIN_REMAINING_MS, writeVidnetsProgressFile, describePausedFailure };
