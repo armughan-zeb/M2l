@@ -98,3 +98,59 @@ def test_enabled_captions_have_separate_reserved_region():
     assert contract['safe_region'][3] <= .80
     assert contract['caption_region'][1] > contract['safe_region'][3]
 
+
+# ── S8: script-derived caption timings (no Whisper for narration) ───────
+def test_script_words_for_audio_covers_every_word_without_drift():
+    script = " ".join(f"word{i}" for i in range(2754))
+    rows = speech_timing.script_words_for_audio(script, 600.0)
+    assert len(rows) == 2754
+    assert rows[0]["start"] == 0.0
+    assert rows[-1]["end"] == 600.0
+    assert all(rows[i]["start"] < rows[i]["end"] for i in range(len(rows)))
+    assert all(rows[i]["end"] <= rows[i + 1]["start"] + 0.001 for i in range(len(rows) - 1))
+    assert all(row["timing_source"] == "tts_script_timing" for row in rows)
+
+
+def test_script_words_for_audio_reanchors_each_chunk():
+    # Each chunk's words are bounded by that chunk's own measured duration,
+    # so timing errors cannot accumulate across chunks.
+    first = speech_timing.script_words_for_audio("The quick brown fox jumps.", 2.0)
+    second = speech_timing.script_words_for_audio("Over the lazy dog today.", 3.0)
+    assert first[-1]["end"] == 2.0
+    assert second[0]["start"] == 0.0
+    assert second[-1]["end"] == 3.0
+
+
+def test_script_chunk_concat_keeps_offsets_and_source_label(tmp_path):
+    paths = []
+    for index, (frames, text) in enumerate(
+        [(24000, "The quick brown fox jumps."), (36000, "Over the lazy dog today.")]
+    ):
+        path = tmp_path / f"part{index}.wav"
+        with wave.open(str(path), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(24000)
+            audio.writeframes(b"\0\0" * frames)
+        speech_timing.save_speech_timing(
+            path,
+            speech_timing.script_words_for_audio(text, frames / 24000),
+            source="tts_script_timing",
+        )
+        paths.append(str(path))
+    with mock.patch.object(edge_tts_service, "TEMP_DIR", tmp_path):
+        path, duration = edge_tts_service._concat_edge_chunks(paths, 0)
+    assert duration == 2.5
+    words = speech_timing.load_speech_timing(path, duration)
+    assert [row["word"] for row in words] == [
+        "The", "quick", "brown", "fox", "jumps.",
+        "Over", "the", "lazy", "dog", "today.",
+    ]
+    assert words[5]["word"] == "Over" and words[5]["start"] == 1.0
+    assert all(row["timing_source"] == "tts_script_timing" for row in words)
+    aligned, audit = speech_timing.aligned_provider_words(
+        path, "The quick brown fox jumps. Over the lazy dog today.", duration
+    )
+    assert audit["exact_match_ratio"] == 1.0
+    assert len(aligned) == 10
+
