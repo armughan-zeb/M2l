@@ -457,6 +457,7 @@ async function main() {
       }
       log(`Edit plan: ${mediaCount.real}/${mediaCount.total} scenes real media (${mediaCount.verified} Muse-verified), ${mediaCount.graphic} graphic fallback(s)`);
       if (mediaCount.real < mediaCount.total) {
+        const strict = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
         const reason = `Vidnets accepted real media in ${mediaCount.real}/${mediaCount.total} scenes. Every scene needs accepted real media.`;
         const msRemaining = deadline - Date.now();
         const minRemainingMs = Math.max(0, Number(process.env.MUSE_REPLAN_MIN_REMAINING_MS) || REPLAN_MIN_REMAINING_MS);
@@ -477,7 +478,13 @@ async function main() {
           lastPendingCheck = 0;
           continue;
         }
-        fail(replanAttempted ? `${reason} (after one bounded media re-plan)` : reason);
+        if (mediaCount.real === 0) {
+          fail(replanAttempted ? `${reason} (0 real-media scenes after bounded media re-plan)` : `${reason} (0 real-media scenes)`);
+        }
+        if (strict) {
+          fail(replanAttempted ? `${reason} (strict mode, after one bounded media re-plan)` : `${reason} (strict mode)`);
+        }
+        log(`Quality advisory: ${mediaCount.real}/${mediaCount.total} real scenes (${mediaCount.graphic} graphic fallbacks). Delivering technically valid video per production policy.`);
       }
       let thumbnailPath = '';
       const dir = path.dirname(videoPath);

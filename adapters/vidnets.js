@@ -447,12 +447,16 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
       const videoPath = resultVideoPath(item);
       if (!videoPath) throw new Error('Vidnets completed the job without a readable video_path');
       const mediaCount = require('../render-vidnets-linux').completedMediaCount(item, videoPath);
-      if (!mediaCount || mediaCount.real !== mediaCount.total) {
-        throw new Error('Vidnets completed without evidence of accepted real media in every scene');
+      const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
+      if (!mediaCount || mediaCount.real === 0) {
+        throw new Error('Vidnets completed without evidence of accepted real media in any scene');
+      }
+      if (strictMedia && mediaCount.real !== mediaCount.total) {
+        throw new Error(`Vidnets completed without evidence of accepted real media in every scene (${mediaCount.real}/${mediaCount.total} real)`);
       }
       onProgress?.(100, 'Vidnets render complete');
       return { videoPath, vidnetsJobId, packageDir, meta: {
-        engine: 'vidnets', vidnetsJobId, realScenes: mediaCount.real, totalScenes: mediaCount.total
+        engine: 'vidnets', vidnetsJobId, realScenes: mediaCount.real, totalScenes: mediaCount.total, graphicScenes: mediaCount.graphic
       } };
     }
     const cleanupPending = item.status === 'shutdown_timeout' && item.retryable === true && !item.cancel_requested;
