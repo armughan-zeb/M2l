@@ -125,6 +125,76 @@ def test_manager_keeps_partial_success_when_one_engine_fails():
     assert "unavailable" in response.stats[1].error
 
 
+def test_default_engine_order_is_yandex_first():
+    # Yandex bot-walls least, so it is always first; Bing, Flickr and
+    # DuckDuckGo are fallbacks in that order (WEB_ENGINE_PRIORITY).
+    assert UniversalScraperManager.DEFAULT_ENGINES == (
+        "yandex", "bing", "flickr", "duckduckgo",
+    )
+    assert UniversalScraperManager.DEFAULT_ENGINES[0] == "yandex"
+
+
+def test_is_bot_gate_error_matches_known_challenge_messages():
+    from services.web_image.universal_scraper import is_bot_gate_error
+
+    assert is_bot_gate_error(RuntimeError(
+        "DuckDuckGo returned no results after 2 attempts (likely bot-gate interstitial)"
+    ))
+    assert is_bot_gate_error(RuntimeError(
+        "Yandex bot challenge (SmartCaptcha; egress IP gated)"
+    ))
+    assert not is_bot_gate_error(RuntimeError("connection timed out"))
+    assert not is_bot_gate_error(RuntimeError("Bing returned HTTP status 403"))
+
+
+def test_bot_gated_engine_is_skipped_for_the_rest_of_the_run():
+    # DuckDuckGo bot-gates once (its 202 anomaly interstitial). The manager
+    # must not pay its retry/timeout budget again on the next scene.
+    calls = {"duckduckgo": 0, "yandex": 0}
+
+    class BotGatedEngine(_FakeEngine):
+        def search(self, query, limit, page, safe_search):
+            calls[self.name] += 1
+            raise RuntimeError(
+                "DuckDuckGo returned no results after 2 attempts "
+                "(likely bot-gate interstitial)"
+            )
+
+    class CountingEngine(_FakeEngine):
+        def search(self, query, limit, page, safe_search):
+            calls[self.name] += 1
+            return super().search(query, limit, page, safe_search)
+
+    manager = UniversalScraperManager(max_workers=2, engine_timeout_seconds=2)
+    manager._engines = {
+        "yandex": CountingEngine("yandex", rows=1),
+        "duckduckgo": BotGatedEngine("duckduckgo"),
+    }
+    first = manager.search("train wheel", engine_ids=["yandex", "duckduckgo"], limit_per_engine=1)
+    assert first.total == 1
+    assert calls == {"duckduckgo": 1, "yandex": 1}
+    second = manager.search(
+        "train wheel flange", engine_ids=["yandex", "duckduckgo"], limit_per_engine=1
+    )
+    assert second.total == 1
+    # DuckDuckGo was not called again; Yandex still runs.
+    assert calls == {"duckduckgo": 1, "yandex": 2}
+    assert all(stat.engine != "duckduckgo" for stat in second.stats)
+
+
+def test_ordinary_engine_failure_is_not_sticky():
+    # A transport failure (not a bot challenge) must not disable the engine
+    # for the rest of the run; it may recover on the next scene.
+    manager = UniversalScraperManager(max_workers=2, engine_timeout_seconds=2)
+    manager._engines = {
+        "good": _FakeEngine("good", rows=1),
+        "bad": _FakeEngine("bad", fail=True),
+    }
+    manager.search("royal family", engine_ids=["good", "bad"], limit_per_engine=1)
+    second = manager.search("royal family", engine_ids=["good", "bad"], limit_per_engine=1)
+    assert any(stat.engine == "bad" and not stat.success for stat in second.stats)
+
+
 def test_manager_converts_future_timeout_into_partial_response():
     manager = UniversalScraperManager(max_workers=2, engine_timeout_seconds=1)
     manager._engines = {
