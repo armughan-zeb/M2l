@@ -90,6 +90,7 @@ _flickr_session: Optional[requests.Session] = None
 # from a legitimate zero-result query.
 _last_search_network_failed: bool = False
 _last_search_network_error: str = ""
+_flickr_api_key_invalid: bool = False
 
 
 def flickr_last_search_network_failure() -> Tuple[bool, str]:
@@ -369,9 +370,19 @@ def search_flickr_api(
     q = re.sub(r"\s+", " ", (query or "").strip())
     if not q or len(q) < 2:
         return []
-    global _last_search_network_failed, _last_search_network_error
+    global _last_search_network_failed, _last_search_network_error, _flickr_api_key_invalid
     _last_search_network_failed = False
     _last_search_network_error = ""
+
+    if _flickr_api_key_invalid:
+        html_rows = _search_flickr_html(q, limit=limit, min_views=min_views)
+        if html_rows:
+            _last_search_network_failed = False
+            _last_search_network_error = ""
+            return html_rows
+        _last_search_network_failed = True
+        _last_search_network_error = "flickr 100: Invalid API Key (Key not found)"
+        return []
 
     api_key = _resolve_api_key()
     session = _get_session()
@@ -409,6 +420,9 @@ def search_flickr_api(
                     if code in {100, 105, 429} or "rate" in message.lower():
                         network_failed = True
                     data = None
+                    if code in {100, 105}:
+                        _flickr_api_key_invalid = True
+                        break
                     if last_status not in {408, 425, 429, 500, 502, 503, 504}:
                         last_status = 429
                 else:

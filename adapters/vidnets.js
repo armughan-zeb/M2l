@@ -399,7 +399,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   // (elapsed seconds) so it is not deduped as a repeat.
   const heartbeatMs = Math.max(60000, Number(process.env.MUSE_PROGRESS_HEARTBEAT_MS) || 300000);
   const deadline = Date.now() + renderBudgetMs(job);
-  const pollMs = Math.max(1000, Number(process.env.MUSE_VIDNETS_POLL_MS) || 4000);
+  const pollMs = Math.max(500, Number(process.env.MUSE_VIDNETS_POLL_MS) || 1000);
   let statusFailures = 0;
 
   while (true) {

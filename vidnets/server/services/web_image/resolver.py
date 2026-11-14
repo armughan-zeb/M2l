@@ -854,10 +854,20 @@ def _report_provider_failure(source_name: str, exc: BaseException) -> None:
     health = _ACTIVE_PROVIDER_HEALTH
     if health is not None:
         reason = f"{type(exc).__name__}: {str(exc)[:100]}"
+        text = str(exc).lower()
         status = re.search(r"\b(?:HTTP(?: status)?\s*|status\s*)(\d{3})\b", str(exc), re.I)
-        if status and int(status.group(1)) in {
-            401, 403, 404, 410, 429, 451, 500, 502, 503, 504,
-        }:
+        status_code = int(status.group(1)) if status else 0
+        is_definitive = (
+            status_code in {401, 403, 404, 410, 429, 451, 500, 502, 503, 504}
+            or "flickr 100" in text
+            or any(marker in text for marker in (
+                "bot-gate", "bot check", "bot challenge", "robot check",
+                "smartcaptcha", "captcha", "unparseable json", "vqd token",
+                "invalid api key", "key not found", "unauthorized", "forbidden",
+                "circuit open", "ratelimit", "rate limit"
+            ))
+        )
+        if is_definitive:
             health.trip(source_name, reason)
         else:
             health.note_failure(source_name, reason)
@@ -1142,6 +1152,10 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
     try:
         if source_name == "openverse":
             candidates = _OPENVERSE_SOURCE.search(query, limit=20)
+            if not candidates and getattr(_OPENVERSE_SOURCE, "_circuit_open", False):
+                health = _ACTIVE_PROVIDER_HEALTH
+                if health is not None:
+                    health.trip("openverse", "Openverse circuit open (504 or unauthenticated)")
         elif source_name == "wikimedia":
             candidates = _WIKIMEDIA_SOURCE.search(query, limit=20)
             candidates = _WIKIMEDIA_SOURCE.enrich_rights(candidates, limit=6)
@@ -1166,6 +1180,10 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
             candidates = _SEARXNG_SOURCE.search(query, limit=20)
         elif source_name == "duckduckgo":
             candidates = _DUCKDUCKGO_SOURCE.search(query, limit=20)
+            if not candidates and getattr(_DUCKDUCKGO_SOURCE, "_circuit_open", False):
+                health = _ACTIVE_PROVIDER_HEALTH
+                if health is not None:
+                    health.trip("duckduckgo", "DuckDuckGo circuit open (bot gate)")
         elif source_name == "reddit":
             candidates = _REDDIT_SOURCE.search(query, limit=20)
             return [{

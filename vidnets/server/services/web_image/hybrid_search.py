@@ -504,6 +504,9 @@ def search_bing(query: str, limit: int = 36) -> List[Dict]:
     return _relevance_gate(all_results[:limit * 2], q)
 
 
+_ddg_down_until: float = 0.0
+
+
 # ── URL DISCOVERY: DuckDuckGo (requests) ────────────────────────────
 def search_ddg(query: str, limit: int = 36) -> List[Dict]:
     """Search DuckDuckGo synchronously.
@@ -516,6 +519,10 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
     query (search_hybrid), so raising here makes the failure visible
     without changing the fallback behaviour.
     """
+    global _ddg_down_until
+    if time.monotonic() < _ddg_down_until:
+        raise RuntimeError("DDG circuit open (cooldown active after bot check/error)")
+
     q = re.sub(r"\s+", " ", (query or "").strip())
     if not q:
         return []
@@ -527,14 +534,17 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
     try:
         r = _request_get_with_retries(session, DUCKDUCKGO_HOMEPAGE, params={"q": q, "kp": "1"}, timeout=10)
     except Exception as exc:
+        _ddg_down_until = time.monotonic() + 600.0
         raise RuntimeError(f"DDG homepage unreachable: {type(exc).__name__}: {exc}") from exc
     if r is None:
+        _ddg_down_until = time.monotonic() + 600.0
         raise RuntimeError("DDG homepage unreachable after retries")
     token_match = (
         re.search(r"vqd=['\"]?([0-9A-Za-z\-_]+)['\"]?", r.text)
         or re.search(r"vqd=([0-9A-Za-z\-_]+)&", r.text)
     )
     if not token_match:
+        _ddg_down_until = time.monotonic() + 600.0
         raise RuntimeError("DDG vqd token unavailable (bot check or markup change)")
     vqd = token_match.group(1)
 
@@ -552,12 +562,15 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
             timeout=10,
         )
     except Exception as exc:
+        _ddg_down_until = time.monotonic() + 600.0
         raise RuntimeError(f"DDG image API failed: {type(exc).__name__}: {exc}") from exc
     if r is None:
+        _ddg_down_until = time.monotonic() + 600.0
         raise RuntimeError("DDG image API unreachable after retries")
     try:
         payload = r.json()
     except Exception as exc:
+        _ddg_down_until = time.monotonic() + 600.0
         raise RuntimeError(f"DDG image API returned unparseable JSON: {type(exc).__name__}: {exc}") from exc
 
     results = []
@@ -615,6 +628,8 @@ def search_hybrid(
         # engine must cost only its own rows, and the failure is logged
         # with its error class instead of swallowed.
         for engine_name, engine_fn in (("bing", search_bing), ("ddg", search_ddg)):
+            if engine_name == "ddg" and time.monotonic() < _ddg_down_until:
+                continue
             try:
                 engine_results = engine_fn(q, limit_per_query)
             except Exception as exc:
