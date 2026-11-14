@@ -310,6 +310,10 @@ async function serviceInbox(vidnetsJobId, workDir, transport, signal, handled) {
       await answerOne(row, workDir, transport, signal, state);
       state.done = true;
     } catch (error) {
+      if (/already answered|expired/i.test(error.message)) {
+        state.done = true;
+        return;
+      }
       if (signal?.aborted) throw error;
       state.retryAt = Date.now() / 1000 + Math.min(8, 2 ** (state.attempts - 1));
       log.warn(`Vidnets inference request ${String(row.id).slice(0, 8)} failed: ${error.message}`);
