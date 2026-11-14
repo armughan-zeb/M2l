@@ -14645,7 +14645,7 @@ def _fill_strict_visual_delivery_fallback(
         _config_bool((job_config or {}).get("strict_retrieval_accuracy"), False)
         or _config_bool((job_config or {}).get("visual_required"), False)
     )
-    if (
+    if not grounded_graphics_allowed(job_config) and (
         (strict_real_media_job and not _config_bool(
             (job_config or {}).get("allow_grounded_graphic_fallback_strict"), False
         ))

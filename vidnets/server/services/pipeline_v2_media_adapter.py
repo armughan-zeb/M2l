@@ -7858,6 +7858,115 @@ def validate_media_plan_for_render_v2(
             continue
         if valid:
             continue
+        # Reuse real media only when its existing review covers this exact
+        # requirement and these bytes. A decodable emergency plate must never
+        # become a "borrowed verified" source for the rest of the documentary.
+        # Verified reuse of real media comes before grounded graphics or error gates.
+        target_requirement = _scene_value(scene, 'visual_requirement', {})
+        target_strict = bool(isinstance(target_requirement, Mapping) and target_requirement.get('strict_identity'))
+        def _is_video_ext(asset_path: str) -> bool:
+            return os.path.splitext(str(asset_path).lower())[1] in {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+
+        def eligible_donor(i, p):
+            if not p or i == index or is_synthetic_media(p, labels[i]):
+                return False
+            # AGENTS.md: Exact YouTube clips remain single-use.
+            if _is_video_ext(str(p)):
+                return False
+            donor = resolution_rows[i] if i < len(resolution_rows) and isinstance(resolution_rows[i], dict) else {}
+            provider = str(donor.get('provider') or '').casefold()
+            if provider in {'graphic', 'neutral', 'generated_graphic', 'youtube', 'youtube clips', 'yt'}:
+                return False
+            if not _validate_local_asset(str(p))[0]:
+                return False
+            if paths.count(p) >= 2:
+                return False
+            donor_decision = donor.get("visual_decision") or {}
+            if donor_decision.get("accepted") is False or donor_decision.get("fatal_mismatch") or donor_decision.get("entity_conflict"):
+                return False
+            if str(donor.get("status") or "").strip().lower() in {"rejected", "reject", "failed"}:
+                return False
+            if target_strict:
+                donor_req = donor.get('visual_requirement') if isinstance(donor, Mapping) else {}
+                donor_entity = str((donor_req or {}).get('canonical_entity') or '').strip().casefold()
+                target_entity = str(target_requirement.get('canonical_entity') or '').strip().casefold()
+                req_subject = str(target_requirement.get('subject_type') or '').strip().casefold()
+                if req_subject in {'person', 'named_person', 'celebrity', 'politician'}:
+                    if not _has_bound_pixel_review(target_requirement, donor, p):
+                        return False
+                elif target_entity and donor_entity and target_entity != donor_entity:
+                    return False
+                return not _visual_requirement_issue(scene, donor, None, labels[i])
+            return True
+        valid_candidate_indices = [
+            i for i, p in enumerate(paths)
+            if eligible_donor(i, p)
+        ]
+        if valid_candidate_indices:
+            # AGENTS.md: prefer non-adjacent appearances to prevent back-to-back repeats
+            nearest_idx = min(valid_candidate_indices, key=lambda i: (0 if abs(i - index) > 1 else 1, abs(i - index)))
+            borrowed_path = paths[nearest_idx]
+            paths[index] = borrowed_path
+            labels[index] = str(labels[nearest_idx]).split(' (nearest documentary fallback)')[0] + ' (verified reuse)'
+            if index < len(resolution_rows) and isinstance(resolution_rows[index], dict):
+                donor = dict(resolution_rows[nearest_idx]) if nearest_idx < len(resolution_rows) else {}
+                scene_fields = {key: resolution_rows[index].get(key) for key in
+                                ('scene_index', 'scene_id', 'container_id', 'contract_hash', 'final_scene_context')}
+                resolution_rows[index] = {**donor, **scene_fields, **{
+                    "candidate_id": f"borrowed:{nearest_idx}:{_scene_value(scene, 'scene_id', index)}",
+                    "selected_path": str(borrowed_path),
+                    "path": str(borrowed_path),
+                    "provider": donor.get('provider') or 'web',
+                    "status": "accepted",
+                    "resolution_kind": "verified_same_requirement_reuse",
+                    "verification_status": "verified_reuse",
+                    "fallback_reason": f"borrowed_from_scene_{nearest_idx}:{reason}",
+                    "asset_fingerprint": _asset_fingerprint(str(borrowed_path)),
+                }}
+            continue
+
+        if allow_grounded_graphics:
+            neutral_kwargs = {
+                "title": title,
+                "scene_text": str(_scene_value(scene, "scene_id", "")),
+                "index": index + 1,
+            }
+            try:
+                neutral_path = neutral_asset_factory(
+                    render_resolution,
+                    root_dir=run_root,
+                    **neutral_kwargs,
+                )
+            except TypeError:
+                neutral_path = neutral_asset_factory(render_resolution, **neutral_kwargs)
+            neutral_valid, neutral_reason, neutral_media_type = _validate_local_asset(
+                str(neutral_path or "")
+            )
+            if neutral_valid:
+                paths[index] = str(neutral_path)
+                labels[index] = "Grounded Graphic Fallback"
+                degraded.append(index)
+                scene_id = str(_scene_value(scene, "scene_id", index))
+                fingerprint = _asset_fingerprint(str(neutral_path))
+                if index < len(resolution_rows) and isinstance(resolution_rows[index], dict):
+                    resolution_rows[index].update({
+                        "candidate_id": f"graphic:grounded_terminal:{index}:{scene_id}",
+                        "selected_path": str(neutral_path),
+                        "path": str(neutral_path),
+                        "provider": "graphic",
+                        "status": "degraded",
+                        "verification_status": "grounded_graphic_fallback",
+                        "resolution_kind": "grounded_graphic_fallback",
+                        "fallback_reason": f"terminal_grounded_graphic_after_real_media_exhausted:{reason}",
+                        "asset_fingerprint": fingerprint,
+                        "graphic_fallback": {
+                            "schema_version": "graphic_fallback.v1",
+                            "scene_index": index,
+                            "grounded": True,
+                        },
+                    })
+                continue
+
         if not allow_emergency_media:
             failure_snapshot_path = ""
             if run_root:
@@ -7911,70 +8020,6 @@ def validate_media_plan_for_render_v2(
                 f"V2 scene {_scene_value(scene, 'scene_id', index)} has no verified real media.",
                 details,
             )
-        # Reuse real media only when its existing review covers this exact
-        # requirement and these bytes. A decodable emergency plate must never
-        # become a "borrowed verified" source for the rest of the documentary.
-        target_requirement = _scene_value(scene, 'visual_requirement', {})
-        target_strict = bool(isinstance(target_requirement, Mapping) and target_requirement.get('strict_identity'))
-        def _is_video_ext(asset_path: str) -> bool:
-            return os.path.splitext(str(asset_path).lower())[1] in {".mp4", ".mov", ".mkv", ".webm", ".avi"}
-
-        def eligible_donor(i, p):
-            if not p or i == index or is_synthetic_media(p, labels[i]):
-                return False
-            # AGENTS.md: Exact YouTube clips remain single-use.
-            if _is_video_ext(str(p)):
-                return False
-            donor = resolution_rows[i] if i < len(resolution_rows) and isinstance(resolution_rows[i], dict) else {}
-            provider = str(donor.get('provider') or '').casefold()
-            if provider in {'graphic', 'neutral', 'generated_graphic', 'youtube', 'youtube clips', 'yt'}:
-                return False
-            if not _validate_local_asset(str(p))[0]:
-                return False
-            if paths.count(p) >= 2:
-                return False
-            donor_decision = donor.get("visual_decision") or {}
-            if donor_decision.get("accepted") is False or donor_decision.get("fatal_mismatch") or donor_decision.get("entity_conflict"):
-                return False
-            if str(donor.get("status") or "").strip().lower() in {"rejected", "reject", "failed"}:
-                return False
-            if target_strict:
-                donor_req = donor.get('visual_requirement') if isinstance(donor, Mapping) else {}
-                donor_entity = str((donor_req or {}).get('canonical_entity') or '').strip().casefold()
-                target_entity = str(target_requirement.get('canonical_entity') or '').strip().casefold()
-                req_subject = str(target_requirement.get('subject_type') or '').strip().casefold()
-                if req_subject in {'person', 'named_person', 'celebrity', 'politician'}:
-                    if not _has_bound_pixel_review(target_requirement, donor, p):
-                        return False
-                elif target_entity and donor_entity and target_entity != donor_entity:
-                    return False
-                return not _visual_requirement_issue(scene, donor, None, labels[i])
-            return True
-        valid_candidate_indices = [
-            i for i, p in enumerate(paths)
-            if eligible_donor(i, p)
-        ]
-        if valid_candidate_indices:
-            nearest_idx = min(valid_candidate_indices, key=lambda i: abs(i - index))
-            borrowed_path = paths[nearest_idx]
-            paths[index] = borrowed_path
-            labels[index] = str(labels[nearest_idx]).split(' (nearest documentary fallback)')[0] + ' (verified reuse)'
-            if index < len(resolution_rows) and isinstance(resolution_rows[index], dict):
-                donor = dict(resolution_rows[nearest_idx]) if nearest_idx < len(resolution_rows) else {}
-                scene_fields = {key: resolution_rows[index].get(key) for key in
-                                ('scene_index', 'scene_id', 'container_id', 'contract_hash', 'final_scene_context')}
-                resolution_rows[index] = {**donor, **scene_fields, **{
-                    "candidate_id": f"borrowed:{nearest_idx}:{_scene_value(scene, 'scene_id', index)}",
-                    "selected_path": str(borrowed_path),
-                    "path": str(borrowed_path),
-                    "provider": donor.get('provider') or 'web',
-                    "status": "accepted",
-                    "resolution_kind": "verified_same_requirement_reuse",
-                    "verification_status": "verified_reuse",
-                    "fallback_reason": f"borrowed_from_scene_{nearest_idx}:{reason}",
-                    "asset_fingerprint": _asset_fingerprint(str(borrowed_path)),
-                }}
-            continue
 
         neutral_kwargs = {
             "title": title,

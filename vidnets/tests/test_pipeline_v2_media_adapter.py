@@ -2371,3 +2371,122 @@ def test_media_stage_never_collapses_to_a_one_second_wall_when_budget_is_spent()
     assert _media_stage_deadline_seconds(agent_config, "Mixed Media") == AGENT_REQUEST_WALL_SECONDS
     plain_config = {"_delivery_budget": exhausted_budget()}
     assert _media_stage_deadline_seconds(plain_config, "Mixed Media") == 300.0
+
+
+def test_unresolved_scene_reuses_verified_real_donor_before_error_gate(tmp_path):
+    """When a scene has no real media after recovery, an eligible real-media donor
+    from the project is reused before the emergency media gate can fail the job."""
+    from services.pipeline_v2_media_adapter import validate_media_plan_for_render_v2
+
+    img0 = tmp_path / "real_0.jpg"
+    img0.write_bytes(b"real image content 0")
+    img1 = tmp_path / "real_1.jpg"
+    img1.write_bytes(b"real image content 1")
+
+    plan = {
+        "media_paths": [str(img0), str(img1), ""],
+        "source_labels": ["Web Images", "Web Images", ""],
+        "metadata": {
+            "source_lane_policy": {"mode": "Mixed Media"},
+            "media_resolution_v2": [
+                {
+                    "scene_index": 0,
+                    "scene_id": "scene-0",
+                    "path": str(img0),
+                    "selected_path": str(img0),
+                    "provider": "web",
+                    "status": "accepted",
+                    "visual_decision": {"accepted": True},
+                },
+                {
+                    "scene_index": 1,
+                    "scene_id": "scene-1",
+                    "path": str(img1),
+                    "selected_path": str(img1),
+                    "provider": "web",
+                    "status": "accepted",
+                    "visual_decision": {"accepted": True},
+                },
+                {
+                    "scene_index": 2,
+                    "scene_id": "scene-2",
+                    "path": "",
+                    "selected_path": "",
+                    "provider": "web",
+                    "status": "rejected",
+                },
+            ],
+        },
+    }
+
+    def fake_validate(p):
+        if not str(p or "").strip():
+            return False, "missing_asset_path", ""
+        return True, "ok", "image"
+
+    with mock.patch("services.pipeline_v2_media_adapter._validate_renderable_asset", side_effect=fake_validate):
+        result = validate_media_plan_for_render_v2(
+            plan,
+            [{"scene_id": "scene-0"}, {"scene_id": "scene-1"}, {"scene_id": "scene-2"}],
+            render_resolution=(1280, 720),
+            title="Broken Rail Physics",
+            neutral_asset_factory=lambda *_args, **_kwargs: None,
+            allow_emergency_media=False,
+            allow_grounded_graphics=False,
+        )
+
+    # Scene 2 borrowed non-adjacent img0 (abs(0-2) = 2 > 1)
+    assert result["media_paths"][2] == str(img0)
+    assert "verified reuse" in result["source_labels"][2]
+    row2 = result["metadata"]["media_resolution_v2"][2]
+    assert row2["verification_status"] == "verified_reuse"
+    assert row2["selected_path"] == str(img0)
+
+
+def test_unresolved_scene_uses_grounded_graphic_when_no_donor_and_emergency_media_disabled(tmp_path):
+    """When no real-media donor exists, grounded graphics finish the unresolved scene
+    without tripping the emergency media error gate."""
+    from services.pipeline_v2_media_adapter import validate_media_plan_for_render_v2
+
+    plate = tmp_path / "grounded_plate.png"
+    plate.write_bytes(b"grounded plate png content")
+
+    plan = {
+        "media_paths": [""],
+        "source_labels": [""],
+        "metadata": {
+            "source_lane_policy": {"mode": "Mixed Media"},
+            "media_resolution_v2": [
+                {
+                    "scene_index": 0,
+                    "scene_id": "scene-0",
+                    "path": "",
+                    "selected_path": "",
+                    "provider": "web",
+                    "status": "rejected",
+                },
+            ],
+        },
+    }
+
+    def fake_validate(p):
+        if not str(p or "").strip():
+            return False, "missing_asset_path", ""
+        return True, "ok", "image"
+
+    with mock.patch("services.pipeline_v2_media_adapter._validate_renderable_asset", side_effect=fake_validate):
+        result = validate_media_plan_for_render_v2(
+            plan,
+            [{"scene_id": "scene-0"}],
+            render_resolution=(1280, 720),
+            title="Broken Rail Physics",
+            neutral_asset_factory=lambda *_args, **_kwargs: str(plate),
+            allow_emergency_media=False,
+            allow_grounded_graphics=True,
+        )
+
+    assert result["media_paths"][0] == str(plate)
+    assert result["source_labels"][0] == "Grounded Graphic Fallback"
+    row0 = result["metadata"]["media_resolution_v2"][0]
+    assert row0["verification_status"] == "grounded_graphic_fallback"
+

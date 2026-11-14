@@ -6236,13 +6236,14 @@ def _visual_retry_scene(
             fq = str(fq or "").strip()
             if fq and fq.lower() not in original_set and fq not in queries:
                 queries.append(fq)
-    if not queries and subject:
+    if not queries and (subject or global_topic):
+        anchor = subject or global_topic
         for fq in (
-            f"{subject} documentary photograph",
-            f"{subject} archival footage still",
-            f"{subject} historical event photo",
+            f"{anchor} documentary photograph",
+            f"{anchor} archival footage still",
+            f"{anchor} historical event photo",
         ):
-            if fq.lower() not in original_set:
+            if fq.lower() not in original_set and fq not in queries:
                 queries.append(fq)
     queries = queries[:6]
     if not queries:
