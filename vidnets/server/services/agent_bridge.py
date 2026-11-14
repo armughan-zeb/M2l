@@ -88,7 +88,7 @@ def _request_lock(path):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def read_request(request_id, owner_id):
+def read_request(request_id, owner_id, *, locked=False):
     path = _request_path(request_id)
     if not path.is_file():
         raise ValueError('Agent request was not found.')
@@ -97,7 +97,14 @@ def read_request(request_id, owner_id):
         raise PermissionError('This agent request belongs to another account.')
     # Deadline is authoritative, even if the generation process exited.
     if row['state'] == 'pending' and row['expires_at'] <= time.time():
-        row['state'] = 'expired'
+        if not locked:
+            with _request_lock(path):
+                return read_request(request_id, owner_id, locked=True)
+        if path.with_name('response.json').exists():
+            row['state'] = 'answered'
+        else:
+            row['state'] = 'expired'
+        atomic_json(path, row)
     return row
 
 
@@ -120,7 +127,7 @@ def complete_request(request_id, owner_id, content, error=''):
     if not path.exists():
         raise ValueError('Agent request was not found.')
     with _request_lock(path):
-        row = read_request(request_id, owner_id)
+        row = read_request(request_id, owner_id, locked=True)
         if row['state'] != 'pending' or path.with_name('response.json').exists():
             raise ValueError('This request expired or was already answered.')
         if error:

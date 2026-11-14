@@ -3,7 +3,28 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { startResidentInbox, createInboxReadiness } = require('../lib/museInbox');
+const { startResidentInbox, createInboxReadiness, pendingSummary } = require('../lib/museInbox');
+
+test('local diagnostic reports only live requests for the requested job and owner', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-summary-'));
+  try {
+    const now = Date.now() / 1000;
+    for (let index = 1; index <= 8; index++) {
+      const id = index.toString(16).padStart(32, '0');
+      const dir = path.join(root, id);
+      fs.mkdirSync(dir);
+      const row = { id, owner_id: index === 3 ? 'other' : 'local-user',
+        job_id: index === 4 ? 'other' : 'job', state: index === 5 ? 'answered' : 'pending',
+        created_at: now - index, expires_at: now + (index === 6 ? -1 : 60) };
+      fs.writeFileSync(path.join(dir, 'request.json'), JSON.stringify(row));
+      if (index === 7) fs.writeFileSync(path.join(dir, 'response.json'), '{}');
+      if (index === 8) fs.writeFileSync(path.join(dir, 'request.json'), '{');
+    }
+    const result = await pendingSummary(root, 'job');
+    assert.deepEqual(result.rows.map(row => row.id), ['2'.padStart(32, '0'), '1'.padStart(32, '0')]);
+    assert.ok(result.elapsedMs >= 0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test('three expired inbox requests invalidate readiness until a fresh probe', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-expiry-'));

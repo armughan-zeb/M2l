@@ -28,7 +28,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { bridgeRoot, checkMuseInferenceBridge } = require('./lib/museInference');
-const { pendingRequests } = require('./lib/museInbox');
+const { pendingSummary } = require('./lib/museInbox');
 const { writeJsonAtomic } = require('./lib/config');
 const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs } = require('./lib/vidnetsSubmission');
 
@@ -354,6 +354,7 @@ async function main() {
   let lastDetail = '';
   let lastPendingCheck = 0;
   let pendingCheck = null;
+  let pendingFailures = 0;
   let statusFailures = 0;
 
   while (true) {
@@ -385,17 +386,20 @@ async function main() {
     }
 
     // Inbox diagnostics must not delay progress polling.
-    if (!pendingCheck && Date.now() - lastPendingCheck >= Math.max(pollMs, 10000)) {
+    const pendingInterval = Math.min(60000, Math.max(pollMs, 10000) * 2 ** Math.min(pendingFailures, 3));
+    if (!pendingCheck && Date.now() - lastPendingCheck >= pendingInterval) {
       lastPendingCheck = Date.now();
       const polledJob = vidnetsJobId;
-      pendingCheck = vidnets(['pending'], 8000).then(pending => {
-        const rows = Array.isArray(pending.requests) ? pending.requests : [];
-        const mine = rows.filter(row => String(row.job_id || '') === polledJob);
+      pendingCheck = pendingSummary(bridgeRoot(), polledJob).then(({ rows: mine, elapsedMs }) => {
+        pendingFailures = 0;
         if (mine.length && polledJob === vidnetsJobId) {
           const oldest = mine.reduce((age, row) => Math.max(age, Date.now() / 1000 - (Number(row.created_at) || Date.now() / 1000)), 0);
-          log(`Waiting for Muse: ${mine.length} pending request(s), oldest ${Math.floor(oldest)}s (${mine[0].operation || mine[0].kind || 'inference'})`);
+          log(`Waiting for Muse: ${mine.length} pending request(s), oldest ${Math.floor(oldest)}s (${mine[0].operation || mine[0].kind || 'inference'}; local scan ${elapsedMs}ms)`);
         }
-      }).catch(error => log('Inbox pending check failed (non-fatal): ' + error.message))
+      }).catch(error => {
+        pendingFailures += 1;
+        log(`Inbox local scan failed (attempt ${pendingFailures}, next check within 60s): ${error.message}`);
+      })
         .finally(() => { pendingCheck = null; });
     }
     const item = snapshot.item || {};
