@@ -50,6 +50,8 @@ try:  # Optional DDG scraper dependency.
 except Exception:  # pragma: no cover - optional in minimal deployments
     DDGS = None
 
+from .source_broker import WEB_ENGINE_PRIORITY
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -689,6 +691,22 @@ class FlickrEngine(_Engine):
         return out
 
 
+_BOT_GATE_MARKERS = ("bot-gate", "bot challenge", "smartcaptcha", "robot check", "captcha")
+
+
+def is_bot_gate_error(exc: BaseException) -> bool:
+    """True when an engine failure is a definitive bot/robot challenge.
+
+    A bot-gated engine will not return results for any further scene in this
+    run (DuckDuckGo's 202 anomaly interstitial, Yandex SmartCaptcha), so the
+    manager skips it instead of paying its retry/timeout budget once per
+    scene. Ordinary transport errors (timeouts, 5xx) are NOT bot-gates and
+    keep their normal per-query retry behaviour.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _BOT_GATE_MARKERS)
+
+
 class UniversalScraperManager:
     """Run the supplied four-engine search strategy as a resolver lane.
 
@@ -701,7 +719,11 @@ class UniversalScraperManager:
     slot on an engine that cannot return results.
     """
 
-    DEFAULT_ENGINES = ("yandex", "bing", "duckduckgo", "flickr")
+    # Canonical engine order: Yandex first (it bot-walls least), then Bing,
+    # Flickr, DuckDuckGo. See WEB_ENGINE_PRIORITY in source_broker.py. The
+    # manager interleaves results in this order, so Yandex rows surface first
+    # and a bot-gated DuckDuckGo never outranks a working Flickr lane.
+    DEFAULT_ENGINES = WEB_ENGINE_PRIORITY
 
     def __init__(
         self,
@@ -744,6 +766,19 @@ class UniversalScraperManager:
         )
         self._lock = threading.Lock()
         self._last_response: Optional[UniversalSearchResponse] = None
+        # Engines that hit a definitive bot/robot challenge are skipped for
+        # the rest of this run instead of burning their retry/timeout budget
+        # once per scene. Keyed by engine name, value is the monotonic time
+        # after which the engine may be tried again (a gated egress IP
+        # rarely recovers mid-job; a fresh manager starts clean).
+        self._bot_gated: Dict[str, float] = {}
+        try:
+            self._bot_gate_skip_seconds = max(
+                0.0,
+                float(os.environ.get("VIDZEO_UNIVERSAL_BOT_GATE_SKIP_SECONDS", "900") or 900),
+            )
+        except (TypeError, ValueError):
+            self._bot_gate_skip_seconds = 900.0
 
     @property
     def engines(self) -> Tuple[str, ...]:
@@ -772,6 +807,17 @@ class UniversalScraperManager:
         clean = re.sub(r"\s+", " ", str(query or "")).strip()
         selected = [str(e).strip().lower() for e in (engine_ids or self.DEFAULT_ENGINES)]
         selected = list(dict.fromkeys(e for e in selected if e in self._engines))
+        # Skip engines that hit a definitive bot/robot challenge earlier in
+        # this run. A bot-gated engine returns nothing for any further scene,
+        # so trying it again only burns its retry budget and a worker slot.
+        now = time.monotonic()
+        with self._lock:
+            gated = [e for e in selected if self._bot_gated.get(e, 0.0) > now]
+            selected = [e for e in selected if e not in gated]
+        if gated:
+            self._log(
+                f"[universal] skipping bot-gated engine(s) for this run: {','.join(gated)}"
+            )
         limit = max(1, min(50, int(limit_per_engine or 20)))
         if not clean or not selected:
             return UniversalSearchResponse(clean, 0, [], [])
@@ -809,6 +855,18 @@ class UniversalScraperManager:
             except Exception as exc:
                 duration = int((time.perf_counter() - started) * 1000)
                 error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                # A definitive bot/robot challenge will not clear for the
+                # next scene, so skip this engine for the rest of the run
+                # instead of paying its retry/timeout budget on every scene.
+                if is_bot_gate_error(exc):
+                    with self._lock:
+                        self._bot_gated[engine_name] = (
+                            time.monotonic() + self._bot_gate_skip_seconds
+                        )
+                    self._log(
+                        f"[universal] {engine_name}: bot-gated ({error}); "
+                        f"skipping for {self._bot_gate_skip_seconds:.0f}s"
+                    )
                 if batch_finished.is_set():
                     self._log(
                         f"[universal] {engine_name}: late failure ignored after batch deadline "
