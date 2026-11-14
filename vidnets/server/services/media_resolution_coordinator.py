@@ -7,6 +7,7 @@ orphaned yt-dlp workers behind.
 """
 from __future__ import annotations
 from .youtube_overlay_policy import source_overlays_preserved
+from .pipeline_activity import record_activity
 
 import os
 import hashlib
@@ -3980,6 +3981,11 @@ def resolve_storyboard_media_v2(
             with gate_lock:
                 count = len(gated_outcomes)
             if count != last_count and callable(progress_callback):
+                # Ground-truth activity for the preparation-stall
+                # detector: vision rounds sanitise to one constant
+                # label, so the display pipeline drops every repeat
+                # while a long round is still working.
+                record_activity("vision")
                 try:
                     progress_callback(.45 + .10 * min(1, count / max(1, len(primary_work))),
                                       f"Checking media relevance: {count} reviewed")
