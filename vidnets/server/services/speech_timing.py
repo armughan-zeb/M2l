@@ -6,6 +6,46 @@ import re
 from pathlib import Path
 
 
+def script_words_for_audio(text, duration, *, timing_source='tts_script_timing'):
+    """Distribute a known narration text across a measured audio duration.
+
+    Each word gets a slice proportional to its length (longer words take
+    longer to say), with a small bonus after sentence/clause punctuation
+    for the natural pause. The rows are bounded by [0, duration] of THIS
+    audio span, so when a long narration is built from per-chunk spans
+    each chunk re-anchors at its own measured start and timing errors
+    cannot accumulate across chunks (no drift). This is script-derived
+    timing, not speech recognition: it is only valid when ``text`` is the
+    exact text spoken in the audio, which is true for TTS narration.
+    """
+    tokens = re.findall(r"\S+", str(text or "").strip())
+    if not tokens:
+        return []
+    total = max(0.1, float(duration or 0.1))
+    weights = []
+    for token in tokens:
+        clean = re.sub(r"[^A-Za-z0-9']", "", token)
+        weight = max(1.0, min(2.8, 0.55 + len(clean) * 0.075))
+        if re.search(r"[.!?]$", token):
+            weight += 0.22
+        elif re.search(r"[,;:]$", token):
+            weight += 0.08
+        weights.append(weight)
+    step = total / max(1.0, sum(weights))
+    cursor = 0.0
+    rows = []
+    for index, token in enumerate(tokens):
+        start = cursor
+        end = min(total, start + step * weights[index])
+        rows.append({"word": token, "start": round(start, 3),
+                     "end": round(max(start + 0.02, end), 3),
+                     "index": index, "timing_source": timing_source})
+        cursor = end
+    if rows:
+        rows[-1]["end"] = total
+    return rows
+
+
 def timing_path(audio_path):
     return Path(str(audio_path) + '.speech-timing.json')
 
