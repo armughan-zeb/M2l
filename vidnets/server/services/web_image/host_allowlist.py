@@ -71,6 +71,13 @@ SEED_HOSTS: Dict[str, str] = {
     "live.staticflickr.com": "seed:bnsf-pixel",
     "upload.wikimedia.org": "seed:bnsf-pixel",
     "s3.amazonaws.com": "seed:bnsf-pixel",
+    # Search-provider thumbnail CDNs used as the bounded rescue when a
+    # publisher's original image host refuses the proxy request.
+    "mm.bing.net": "seed:provider-preview",
+    "gstatic.com": "seed:provider-preview",
+    "yandex.net": "seed:provider-preview",
+    "yandex.com": "seed:provider-preview",
+    "duckduckgo.com": "seed:provider-preview",
     # Page/origin hosts from the same pool.
     "www.pinterest.com": "seed:bnsf-origin",
     "www.youtube.com": "seed:bnsf-origin",

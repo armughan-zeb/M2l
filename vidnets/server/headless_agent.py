@@ -198,7 +198,7 @@ def main(argv=None):
     commands.add_parser('start').add_argument('--recover', action='store_true')
     commands.add_parser('capabilities')
     commands.add_parser('pending')
-    for name in ('request', 'job', 'retry'):
+    for name in ('request', 'job', 'retry', 'reuse'):
         commands.add_parser(name).add_argument('id')
     commands.add_parser('submit').add_argument('file')
     answer = commands.add_parser('answer')
@@ -217,6 +217,13 @@ def main(argv=None):
             # the fixed local worker token, which the local-mode server maps to
             # the 'local-user' agent owner.
             key = 'local-bypass'
+        if args.command == 'reuse':
+            # Answer-cache reuse needs no server: it reads the bridge dir
+            # directly, so it works even while the server is slow or down.
+            from services.agent_bridge import reuse_cached_answer
+            result = reuse_cached_answer(args.id)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
         url = service_url(root)
         status = _json_http(url + '/api/status', timeout=5)
         if status.get('pipeline_build_id') != BUILD_ID or Path(status.get('resource_root', '')).resolve() != resources:

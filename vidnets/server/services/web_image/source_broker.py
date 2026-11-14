@@ -31,20 +31,27 @@ WEB_IMAGE_SOURCE_CATALOG: Tuple[Dict[str, object], ...] = (
     {"name": "universal_scraper", "tier": 0, "kind": "universal", "role": "parallel_multiengine_scraper", "default": True},
     {"name": "yandex", "tier": 0, "kind": "api", "role": "fast_scraper", "default": True},
     {"name": "bing_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": True},
-    {"name": "ddg_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": False},
     {"name": "flickr_api", "tier": 0, "kind": "flickr_api", "role": "fast_api", "default": True},
-    {"name": "openverse", "tier": 1, "kind": "api", "role": "rights_friendly_api", "default": False},
+    {"name": "ddg_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": True},
+    {"name": "openverse", "tier": 1, "kind": "api", "role": "rights_friendly_api", "default": True},
     {"name": "wikimedia", "tier": 1, "kind": "api", "role": "rights_friendly_api", "default": True},
     {"name": "google_images", "tier": 1, "kind": "api", "role": "html_scraper", "default": True},
-    {"name": "duckduckgo", "tier": 1, "kind": "api", "role": "html_scraper", "default": False},
+    {"name": "duckduckgo", "tier": 1, "kind": "api", "role": "html_scraper", "default": True},
     {"name": "brave_images", "tier": 1, "kind": "api", "role": "optional_api", "default": False},
     {"name": "searxng_images", "tier": 1, "kind": "api", "role": "metasearch", "default": False},
-    {"name": "getty_bing", "tier": 2, "kind": "hybrid", "role": "editorial_site_filter", "default": False},
-    {"name": "getty_ddg", "tier": 2, "kind": "hybrid", "role": "editorial_site_filter", "default": False},
+    {"name": "getty_bing", "tier": 2, "kind": "hybrid", "role": "editorial_site_filter", "default": True},
+    {"name": "getty_ddg", "tier": 2, "kind": "hybrid", "role": "editorial_site_filter", "default": True},
     {"name": "pinterest", "tier": 3, "kind": "gdl", "role": "gallery_dl", "default": False},
     {"name": "reddit", "tier": 3, "kind": "api", "role": "community_api", "default": False},
     {"name": "flickr", "tier": 3, "kind": "gdl", "role": "gallery_dl", "default": False},
 )
+
+
+# Canonical search-engine priority for web-image retrieval. Yandex
+# bot-walls least on this deployment, so it is always tried first; Bing,
+# Flickr and DuckDuckGo are fallbacks in that order. The universal scraper
+# and the resolver's fast lanes must keep this relative order.
+WEB_ENGINE_PRIORITY = ("yandex", "bing", "flickr", "duckduckgo")
 
 
 def web_image_source_catalog() -> List[Dict[str, object]]:

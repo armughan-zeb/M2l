@@ -8647,7 +8647,12 @@ def _warm_local_whisper_if_needed(config):
 def _start_whisper_warmup(config):
     # Edge supplies its own audio-bound word clock; loading extra ASR models
     # before those boundaries arrive wastes RAM. ASR can still load on demand.
-    if str(config.get('tts_model') or 'audiogram').lower() in {'audiogram', 'edge', 'edge-tts', 'edge_tts'}:
+    # EXCEPT the offline Linux TTS command: it produces plain audio with no
+    # provider word timings, so captions still need Whisper — warm it even
+    # for edge/audiogram jobs when that command is configured, or captions
+    # load the model cold (~11 min stall on Broken Rail attempt 1).
+    linux_tts = bool(str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip())
+    if not linux_tts and str(config.get('tts_model') or 'audiogram').lower() in {'audiogram', 'edge', 'edge-tts', 'edge_tts'}:
         return None
     try:
         from services.transcription_service import start_whisper_job_warmup

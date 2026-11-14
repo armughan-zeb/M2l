@@ -624,6 +624,22 @@ def test_mixed_direct_clip_lane_uses_bounded_coordinator_wall():
         assert _media_stage_deadline_seconds({}, "Mixed Media") == 600.0
 
 
+def test_long_mixed_storyboard_deadline_covers_primary_web_batch_even_when_explicit():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        deadline = _media_stage_deadline_seconds(
+            {
+                "media_deadline_seconds": 600,
+                "_web_budget_scene_count": 121,
+                "_youtube_budget_scene_count": 0,
+            },
+            "Mixed Media",
+        )
+    # 121 scenes need 855s for the web lane's queued completion waves plus
+    # the coordinator's 60s publish/review tail; the shorter UI default must
+    # not terminalize them first.
+    assert deadline >= 915.0
+
+
 def test_mixed_youtube_lane_budget_fits_clip_quota_waves():
     from services.pipeline_v2_media_adapter import mixed_youtube_time_budget
 

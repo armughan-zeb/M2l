@@ -50,6 +50,8 @@ try:  # Optional DDG scraper dependency.
 except Exception:  # pragma: no cover - optional in minimal deployments
     DDGS = None
 
+from .source_broker import WEB_ENGINE_PRIORITY
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +111,96 @@ _Y_IMG_RE = re.compile(r'\\?"img_href\\?"\s*:\s*\\?"(https?://[^"\\]+)', re.I)
 _Y_THUMB_RE = re.compile(r'\\?"image\\?"\s*:\s*\\?"(//[^"\\]+|https?://[^"\\]+)', re.I)
 _Y_TITLE_RE = re.compile(r'\\?"(?:snippet"\s*:\s*\{[^{}]{0,600}?\\?"title|title)\\?"\s*:\s*\\?"([^"\\]+)', re.I)
 _URL_RE = re.compile(r"https?://[^\"'<>\\\s]+", re.I)
+
+
+# ── Per-host search throttling (S7) ──────────────────────────────────────
+# The manager fans engines out in parallel and several scene workers can
+# run batches at once, so one host (e.g. yandex.com) can see many
+# simultaneous requests — enough to trigger SmartCaptcha / 429. Bound it:
+# at most N concurrent requests per host, at least ``delay`` between
+# request starts to the same host, and exponential backoff on 429. A 403 is
+# definitive for the current egress and is retired by the per-run engine gate.
+# The state is module-global, so it bounds ALL managers and scene workers
+# collectively, not just one batch. This reuses the download limiter's
+# philosophy (per-host caps + backoff) for the search path, which
+# previously had no throttle at all. The DuckDuckGo engine is the one
+# exception: it goes through a subprocess worker, not a client.get, so it
+# is not routed through here (it has its own 15s budget + 2 attempts).
+def _universal_per_host() -> int:
+    try:
+        return max(1, min(8, int(os.environ.get("VIDZEO_UNIVERSAL_PER_HOST", "2") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _universal_min_delay() -> float:
+    try:
+        return max(0.0, min(5.0, float(os.environ.get("VIDZEO_UNIVERSAL_MIN_DELAY_SECONDS", "0.5") or 0.5)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _universal_retry_count() -> int:
+    try:
+        return max(0, min(3, int(os.environ.get("VIDZEO_UNIVERSAL_RETRIES", "2") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _universal_retry_delay(attempt: int) -> float:
+    try:
+        base = max(0.1, min(3.0, float(os.environ.get("VIDZEO_UNIVERSAL_RETRY_BASE", "1.0") or 1.0)))
+    except (TypeError, ValueError):
+        base = 1.0
+    return min(8.0, base * (2 ** attempt))
+
+
+_universal_host_state: Dict[str, Dict[str, object]] = {}
+_universal_host_guard = threading.Lock()
+
+
+def _universal_host_slot(host: str) -> Dict[str, object]:
+    with _universal_host_guard:
+        state = _universal_host_state.get(host)
+        if state is None:
+            state = {
+                "semaphore": threading.Semaphore(_universal_per_host()),
+                "last_start": 0.0,
+                "lock": threading.Lock(),
+            }
+            _universal_host_state[host] = state
+        return state
+
+
+def _throttled_get(client, url: str, *, headers, timeout):
+    """GET through the per-host throttle, with bounded 429 backoff retries.
+
+    ``client`` is any object with ``.get(url, headers=..., timeout=...)``
+    (the isolated native client, a requests.Session, or the requests
+    module). Returns the response-like object (status_code + text/json).
+    Only 429 is retried with exponential backoff. A 403 is returned
+    immediately so the manager can retire that engine for this run rather
+    than repeat a refusal for every scene. Other non-200 responses are
+    returned as-is and recorded as per-engine failures.
+    """
+    host = (urlparse(url).netloc or "").lower()
+    state = _universal_host_slot(host)
+    semaphore = state["semaphore"]
+    lock = state["lock"]
+    response = None
+    for attempt in range(_universal_retry_count() + 1):
+        with lock:
+            wait = _universal_min_delay() - (time.monotonic() - float(state["last_start"]))
+            if wait > 0:
+                time.sleep(wait)
+            state["last_start"] = time.monotonic()
+        with semaphore:
+            response = client.get(url, headers=headers, timeout=timeout)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 429 or attempt >= _universal_retry_count():
+            return response
+        time.sleep(_universal_retry_delay(attempt))
+    return response
 
 
 def _title_is_query_echo(title: object, query: str) -> bool:
@@ -261,10 +353,11 @@ class YandexEngine(_Engine):
         if safe_search:
             url += "&family=yes"
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=15)
+            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=15)
+            response = _throttled_get(requests, url, headers=_HEADERS, timeout=15)
+
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Yandex returned HTTP status {status}")
@@ -324,10 +417,11 @@ class BingEngine(_Engine):
             f"q={urllib.parse.quote(query)}&first={first}&count={limit}&mmasync=1&adlt={safe}"
         )
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=15)
+            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=15)
+            response = _throttled_get(requests, url, headers=_HEADERS, timeout=15)
+
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Bing returned HTTP status {status}")
@@ -468,10 +562,11 @@ class BaiduEngine(_Engine):
             f"&pn={start}&rn={limit}"
         )
         try:
-            response = self._get_client().get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
+            response = _throttled_get(self._get_client(), url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
+            response = _throttled_get(requests, url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
+
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Baidu returned HTTP status {status}")
@@ -527,10 +622,11 @@ class OpenverseEngine(_Engine):
             f"&page={max(1, page)}&page_size={min(limit, 50)}"
         )
         try:
-            response = self._get_client().get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
+            response = _throttled_get(self._get_client(), url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
+            response = _throttled_get(requests, url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
+
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Openverse returned HTTP status {status}")
@@ -583,10 +679,11 @@ class FlickrEngine(_Engine):
                                          "format": "json", "nojsoncallback": "1"})
         url = f"https://www.flickr.com/services/feeds/photos_public.gne?{params}"
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=15)
+            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=15)
+            response = _throttled_get(requests, url, headers=_HEADERS, timeout=15)
+
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Flickr returned HTTP status {status}")
@@ -609,6 +706,23 @@ class FlickrEngine(_Engine):
         return out
 
 
+_BOT_GATE_MARKERS = ("bot-gate", "bot challenge", "smartcaptcha", "robot check", "captcha")
+
+
+def is_bot_gate_error(exc: BaseException) -> bool:
+    """True when an engine failure is a definitive refusal for this run.
+
+    Bot gates, HTTP 403 refusals, and exhausted 429 responses should not be
+    repeated for every scene through the same egress. The manager applies a
+    short cooldown to HTTP refusals/rate limits and a longer one to bot gates.
+    Ordinary transport errors (timeouts, 5xx) remain eligible for later queries.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _BOT_GATE_MARKERS) or bool(
+        re.search(r"\b(?:http(?: status)?\s*|status\s*)(?:403|429)\b", text)
+    )
+
+
 class UniversalScraperManager:
     """Run the supplied four-engine search strategy as a resolver lane.
 
@@ -621,7 +735,11 @@ class UniversalScraperManager:
     slot on an engine that cannot return results.
     """
 
-    DEFAULT_ENGINES = ("yandex", "bing", "duckduckgo", "flickr")
+    # Canonical engine order: Yandex first (it bot-walls least), then Bing,
+    # Flickr, DuckDuckGo. See WEB_ENGINE_PRIORITY in source_broker.py. The
+    # manager interleaves results in this order, so Yandex rows surface first
+    # and a bot-gated DuckDuckGo never outranks a working Flickr lane.
+    DEFAULT_ENGINES = WEB_ENGINE_PRIORITY
 
     def __init__(
         self,
@@ -664,6 +782,28 @@ class UniversalScraperManager:
         )
         self._lock = threading.Lock()
         self._last_response: Optional[UniversalSearchResponse] = None
+        # Engines that hit a definitive bot challenge or HTTP refusal are
+        # cooled down instead of burning their retry/timeout budget once per
+        # scene. Keyed by engine name, value is the monotonic time after which
+        # that source can be tried again.
+        self._bot_gated: Dict[str, float] = {}
+        try:
+            self._bot_gate_skip_seconds = max(
+                0.0,
+                float(os.environ.get("VIDZEO_UNIVERSAL_BOT_GATE_SKIP_SECONDS", "900") or 900),
+            )
+        except (TypeError, ValueError):
+            self._bot_gate_skip_seconds = 900.0
+        try:
+            self._refusal_skip_seconds = max(
+                0.0,
+                min(
+                    600.0,
+                    float(os.environ.get("VIDZEO_UNIVERSAL_REFUSAL_SKIP_SECONDS", "60") or 60),
+                ),
+            )
+        except (TypeError, ValueError):
+            self._refusal_skip_seconds = 60.0
 
     @property
     def engines(self) -> Tuple[str, ...]:
@@ -692,6 +832,17 @@ class UniversalScraperManager:
         clean = re.sub(r"\s+", " ", str(query or "")).strip()
         selected = [str(e).strip().lower() for e in (engine_ids or self.DEFAULT_ENGINES)]
         selected = list(dict.fromkeys(e for e in selected if e in self._engines))
+        # Skip engines that hit a definitive bot/robot challenge earlier in
+        # this run. A bot-gated engine returns nothing for any further scene,
+        # so trying it again only burns its retry budget and a worker slot.
+        now = time.monotonic()
+        with self._lock:
+            gated = [e for e in selected if self._bot_gated.get(e, 0.0) > now]
+            selected = [e for e in selected if e not in gated]
+        if gated:
+                self._log(
+                    f"[universal] skipping temporarily unavailable engine(s): {','.join(gated)}"
+                )
         limit = max(1, min(50, int(limit_per_engine or 20)))
         if not clean or not selected:
             return UniversalSearchResponse(clean, 0, [], [])
@@ -729,6 +880,26 @@ class UniversalScraperManager:
             except Exception as exc:
                 duration = int((time.perf_counter() - started) * 1000)
                 error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                # A definitive bot/robot challenge will not clear for the
+                # next scene, so skip this engine for the rest of the run
+                # instead of paying its retry/timeout budget on every scene.
+                if is_bot_gate_error(exc):
+                    is_http_refusal = bool(
+                        re.search(r"\b(?:http(?: status)?\s*|status\s*)(?:403|429)\b", error, re.I)
+                    )
+                    skip_seconds = (
+                        self._refusal_skip_seconds
+                        if is_http_refusal
+                        else self._bot_gate_skip_seconds
+                    )
+                    with self._lock:
+                        self._bot_gated[engine_name] = (
+                            time.monotonic() + skip_seconds
+                        )
+                    self._log(
+                        f"[universal] {engine_name}: temporarily unavailable ({error}); "
+                        f"skipping for {skip_seconds:.0f}s"
+                    )
                 if batch_finished.is_set():
                     self._log(
                         f"[universal] {engine_name}: late failure ignored after batch deadline "

@@ -43,7 +43,37 @@ def _bounded_worker_drain_seconds(stage_seconds: float) -> float:
     return min(max(0.0, requested), 0.5, max(0.0, stage_seconds) * .1)
 
 
-_WEB_STAGE_HARD_CAP_SECONDS = 180.0
+def _default_web_stage_deadline_seconds(scene_count: int) -> float:
+    """Completion-scaled default stage wall: 12s per scene, floored at 45s.
+
+    A 121-scene job gets 1452s instead of being cut off at the old fixed
+    180s ceiling after ~35 scenes; a 2-scene job keeps its 45s floor.
+    """
+    return max(
+        45.0,
+        min(_web_stage_hard_cap_seconds(), max(1, int(scene_count)) * 12.0),
+    )
+
+
+def _web_stage_hard_cap_seconds() -> float:
+    """Completion-oriented ceiling for one web retrieval stage.
+
+    The old 180s ceiling cut a 121-scene job off after ~35 scenes: the
+    stage wall must scale with the scenes left to resolve, not end at a
+    fixed time. The default 1800s still bounds a wedged stage, and the
+    delivery budget (render reserve) and the coordinator's outer wall clamp
+    it further downstream.
+    """
+    try:
+        return max(
+            180.0,
+            float(os.environ.get("VIDZEO_WEB_STAGE_HARD_CAP_SECONDS", "1800") or 1800),
+        )
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+_WEB_STAGE_HARD_CAP_SECONDS = 1800.0
 _WEB_SCENE_HARD_CAP_SECONDS = 90.0
 
 
@@ -760,8 +790,8 @@ _FAST_SOURCES = [
     ("primary_archive", "hybrid"), # Official publishers enter the same identity/vision gates.
     ("universal_scraper", "universal"), # four-engine parallel scraper adapter
     ("yandex", "api"),             # Yandex Images HTML scraper — priority lane
-    ("flickr_api", "flickr_api"),  # Flickr REST API — fast, reliable, no scraping
     ("bing_hybrid", "hybrid"),     # Bing image search
+    ("flickr_api", "flickr_api"),  # Flickr REST API — fast, reliable, no scraping
     ("ddg_hybrid", "hybrid"),      # DuckDuckGo image search
     ("openverse", "api"),          # Openverse CC image API
     ("wikimedia", "api"),
@@ -822,7 +852,14 @@ _PROVIDER_HOSTS = {
 def _report_provider_failure(source_name: str, exc: BaseException) -> None:
     health = _ACTIVE_PROVIDER_HEALTH
     if health is not None:
-        health.note_failure(source_name, f"{type(exc).__name__}: {str(exc)[:100]}")
+        reason = f"{type(exc).__name__}: {str(exc)[:100]}"
+        status = re.search(r"\b(?:HTTP(?: status)?\s*|status\s*)(\d{3})\b", str(exc), re.I)
+        if status and int(status.group(1)) in {
+            401, 403, 404, 410, 429, 451, 500, 502, 503, 504,
+        }:
+            health.trip(source_name, reason)
+        else:
+            health.note_failure(source_name, reason)
 
 
 def _report_provider_success(source_name: str) -> None:
@@ -852,11 +889,10 @@ def _semantic_pending_wave_limit() -> int:
 
 
 def _enabled_fast_sources() -> List[Tuple[str, str]]:
-    """Return the bounded fast lanes enabled for this process.
+    """Return public fast lanes plus configured credentialed providers.
 
-    Bing and DDG are complementary hybrid lanes. Getty-restricted variants
-    are included by default so a single provider outage does not collapse
-    recall; the legacy expansion switch still enables every slow lane.
+    A broad default source mix improves scene coverage. Per-job provider
+    circuits retire failing services without disabling healthy alternatives.
     """
     # Operator-scoped allowlist used for controlled source benchmarks and
     # single-provider production jobs.  Keep it here so the shared warm pool,
@@ -869,30 +905,12 @@ def _enabled_fast_sources() -> List[Tuple[str, str]]:
         wanted = {item.strip() for item in only.split(",") if item.strip()}
         wanted.add("universal_scraper")
         return [(name, kind) for name, kind in _FAST_SOURCES if name in wanted]
-    legacy_setting = os.environ.get("VIDZEO_ENABLE_LEGACY_WEB_SEARCH")
-    legacy = str(legacy_setting or "0").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
-    # Getty-via-Bing/DDG used to be launched for every scene query.  Each of
-    # those lanes performs its own multi-pass search, so a 20-scene job could
-    # create hundreds of provider requests before *any* scene returned.  The
-    # default batch uses one complementary request per provider.  The older
-    # expansion lanes remain available behind the existing legacy switch.
-    # Host-cost cut (2026-11-10, BNSF job): every default lane costs at least
-    # one fresh per-host network approval card, and each lane's results can
-    # fan out to arbitrary publisher hosts. Demoted from the defaults:
-    #  - "openverse": api.openverse.org 504s through the egress proxy
-    #    (already dropped from the universal scraper's defaults in 1d441ef,
-    #    but this resolver lane still hit it per scene query).
-    #  - "getty_bing" / "getty_ddg": 1 row in the BNSF pool's first 51
-    #    candidates, and Getty images are watermarked editorial frames the
-    #    vision gate usually rejects anyway.
-    # All three stay reachable via VIDZEO_ENABLE_LEGACY_WEB_SEARCH=1 or
-    # VIDZEO_WEB_ONLY_PROVIDER. Wikimedia remains the rights-friendly lane.
+    # Public providers run by default. Their requests share the bounded scene
+    # pool; definitive 4xx responses open a circuit so blocked services do not
+    # consume every scene's retrieval budget.
     default_names = {
-        "universal_scraper",
-        "wikimedia", "flickr_api", "bing_hybrid",
-        "yandex", "google_images", "library_of_congress",
+        name for name, _kind in _FAST_SOURCES
+        if name not in {"brave_images", "searxng_images"}
     }
     if _BRAVE_SOURCE.is_available():
         default_names.add("brave_images")
@@ -906,17 +924,12 @@ def _enabled_fast_sources() -> List[Tuple[str, str]]:
         or os.environ.get("VIDZEO_SEARXNG_URLS")
         or os.environ.get("VIDZEO_SEARXNG_URL")
     )
-    if searx_configured and _SEARXNG_SOURCE.is_available():
+    if searx_configured:
         default_names.add("searxng_images")
-    # Preserve the broad provider mix for installations that have never set
-    # this switch. An explicit false value is an operator request to suppress
-    # the older DDG hybrid lane; an explicit true value enables every lane.
-    if legacy_setting is None:
-        default_names.add("ddg_hybrid")
     return [
         (name, kind)
         for name, kind in _FAST_SOURCES
-        if legacy or name in default_names
+        if name in default_names
     ]
 
 
@@ -2421,10 +2434,44 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
         return None
     if _is_biographical_person(main_subject) and not _metadata_has_identity(item.get("title", ""), url, "", identity_terms):
         return None
-    dl_results = download_bulk([url], scene_dir, max_concurrent=1, timeout_seconds=30)
-    for _url, fpath, err in dl_results:
-        if err or not fpath or not fpath.exists():
-            continue
+    download_headers = _provider_download_headers([item])
+    dl_results = download_bulk(
+        [url], scene_dir, max_concurrent=1, timeout_seconds=30,
+        headers_by_url=download_headers,
+    )
+    downloaded_url = url
+    usable_downloads = [
+        (fpath, err)
+        for _downloaded, fpath, err in dl_results
+        if not err and fpath and fpath.exists()
+    ]
+    if not usable_downloads:
+        preview_url = str(item.get("preview_url") or item.get("thumbnail_url") or "").strip()
+        preview_host = urllib.parse.urlparse(preview_url).netloc.lower()
+        preview_allowed = bool(
+            preview_host
+            and (
+                is_seen_host(preview_host, load_seen_hosts())
+                or _host_is_preferred(preview_host, _preferred_image_hosts())
+            )
+        )
+        if (
+            preview_allowed
+            and preview_url.startswith(("https://", "http://"))
+            and preview_url != url
+        ):
+            preview_results = download_bulk(
+                [preview_url], scene_dir, max_concurrent=1, timeout_seconds=30,
+                headers_by_url=download_headers,
+            )
+            usable_downloads = [
+                (fpath, err)
+                for _downloaded, fpath, err in preview_results
+                if not err and fpath and fpath.exists()
+            ]
+            if usable_downloads:
+                downloaded_url = preview_url
+    for fpath, err in usable_downloads:
         dims = _validate_image(fpath)
         if dims is None:
             continue
@@ -2476,6 +2523,7 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
             **item,
             "path": str(fpath),
             "query_used": item.get("query", main_subject),
+            "download_url_used": downloaded_url,
         }
         if score < 0.0 or not _passes_web_relevance_floor(candidate_for_gate, score, main_subject):
             try:
@@ -2486,6 +2534,7 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
         return {
             "path": str(fpath), "width": w, "height": h,
             "url": url, "domain": item.get("domain") or item.get("source", "flickr_api"),
+            "download_url_used": downloaded_url,
             "relevance": score, "final_score": score, "reused_from_scene": False,
             "title": item.get("title", "") or f"scene_{idx + 1}",
             "source_url": item.get("source_url") or item.get("page_url") or url,
@@ -2515,6 +2564,11 @@ _DEFAULT_PREFERRED_IMAGE_HOSTS = (
     "live.staticflickr.com",
     "i.ytimg.com",
     "i.pinimg.com",
+    "mm.bing.net",
+    "gstatic.com",
+    "yandex.net",
+    "yandex.com",
+    "duckduckgo.com",
     "pinterest.com",
     "www.pinterest.com",
     "flickr.com",
@@ -2741,12 +2795,17 @@ def _download_candidate_batch(items, output_dir, max_concurrent, timeout_seconds
     # preview remains accessible. The normal image validation and visual gate
     # still decide whether the recovered pixels are usable for this scene.
     fallback = {}
+    preview_seen_hosts = load_seen_hosts()
+    preview_preferred_hosts = _preferred_image_hosts()
     for url, path, error in results:
         item = by_url.get(url, {})
         preview = str(item.get("preview_url") or item.get("thumbnail_url") or "").strip()
         if not path and preview.startswith(("https://", "http://")) and preview != url:
             _preview_host = urllib.parse.urlparse(preview).netloc.lower()
-            if _preview_host:
+            if _preview_host and (
+                is_seen_host(_preview_host, preview_seen_hosts)
+                or _host_is_preferred(_preview_host, preview_preferred_hosts)
+            ):
                 fallback[url] = preview
     if fallback:
         try:
@@ -5374,6 +5433,41 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             if _web_verbose():
                 _web_log(f"scene {idx + 1} query '{q}' yielded only duplicate images. Trying next fallback...")
 
+    # Broadened-query round: the specific query waves above all failed.
+    # Before the fallbacks, progressively drop the most specific terms
+    # from the scene's own queries (the `broaden` flag is honoured here;
+    # it was previously accepted but never used). The universal scraper
+    # fans each broadened query out to all four engines with Yandex
+    # first, so this is one bounded multi-engine wave, not a
+    # per-provider retry loop. This round runs BEFORE the emergency
+    # subject fallback below: the bare canonical subject must stay the
+    # final query attempted (see
+    # test_full_query_pack_reserves_canonical_subject).
+    if selected_candidate is None and broaden and not _deadline_reached():
+        try:
+            from .query import _broaden_scene_queries
+        except Exception:
+            _broaden_scene_queries = None
+        if _broaden_scene_queries:
+            broadened = _broaden_scene_queries(queries, main_subject)
+            for _bq in broadened:
+                if _deadline_reached():
+                    break
+                if _web_verbose():
+                    _web_log(f"scene {idx + 1} broadened query: '{_bq}'")
+                _bq_rows = _fetch_source_query("universal_scraper", "universal", _bq)
+                if not _bq_rows:
+                    continue
+                _sel = _download_and_accept_single_candidate(
+                    _bq_rows[0], scene_dir, idx, scene_text,
+                    identity_terms, main_subject, global_phashes, global_md5s, used_files,
+                    phash_lock, md5_lock, file_lock, weak_terms)
+                if _sel:
+                    if _web_verbose():
+                        _web_log(f"scene {idx + 1} successfully rescued via broadened query '{_bq}'!")
+                    selected_candidate = _sel
+                    break
+
     # Emergency Rescue Fallback:
     # If all query options failed, run an immediate emergency subject search on Flickr API
     # to guarantee we find a valid image (e.g. searching "[Subject] portrait", "[Subject] photo", "[Subject]")
@@ -6264,11 +6358,11 @@ def resolve_web_images_for_video_fast(
     max_scene_workers = max(1, min(16, int(max_scene_workers)))
     api_worker_limit = max(1, min(12, int(api_worker_limit)))
     stage_started_at = time.monotonic()
-    # Give queued scene waves a bounded allowance that grows with the job.
-    # The shared delivery budget and per-scene deadlines still apply.
-    from .source_broker import long_form_web_budget
-    stage_cap = long_form_web_budget(len(scene_texts), max_scene_workers)
-    default_stage_deadline = max(45.0, min(stage_cap, len(scene_texts) * 12.0))
+    # Scale the finite wall with scene count. Request timeouts, the stage hard
+    # cap, and the shared delivery budget still bound unhealthy providers and
+    # protect the render reserve on long jobs.
+    default_stage_deadline = _default_web_stage_deadline_seconds(len(scene_texts))
+
     try:
         stage_deadline_seconds = _bounded_web_seconds(
             stage_deadline_seconds
@@ -6276,7 +6370,7 @@ def resolve_web_images_for_video_fast(
             else os.environ.get("VIDZEO_WEB_STAGE_DEADLINE_SECONDS", "")
             or default_stage_deadline,
             default_stage_deadline,
-            stage_cap,
+            _web_stage_hard_cap_seconds(),
         )
     except Exception:
         stage_deadline_seconds = default_stage_deadline

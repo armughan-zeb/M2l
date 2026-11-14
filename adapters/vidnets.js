@@ -328,6 +328,20 @@ function resultVideoPath(item) {
   return candidates.map(value => String(value || '').trim()).find(value => value && fs.existsSync(value)) || '';
 }
 
+function progressReportForPoll({ progress, detail, lastProgress, lastDetail, lastReportAt, now, heartbeatMs, renderStartedAt }) {
+  if (progress !== lastProgress || detail !== lastDetail) {
+    return { progress, detail, changed: true };
+  }
+  if (now - lastReportAt >= heartbeatMs) {
+    // Silent phase heartbeat: same % and detail, but the work is live.
+    // The elapsed seconds make the detail change every time, so the CMS
+    // sees it as advancement rather than a repeat.
+    const elapsedSec = Math.floor((now - renderStartedAt) / 1000);
+    return { progress, detail: `${detail} (still working, ${elapsedSec}s elapsed)`, changed: false };
+  }
+  return null;
+}
+
 async function render(job, scriptText, workDir, { signal, onProgress, attempt } = {}) {
   // Muse inference is compulsory: refuse before any Vidnets call if an
   // OpenRouter key is present in the environment.
@@ -368,6 +382,16 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   const handledInference = new Map();
   let lastProgress = -1;
   let lastDetail = '';
+  const renderStartedAt = Date.now();
+  let lastReportAt = 0;
+  // A long silent phase (same % and same detail, e.g. the relevance check
+  // sitting at 61% for ~28 min on Broken Rail attempt 3) sends no advancing
+  // progress, and the CMS stall timer kills the job after 20 min — the
+  // keepalive in jobRunner sends advancing=false, which explicitly never
+  // counts as advancement. So when nothing has changed for this long, send
+  // an advancing update anyway, with a detail that changes every time
+  // (elapsed seconds) so it is not deduped as a repeat.
+  const heartbeatMs = Math.max(60000, Number(process.env.MUSE_PROGRESS_HEARTBEAT_MS) || 300000);
   const deadline = Date.now() + renderBudgetMs(job);
   const pollMs = Math.max(1000, Number(process.env.MUSE_VIDNETS_POLL_MS) || 4000);
   let statusFailures = 0;
@@ -404,10 +428,17 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     }
     const progress = Math.max(0, Math.min(100, Number(item.progress) || 0));
     const detail = String(item.progress_text || item.status || '').replace(/\s+/g, ' ').trim().slice(0, 400) || 'Rendering';
-    if (progress !== lastProgress || detail !== lastDetail) {
-      lastProgress = progress;
-      lastDetail = detail;
-      onProgress?.(progress, detail);
+    const report = progressReportForPoll({
+      progress, detail, lastProgress, lastDetail, lastReportAt,
+      now: Date.now(), heartbeatMs, renderStartedAt,
+    });
+    if (report) {
+      if (report.changed) {
+        lastProgress = progress;
+        lastDetail = detail;
+      }
+      lastReportAt = Date.now();
+      onProgress?.(report.progress, report.detail);
     }
 
     if (item.status === 'completed') {
@@ -453,4 +484,4 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   }
 }
 
-module.exports = { render, buildRequest, ensureReady, agentCommand, inferenceTransport, inferenceConcurrency, runInferenceCommand, runInferenceHttp };
+module.exports = { render, buildRequest, ensureReady, agentCommand, inferenceTransport, inferenceConcurrency, runInferenceCommand, runInferenceHttp, progressReportForPoll };

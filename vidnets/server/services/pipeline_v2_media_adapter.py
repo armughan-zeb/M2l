@@ -3249,6 +3249,85 @@ def _youtube_branch_return_tail_seconds(config: Mapping[str, Any], lane_mode: st
     return max(60.0, min(300.0, value))
 
 
+def _mixed_web_completion_cap_seconds() -> float:
+    """Ceiling for the primary Mixed Media web wall.
+
+    The old 180s ceiling cut a 121-scene job off after ~35 scenes. The
+    completion cap is generous (30 minutes by default) so the wall can
+    scale with the scenes left to resolve; the delivery budget and the
+    coordinator's outer wall still bound the stage from above.
+    """
+    try:
+        return max(
+            180.0,
+            float(
+                os.environ.get("VIDZEO_MIXED_WEB_COMPLETION_CAP_SECONDS", "1800")
+                or 1800
+            ),
+        )
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _mixed_web_per_scene_seconds() -> float:
+    """Per-scene allowance the primary web wall scales with."""
+    try:
+        return max(
+            1.0,
+            min(
+                30.0,
+                float(
+                    os.environ.get("VIDZEO_MIXED_WEB_PER_SCENE_SECONDS", "6")
+                    or 6
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 6.0
+
+
+def _mixed_web_wall_seconds(
+    scene_count: int,
+    configured_wall: float,
+    floor: float,
+    cap: float,
+    budget_allowance_seconds: Optional[float] = None,
+) -> float:
+    """Completion-oriented primary web wall for the Mixed Media lane.
+
+    The wall is the largest of the floor, the operator-configured wall, and
+    a scene-scaled allowance (scene_count * per-scene seconds), capped by
+    the completion cap and — when given — the delivery-budget allowance
+    (the render reserve is never spent). A large job therefore finishes
+    its queued scenes instead of being cut off at a fixed time; a small
+    job keeps its short wall.
+    """
+    try:
+        floor_value = max(1.0, float(floor))
+    except (TypeError, ValueError):
+        floor_value = 120.0
+    try:
+        cap_value = max(floor_value, float(cap))
+    except (TypeError, ValueError):
+        cap_value = max(floor_value, 1800.0)
+    if budget_allowance_seconds is not None:
+        try:
+            cap_value = min(
+                cap_value, max(floor_value, float(budget_allowance_seconds))
+            )
+        except (TypeError, ValueError):
+            pass
+    try:
+        configured_value = max(floor_value, float(configured_wall))
+    except (TypeError, ValueError):
+        configured_value = floor_value
+    scaled_value = max(
+        floor_value,
+        min(cap_value, max(1, int(scene_count)) * _mixed_web_per_scene_seconds()),
+    )
+    return min(cap_value, max(floor_value, configured_value, scaled_value))
+
+
 def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> float:
     """Keep V2 alive until the enabled provider can publish its rows.
 
@@ -3268,11 +3347,17 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
         # Still bounded by the job delivery allowance below.
         base = 1200.0
     normalized_mode = str(lane_mode or "").strip().casefold()
-    if normalized_mode == "mixed media" and not config.get("media_deadline_seconds"):
+    web_scene_count = 0
+    if normalized_mode == "mixed media":
         from .web_image.source_broker import long_form_web_budget
-        scene_count = int(config.get("_web_budget_scene_count") or 0)
-        if scene_count >= 32:
-            base = max(base, long_form_web_budget(scene_count, _mixed_web_scene_worker_limit(config)) + 60.0)
+        web_scene_count = int(config.get("_web_budget_scene_count") or 0)
+        if web_scene_count >= 32 and not config.get("media_deadline_seconds"):
+            base = max(
+                base,
+                long_form_web_budget(
+                    web_scene_count, _mixed_web_scene_worker_limit(config)
+                ) + 60.0,
+            )
     if normalized_mode == "mixed media":
         yt_branch_wall = _effective_mixed_youtube_branch_wall_seconds(config)
 
@@ -3307,6 +3392,38 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
         computed = max(base, branch_wall + 120.0)
     else:
         computed = base
+
+    # A configured media deadline must not silently truncate the primary web
+    # batch on a long storyboard. The resolver has its own finite stage wall;
+    # keep the coordinator alive through that scene-scaled wall and its bounded
+    # publication/review tail. The shared delivery budget below remains the
+    # final cap and continues to protect render time.
+    if normalized_mode == "mixed media" and web_scene_count >= 32:
+        from .web_image.source_broker import long_form_web_budget
+
+        long_form_wall = long_form_web_budget(
+            web_scene_count, _mixed_web_scene_worker_limit(config)
+        )
+        web_wall = max(
+            long_form_wall,
+            web_scene_count * _mixed_web_per_scene_seconds(),
+        )
+        try:
+            configured_web_wall = float(
+                config.get("web_stage_deadline_seconds")
+                or os.environ.get("VIDZEO_WEB_STAGE_DEADLINE_SECONDS")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            configured_web_wall = 0.0
+        web_wall = max(
+            long_form_wall,
+            min(
+                _mixed_web_completion_cap_seconds(),
+                max(web_wall, configured_web_wall),
+            ),
+        )
+        computed = max(computed, web_wall + 60.0)
 
     # The provider branches and the V2 coordinator must share one wall clock.
     # Previously this function returned the configured media ceiling even when
@@ -5705,21 +5822,24 @@ def resolve_existing_provider_branches_v2(
                 web_wall_cap = max(
                     web_wall_floor,
                     min(
-                        180.0,
+                        _mixed_web_completion_cap_seconds(),
                         float(
                             lane_config.get("mixed_web_max_wall_seconds")
-                            or os.environ.get("VIDZEO_MIXED_WEB_MAX_WALL_SECONDS", "180")
-                            or 180.0
+                            or os.environ.get(
+                                "VIDZEO_MIXED_WEB_MAX_WALL_SECONDS",
+                                str(_mixed_web_completion_cap_seconds()),
+                            )
+                            or _mixed_web_completion_cap_seconds()
                         ),
                     ),
                 )
             except (TypeError, ValueError):
-                web_wall_cap = max(web_wall_floor, 180.0)
+                web_wall_cap = max(web_wall_floor, _mixed_web_completion_cap_seconds())
             if str(config.get("llm_provider") or "") == "external_agent":
-                # Agent-driven jobs can gather slower complementary results,
-                # but the web stage still has the same 180s stall ceiling as
-                # every other provider path. Delivery-budget exhaustion may
-                # shorten this further in the resolver.
+                # Agent-driven jobs can gather slower complementary results.
+                # The delivery-budget allowance still bounds the wall (the
+                # render reserve is never spent); the old fixed 180s ceiling
+                # that cut large jobs off mid-batch is gone.
                 try:
                     agent_wall = 120.0
                 except (TypeError, ValueError):
@@ -5741,20 +5861,23 @@ def resolve_existing_provider_branches_v2(
                     agent_wall = max(
                         60.0,
                         min(
-                            180.0,
+                            _mixed_web_completion_cap_seconds(),
                             _budget.allowance(None, reserve_after_seconds=_reserve),
                         ),
                     )
                 web_wall_floor = agent_wall
-                web_wall_cap = min(180.0, max(web_wall_cap, agent_wall))
-            # Larger storyboards can use more of the same hard 180s retrieval
-            # ceiling, but no long-form override can extend it.
+                web_wall_cap = min(
+                    _mixed_web_completion_cap_seconds(),
+                    max(web_wall_cap, agent_wall),
+                )
+            # Larger storyboards can use more of the completion ceiling; a
+            # long-form override can raise the cap but never lowers it.
             if len(active_indices) >= 32 and web_wall_cap <= 120.0:
                 try:
                     long_form_cap = max(
                         web_wall_cap,
                         min(
-                            180.0,
+                            _mixed_web_completion_cap_seconds(),
                             float(
                                 lane_config.get("mixed_web_long_form_max_wall_seconds")
                                 or os.environ.get("VIDZEO_MIXED_WEB_LONG_FORM_MAX_WALL_SECONDS", "240")
@@ -5765,17 +5888,14 @@ def resolve_existing_provider_branches_v2(
                 except (TypeError, ValueError):
                     long_form_cap = max(web_wall_cap, 180.0)
                 web_wall_cap = long_form_cap
-            # Scale gently with the number of scenes.  A 24-scene job gets the
-            # default 120s cap instead of the old 150s tail; the hard cap is
-            # shared by short and long jobs.
-            scaled_web_wall = max(
+            # Completion-oriented: the wall grows with the scenes left to
+            # resolve (per-scene allowance) instead of cutting the batch off
+            # at a fixed time. See _mixed_web_wall_seconds.
+            lane_config["web_stage_deadline_seconds"] = _mixed_web_wall_seconds(
+                len(active_indices),
+                configured_web_wall,
                 web_wall_floor,
-                min(web_wall_cap, max(1, len(active_indices)) * 6.0),
-            )
-            requested_web_wall = max(web_wall_floor, configured_web_wall)
-            lane_config["web_stage_deadline_seconds"] = min(
                 web_wall_cap,
-                max(web_wall_floor, min(requested_web_wall, scaled_web_wall)),
             )
             if len(active_indices) >= 32:
                 from .web_image.source_broker import long_form_web_budget
@@ -5789,7 +5909,8 @@ def resolve_existing_provider_branches_v2(
             )
         elif lane_policy.get("mode") == "Mixed Media":
             print(
-                "   [budget] mixed web soft wall: disabled; the resolver's 180s hard ceiling remains",
+                "   [budget] mixed web soft wall: disabled; the resolver's "
+                "completion-scaled stage ceiling applies",
                 flush=True,
             )
         if str(config.get("llm_provider") or "") == "external_agent":

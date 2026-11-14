@@ -1062,6 +1062,271 @@ class CrossContainerReuseContractTests(unittest.TestCase):
         self.assertEqual(after_bounded_attempt[0].provider, "web")
         self.assertEqual(repeat_calls, [])
 
+    def test_web_transport_failure_falls_through_to_youtube_only(self):
+        from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        accepted = lambda _scene, _candidate: {"accepted": True, "status": "accepted", "score": 95}
+        youtube_fallback = lambda _scene, _cancel: {
+            "path": "yt-jaguar.mp4", "source": "youtube", "provider": "youtube", "media_type": "video", "score": 95,
+        }
+        web_fallback = lambda _scene, _cancel: {
+            "path": "web-jaguar.jpg", "source": "web", "provider": "web", "score": 95,
+        }
+
+        # Web lane raises (transport failure) with zero candidates: the web
+        # recovery lane must not be retried — it would hit the same
+        # proxy/hosts — and the scene falls through to YouTube only.
+        web_fallback_calls = []
+        youtube_fallback_calls = []
+        result = resolve_storyboard_media_v2(
+            [scene(0)],
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: (_ for _ in ()).throw(RuntimeError("boom")),
+            youtube_fallback_lane=lambda *_args: youtube_fallback_calls.append(True) or youtube_fallback(*_args),
+            web_fallback_lane=lambda *_args: web_fallback_calls.append(True) or web_fallback(*_args),
+            visual_verifier=accepted,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=2,
+        )
+        self.assertEqual(result[0].provider, "youtube")
+        self.assertEqual(result[0].resolution_kind, "cross_lane_youtube_fallback")
+        self.assertEqual(youtube_fallback_calls, [True])
+        self.assertEqual(web_fallback_calls, [])
+
+        # Web lane hangs past the env-tunable web cap: same fast fall-through.
+        web_fallback_calls.clear()
+        youtube_fallback_calls.clear()
+
+        def hanging_web_lane(_scene, _cancel):
+            time.sleep(5)
+            return []
+
+        with mock.patch.dict(os.environ, {"VIDZEO_WEB_LANE_TIMEOUT_SECONDS": "0.3"}):
+            result = resolve_storyboard_media_v2(
+                [scene(0)],
+                youtube_lane=lambda _scene, _cancel: [],
+                web_lane=hanging_web_lane,
+                youtube_fallback_lane=lambda *_args: youtube_fallback_calls.append(True) or youtube_fallback(*_args),
+                web_fallback_lane=lambda *_args: web_fallback_calls.append(True) or web_fallback(*_args),
+                visual_verifier=accepted,
+                neutral_factory=lambda _scene: None,
+                deadline_seconds=5,
+            )
+        self.assertEqual(result[0].provider, "youtube")
+        self.assertEqual(result[0].resolution_kind, "cross_lane_youtube_fallback")
+        self.assertEqual(youtube_fallback_calls, [True])
+        self.assertEqual(web_fallback_calls, [])
+
+    def test_vision_verdict_cache_reuses_candidate_across_rounds(self):
+        from services.media_resolution_coordinator import (
+            _vision_verdict_cache_key,
+            resolve_storyboard_media_v2,
+        )
+
+        # Cache key: same clip+timestamp, same URL, same file — and empty
+        # when there is nothing to identify the candidate with.
+        self.assertEqual(
+            _vision_verdict_cache_key({
+                "fallback_source_path": "/tmp/clip.mp4", "fallback_frame_index": 2,
+            }),
+            "yt-frame:/tmp/clip.mp4#2",
+        )
+        self.assertEqual(
+            _vision_verdict_cache_key({"source": "web", "source_url": "https://example.test/a.jpg"}),
+            "url:https://example.test/a.jpg",
+        )
+        self.assertEqual(_vision_verdict_cache_key({}), "")
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        def web_candidate(url, path):
+            return {
+                "path": path, "source": "web", "provider": "web",
+                "source_url": url, "score": 90,
+            }
+
+        calls = []
+
+        def verifier(_scene, candidate):
+            calls.append(candidate.get("source_url"))
+            return {
+                "accepted": False, "status": "rejected", "final_score": 30,
+                "visual_checked": True, "visual_available": True,
+                "reason": "not the subject",
+            }
+
+        candidate_a = web_candidate("https://example.test/a.jpg", "/tmp/a.jpg")
+        candidate_b = web_candidate("https://example.test/b.jpg", "/tmp/b.jpg")
+        candidate_c = web_candidate("https://example.test/c.jpg", "/tmp/c.jpg")
+        # The recovery round returns candidate A again (same URL) plus a new
+        # candidate C. A must reuse its primary-round verdict without a
+        # second live vision read; C is verified once. adaptive_media_review
+        # is on so the recovery round actually vision-checks (the default
+        # fast path accepts recovery candidates on metadata alone).
+        result = resolve_storyboard_media_v2(
+            [scene(0)],
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: [candidate_a, candidate_b],
+            youtube_fallback_lane=None,
+            web_fallback_lane=lambda _scene, _cancel: [candidate_a, candidate_c],
+            visual_verifier=verifier,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=5,
+            adaptive_media_review=True,
+        )
+        self.assertEqual(sorted(calls), [
+            "https://example.test/a.jpg",
+            "https://example.test/b.jpg",
+            "https://example.test/c.jpg",
+        ])
+        self.assertEqual(len(calls), 3)
+
+    def test_timed_out_vision_is_not_reissued_within_ttl(self):
+        # A verifier timeout is a transient outage, not a verdict. The
+        # recovery round must not spend a second live vision read on the
+        # same candidate while the outage TTL holds; after the TTL it may
+        # try again. Genuine verdicts still go through the verdict cache.
+        from services.media_resolution_coordinator import (
+            resolve_storyboard_media_v2,
+        )
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        def web_candidate(url, path):
+            return {
+                "path": path, "source": "web", "provider": "web",
+                "source_url": url, "score": 90,
+            }
+
+        calls = []
+
+        def verifier(_scene, candidate):
+            calls.append(candidate.get("source_url"))
+            if candidate.get("source_url") == "https://example.test/a.jpg":
+                raise TimeoutError("visual_verifier timed out")
+            return {
+                "accepted": False, "status": "rejected", "final_score": 30,
+                "visual_checked": True, "visual_available": True,
+                "reason": "not the subject",
+            }
+
+        candidate_a = web_candidate("https://example.test/a.jpg", "/tmp/a.jpg")
+        candidate_b = web_candidate("https://example.test/b.jpg", "/tmp/b.jpg")
+        candidate_c = web_candidate("https://example.test/c.jpg", "/tmp/c.jpg")
+        kwargs = dict(
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: [candidate_a, candidate_b],
+            youtube_fallback_lane=None,
+            web_fallback_lane=lambda _scene, _cancel: [candidate_a, candidate_c],
+            visual_verifier=verifier,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=5,
+            adaptive_media_review=True,
+        )
+        with mock.patch.dict(os.environ, {"VIDZEO_VISION_UNAVAILABLE_TTL_SECONDS": "60"}):
+            resolve_storyboard_media_v2([scene(0)], **kwargs)
+        # A timed out once (primary round); the recovery round reuses the
+        # stored outage verdict instead of calling the verifier again.
+        self.assertEqual(sorted(calls), [
+            "https://example.test/a.jpg",
+            "https://example.test/b.jpg",
+            "https://example.test/c.jpg",
+        ])
+        calls.clear()
+        with mock.patch.dict(os.environ, {"VIDZEO_VISION_UNAVAILABLE_TTL_SECONDS": "0"}):
+            resolve_storyboard_media_v2([scene(0)], **kwargs)
+        # With a zero TTL the outage is not suppressed: A is re-issued in
+        # the recovery round.
+        self.assertEqual(calls.count("https://example.test/a.jpg"), 2)
+
+    def test_scene_budget_resolves_best_so_far_without_new_vision_calls(self):
+        # F2: when the per-scene budget expires, the scene resolves with the
+        # best hard-gate-passing candidate found so far instead of burning
+        # minutes on further vision rounds and then failing bare. A candidate
+        # genuinely rejected by vision is never resurrected.
+        from services.media_resolution_coordinator import (
+            resolve_storyboard_media_v2,
+        )
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        def web_candidate(url, path, score):
+            return {
+                "path": path, "source": "web", "provider": "web",
+                "source_url": url, "score": score,
+            }
+
+        calls = []
+
+        def verifier(_scene, candidate):
+            calls.append(candidate.get("source_url"))
+            # One live vision read takes 0.6s, so the first primary read
+            # alone exhausts the 0.5s test budget; no second read may start.
+            time.sleep(0.6)
+            return {
+                "accepted": False, "status": "rejected", "final_score": 30,
+                "visual_checked": True, "visual_available": True,
+                "reason": "not the subject",
+            }
+
+        candidate_a = web_candidate("https://example.test/a.jpg", "/tmp/a.jpg", 90)
+        candidate_b = web_candidate("https://example.test/b.jpg", "/tmp/b.jpg", 80)
+        candidate_c = web_candidate("https://example.test/c.jpg", "/tmp/c.jpg", 95)
+        result = resolve_storyboard_media_v2(
+            [scene(0)],
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: [candidate_a, candidate_b],
+            youtube_fallback_lane=None,
+            web_fallback_lane=lambda _scene, _cancel: [candidate_a, candidate_c],
+            visual_verifier=verifier,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=30,
+            adaptive_media_review=True,
+            scene_budget_seconds=1.0,
+        )
+        # Only the primary gate's two vision reads happened (1.2s total,
+        # past the 1.0s budget); the recovery round spent no further vision
+        # call.
+        self.assertEqual(
+            sorted(calls),
+            ["https://example.test/a.jpg", "https://example.test/b.jpg"],
+        )
+        # The scene still resolved with real media: candidate C, the best
+        # hard-gate-passing candidate not rejected by vision.
+        self.assertEqual(result[0].selected_path, "/tmp/c.jpg")
+        self.assertTrue(
+            any(
+                attempt.get("status") == "scene_budget_exhausted"
+                for attempt in result[0].attempts
+            )
+        )
+
     def test_serial_fallbacks_stop_after_coordinator_deadline(self):
         from services.media_resolution_coordinator import resolve_storyboard_media_v2
 

@@ -33,6 +33,30 @@ def test_limits_span_independent_scene_event_loops():
     assert limiter.active == 0
 
 
+def test_open_circuit_blocks_on_first_403():
+    """A 403 is a refusal: the circuit opens on the first one, not the third.
+
+    The failure-count path still needs 3 failures for timeouts, but a host
+    that answers 403 has already refused — waiting for 2 more refusals
+    burns candidate attempts against a dead host (Broken Rail: 18
+    circuit-open failures on one host after its 403s).
+    """
+    from services.web_image.hybrid_search import DownloadLimiter
+    limiter = DownloadLimiter(total=3, per_host=2)
+    limiter.open_circuit("dead.test")
+
+    async def probe():
+        try:
+            async with limiter.slot("dead.test", time.monotonic() + 1):
+                raise AssertionError("circuit did not open on first 403")
+        except RuntimeError as exc:
+            assert "circuit open" in str(exc)
+        async with limiter.slot("healthy.test", time.monotonic() + 1):
+            assert limiter.active == 1
+    asyncio.run(probe())
+    assert limiter.active == 0
+
+
 def test_host_cooldown_does_not_block_other_sources():
     from services.web_image.hybrid_search import DownloadLimiter
     limiter = DownloadLimiter()
@@ -240,15 +264,17 @@ def test_denied_origin_opens_circuit_without_blocking_healthy_download(tmp_path,
     urls = [f"{blocked}/{index}.jpg" for index in range(5)] + [f"{healthy}/valid.jpg"]
     try:
         rows = hybrid_search.download_bulk(urls, tmp_path, max_concurrent=1, timeout_seconds=2)
-        assert hits == [3, 1]
-        assert [row[2] for row in rows[:3]] == ["HTTP 403"] * 3
-        assert all("circuit open" in row[2] for row in rows[3:5])
+        # First 403 opens the host circuit immediately: exactly one request
+        # reaches the denying host, the rest fail fast on the open circuit.
+        assert hits == [1, 1]
+        assert rows[0][2] == "HTTP 403"
+        assert all("circuit open" in row[2] for row in rows[1:5])
         assert rows[5][1] is not None, rows[5][2]
         assert rows[5][1].read_bytes() == body
         host = blocked.split("://")[1]
         limiter.cooldowns[host] = time.monotonic() - 1
         recovered = hybrid_search.download_bulk(urls[:2], tmp_path, max_concurrent=2, timeout_seconds=2)
-        assert hits == [4, 1]
+        assert hits == [2, 1]
         assert recovered[0][2] == "HTTP 403"
         assert "circuit open" in recovered[1][2]
     finally:
