@@ -43,7 +43,37 @@ def _bounded_worker_drain_seconds(stage_seconds: float) -> float:
     return min(max(0.0, requested), 0.5, max(0.0, stage_seconds) * .1)
 
 
-_WEB_STAGE_HARD_CAP_SECONDS = 180.0
+def _default_web_stage_deadline_seconds(scene_count: int) -> float:
+    """Completion-scaled default stage wall: 12s per scene, floored at 45s.
+
+    A 121-scene job gets 1452s instead of being cut off at the old fixed
+    180s ceiling after ~35 scenes; a 2-scene job keeps its 45s floor.
+    """
+    return max(
+        45.0,
+        min(_web_stage_hard_cap_seconds(), max(1, int(scene_count)) * 12.0),
+    )
+
+
+def _web_stage_hard_cap_seconds() -> float:
+    """Completion-oriented ceiling for one web retrieval stage.
+
+    The old 180s ceiling cut a 121-scene job off after ~35 scenes: the
+    stage wall must scale with the scenes left to resolve, not end at a
+    fixed time. The default 1800s still bounds a wedged stage, and the
+    delivery budget (render reserve) and the coordinator's outer wall clamp
+    it further downstream.
+    """
+    try:
+        return max(
+            180.0,
+            float(os.environ.get("VIDZEO_WEB_STAGE_HARD_CAP_SECONDS", "1800") or 1800),
+        )
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+_WEB_STAGE_HARD_CAP_SECONDS = 1800.0
 _WEB_SCENE_HARD_CAP_SECONDS = 90.0
 
 
@@ -760,8 +790,8 @@ _FAST_SOURCES = [
     ("primary_archive", "hybrid"), # Official publishers enter the same identity/vision gates.
     ("universal_scraper", "universal"), # four-engine parallel scraper adapter
     ("yandex", "api"),             # Yandex Images HTML scraper — priority lane
-    ("flickr_api", "flickr_api"),  # Flickr REST API — fast, reliable, no scraping
     ("bing_hybrid", "hybrid"),     # Bing image search
+    ("flickr_api", "flickr_api"),  # Flickr REST API — fast, reliable, no scraping
     ("ddg_hybrid", "hybrid"),      # DuckDuckGo image search
     ("openverse", "api"),          # Openverse CC image API
     ("wikimedia", "api"),
@@ -5378,6 +5408,41 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             if _web_verbose():
                 _web_log(f"scene {idx + 1} query '{q}' yielded only duplicate images. Trying next fallback...")
 
+    # Broadened-query round: the specific query waves above all failed.
+    # Before the fallbacks, progressively drop the most specific terms
+    # from the scene's own queries (the `broaden` flag is honoured here;
+    # it was previously accepted but never used). The universal scraper
+    # fans each broadened query out to all four engines with Yandex
+    # first, so this is one bounded multi-engine wave, not a
+    # per-provider retry loop. This round runs BEFORE the emergency
+    # subject fallback below: the bare canonical subject must stay the
+    # final query attempted (see
+    # test_full_query_pack_reserves_canonical_subject).
+    if selected_candidate is None and broaden and not _deadline_reached():
+        try:
+            from .query import _broaden_scene_queries
+        except Exception:
+            _broaden_scene_queries = None
+        if _broaden_scene_queries:
+            broadened = _broaden_scene_queries(queries, main_subject)
+            for _bq in broadened:
+                if _deadline_reached():
+                    break
+                if _web_verbose():
+                    _web_log(f"scene {idx + 1} broadened query: '{_bq}'")
+                _bq_rows = _fetch_source_query("universal_scraper", "universal", _bq)
+                if not _bq_rows:
+                    continue
+                _sel = _download_and_accept_single_candidate(
+                    _bq_rows[0], scene_dir, idx, scene_text,
+                    identity_terms, main_subject, global_phashes, global_md5s, used_files,
+                    phash_lock, md5_lock, file_lock, weak_terms)
+                if _sel:
+                    if _web_verbose():
+                        _web_log(f"scene {idx + 1} successfully rescued via broadened query '{_bq}'!")
+                    selected_candidate = _sel
+                    break
+
     # Emergency Rescue Fallback:
     # If all query options failed, run an immediate emergency subject search on Flickr API
     # to guarantee we find a valid image (e.g. searching "[Subject] portrait", "[Subject] photo", "[Subject]")
@@ -6271,7 +6336,7 @@ def resolve_web_images_for_video_fast(
     # The 3-minute ceiling is part of the production stall contract. Smaller
     # explicit delivery budgets still win, but configuration cannot disable
     # the wall and recreate the reported 20+ minute image stage.
-    default_stage_deadline = max(45.0, min(_WEB_STAGE_HARD_CAP_SECONDS, len(scene_texts) * 12.0))
+    default_stage_deadline = _default_web_stage_deadline_seconds(len(scene_texts))
     try:
         stage_deadline_seconds = _bounded_web_seconds(
             stage_deadline_seconds
@@ -6279,7 +6344,7 @@ def resolve_web_images_for_video_fast(
             else os.environ.get("VIDZEO_WEB_STAGE_DEADLINE_SECONDS", "")
             or default_stage_deadline,
             default_stage_deadline,
-            _WEB_STAGE_HARD_CAP_SECONDS,
+            _web_stage_hard_cap_seconds(),
         )
     except Exception:
         stage_deadline_seconds = default_stage_deadline

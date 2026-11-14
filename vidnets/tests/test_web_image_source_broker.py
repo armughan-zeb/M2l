@@ -10,6 +10,27 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 
 
 class SourceBrokerTests(unittest.TestCase):
+    def test_yandex_is_first_in_the_provider_catalog(self):
+        from services.web_image.source_broker import (
+            WEB_ENGINE_PRIORITY,
+            web_image_source_catalog,
+        )
+
+        self.assertEqual(
+            WEB_ENGINE_PRIORITY, ("yandex", "bing", "flickr", "duckduckgo")
+        )
+        tier_zero = [
+            row["name"] for row in web_image_source_catalog() if int(row["tier"]) == 0
+        ]
+        # Yandex first; Bing, Flickr and DuckDuckGo are fallbacks in that
+        # order (lane names differ from engine names, hence the mapping).
+        for earlier, later in (
+            ("yandex", "bing_hybrid"),
+            ("bing_hybrid", "flickr_api"),
+            ("flickr_api", "ddg_hybrid"),
+        ):
+            self.assertLess(tier_zero.index(earlier), tier_zero.index(later))
+
     def test_repairs_cross_job_sports_leak_and_duplicate_terms(self):
         from services.web_image.source_broker import sanitize_source_query
 

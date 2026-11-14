@@ -228,6 +228,42 @@ class WebImageModularTests(unittest.TestCase):
             "Grand Theft Auto VI",
         ))
 
+    def test_broadened_queries_drop_specific_terms_before_bare_subject(self):
+        from services.web_image.query import _broaden_scene_queries
+
+        broadened = _broaden_scene_queries(
+            ["Single wheel climbing rail diagram photograph"],
+            "train wheel",
+        )
+        # Progressive specificity loss, never the original query again, and
+        # the generic subject queries come last.
+        self.assertEqual(
+            broadened,
+            [
+                "Single wheel climbing rail diagram",
+                "Single wheel climbing rail",
+                "Single wheel climbing",
+                "Single wheel",
+                "train wheel photo",
+                "train wheel photograph",
+            ][:6],
+        )
+        self.assertNotIn(
+            "Single wheel climbing rail diagram photograph", broadened
+        )
+
+    def test_broadened_queries_never_repeat_tried_queries(self):
+        from services.web_image.query import _broaden_scene_queries
+
+        broadened = _broaden_scene_queries(
+            ["train wheel flange close up photograph", "train wheel flange"],
+            "train wheel",
+            tried=["train wheel flange close up"],
+        )
+        self.assertNotIn("train wheel flange close up", broadened)
+        self.assertNotIn("train wheel flange", broadened)
+        self.assertIn("train wheel photo", broadened)
+
     def test_topic_fallback_queries_keep_generic_terms_anchored(self):
         from services.web_image.query import _topic_fallback_queries
 

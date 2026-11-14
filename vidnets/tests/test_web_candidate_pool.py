@@ -140,6 +140,17 @@ def test_library_of_congress_is_wired_into_fast_sources(monkeypatch):
     assert rows[0]["url"].startswith("https://tile.loc.gov/")
 
 
+def test_fast_sources_try_yandex_before_bing_flickr_and_ddg():
+    """Yandex bot-walls least, so it is first; Bing, Flickr and DDG are
+    fallbacks in that order (WEB_ENGINE_PRIORITY in source_broker.py)."""
+    from services.web_image import resolver
+
+    names = [name for name, _kind in resolver._FAST_SOURCES]
+    assert names.index("yandex") < names.index("bing_hybrid")
+    assert names.index("bing_hybrid") < names.index("flickr_api")
+    assert names.index("flickr_api") < names.index("ddg_hybrid")
+
+
 def test_five_hundred_px_stays_out_of_slow_sources():
     """500px needs a logged-in cookie and returns no URLs without it
     (verified live Nov 10, 2026: 40s, zero URLs). It stays undispatched

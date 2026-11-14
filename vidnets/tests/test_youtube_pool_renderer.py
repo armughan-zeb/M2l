@@ -629,6 +629,162 @@ def test_probe_collection_enforces_wall_and_isolates_stalled_worker(tmp_path, mo
         release_slow.set()
 
 
+def _probe_first_pools():
+    # One scene, one source, weak metadata (score 50 < trust 70) so the
+    # scene is a vision priority scene, not a metadata-trusted bypass.
+    source = SimpleNamespace(
+        video_id="source-0", url="https://youtube.test/source-0",
+        title="RMS Titanic archival footage", channel="Archive", duration=600,
+        metadata_score=50,
+    )
+    return SimpleNamespace(
+        source_records={"source-0": source},
+        moment_assignments={},
+        assignments=[{"id": "source-0", "duration": 600, "best_timestamp": 20}],
+        rows=[{"scene_text": "Scene 0", "candidate_subject": "RMS Titanic", "title_anchor": "RMS Titanic"}],
+        scene_durations=[4.0],
+    )
+
+
+def test_probe_first_vision_reject_makes_no_full_cut(tmp_path):
+    """F1: a vision-rejected candidate costs only a cheap probe cut, never
+    a full 1080p re-encode."""
+    pools = _probe_first_pools()
+    cuts = []
+    verdict_paths = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append((str(output_path), dict(kwargs)))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    def fake_verdict(path, *args, **kwargs):
+        verdict_paths.append(str(path))
+        return (False, 20.0, True, "not the subject")
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", side_effect=fake_verdict), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 3  # one probe per moment option; each was vetoed
+    for probe_path, probe_kwargs in cuts:
+        assert probe_path.endswith(".probe.mp4")
+        assert probe_kwargs == {
+            "width": 640, "height": 360, "preset": "ultrafast",
+            "crf": 28, "timeout_seconds": 60.0,
+        }
+    # Vision saw the probes, never a full cut.
+    assert len(verdict_paths) == 3
+    assert all(path.endswith(".probe.mp4") for path in verdict_paths)
+    # No full 1080p cut was ever made and the scene has no accepted media.
+    assert not (tmp_path / "cuts" / "scene_001.moment_00.mp4").exists()
+    assert result[0] is None
+
+
+def test_probe_first_vision_accept_cuts_full_1080p_once(tmp_path):
+    """F1: the accepted winner gets exactly one full 1080p cut, after the
+    probe already passed every gate."""
+    pools = _probe_first_pools()
+    cuts = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append((str(output_path), dict(kwargs)))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", return_value=(True, 85.0, True, "visual_pass")), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 2
+    assert cuts[0][0].endswith(".probe.mp4")
+    assert cuts[0][1]["width"] == 640
+    assert cuts[1][0].endswith("scene_001.moment_00.mp4")
+    assert "width" not in cuts[1][1]
+    assert result[0] is not None
+    assert str(result[0]).endswith("scene_001.moment_00.mp4")
+    assert (tmp_path / "cuts" / "scene_001.moment_00.mp4").exists()
+
+
+def test_probe_first_falls_back_to_full_cut_when_probe_fails(tmp_path):
+    """F1: a probe ffmpeg hiccup never loses a scene; the old full-cut
+    path runs instead."""
+    pools = _probe_first_pools()
+    cuts = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append(str(output_path))
+        if ".probe." in str(output_path):
+            return False
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", return_value=(True, 85.0, True, "visual_pass")), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 2
+    assert cuts[0].endswith(".probe.mp4")
+    assert cuts[1].endswith("scene_001.moment_00.mp4")
+    assert result[0] is not None
+
+
+def test_probe_first_can_be_disabled(tmp_path, monkeypatch):
+    """F1: VIDZEO_YT_PROBE_FIRST=0 restores the old cut-first behaviour."""
+    monkeypatch.setenv("VIDZEO_YT_PROBE_FIRST", "0")
+    pools = _probe_first_pools()
+    cuts = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append(str(output_path))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", return_value=(True, 85.0, True, "visual_pass")), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 1
+    assert cuts[0].endswith("scene_001.moment_00.mp4")
+    assert result[0] is not None
+
+
 def test_pool_renderer_heuristic_fallback_covers_all_scenes_without_transcripts(tmp_path):
     sources = {
         f"source-{index}": SimpleNamespace(

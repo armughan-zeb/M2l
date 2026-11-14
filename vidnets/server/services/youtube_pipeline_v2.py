@@ -4210,7 +4210,11 @@ def _heuristic_moment_for_assignment(assignment: Dict[str, Any], scene_index: in
     )
 
 
-def _cut_local_segment(source_path: Path, output_path: Path, start: float, duration: float, cancellation: Any = None) -> bool:
+def _cut_local_segment(source_path: Path, output_path: Path, start: float, duration: float, cancellation: Any = None, width: Optional[int] = None, height: Optional[int] = None, preset: Optional[str] = None, crf: Optional[int] = None, timeout_seconds: Optional[float] = None) -> bool:
+    """Cut one local segment. Width/height/preset/crf/timeout_seconds override
+    the VIDZEO_YT_CLIP_* environment defaults when given. The pool renderer
+    uses the overrides for its cheap probe cut (640p, ultrafast, crf 28) so
+    vision can veto a candidate before the full 1080p cut is paid for."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     part_path = output_path.with_name(
         f"{output_path.stem}.{os.getpid()}.{threading.get_ident()}.part{output_path.suffix}"
@@ -4223,16 +4227,17 @@ def _cut_local_segment(source_path: Path, output_path: Path, start: float, durat
     requested_duration = max(1.0, float(duration))
     _source_height, target_fps = _youtube_quality_limits()
     try:
-        target_width = int(os.environ.get("VIDZEO_YT_CLIP_WIDTH", "1920") or 1920)
-        target_height = int(os.environ.get("VIDZEO_YT_CLIP_HEIGHT", "1080") or 1080)
+        target_width = int(width if width is not None else os.environ.get("VIDZEO_YT_CLIP_WIDTH", "1920") or 1920)
+        target_height = int(height if height is not None else os.environ.get("VIDZEO_YT_CLIP_HEIGHT", "1080") or 1080)
     except (TypeError, ValueError):
         target_width, target_height = 1920, 1080
     target_width = max(320, min(3840, target_width))
     target_height = max(180, min(1080, target_height))
     try:
-        clip_crf = max(14, min(28, int(os.environ.get("VIDZEO_YT_CLIP_CRF", "18") or 18)))
+        clip_crf = max(14, min(28, int(crf if crf is not None else os.environ.get("VIDZEO_YT_CLIP_CRF", "18") or 18)))
     except (TypeError, ValueError):
         clip_crf = 18
+    clip_preset = str(preset or os.environ.get("VIDZEO_YT_CLIP_PRESET", "fast") or "fast")
     cmd = [
         _ffmpeg_bin("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
         "-ss", f"{seek_start:.3f}", "-i", str(source_path),
@@ -4243,13 +4248,19 @@ def _cut_local_segment(source_path: Path, output_path: Path, start: float, durat
             f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={target_width}:{target_height},fps={target_fps}"
         ),
-        "-c:v", "libx264", "-preset", os.environ.get("VIDZEO_YT_CLIP_PRESET", "fast"), "-crf", str(clip_crf),
+        "-c:v", "libx264", "-preset", clip_preset, "-crf", str(clip_crf),
         "-pix_fmt", "yuv420p", "-r", str(target_fps), str(part_path),
     ]
     # High-quality 1080p transcodes are still bounded, but sources can be slow
     # on disk or heavily compressed muxes. Scale the bound with the requested
     # duration so long documentary scenes are not silently truncated.
-    cut_timeout = max(90.0, min(300.0, 30.0 + requested_duration * 10.0))
+    if timeout_seconds is not None:
+        try:
+            cut_timeout = max(10.0, float(timeout_seconds))
+        except (TypeError, ValueError):
+            cut_timeout = max(90.0, min(300.0, 30.0 + requested_duration * 10.0))
+    else:
+        cut_timeout = max(90.0, min(300.0, 30.0 + requested_duration * 10.0))
     try:
         if cancellation is not None:
             from services.cancellation import run_cancellable_process

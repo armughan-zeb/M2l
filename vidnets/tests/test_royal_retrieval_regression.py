@@ -68,8 +68,19 @@ def test_full_query_pack_reserves_canonical_subject(monkeypatch, tmp_path):
         threading.Lock(), threading.Lock(), threading.Lock(), fast_mode=True,
         visual_requirement={"canonical_entity": "British Royal Family", "strict_identity": True},
     )
-    assert len(searched) == 4
-    assert searched[-1] == "British Royal Family"
+    # The canonical pack is unchanged: three variants, then the bare
+    # canonical subject as the final wave of the pack. The F3 broadening
+    # round appends one bounded wave after the pack (5 queries here); the
+    # bare canonical subject is attempted exactly once, in the pack, and
+    # is never repeated by the broadening round.
+    assert searched[:4] == [
+        "British Royal Family 2026 variant 0",
+        "British Royal Family 2026 variant 1",
+        "British Royal Family 2026 variant 2",
+        "British Royal Family",
+    ]
+    assert len(searched) == 9
+    assert searched.count("British Royal Family") == 1
 
 
 def test_youtube_explicit_budget_includes_auth_retry(monkeypatch):
