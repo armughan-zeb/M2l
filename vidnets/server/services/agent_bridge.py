@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import threading
 import time
 import requests
@@ -108,12 +109,175 @@ def read_request(request_id, owner_id, *, locked=False):
     return row
 
 
+# --- Answer cache + bridge prune (inbox reliability) ---
+
+# A re-issued request carries the same payload under a new id (verified by
+# fingerprint 2026-11-14: identical messages, operation and response
+# format). Caching a composed answer under its payload fingerprint lets a
+# re-issue be answered immediately instead of being composed again against
+# the 120s wall. The cache lives in one file at the bridge root so it is
+# never scanned by pending_requests() and never pruned with the dirs.
+_ANSWER_CACHE_FILE = '_answer_cache.json'
+_ANSWER_CACHE_MAX_ENTRIES = 200
+_PRUNE_GRACE_SECONDS = 24 * 60 * 60
+_PRUNE_INTERVAL_SECONDS = 3600
+_last_prune_monotonic = 0.0
+_prune_lock = threading.Lock()
+
+
+def payload_fingerprint(row):
+    """Stable identity of what an answer must contain.
+
+    Covers everything the answer depends on — job, operation, kind,
+    messages, response format — and nothing that changes on re-issue
+    (id, created/expires times).
+    """
+    canonical = {
+        'job_id': row.get('job_id', ''),
+        'operation': row.get('operation', ''),
+        'kind': row.get('kind', ''),
+        'messages': row.get('messages', []),
+        'response_format': row.get('response_format', {}),
+    }
+    blob = json.dumps(canonical, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _cache_path():
+    return bridge_root() / _ANSWER_CACHE_FILE
+
+
+def _read_answer_cache():
+    try:
+        data = json.loads(_cache_path().read_text(encoding='utf-8'))
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _cache_answer(fingerprint, content, operation=''):
+    """Best-effort: a cache failure must never break a completed answer."""
+    try:
+        cache = _read_answer_cache()
+        cache[fingerprint] = {
+            'content': content,
+            'operation': operation,
+            'saved_at': time.time(),
+        }
+        while len(cache) > _ANSWER_CACHE_MAX_ENTRIES:
+            oldest = min(cache, key=lambda key: cache[key].get('saved_at', 0))
+            del cache[oldest]
+        atomic_json(_cache_path(), cache)
+    except Exception:
+        pass
+
+
+def cached_answer_for(request_id, owner_id):
+    """Return the previously composed answer for this request's payload, if any.
+
+    Returns None when the request is not pending or its payload has never
+    been answered. The caller still has to submit the content through
+    complete_request, which re-validates it against this request's schema.
+    """
+    row = read_request(request_id, owner_id)
+    if row['state'] != 'pending':
+        return None
+    entry = _read_answer_cache().get(payload_fingerprint(row))
+    return entry.get('content') if isinstance(entry, dict) else None
+
+
+def reuse_cached_answer(request_id):
+    """Complete a re-issued request from a previously composed answer.
+
+    Returns {'reused': True, ...} when the payload matches a cached answer
+    and it was submitted, {'reused': False, ...} when there is nothing to
+    reuse (including an expired request). The cached content is
+    re-validated by complete_request against this request's schema, so a
+    stale or mismatched cache entry cannot be submitted.
+    """
+    path = _request_path(request_id)
+    if not path.is_file():
+        raise ValueError('Agent request was not found.')
+    row = json.loads(path.read_text(encoding='utf-8'))
+    content = cached_answer_for(request_id, str(row.get('owner_id', '')))
+    if content is None:
+        return {'reused': False, 'request_id': request_id}
+    complete_request(request_id, str(row.get('owner_id', '')), content)
+    return {'reused': True, 'request_id': request_id}
+
+
+def prune_bridge(*, grace_seconds=_PRUNE_GRACE_SECONDS):
+    """Delete request directories that are terminal and long past expiry.
+
+    A request whose expiry is more than ``grace_seconds`` in the past can
+    never be answered or re-issued against (a re-issue gets a new id), so
+    its payload is dead history. Only directories are removed; the answer
+    cache file lives at the bridge root and is untouched. Returns the number
+    of directories removed. A file written within the grace window is kept
+    without parsing: its mtime is its creation time for a fresh request and
+    its answer time for a completed one, so a recent file cannot be
+    terminal and old.
+    """
+    root = bridge_root()
+    if not root.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for directory in root.iterdir():
+        if not directory.is_dir():
+            continue
+        request_file = directory / 'request.json'
+        if not request_file.is_file():
+            continue
+        try:
+            if request_file.stat().st_mtime > now - grace_seconds:
+                continue
+            row = json.loads(request_file.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        try:
+            expires_at = float(row.get('expires_at') or 0)
+        except (TypeError, ValueError):
+            continue
+        if expires_at and expires_at < now - grace_seconds:
+            shutil.rmtree(directory, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def _maybe_prune_bridge():
+    """Run prune_bridge at most once per hour, from whichever caller arrives first."""
+    global _last_prune_monotonic
+    now = time.monotonic()
+    if now - _last_prune_monotonic < _PRUNE_INTERVAL_SECONDS:
+        return 0
+    if not _prune_lock.acquire(False):
+        return 0
+    try:
+        if time.monotonic() - _last_prune_monotonic < _PRUNE_INTERVAL_SECONDS:
+            return 0
+        _last_prune_monotonic = time.monotonic()
+        return prune_bridge()
+    finally:
+        _prune_lock.release()
+
+
 def pending_requests(owner_id):
     rows = []
     if not bridge_root().exists():
         return rows
+    _maybe_prune_bridge()
+    now = time.time()
+    # Cheap filter: a request file last written more than one wall plus
+    # grace ago cannot be live — its wall is 120s from creation, and an
+    # answer rewrites the file at answer time. Skip the parse entirely.
+    cutoff = now - (AGENT_REQUEST_WALL_SECONDS + 60.0)
     for path in bridge_root().glob('*/request.json'):
         try:
+            if path.stat().st_mtime < cutoff:
+                continue
             row = read_request(path.parent.name, owner_id)
             if row['state'] == 'pending':
                 rows.append({key: row[key] for key in ('id', 'job_id', 'operation', 'kind', 'created_at', 'expires_at')})
@@ -157,6 +321,13 @@ def complete_request(request_id, owner_id, content, error=''):
         atomic_json(path.with_name('response.json'), reply)
         row['state'] = 'answered'
         atomic_json(path, row)
+        if not error:
+            # Cache the composed answer under its payload fingerprint so a
+            # re-issued request (same payload, new id) can reuse it
+            # immediately instead of being composed again against the wall.
+            # Best-effort: _cache_answer swallows its own failures.
+            _cache_answer(payload_fingerprint(row), content,
+                          operation=str(row.get('operation', '')))
     return {'success': True, 'request_id': request_id}
 
 
