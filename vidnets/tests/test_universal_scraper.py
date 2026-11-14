@@ -152,3 +152,80 @@ def test_result_adapter_preserves_provenance_and_pending_visual_gate():
     assert candidate["provider"] == "universal_yandex"
     assert candidate["metadata_pending"] is True
     assert candidate["source_url"] == "https://archive.example/apollo"
+
+
+# ── S7: per-host search throttling ───────────────────────────────────────
+def test_throttled_get_caps_per_host_concurrency_and_enforces_gap(monkeypatch):
+    """One host sees at most VIDZEO_UNIVERSAL_PER_HOST concurrent requests,
+    and request starts to the same host are spaced by the minimum delay."""
+    import threading
+
+    from services.web_image import universal_scraper as scraper
+
+    monkeypatch.setenv("VIDZEO_UNIVERSAL_PER_HOST", "2")
+    monkeypatch.setenv("VIDZEO_UNIVERSAL_MIN_DELAY_SECONDS", "0.5")
+    host = "https://throttle-test-unique.example/search"
+
+    class FakeResp:
+        status_code = 200
+        text = "ok"
+
+    class FakeClient:
+        def __init__(self):
+            self.starts = []
+            self.inflight = 0
+            self.peak = 0
+            self.lock = threading.Lock()
+
+        def get(self, url, headers=None, timeout=None):
+            with self.lock:
+                self.starts.append(time.monotonic())
+                self.inflight += 1
+                self.peak = max(self.peak, self.inflight)
+            time.sleep(0.2)
+            with self.lock:
+                self.inflight -= 1
+            return FakeResp()
+
+    client = FakeClient()
+    threads = [
+        threading.Thread(
+            target=lambda: scraper._throttled_get(client, host, headers={}, timeout=5)
+        )
+        for _ in range(3)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert client.peak <= 2, "per-host concurrency cap exceeded"
+    gaps = [client.starts[i + 1] - client.starts[i] for i in range(len(client.starts) - 1)]
+    assert gaps and all(gap >= 0.45 for gap in gaps), f"min delay not enforced: {gaps}"
+
+
+def test_throttled_get_retries_429_with_backoff(monkeypatch):
+    """A 429 is retried with backoff; a 200 on the retry is returned."""
+    from services.web_image import universal_scraper as scraper
+
+    monkeypatch.setenv("VIDZEO_UNIVERSAL_MIN_DELAY_SECONDS", "0")
+    monkeypatch.setenv("VIDZEO_UNIVERSAL_RETRY_BASE", "0.05")
+
+    class FakeResp:
+        def __init__(self, status):
+            self.status_code = status
+            self.text = ""
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, headers=None, timeout=None):
+            self.calls += 1
+            return FakeResp(429 if self.calls == 1 else 200)
+
+    client = FlakyClient()
+    response = scraper._throttled_get(
+        client, "https://throttle-retry-unique.example/x", headers={}, timeout=5
+    )
+    assert client.calls == 2
+    assert response.status_code == 200
