@@ -21,6 +21,10 @@ const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetr
 
 const MINUTE = 60 * 1000;
 
+function inferenceConcurrency() {
+  return Math.max(1, Math.min(8, Math.floor(Number(process.env.MUSE_INBOX_CONCURRENCY) || 8)));
+}
+
 function agentCommand() {
   const explicit = String(process.env.MUSE_VIDNETS_COMMAND || '').trim();
   if (explicit) return explicit;
@@ -259,11 +263,17 @@ function inferenceTransport() {
 
 async function answerOne(requestMeta, workDir, transport, signal) {
   if (signal?.aborted) throw new Error('Render cancelled by operator');
-  const request = await vidnets(`request ${requestId(requestMeta.id)}`, { timeoutMs: MINUTE, signal, label: 'Vidnets agent request read' });
+  const expiresAt = Number(requestMeta.expires_at) * 1000;
+  const remaining = () => Math.min(MINUTE, Math.floor(expiresAt - Date.now()));
+  if (!(remaining() > 0)) return;
+  const request = await vidnets(`request ${requestId(requestMeta.id)}`, { timeoutMs: remaining(), signal, label: 'Vidnets agent request read' });
   request.id = requestMeta.id;
-  let content;
-  if (transport.kind === 'command') content = await runInferenceCommand(transport.command, request, workDir);
-  else content = await runInferenceHttp(transport.url, request);
+  const timeoutMs = remaining() - 5000;
+  if (timeoutMs <= 0 || signal?.aborted) return;
+  const content = transport.kind === 'command'
+    ? await runInferenceCommand(transport.command, request, workDir, { timeoutMs, signal })
+    : await runInferenceHttp(transport.url, request, { timeoutMs, signal });
+  if (remaining() <= 0 || signal?.aborted) return;
 
   const answerDir = path.join(workDir, 'inference');
   fs.mkdirSync(answerDir, { recursive: true });
@@ -271,25 +281,28 @@ async function answerOne(requestMeta, workDir, transport, signal) {
   try { parsedJson = JSON.parse(content); } catch { /* text response */ }
   const answerFile = path.join(answerDir, `${request.id}.${parsedJson ? 'json' : 'txt'}`);
   fs.writeFileSync(answerFile, parsedJson ? JSON.stringify(parsedJson) : content, 'utf8');
-  await vidnets(`answer ${request.id} ${quoteArg(answerFile)}`, { timeoutMs: MINUTE, signal, label: 'Vidnets agent answer' });
+  await vidnets(`answer ${request.id} ${quoteArg(answerFile)}`, { timeoutMs: Math.max(1, remaining()), signal, label: 'Vidnets agent answer' });
   log.info(`Answered Vidnets ${request.kind || 'text'} request${request.operation ? ` (${request.operation})` : ''}`);
 }
 
-async function serviceInbox(vidnetsJobId, workDir, transport, signal, active) {
+async function serviceInbox(vidnetsJobId, workDir, transport, signal, handled) {
   if (!transport || !vidnetsJobId) return;
   const pending = await vidnets('pending', { timeoutMs: MINUTE, signal, label: 'Vidnets agent inbox' });
+  const now = Date.now() / 1000;
+  for (const [id, expiry] of handled) if (expiry <= now) handled.delete(id);
   const rows = (Array.isArray(pending.requests) ? pending.requests : [])
     .filter(row => String(row.job_id || '') === String(vidnetsJobId))
-    .filter(row => !active.has(row.id));
-  for (const row of rows) active.add(row.id);
+    .filter(row => !handled.has(row.id) && Number(row.expires_at) > now)
+    .sort((a, b) => Number(String(b.operation).startsWith('scriptit.')) -
+      Number(String(a.operation).startsWith('scriptit.')) || a.expires_at - b.expires_at)
+    .slice(0, inferenceConcurrency());
+  for (const row of rows) handled.set(row.id, Number(row.expires_at));
   await Promise.all(rows.map(async row => {
     try {
       await answerOne(row, workDir, transport, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
       log.warn(`Vidnets inference request ${String(row.id).slice(0, 8)} failed: ${error.message}`);
-    } finally {
-      active.delete(row.id);
     }
   }));
 }
@@ -344,7 +357,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   }
   log.info(`Following Vidnets job ${vidnetsJobId} for "${job.title}"`);
 
-  const activeInference = new Set();
+  const handledInference = new Map();
   let lastProgress = -1;
   let lastDetail = '';
   const deadline = Date.now() + Math.max(10 * MINUTE, Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE);
@@ -355,7 +368,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     if (signal?.aborted) throw new Error('Render cancelled by operator');
     if (Date.now() > deadline) throw new Error('Vidnets render exceeded the configured Muse render budget');
 
-    if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(error => {
+    if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, handledInference).catch(error => {
       if (signal?.aborted) throw error;
       log.warn('Vidnets inbox poll failed; retrying: ' + error.message);
     });
@@ -396,7 +409,6 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
       if (!mediaCount || mediaCount.real !== mediaCount.total) {
         throw new Error('Vidnets completed without evidence of accepted real media in every scene');
       }
-      if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(() => {});
       onProgress?.(100, 'Vidnets render complete');
       return { videoPath, vidnetsJobId, packageDir, meta: {
         engine: 'vidnets', vidnetsJobId, realScenes: mediaCount.real, totalScenes: mediaCount.total
@@ -433,4 +445,4 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   }
 }
 
-module.exports = { render, buildRequest, ensureReady, agentCommand, inferenceTransport, runInferenceCommand, runInferenceHttp };
+module.exports = { render, buildRequest, ensureReady, agentCommand, inferenceTransport, inferenceConcurrency, runInferenceCommand, runInferenceHttp };

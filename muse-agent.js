@@ -580,7 +580,7 @@ async function startCommand(args) {
       releaseInboxLock = acquireLock(path.join(inboxRoot, 'resident.lock'));
       const stop = startResidentInbox({
         root: inboxRoot,
-        concurrency: Math.max(1, Math.min(8, Math.floor(Number(process.env.MUSE_INBOX_CONCURRENCY) || 8))),
+        concurrency: vidnets.inferenceConcurrency(),
         logger: log,
         onExpiryLimit: () => {
           refreshInboxHealth.invalidate();
