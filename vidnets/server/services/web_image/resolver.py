@@ -26,6 +26,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from ..job_context import JobThreadPoolExecutor as ThreadPoolExecutor
+from ..pipeline_activity import record_activity
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
 
@@ -7212,6 +7213,10 @@ def resolve_web_images_for_video_fast(
     timed_out_scene_indexes: set[int] = set()
     progress_log_every = max(1, min(10, n // 5 or 1))
     pending = set(futures)
+    # Ground-truth activity for the preparation-stall detector: a scene
+    # completing here is real work even when the display pipeline filters
+    # the progress report out (a recovery wave restarts its counter).
+    record_activity("web")
     try:
         while pending and not scene_cancel_event.is_set():
             remaining = stage_deadline_at - time.monotonic()
@@ -7228,6 +7233,7 @@ def resolve_web_images_for_video_fast(
                 try:
                     results[idx] = future.result()
                     resolved_so_far = sum(1 for r in results if r is not None and r.get("path"))
+                    record_activity("web")
                     if completed <= 3 or completed == n or completed % progress_log_every == 0:
                         _web_log(f"scene progress: {completed}/{n} checked, {resolved_so_far} resolved")
                     if progress_callback:
