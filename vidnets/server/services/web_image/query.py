@@ -802,6 +802,50 @@ def _topic_fallback_queries(subject: str, scene_text: str = "", limit: int = 5) 
     return queries[:limit]
 
 
+def _broaden_scene_queries(
+    queries: List[str],
+    main_subject: str = "",
+    tried: Optional[List[str]] = None,
+    limit: int = 6,
+) -> List[str]:
+    """Progressively broaden specific queries that returned nothing.
+
+    Drop the most specific (trailing) terms one at a time, so a query like
+    "Single wheel climbing rail diagram photograph" degrades through
+    "Single wheel climbing rail diagram" to "Single wheel" before the bare
+    subject is tried. Generic subject queries come last. Queries already
+    tried (including the originals) are never repeated.
+    """
+    tried_lower = {str(q or "").strip().lower() for q in (tried or [])}
+    tried_lower |= {str(q or "").strip().lower() for q in (queries or [])}
+    subject = str(main_subject or "").strip()
+    out: List[str] = []
+
+    def _add(raw: str) -> None:
+        cleaned = _clean_query(raw)
+        if not cleaned:
+            return
+        # Single-word variants are only useful as the bare subject itself.
+        if len(cleaned.split()) < 2 and cleaned.lower() != subject.lower():
+            return
+        if cleaned.lower() in tried_lower:
+            return
+        tried_lower.add(cleaned.lower())
+        out.append(cleaned)
+
+    for query in (queries or []):
+        tokens = [token for token in str(query or "").split() if token]
+        for end in range(len(tokens) - 1, 1, -1):
+            _add(" ".join(tokens[:end]))
+            if len(out) >= limit:
+                return out
+    if subject:
+        _add(f"{subject} photo")
+        _add(f"{subject} photograph")
+        _add(subject)
+    return out[:limit]
+
+
 def _history_visual_terms(scene_text: str) -> List[str]:
     """Return concrete historical subjects/actions, never narration prose."""
     lower = str(scene_text or "").lower()
