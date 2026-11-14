@@ -197,6 +197,61 @@ class SourceBrokerTests(unittest.TestCase):
         assert rows[0]["thumbnail_url"] == "https://bing.example/titanic-thumb.jpg"
         assert rows[0]["width"] == 1200
 
+    def test_flickr_html_parser_reads_server_rendered_search_page(self):
+        """S7: Flickr's search page (no API key) yields full-text results.
+        Fixture mirrors the real page shape: modelExport photo objects
+        with escaped slashes, ownerNsid/title/sizes, _b as the large size."""
+        from services.web_image.flickr_api_source import _parse_flickr_html
+
+        def photo(photo_id, owner, alias, title):
+            sizes = "".join(
+                f'"{key}":{{"data":{{"displayUrl":"\\/\\/live.staticflickr.com\\/8660\\/'
+                f'{photo_id}_382a71b7a1_{key}.jpg","url":"\\/\\/live.staticflickr.com\\/8660\\/'
+                f'{photo_id}_382a71b7a1_{key}.jpg"}}}},'
+                for key in ("s", "m", "z", "c", "b")
+            )
+            return (
+                f'{{"data":{{"pathAlias":"{alias}","username":"{alias}",'
+                f'"ownerNsid":"{owner}","faveCount":17,"commentCount":6,'
+                f'"title":"{title}","description":"Iceland aurora.",'
+                f'"license":0,"sizes":{{"data":{{{sizes.rstrip(",")}}}}}}}}}'
+            )
+
+        html = (
+            '<html><body>'
+            + photo("16492450850", "61827574@N03", "snow_cheetah", "Northern lights")
+            + photo("55622475618", "12345678@N00", "hdr-nutter", "Northern Lights - Eagle")
+            + "</body></html>"
+        )
+        rows = _parse_flickr_html(html, 5)
+
+        assert len(rows) == 2
+        assert rows[0]["image_url"] == (
+            "https://live.staticflickr.com/8660/16492450850_382a71b7a1_b.jpg"
+        )
+        assert rows[0]["title"] == "Northern lights"
+        assert rows[0]["source_url"] == (
+            "https://www.flickr.com/photos/snow_cheetah/16492450850/"
+        )
+        assert rows[0]["resolver_lane"] == "flickr-html"
+        assert rows[1]["image_url"].endswith("_b.jpg")
+        assert rows[1]["source_url"].startswith(
+            "https://www.flickr.com/photos/hdr-nutter/"
+        )
+
+    def test_flickr_html_parser_prefers_largest_size_and_dedupes(self):
+        from services.web_image.flickr_api_source import _parse_flickr_html
+
+        # Same photo at _m and _b: only the _b row survives, once.
+        html = (
+            '"ownerNsid":"1@N01","title":"Aurora",'
+            '"sizes":{"data":{"m":{"data":{"url":"\\/\\/live.staticflickr.com\\/1\\/9_a_m.jpg"}},'
+            '"b":{"data":{"url":"\\/\\/live.staticflickr.com\\/1\\/9_a_b.jpg"}}}}'
+        )
+        rows = _parse_flickr_html(html, 5)
+        assert len(rows) == 1
+        assert rows[0]["image_url"] == "https://live.staticflickr.com/1/9_a_b.jpg"
+
     def test_provider_download_headers_use_publisher_for_originals(self):
         from services.web_image.resolver import _provider_download_headers
 

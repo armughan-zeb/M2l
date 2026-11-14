@@ -111,6 +111,94 @@ _Y_TITLE_RE = re.compile(r'\\?"(?:snippet"\s*:\s*\{[^{}]{0,600}?\\?"title|title)
 _URL_RE = re.compile(r"https?://[^\"'<>\\\s]+", re.I)
 
 
+# ── Per-host search throttling (S7) ──────────────────────────────────────
+# The manager fans engines out in parallel and several scene workers can
+# run batches at once, so one host (e.g. yandex.com) can see many
+# simultaneous requests — enough to trigger SmartCaptcha / 429. Bound it:
+# at most N concurrent requests per host, at least ``delay`` between
+# request starts to the same host, and exponential backoff on 429/403.
+# The state is module-global, so it bounds ALL managers and scene workers
+# collectively, not just one batch. This reuses the download limiter's
+# philosophy (per-host caps + backoff) for the search path, which
+# previously had no throttle at all. The DuckDuckGo engine is the one
+# exception: it goes through a subprocess worker, not a client.get, so it
+# is not routed through here (it has its own 15s budget + 2 attempts).
+def _universal_per_host() -> int:
+    try:
+        return max(1, min(8, int(os.environ.get("VIDZEO_UNIVERSAL_PER_HOST", "2") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _universal_min_delay() -> float:
+    try:
+        return max(0.0, min(5.0, float(os.environ.get("VIDZEO_UNIVERSAL_MIN_DELAY_SECONDS", "0.5") or 0.5)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _universal_retry_count() -> int:
+    try:
+        return max(0, min(3, int(os.environ.get("VIDZEO_UNIVERSAL_RETRIES", "2") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _universal_retry_delay(attempt: int) -> float:
+    try:
+        base = max(0.1, min(3.0, float(os.environ.get("VIDZEO_UNIVERSAL_RETRY_BASE", "1.0") or 1.0)))
+    except (TypeError, ValueError):
+        base = 1.0
+    return min(8.0, base * (2 ** attempt))
+
+
+_universal_host_state: Dict[str, Dict[str, object]] = {}
+_universal_host_guard = threading.Lock()
+
+
+def _universal_host_slot(host: str) -> Dict[str, object]:
+    with _universal_host_guard:
+        state = _universal_host_state.get(host)
+        if state is None:
+            state = {
+                "semaphore": threading.Semaphore(_universal_per_host()),
+                "last_start": 0.0,
+                "lock": threading.Lock(),
+            }
+            _universal_host_state[host] = state
+        return state
+
+
+def _throttled_get(client, url: str, *, headers, timeout):
+    """GET through the per-host throttle, with 429/403 backoff retries.
+
+    ``client`` is any object with ``.get(url, headers=..., timeout=...)``
+    (the isolated native client, a requests.Session, or the requests
+    module). Returns the response-like object (status_code + text/json).
+    A 429/403 is retried with exponential backoff; a final non-200 is
+    returned as-is so the engine can raise its usual error and the
+    manager can record a per-engine failure without losing the batch.
+    """
+    host = (urlparse(url).netloc or "").lower()
+    state = _universal_host_slot(host)
+    semaphore = state["semaphore"]
+    lock = state["lock"]
+    response = None
+    for attempt in range(_universal_retry_count() + 1):
+        with lock:
+            wait = _universal_min_delay() - (time.monotonic() - float(state["last_start"]))
+            if wait > 0:
+                time.sleep(wait)
+            state["last_start"] = time.monotonic()
+        with semaphore:
+            response = client.get(url, headers=headers, timeout=timeout)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status not in (429, 403) or attempt >= _universal_retry_count():
+            return response
+        time.sleep(_universal_retry_delay(attempt))
+    return response
+
+
 def _title_is_query_echo(title: object, query: str) -> bool:
     """Identify provider placeholders that repeat the retrieval query."""
     raw_title = re.sub(r"\s+", " ", str(title or "")).strip()
@@ -259,10 +347,10 @@ class YandexEngine(_Engine):
         if safe_search:
             url += "&family=yes"
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
+            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=300)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=300)
+            response = _throttled_get(requests, url, headers=_HEADERS, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Yandex returned HTTP status {status}")
@@ -322,10 +410,10 @@ class BingEngine(_Engine):
             f"q={urllib.parse.quote(query)}&first={first}&count={limit}&mmasync=1&adlt={safe}"
         )
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
+            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=300)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=300)
+            response = _throttled_get(requests, url, headers=_HEADERS, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Bing returned HTTP status {status}")
@@ -466,10 +554,10 @@ class BaiduEngine(_Engine):
             f"&pn={start}&rn={limit}"
         )
         try:
-            response = self._get_client().get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
+            response = _throttled_get(self._get_client(), url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
+            response = _throttled_get(requests, url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Baidu returned HTTP status {status}")
@@ -525,10 +613,10 @@ class OpenverseEngine(_Engine):
             f"&page={max(1, page)}&page_size={min(limit, 50)}"
         )
         try:
-            response = self._get_client().get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
+            response = _throttled_get(self._get_client(), url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
+            response = _throttled_get(requests, url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Openverse returned HTTP status {status}")
@@ -575,10 +663,10 @@ class FlickrEngine(_Engine):
         tags = urllib.parse.quote(query.replace(" ", ","))
         url = f"https://www.flickr.com/services/feeds/photos_public.gne?tags={tags}&format=json&nojsoncallback=1"
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
+            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=300)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=300)
+            response = _throttled_get(requests, url, headers=_HEADERS, timeout=300)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Flickr returned HTTP status {status}")

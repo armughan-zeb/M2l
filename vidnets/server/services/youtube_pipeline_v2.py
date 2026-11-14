@@ -68,7 +68,6 @@ def _youtube_js_runtime_options() -> Dict[str, Any]:
         (str(value).strip() for value in runtime_candidates if value and Path(value).is_file()),
         "",
     )
-    options: Dict[str, Any] = {}
     if runtime_path:
         options["js_runtimes"] = {"node": {"path": runtime_path}}
     from importlib.util import find_spec

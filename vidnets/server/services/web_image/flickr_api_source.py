@@ -14,6 +14,8 @@ Falls back gracefully if no key is available.
 """
 from __future__ import annotations
 
+import html
+import json
 import os
 import re
 import threading
@@ -205,6 +207,152 @@ def _flickr_metadata_relevant(query: str, title: str, tags: str, description: st
     return any(re.search(rf"\b{re.escape(term)}\b", blob) for term in terms)
 
 
+# ── No-key HTML fallback (S7) ─────────────────────────────────────────────
+# The REST API above needs a valid key. The bundled demo key is dead
+# (Flickr returns "100: Invalid API Key (Key not found)", verified live
+# 2026-11-14), and no FLICKR_API_KEY is configured on this VM, so the
+# `flickr_api` fast source returned zero rows. Flickr's own search page
+# (https://www.flickr.com/search/?text=...) is server-rendered and needs
+# no key: each photo is a modelExport object with ownerNsid, title,
+# description and a sizes map whose _b entry is the 1024px image at
+# live.staticflickr.com. If a valid key is ever configured via
+# FLICKR_API_KEY, the API path above is used and this fallback never runs.
+# (Flickr also offers a tag-based public feed, used by the universal
+# scraper's FlickrEngine; this HTML path is the full-text search, so it
+# matches the API's relevance instead of only recent tag matches.)
+_FLICKR_SEARCH_URL = "https://www.flickr.com/search/"
+_FLICKR_HTML_SIZE_ORDER = ("_b", "_c", "_z", "_m", "_w", "_n", "_q", "_s", "")
+
+
+def _json_unescape(raw: str) -> str:
+    """Unescape one JSON string body (no surrounding quotes)."""
+    try:
+        return json.loads('"' + raw + '"')
+    except Exception:
+        return raw.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _parse_flickr_html(html_text: str, limit: int) -> List[Dict]:
+    """Parse Flickr's server-rendered search page into API-shaped rows.
+
+    Splits the modelExport JSON into per-photo slices at each
+    ``"ownerNsid"`` (the first field of a photo object), so a slice is
+    exactly one photo and titles/URLs cannot leak across photos.
+    """
+    text = (html_text or "").replace("\\/", "/")
+    starts = [m.start() for m in re.finditer(r'"ownerNsid":"', text)]
+    if not starts:
+        return []
+    rows: List[Dict] = []
+    seen = set()
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else min(len(text), start + 20000)
+        seg = text[start:end]
+        title_m = re.search(r'"title":"((?:[^"\\]|\\.)*)"', seg)
+        title = _json_unescape(title_m.group(1)) if title_m else ""
+        desc_m = re.search(r'"description":"((?:[^"\\]|\\.)*)"', seg)
+        description = _json_unescape(desc_m.group(1)) if desc_m else ""
+        owner_m = re.search(r'"ownerNsid":"([^"]+)"', seg)
+        # pathAlias (the username slug) sits just before ownerNsid, so it
+        # is outside this slice; look back a short window for it.
+        alias_m = re.search(
+            r'"pathAlias":"((?:[^"\\]|\\.)*)"', text[max(0, start - 500):start]
+        )
+        owner = (
+            _json_unescape(alias_m.group(1))
+            if alias_m
+            else (owner_m.group(1) if owner_m else "unknown")
+        )
+        image_url = ""
+        thumb_url = ""
+        for suffix in _FLICKR_HTML_SIZE_ORDER:
+            m = re.search(
+                r'live\.staticflickr\.com/\d+/\d+_[a-z0-9]+' + re.escape(suffix) + r'\.jpg',
+                seg,
+            )
+            if m:
+                image_url = "https://" + m.group(0)
+                break
+        if not image_url:
+            continue
+        id_m = re.search(r'live\.staticflickr\.com/\d+/(\d+)_[a-z0-9]+', seg)
+        photo_id = id_m.group(1) if id_m else image_url
+        if photo_id in seen:
+            continue
+        seen.add(photo_id)
+        thumb_m = re.search(r'live\.staticflickr\.com/\d+/\d+_[a-z0-9]+_m\.jpg', seg)
+        thumb_url = "https://" + thumb_m.group(0) if thumb_m else image_url
+        source_url = f"https://www.flickr.com/photos/{owner}/{photo_id}/"
+        rows.append({
+            "title": title,
+            "image_url": image_url,
+            "url": image_url,
+            "source_url": source_url,
+            "page_url": source_url,
+            "thumbnail_url": thumb_url,
+            "preview_url": thumb_url,
+            "domain": "flickr.com",
+            "source": "flickr_api",
+            "provider": "flickr",
+            "resolver_lane": "flickr-html",
+            "tags": "",
+            "views": 0,
+            "owner": owner,
+            "description": description[:400],
+        })
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _search_flickr_html(query: str, limit: int = 20, min_views: int = 0) -> List[Dict]:
+    """Full-text Flickr search via the public search page (no API key)."""
+    q = re.sub(r"\s+", " ", (query or "").strip())
+    if not q:
+        return []
+    session = _get_session()
+    data = None
+    last_error = ""
+    for attempt in range(_retry_count()):
+        try:
+            _pace_flickr_call()
+            resp = session.get(
+                _FLICKR_SEARCH_URL,
+                params={"text": q},
+                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.text
+                break
+            last_error = f"HTTP {resp.status_code}"
+            if resp.status_code not in {408, 425, 429, 500, 502, 503, 504}:
+                break
+        except Exception as exc:
+            last_error = type(exc).__name__
+        if attempt < _retry_count() - 1:
+            time.sleep(_retry_delay(attempt))
+    if data is None:
+        _web_log(f"flickr-html: request failed for '{q[:40]}': {last_error or 'unknown'}")
+        return []
+    results = []
+    for cand in _parse_flickr_html(data, limit * 2):
+        if len(results) >= limit:
+            break
+        if _tags_bad(cand.get("tags", ""), q) or not _flickr_metadata_relevant(
+            q, cand.get("title", ""), cand.get("tags", ""), cand.get("description", "")
+        ):
+            continue
+        if min_views > 0 and int(cand.get("views", 0) or 0) < min_views:
+            continue
+        safe, _reason = candidate_is_safe(cand)
+        if not safe:
+            continue
+        results.append(cand)
+    if _web_verbose():
+        _web_log(f"flickr-html: {len(results)} usable results for '{q[:40]}'")
+    return results
+
 
 def search_flickr_api(
     query: str,
@@ -277,6 +425,14 @@ def search_flickr_api(
                 _web_log(f"flickr-api: retrying '{q[:40]}' after {last_error}")
             time.sleep(_retry_delay(attempt))
     if data is None:
+        # API failed (dead bundled key, rate limit, or network). Fall back
+        # to the no-key HTML search page before giving up, so the flickr
+        # lane still returns full-text results without a configured key.
+        html_rows = _search_flickr_html(q, limit=limit, min_views=min_views)
+        if html_rows:
+            _last_search_network_failed = False
+            _last_search_network_error = ""
+            return html_rows
         if last_status in {408, 425, 429, 500, 502, 503, 504}:
             network_failed = True
         _last_search_network_failed = network_failed
