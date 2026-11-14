@@ -1020,7 +1020,35 @@ def _vision_verdict_cache_key(candidate: Mapping[str, Any] | None) -> str:
     return ''
 
 
-def _cached_verification_result(scene_index, scene, candidate, verifier, cache):
+def _vision_unavailable_ttl_seconds() -> float:
+    """How long a verifier outage suppresses re-issuing the same check."""
+    try:
+        return max(
+            0.0,
+            float(
+                os.environ.get("VIDZEO_VISION_UNAVAILABLE_TTL_SECONDS", "60")
+                or 60
+            ),
+        )
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _is_verifier_unavailable_result(reason: str, verdict) -> bool:
+    """True when a verification outcome means 'the verifier could not be
+    reached', not 'the candidate was judged'. Only those outcomes are
+    worth suppressing briefly: a genuine rejection must never be hidden
+    behind a TTL, and genuine verdicts are cached separately."""
+    if isinstance(verdict, dict):
+        status = str(verdict.get("status") or "").strip().lower()
+        if status in {"verifier_error", "vision_unavailable"}:
+            return True
+    return str(reason or "").startswith(
+        ("visual_verifier_error", "visual_verifier_unavailable")
+    )
+
+
+def _cached_verification_result(scene_index, scene, candidate, verifier, cache, unavailable=None):
     """Verify a candidate, reusing a live vision verdict for the same scene+candidate.
 
     ``cache`` is a job-scoped dict keyed by (scene_index, candidate identity).
@@ -1028,6 +1056,12 @@ def _cached_verification_result(scene_index, scene, candidate, verifier, cache):
     error verdicts are recomputed (cheap, and must never be cached across a
     transient verifier outage). Thread-safe enough for the gate pools: dict
     get/set are atomic, and a rare duplicate verification is harmless.
+
+    ``unavailable`` is an optional job-scoped ledger for the opposite case:
+    when the verifier itself errors or times out, the identical check is not
+    re-issued for the same scene+candidate until its short TTL expires. The
+    answerer may have caught up by then; until then the stored outage
+    verdict is returned without spending another live vision read.
     """
     key = (int(scene_index), _vision_verdict_cache_key(candidate))
     if key[1]:
@@ -1035,9 +1069,29 @@ def _cached_verification_result(scene_index, scene, candidate, verifier, cache):
         if cached is not None:
             accepted, reason, visual_score, verdict = cached
             return accepted, reason, visual_score, dict(verdict) if isinstance(verdict, dict) else verdict
+        if unavailable is not None:
+            entry = unavailable.get(key)
+            if entry is not None:
+                stored, expires_at = entry
+                if time.monotonic() < expires_at:
+                    accepted, reason, visual_score, verdict = stored
+                    return accepted, reason, visual_score, dict(verdict) if isinstance(verdict, dict) else verdict
+                del unavailable[key]
     accepted, reason, visual_score, verdict = _verification_result(scene, dict(candidate), verifier)
     if key[1] and isinstance(verdict, dict) and verdict.get('visual_checked') is True:
         cache[key] = (accepted, reason, visual_score, dict(verdict))
+    if (
+        key[1]
+        and unavailable is not None
+        and _is_verifier_unavailable_result(reason, verdict)
+    ):
+        stored = (
+            accepted,
+            reason,
+            visual_score,
+            dict(verdict) if isinstance(verdict, dict) else verdict,
+        )
+        unavailable[key] = (stored, time.monotonic() + _vision_unavailable_ttl_seconds())
     return accepted, reason, visual_score, verdict
 
 
@@ -3294,6 +3348,7 @@ def resolve_storyboard_media_v2(
     web_wait_until_complete: bool = False,
     external_cancel_event: Optional[threading.Event] = None,
     adaptive_media_review: bool = False,
+    scene_budget_seconds: Optional[float] = None,
 ) -> Dict[int, SceneResolution]:
     """Resolve immutable storyboard scenes through the V2 fallback machine.
 
@@ -3346,6 +3401,35 @@ def resolve_storyboard_media_v2(
     # verify_primary); deterministic and error verdicts are cheap to recompute
     # and must never be cached across a transient verifier outage.
     vision_verdict_cache: Dict[tuple, tuple] = {}
+    # Verifier-outage ledger by the same key: a candidate whose live
+    # verification failed with a timeout/verifier error is not re-issued
+    # identically in a later round until its short TTL expires (see
+    # _cached_verification_result). Genuine rejections are never recorded
+    # here; they stay in the verdict cache above.
+    vision_unavailable: Dict[tuple, tuple] = {}
+    # Per-scene total verification budget (F2). The clock starts when a
+    # scene's verification phase starts (queue_review) and bounds review +
+    # finalists + recovery. When it expires the scene resolves with the best
+    # candidate found so far instead of burning minutes on further vision
+    # rounds and then failing bare. Env VIDZEO_SCENE_BUDGET_SECONDS,
+    # default 120s.
+    try:
+        scene_budget_value = float(
+            scene_budget_seconds
+            if scene_budget_seconds is not None
+            else os.environ.get("VIDZEO_SCENE_BUDGET_SECONDS", "120") or 120
+        )
+    except (TypeError, ValueError):
+        scene_budget_value = 120.0
+    scene_budget_value = max(1.0, scene_budget_value)
+    scene_verify_started_at: Dict[int, float] = {}
+
+    def scene_budget_open(index: int) -> bool:
+        started = scene_verify_started_at.get(index)
+        if started is None:
+            scene_verify_started_at[index] = time.monotonic()
+            return True
+        return time.monotonic() - started < scene_budget_value
 
     # LazyBatchLane-backed providers perform one all-scenes network batch and
     # return indexed rows.  Treat that as a single discovery wave even when
@@ -3738,8 +3822,11 @@ def resolve_storyboard_media_v2(
             return None
         if visual_verifier is not None and time.monotonic() >= visual_gate_deadline_at:
             return None
+        if not scene_budget_open(index):
+            return None
         accepted, reason, visual_score, verdict = _cached_verification_result(
-            index, rows[index], candidate, visual_verifier, vision_verdict_cache)
+            index, rows[index], candidate, visual_verifier, vision_verdict_cache,
+            vision_unavailable)
         return score, tie, accepted, reason, visual_score, verdict or {}
 
     def review_scene(items):
@@ -3785,6 +3872,7 @@ def resolve_storyboard_media_v2(
         if not items:
             return
         review_started.add(index)
+        scene_verify_started_at.setdefault(index, time.monotonic())
         primary_work.extend(items)
         if adaptive_media_review:
             pending_reviews.add(gate_pool.submit(review_scene, items))
@@ -4172,6 +4260,13 @@ def resolve_storyboard_media_v2(
                 and not scene_is_strict
                 and not pre_verified
             )
+            budget_exhausted = not scene_budget_open(index)
+            if budget_exhausted:
+                attempts[index].append({
+                    "source": "mixed",
+                    "stage": "scene_budget",
+                    "status": "scene_budget_exhausted",
+                })
             parallel_verdicts: dict[int, tuple] = {}
             if fast_metadata_accept:
                 for candidate_index, (candidate, source) in enumerate(rows_to_verify):
@@ -4193,6 +4288,59 @@ def resolve_storyboard_media_v2(
                                 "reason": "non-strict scene recovery: hard gate passed",
                             },
                         )
+            elif budget_exhausted:
+                # F2 best-so-far: the per-scene budget is gone, so no new
+                # vision call starts. A candidate genuinely rejected by
+                # vision in an earlier round is never resurrected here; the
+                # verdict cache and gated_outcomes both record that.
+                # Non-strict scenes resolve with the highest-metadata-score
+                # hard-gate-passing candidate. Strict scenes only reuse an
+                # already-accepted cached verdict; anything else stays
+                # unresolved for the existing fallback chain.
+                if not scene_is_strict:
+                    best_index: Optional[int] = None
+                    best_score = -1.0
+                    for candidate_index, (candidate, source) in enumerate(rows_to_verify):
+                        cached = vision_verdict_cache.get(
+                            (index, _vision_verdict_cache_key(candidate))
+                        )
+                        if (
+                            cached is not None
+                            and not cached[0]
+                            and isinstance(cached[3], dict)
+                            and cached[3].get("visual_checked") is True
+                        ):
+                            continue
+                        passed, _reason = _candidate_hard_gate(scene, candidate)
+                        if not passed:
+                            continue
+                        score = float(
+                            candidate.get("final_score")
+                            or candidate.get("score")
+                            or candidate.get("metadata_score")
+                            or 0.0
+                        )
+                        if score > best_score:
+                            best_index, best_score = candidate_index, score
+                    if best_index is not None:
+                        parallel_verdicts[best_index] = (
+                            True,
+                            "scene_budget_best_so_far",
+                            best_score * 0.5,
+                            {
+                                "accepted": True,
+                                "status": "scene_budget_best_so_far",
+                                "visual_verification_skipped": True,
+                                "reason": "per-scene budget exhausted: best hard-gate-passing candidate",
+                            },
+                        )
+                else:
+                    for candidate_index, (candidate, source) in enumerate(rows_to_verify):
+                        outcome = gated_outcomes.get((index, str(candidate.get("path") or "")))
+                        if outcome is not None and outcome[2]:
+                            parallel_verdicts[candidate_index] = (
+                                outcome[2], outcome[3], outcome[4], outcome[5]
+                            )
             elif not pre_verified and len(rows_to_verify) > 1:
                 verify_jobs: list[tuple[int, Dict[str, Any], str]] = []
                 for candidate_index, (candidate, source) in enumerate(rows_to_verify):
@@ -4205,9 +4353,17 @@ def resolve_storyboard_media_v2(
 
                     def _verify_recovery(item: tuple[int, Dict[str, Any], str]) -> tuple[int, tuple]:
                         candidate_index, candidate, source = item
+                        if not scene_budget_open(index):
+                            return candidate_index, (
+                                False,
+                                "skipped_after_scene_budget",
+                                0.0,
+                                {"accepted": False, "status": "deadline_exceeded"},
+                            )
                         if visual_budget_open("visual_gate_fallback_parallel", source):
                             result = _cached_verification_result(
-                                index, scene, candidate, visual_verifier, vision_verdict_cache)
+                                index, scene, candidate, visual_verifier, vision_verdict_cache,
+                                vision_unavailable)
                         else:
                             result = (
                                 False,
@@ -4330,7 +4486,7 @@ def resolve_storyboard_media_v2(
                             # cached row. Verify this one motion candidate
                             # inline instead of silently converting the quota
                             # scene to a still.
-                            if visual_budget_open("visual_gate_quota_inline", source):
+                            if scene_budget_open(index) and visual_budget_open("visual_gate_quota_inline", source):
                                 visual_verified, visual_reason, visual_score, inline_qwen = _verification_result(
                                     scene, candidate, visual_verifier,
                                 )
@@ -4368,7 +4524,7 @@ def resolve_storyboard_media_v2(
                             )
                             metadata_score, source_tie, verified, verify_reason, visual_score, qwen = outcome
                         else:
-                            if visual_budget_open("visual_gate_inline", source):
+                            if scene_budget_open(index) and visual_budget_open("visual_gate_inline", source):
                                 visual_verified, visual_reason, visual_score, inline_qwen = _verification_result(
                                     scene, candidate, visual_verifier,
                                 )
@@ -4413,6 +4569,11 @@ def resolve_storyboard_media_v2(
                     cached_verdict = parallel_verdicts.get(candidate_index)
                     if cached_verdict is not None:
                         verified, verify_reason, visual_score, qwen = cached_verdict
+                    elif not scene_budget_open(index):
+                        verified, verify_reason, visual_score, qwen = (
+                            False, "skipped_after_scene_budget", 0.0,
+                            {"accepted": False, "status": "deadline_exceeded"},
+                        )
                     elif visual_budget_open("visual_gate_fallback", source):
                         verified, verify_reason, visual_score, qwen = _verification_result(
                             scene, candidate, visual_verifier,
