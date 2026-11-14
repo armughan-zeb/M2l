@@ -47,6 +47,21 @@ class DownloadLimiter:
         self.failures = {}
         self.lock = threading.Lock()
 
+    def open_circuit(self, host, seconds=60):
+        """Open the host circuit immediately (a 403 is a refusal, not a blip).
+
+        The failure-count path needs 3 failures before it opens; a host that
+        answers 403 has already refused, so waiting for 2 more refusals just
+        burns candidate attempts and slot waits against a dead host. A 403
+        must never be retried either: the same proxy refuses the same URL
+        again, so the only useful response is to stop trying that host and
+        let the scene fall to its next candidate or lane.
+        """
+        with self.lock:
+            self.cooldowns[host] = time.monotonic() + max(1, seconds)
+            self.failures.pop(host, None)
+            LOGGER.warning("Web image host circuit opened for %s after HTTP 403 (%ss)", host, max(1, seconds))
+
     def defer(self, host, seconds=30):
         with self.lock:
             self.cooldowns[host] = max(self.cooldowns.get(host, 0), time.monotonic() + seconds)
@@ -725,7 +740,12 @@ async def _download_bulk_async(
                                     _DOWNLOAD_LIMITER.defer(host, retry_after)
                                     return url, None, last_error
                                 if resp.status == 403:
-                                    _DOWNLOAD_LIMITER.record_outcome(host, failed=True)
+                                    # Refusal, not a blip: open the circuit on
+                                    # the first 403 so the scene stops burning
+                                    # candidates against a dead host. Do NOT
+                                    # add 403 to retry_statuses below — the
+                                    # same proxy refuses the same URL again.
+                                    _DOWNLOAD_LIMITER.open_circuit(host)
                                     return url, None, last_error
                                 _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                 if resp.status not in retry_statuses:
