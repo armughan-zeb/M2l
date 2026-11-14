@@ -583,15 +583,67 @@ def _mixed_web_scene_worker_limit(config: Mapping[str, Any] | None = None) -> in
 
 
 
+def _web_recovery_per_scene_seconds() -> float:
+    """Per-scene allowance the web-recovery wall scales with."""
+    try:
+        return max(
+            1.0,
+            min(
+                30.0,
+                float(
+                    os.environ.get("VIDZEO_WEB_RECOVERY_PER_SCENE_SECONDS", "12")
+                    or 12
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 12.0
+
+
+def _web_recovery_hard_cap_seconds() -> float:
+    """Completion-oriented ceiling for one web-recovery stage.
+
+    The old 180s ceiling cut a 121-scene job off after ~24 scenes: the
+    stage wall must scale with the scenes left to resolve, not end at a
+    fixed time. The default 1800s still bounds a wedged stage, and the
+    delivery-budget allowance clamps it further downstream.
+    """
+    try:
+        return max(
+            180.0,
+            float(os.environ.get("VIDZEO_WEB_RECOVERY_HARD_CAP_SECONDS", "1800") or 1800),
+        )
+    except (TypeError, ValueError):
+        return 1800.0
+
+
 def _web_recovery_stage_seconds(scene_count: int, workers: int, configured: Any = None) -> float:
-    """Keep the final web-recovery wave inside the 3-minute stall ceiling."""
+    """Completion-scaled web-recovery wall: 12s per scene, floored at 90s.
+
+    A 121-scene job gets 1452s instead of being cut off at the old fixed
+    180s ceiling after ~24 scenes; a small job keeps its 90s floor. The
+    delivery-budget allowance (``configured``) still clamps the wall — the
+    render reserve is never spent — and the hard cap still bounds a wedged
+    stage. ``workers`` is retained for call compatibility; the wall scales
+    with scenes, not with the wave count, matching the primary mixed-media
+    wall and the resolver's own scene-scaled default, so the explicit value
+    and the resolver default agree (1452s for 121 scenes).
+    """
+    floor = 90.0
+    cap = _web_recovery_hard_cap_seconds()
+    scaled = max(
+        floor,
+        min(cap, max(1, int(scene_count)) * _web_recovery_per_scene_seconds()),
+    )
+    wall = min(cap, scaled)
     if configured not in (None, "", 0, "0"):
         try:
-            return max(1.0, min(180.0, float(configured)))
+            # The delivery-budget allowance is a ceiling, not a target:
+            # never let the wall spend the render reserve.
+            wall = min(wall, max(1.0, float(configured)))
         except (TypeError, ValueError):
             pass
-    waves = math.ceil(max(1, scene_count) / max(1, workers))
-    return min(180.0, max(90.0, 12.0 + waves * 60.0))
+    return max(1.0, wall)
 
 
 def _score(value: Any) -> float:
@@ -5678,8 +5730,10 @@ def resolve_existing_provider_branches_v2(
                 and str(config.get("llm_provider") or "") == "external_agent"
             ):
                 # Agent jobs: recovery is bounded by the shared delivery
-                # budget and then hard-capped at 180s so a final web retry
-                # cannot repeat the multi-minute image-stage stall.
+                # budget, and the recovery wall itself is scene-scaled
+                # (12s/scene, floor 90s, cap 1800s) so a final web retry
+                # cannot repeat the multi-minute image-stage stall, while a
+                # large job still finishes its queued scenes.
                 try:
                     from .delivery_budget import get_delivery_budget
 
@@ -5866,7 +5920,7 @@ def resolve_existing_provider_branches_v2(
             )
         if str(config.get("llm_provider") or "") == "external_agent":
             # Agent jobs collect all provider results within the bounded
-            # per-scene (90s) and per-stage (180s) walls.
+            # per-scene (90s) and scene-scaled per-stage walls.
             lane_config["web_wait_until_complete"] = True
         try:
             bundle = web_runner(
