@@ -5505,6 +5505,8 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             _is_person_fallback_subject = None
             _topic_fallback_queries = None
         is_person_subject = bool(_is_person_fallback_subject and _is_person_fallback_subject(main_subject))
+        if is_person_subject and any(w in str(main_subject).lower() for w in ("train", "freight", "locomotive", "railway", "railroad", "diesel", "car", "engine")):
+            is_person_subject = False
         if is_person_subject:
             emergency_queries = [f"{main_subject} portrait", f"{main_subject} photo", main_subject]
         else:
@@ -6889,32 +6891,41 @@ def resolve_web_images_for_video_fast(
                 )
                 queries = specific_queries if specific_queries else [active_subject]
             else:
+                subject_anchor = active_subject or main_subject or title or ""
                 if len(scene_kws) >= 3:
-                    queries.append(f"{scene_kws[0]} {scene_kws[1]}")
-                    queries.append(f"{scene_kws[1]} {scene_kws[2]}")
-                    if len(scene_kws) >= 4:
-                        queries.append(f"{scene_kws[0]} {scene_kws[2]}")
-                    queries.append(scene_kws[0])
-                    queries.append(scene_kws[1])
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} {scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{subject_anchor} {scene_kws[1]} {scene_kws[2]}")
+                        if len(scene_kws) >= 4:
+                            queries.append(f"{subject_anchor} {scene_kws[0]} {scene_kws[2]}")
+                        queries.append(f"{subject_anchor} {scene_kws[0]}")
+                    else:
+                        queries.append(f"{scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{scene_kws[1]} {scene_kws[2]}")
+                        if len(scene_kws) >= 4:
+                            queries.append(f"{scene_kws[0]} {scene_kws[2]}")
+                        queries.append(f"{scene_kws[0]} documentary photograph")
                 elif len(scene_kws) == 2:
-                    queries.append(f"{scene_kws[0]} {scene_kws[1]}")
-                    queries.append(scene_kws[0])
-                    queries.append(scene_kws[1])
-                    queries.append(f"{scene_kws[0]} photo")
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} {scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{subject_anchor} {scene_kws[0]}")
+                    else:
+                        queries.append(f"{scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{scene_kws[0]} documentary photograph")
                 elif len(scene_kws) == 1:
-                    queries.append(scene_kws[0])
-                    queries.append(f"{scene_kws[0]} photo")
-                    queries.append(f"{scene_kws[0]} image")
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} {scene_kws[0]}")
+                        queries.append(f"{subject_anchor} documentary photograph")
+                    else:
+                        queries.append(f"{scene_kws[0]} documentary photograph")
                 else:
                     title_kws = _extract_visual_keywords(title or "", max_kws=4) if title else []
-                    if len(title_kws) >= 2:
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} documentary photograph")
+                    elif len(title_kws) >= 2:
                         queries.append(f"{title_kws[0]} {title_kws[1]}")
-                        queries.append(title_kws[0])
-                    elif title_kws:
-                        queries.append(title_kws[0])
-                        queries.append(f"{title_kws[0]} photo")
                     if not queries:
-                        queries = ["photo", "portrait"]
+                        queries = [subject_anchor or "documentary photograph"]
 
         queries = list(dict.fromkeys(q for q in queries if q and len(q) > 2))[:8]
         if not queries:

@@ -595,6 +595,7 @@ _QUERY_OUTPUT_GARBAGE_TERMS = {
 }
 
 _GENERIC_VISUAL_FALLBACKS = {
+    "transportation": ["freight locomotive photograph", "diesel locomotive prime mover", "railway tracks archival", "train yard diesel locomotive"],
     "gaming": ["official gameplay screenshot", "official trailer still", "game environment screenshot", "official key art"],
     "history": ["old archive photo", "historic city street", "historical photograph", "old newspaper"],
     "vehicle": ["photograph", "exterior photograph", "detail photograph", "vintage photograph"],
@@ -715,6 +716,8 @@ def _is_person_fallback_subject(subject: str) -> bool:
     if _topic_family(subject) != 'general':
         return False
     topic_words = {
+        "freight", "train", "trains", "locomotive", "locomotives", "railway", "railroad",
+        "diesel", "track", "tracks", "cab", "cabs", "engine", "engines", "yard", "yards",
         "fans", "supporters", "crowd", "team", "world", "cup", "fifa", "football",
         "soccer", "cricket", "stadium", "tickets", "ticket", "protest", "boycott",
         "war", "battle", "history", "documentary", "truck", "trucks", "city",
@@ -736,6 +739,8 @@ def _topic_family(subject: str, scene_text: str = "") -> str:
     def has_any(terms: Tuple[str, ...]) -> bool:
         return any(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) for term in terms)
 
+    if has_any(("train", "trains", "locomotive", "locomotives", "railway", "railroad", "freight", "diesel", "caboose", "boxcar", "track", "depot", "switchman", "conductor", "engineer", "cab", "bogie", "wagon", "carriage", "tram", "subway")):
+        return "transportation"
     if has_any(("gta", "grand theft auto", "game", "gameplay", "gaming", "playstation", "xbox", "rockstar games", "nintendo", "steam", "tetris", "tetromino")):
         return "gaming"
     if has_any(("football", "soccer", "fifa", "world cup", "cricket", "basketball", "baseball", "tennis", "rugby", "golf", "nfl", "nba", "championship", "tournament", "athlete", "olympics")):
@@ -1795,6 +1800,20 @@ def _clean_query(q: str) -> str:
     return q
 
 
+_WEAK_SOLITARY_TERMS = {
+    "crews", "crew", "members", "begin", "begins", "began", "beginning",
+    "minute", "minutes", "hours", "deep", "inside", "every", "around",
+    "first", "second", "third", "cold", "start", "starting", "procedure",
+    "knowing", "pull", "pulls", "pulled", "sitting", "sits", "dead",
+    "covers", "covered", "another", "something", "everything", "nothing",
+}
+
+_ALLOWED_VISUAL_OBJECT_TERMS = {
+    "dashboard", "cockpit", "display", "screen", "interface", "instrument",
+    "cluster", "switch", "gauges", "gauge", "cabinet", "controls", "telemetry",
+}
+
+
 def _extract_visual_keywords(text: str, max_kws: int = 8) -> List[str]:
     """Extract visually-searchable keywords from text."""
     cleaned = text.lower()
@@ -1802,7 +1821,10 @@ def _extract_visual_keywords(text: str, max_kws: int = 8) -> List[str]:
     cleaned = re.sub(r"[^a-z\s]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return [w for w in re.findall(r'[a-z]{3,}', cleaned)
-            if w not in STOPWORDS and w not in BAD_QUERY_TERMS and w not in _NON_NAME_WORDS][:max_kws]
+            if w not in STOPWORDS
+            and w not in BAD_QUERY_TERMS
+            and w not in _WEAK_SOLITARY_TERMS
+            and (w not in _NON_NAME_WORDS or w in _ALLOWED_VISUAL_OBJECT_TERMS)][:max_kws]
 
 
 def _classify_scene_type(scene_text: str, main_subject: str) -> str:
@@ -2313,6 +2335,13 @@ def _pick_enrichments(subject: str, scene_type: str,
     # Phase 1: Extract scene-specific multi-word action phrases from scene text.
     # Only extract if at least one word in the pair expresses a concrete visual action.
     _VISUAL_ACTION_WORDS = {
+        "locomotive", "diesel", "engine", "prime", "mover", "battery", "switch",
+        "cabinet", "starter", "motor", "motors", "exhaust", "turbocharger",
+        "compressor", "gauge", "gauges", "valves", "piston", "radiator", "brake",
+        "coupler", "bogie", "wheel", "pantograph", "generator", "alternator",
+        "cylinder", "throttle", "injector", "telemetry", "control", "stand",
+        "yard", "track", "freight", "rail", "railway", "frozen", "snow",
+        "pressure", "psi", "starting", "startup", "climb", "aboard",
         "cover", "drive", "pull", "shot", "cut", "sweep", "hook", "glance",
         "bowl", "bowling", "spin", "pace", "throw", "catch", "field",
         "dive", "six", "four", "boundary", "century", "wicket", "stump",
