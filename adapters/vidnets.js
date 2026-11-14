@@ -261,27 +261,28 @@ function inferenceTransport() {
   return null;
 }
 
-async function answerOne(requestMeta, workDir, transport, signal) {
+async function answerOne(requestMeta, workDir, transport, signal, state) {
   if (signal?.aborted) throw new Error('Render cancelled by operator');
   const expiresAt = Number(requestMeta.expires_at) * 1000;
-  const remaining = () => Math.min(MINUTE, Math.floor(expiresAt - Date.now()));
+  const remaining = () => Math.floor(expiresAt - Date.now());
   if (!(remaining() > 0)) return;
-  const request = await vidnets(`request ${requestId(requestMeta.id)}`, { timeoutMs: remaining(), signal, label: 'Vidnets agent request read' });
+  const request = await vidnets(`request ${requestId(requestMeta.id)}`, { timeoutMs: Math.min(MINUTE, remaining()), signal, label: 'Vidnets agent request read' });
   request.id = requestMeta.id;
-  const timeoutMs = remaining() - 5000;
-  if (timeoutMs <= 0 || signal?.aborted) return;
-  const content = transport.kind === 'command'
-    ? await runInferenceCommand(transport.command, request, workDir, { timeoutMs, signal })
-    : await runInferenceHttp(transport.url, request, { timeoutMs, signal });
-  if (remaining() <= 0 || signal?.aborted) return;
-
-  const answerDir = path.join(workDir, 'inference');
-  fs.mkdirSync(answerDir, { recursive: true });
-  let parsedJson = null;
-  try { parsedJson = JSON.parse(content); } catch { /* text response */ }
-  const answerFile = path.join(answerDir, `${request.id}.${parsedJson ? 'json' : 'txt'}`);
-  fs.writeFileSync(answerFile, parsedJson ? JSON.stringify(parsedJson) : content, 'utf8');
-  await vidnets(`answer ${request.id} ${quoteArg(answerFile)}`, { timeoutMs: Math.max(1, remaining()), signal, label: 'Vidnets agent answer' });
+  if (!state.answerFile) {
+    const timeoutMs = remaining() - 5000;
+    if (timeoutMs <= 0 || signal?.aborted) return;
+    const content = transport.kind === 'command'
+      ? await runInferenceCommand(transport.command, request, workDir, { timeoutMs, signal })
+      : await runInferenceHttp(transport.url, request, { timeoutMs, signal });
+    if (remaining() <= 0 || signal?.aborted) return;
+    const answerDir = path.join(workDir, 'inference');
+    fs.mkdirSync(answerDir, { recursive: true });
+    let parsedJson = null;
+    try { parsedJson = JSON.parse(content); } catch { /* text response */ }
+    state.answerFile = path.join(answerDir, `${request.id}.${parsedJson ? 'json' : 'txt'}`);
+    fs.writeFileSync(state.answerFile, parsedJson ? JSON.stringify(parsedJson) : content, 'utf8');
+  }
+  await vidnets(`answer ${request.id} ${quoteArg(state.answerFile)}`, { timeoutMs: Math.max(1, Math.min(MINUTE, remaining())), signal, label: 'Vidnets agent answer' });
   log.info(`Answered Vidnets ${request.kind || 'text'} request${request.operation ? ` (${request.operation})` : ''}`);
 }
 
@@ -289,19 +290,26 @@ async function serviceInbox(vidnetsJobId, workDir, transport, signal, handled) {
   if (!transport || !vidnetsJobId) return;
   const pending = await vidnets('pending', { timeoutMs: MINUTE, signal, label: 'Vidnets agent inbox' });
   const now = Date.now() / 1000;
-  for (const [id, expiry] of handled) if (expiry <= now) handled.delete(id);
+  for (const [id, state] of handled) if (state.expiry <= now) handled.delete(id);
   const rows = (Array.isArray(pending.requests) ? pending.requests : [])
     .filter(row => String(row.job_id || '') === String(vidnetsJobId))
-    .filter(row => !handled.has(row.id) && Number(row.expires_at) > now)
+    .filter(row => {
+      const state = handled.get(row.id);
+      return Number(row.expires_at) > now && (!state || (!state.done && state.attempts < 3 && state.retryAt <= now));
+    })
     .sort((a, b) => Number(String(b.operation).startsWith('scriptit.')) -
       Number(String(a.operation).startsWith('scriptit.')) || a.expires_at - b.expires_at)
     .slice(0, inferenceConcurrency());
-  for (const row of rows) handled.set(row.id, Number(row.expires_at));
   await Promise.all(rows.map(async row => {
+    const state = handled.get(row.id) || { expiry: Number(row.expires_at), attempts: 0, retryAt: 0 };
+    handled.set(row.id, state);
+    state.attempts += 1;
     try {
-      await answerOne(row, workDir, transport, signal);
+      await answerOne(row, workDir, transport, signal, state);
+      state.done = true;
     } catch (error) {
       if (signal?.aborted) throw error;
+      state.retryAt = Date.now() / 1000 + Math.min(8, 2 ** (state.attempts - 1));
       log.warn(`Vidnets inference request ${String(row.id).slice(0, 8)} failed: ${error.message}`);
     }
   }));
