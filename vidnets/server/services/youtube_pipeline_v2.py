@@ -3762,6 +3762,14 @@ def _youtube_quality_formats(*, source: bool = False, max_filesize: Optional[int
     return list(dict.fromkeys(value for value in candidates if value))
 
 
+def _youtube_fragment_concurrency() -> int:
+    try:
+        configured = int(os.environ.get("VIDZEO_YT_FRAGMENT_CONCURRENCY", "2"))
+    except ValueError:
+        configured = 2
+    return max(1, min(8, configured))
+
+
 def _youtube_transport_timeout_defaults() -> Tuple[int, int, int, int]:
     """Return quality-aware network and media-stage timeout defaults.
 
@@ -3901,9 +3909,7 @@ def _download_clip(
         opts['no_warnings'] = False
 
         if stream_downloads:
-            # This is deliberately modest: ranged clips should still make
-            # progress under the branch's bounded worker pool.
-            opts["concurrent_fragment_downloads"] = 2
+            opts["concurrent_fragment_downloads"] = _youtube_fragment_concurrency()
         def _download_progress(_status):
             _remaining_clip_timeout()
             if cancellation is not None:
@@ -4506,7 +4512,7 @@ def _download_source_once(
         if audit is not None:
             audit.update({"max_filesize": max_filesize, "max_height": max_height, "format": opts["format"], "format_candidates": quality_formats})
         if stream_downloads:
-            opts["concurrent_fragment_downloads"] = max(1, int(os.environ.get("VIDZEO_YT_FRAGMENT_CONCURRENCY", "2") or 2))
+            opts["concurrent_fragment_downloads"] = _youtube_fragment_concurrency()
         def _source_progress(_status):
             if cancellation is not None:
                 cancellation.raise_if_cancelled()

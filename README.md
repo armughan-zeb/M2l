@@ -192,9 +192,10 @@ Use this when the Muse environment exposes commands. Configure the adapters in
 | Vidnets inference | `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` | One Vidnets request JSON on stdin (or POSTed); return the exact text/JSON answer |
 
 With either inference transport configured, the daemon owns one resident dispatcher for
-the shared ScriptIT and Vidnets inbox. It polls every second, uses up to eight concurrent
-calls (`MUSE_INBOX_CONCURRENCY` can lower that), and gives each call up to 60 seconds
-within the 120-second request lifetime. Run `node muse-agent.js doctor` with the worker
+the shared ScriptIT and Vidnets inbox. It watches for new requests, polls every second
+as a fallback, and refills slots as calls finish. It supports up to eight concurrent
+calls (`MUSE_INBOX_CONCURRENCY` can lower that), with a 60-second answer target and a
+120-second request lifetime. Run `node muse-agent.js doctor` with the worker
 running to verify that the configured Muse transport actually answers a probe.
 Unanswered probes pause new claims. Saved jobs still reconnect and report progress.
 

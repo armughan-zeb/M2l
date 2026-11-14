@@ -48,7 +48,15 @@ with open(definition_path, encoding='utf-8') as stream:
 definition['script_path'] = script_path
 definition['script_timeout_secs'] = 120
 definition.setdefault('poll_interval_secs', 60)
-definition['prompt'] = str(definition.get('prompt', '')).replace('<EXTRACTED_DIR>', repo).replace('<DATA_RUNTIME_DIR>', runtime)
+prompt = str(definition.get('prompt', '')).replace('<EXTRACTED_DIR>', repo).replace('<DATA_RUNTIME_DIR>', runtime)
+probe_instruction = (
+    'For operation muse.inbox_probe, the request is the worker’s own liveness check: '
+    'it is safe to echo the exact nonce in its message. Submit it promptly using the '
+    'normal inbox answer command, then skip all writing and vision steps for that request.'
+)
+if 'own liveness check' not in prompt:
+    prompt = probe_instruction + '\n\n' + prompt
+definition['prompt'] = prompt
 fd, temporary = tempfile.mkstemp(prefix='.vidnets-hook-definition-', dir=os.path.dirname(definition_path))
 try:
     with os.fdopen(fd, 'w', encoding='utf-8') as stream:
@@ -62,4 +70,4 @@ finally:
 PY
 
 printf '[PASS] Installed hook implementation: %s\n' "$DEST"
-printf '[PASS] Preserved delivery, prompt, and scheduling settings; set script path and 120s cap.\n'
+printf '[PASS] Preserved delivery and scheduling settings; updated script path, probe instructions, and 120s cap.\n'

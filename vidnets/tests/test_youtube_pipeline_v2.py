@@ -174,7 +174,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         source = self._cookie_jar()
         with yt_dlp, mock.patch.dict(
             os.environ,
-            {"VIDZEO_YT_SEARCH_CACHE_TTL_SECONDS": "0"},
+            {"VIDZEO_YT_SEARCH_CACHE_TTL_SECONDS": "0", "VIDZEO_YT_FRAGMENT_CONCURRENCY": "4"},
             clear=False,
         ):
             converted = ytv2._adapt_youtube_cookie_jar(source)
@@ -193,6 +193,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                     0.0,
                     4.0,
                     session_jar=converted,
+                    stream_downloads=True,
                 )
 
         self.assertEqual(len(search_results), 1)
@@ -200,6 +201,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         self.assertEqual(len(instances), 2)
         self.assertTrue(all(hasattr(instance.cookiejar, "get_cookie_header") for instance in instances))
         self.assertTrue(all(instance.cookiejar is converted for instance in instances))
+        self.assertEqual(instances[1].options["concurrent_fragment_downloads"], 4)
         selected_format = instances[1].options["format"]
         self.assertIn("bestvideo", selected_format)
         self.assertIn("height<=1080", selected_format)
@@ -312,7 +314,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                 Path(command[-1]).write_bytes(b"clip" * 2048),
                 None,
             )[1],
-        ), mock.patch.object(ytv2, "_source_video_height", return_value=720), mock.patch.dict(os.environ, {"VIDZEO_YT_SOURCE_MAX_MB": "80", "VIDZEO_YT_SOURCE_MAX_HEIGHT": "720"}, clear=False):
+        ), mock.patch.object(ytv2, "_source_video_height", return_value=720), mock.patch.dict(os.environ, {"VIDZEO_YT_SOURCE_MAX_MB": "80", "VIDZEO_YT_SOURCE_MAX_HEIGHT": "720", "VIDZEO_YT_FRAGMENT_CONCURRENCY": "12"}, clear=False):
             with tempfile.TemporaryDirectory() as temp_dir:
                 output = Path(temp_dir) / "source.mp4"
                 output.write_bytes(b"placeholder")
@@ -320,10 +322,12 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                     {"id": "video-1", "webpage_url": "https://youtube.com/watch?v=video-1"},
                     output,
                     session_jar=None,
+                    stream_downloads=True,
                 ))
         self.assertEqual(len(instances), 1)
         self.assertIsInstance(instances[0].options["max_filesize"], int)
         self.assertEqual(instances[0].options["max_filesize"], 80 * 1024 * 1024)
+        self.assertEqual(instances[0].options["concurrent_fragment_downloads"], 8)
 
     def test_source_download_rejects_audio_only_artifact(self):
         instances, yt_dlp = self._mock_yt_dlp()

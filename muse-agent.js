@@ -566,6 +566,13 @@ async function startCommand(args) {
   const transport = vidnets.inferenceTransport();
   const releaseLock = acquireLock();
   const abort = new AbortController();
+  const refreshInboxHealth = createInboxReadiness({
+    probe: () => probeInbox(process.env, { signal: abort.signal }),
+    onReady: proof => log.info(`Muse inbox probe answered in ${proof.elapsedMs}ms`),
+    onFailure: error => {
+      if (!abort.signal.aborted) log.warn('Muse claims paused: ' + error.message);
+    }
+  });
   let stopInbox;
   if (transport) {
     let releaseInboxLock;
@@ -575,6 +582,10 @@ async function startCommand(args) {
         root: inboxRoot,
         concurrency: Math.max(1, Math.min(8, Math.floor(Number(process.env.MUSE_INBOX_CONCURRENCY) || 8))),
         logger: log,
+        onExpiryLimit: () => {
+          refreshInboxHealth.invalidate();
+          log.warn('Muse claims paused after three consecutive inbox expiries. Waiting for a fresh probe.');
+        },
         answer: (request, options) => transport.kind === 'command'
           ? vidnets.runInferenceCommand(transport.command, request, config.WORK_ROOT, options)
           : vidnets.runInferenceHttp(transport.url, request, options)
@@ -591,13 +602,6 @@ async function startCommand(args) {
     }
   }
   let lastScriptBlocker = '';
-  const refreshInboxHealth = createInboxReadiness({
-    probe: () => probeInbox(process.env, { signal: abort.signal }),
-    onReady: proof => log.info(`Muse inbox probe answered in ${proof.elapsedMs}ms`),
-    onFailure: error => {
-      if (!abort.signal.aborted) log.warn('Muse claims paused: ' + error.message);
-    }
-  });
   let current = null;
   let stopping = false;
   let fatal = null;
