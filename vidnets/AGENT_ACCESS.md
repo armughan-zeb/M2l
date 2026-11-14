@@ -6,7 +6,8 @@ Use the desktop app normally. All text and vision decisions use **Qwen 3.5 Flash
 
 ## Agent generation without the desktop window
 
-1. Sign in to an active Vidnets account. In Settings, select **Enable local agent** once. This authorizes this Windows user and installation. Close the desktop app before starting the headless service.
+1. No Vidnets account is required. This worker build defaults to sign-in-free **local mode**: `VIDNETS_AGENT.cmd start` boots the service unpaired, and CLI commands authenticate with the fixed local worker token, which the local-mode server maps to the `local-user` agent owner. Pairing is optional (see step 1a) and only needed when jobs must be owned by a real Vidnets account.
+   1a. Optional pairing: sign in to an active Vidnets account, select **Enable local agent** once in Settings, and close the desktop app before starting the headless service. This stores a scoped `vna_` key and binds jobs to that account.
 2. Give Codex or another trusted local agent access to the complete app folder and this document. Run `VIDNETS_AGENT.cmd start` from that folder. The launcher uses bundled Python, starts the backend in the background, and prints its local address and log path. No Electron or browser is launched.
 3. The agent writes a generation JSON file and runs `VIDNETS_AGENT.cmd submit "C:\path\video-request.json"`. The response contains `item.id`, the queue job ID.
 4. While the job runs, use `VIDNETS_AGENT.cmd pending` to find reasoning/vision requests. Read each with `VIDNETS_AGENT.cmd request REQUEST_ID`.
@@ -40,11 +41,11 @@ This is a cooperative local protocol. Simply submitting a job does **not** cause
 
 ## Credentials, costs, and limits
 
-- Settings pairing stores a scoped `vna_` key and delegated Vidnets session in a Windows DPAPI-encrypted file under the app's writable `secure` folder. The launcher reads this privately. Do not print, copy into prompts, distribute, or commit that file or the account tokens. Pairing is per Windows user; another Windows account must pair independently.
-- The key authorizes only generation, the inference inbox, and that account's agent job status. It cannot administer accounts, billing, settings, or other users' jobs. Settings can revoke or replace it. Account and active-plan checks remain enforced.
+- By default no credential file exists: the service runs in local mode with the `local-user` owner and no account. Settings pairing (optional) stores a scoped `vna_` key and delegated Vidnets session in a Windows DPAPI-encrypted file under the app's writable `secure` folder. The launcher reads this privately. Do not print, copy into prompts, distribute, or commit that file or the account tokens. Pairing is per Windows user; another Windows account must pair independently.
+- Without pairing, agent jobs are owned by `local-user` and remain limited to generation, the inference inbox, and that owner's agent job status. The key (when paired) authorizes only generation, the inference inbox, and that account's agent job status. It cannot administer accounts, billing, settings, or other users' jobs. Settings can revoke or replace it. Account and active-plan checks remain enforced.
 - Agent jobs use the host agent's own inference and block OpenRouter calls, including paid OpenRouter voice routes. They use local Audiogram narration. Agent subscription limits, downloaded assets, and separately billed media services are not free or included by implication. Job cost receipts count external agent requests separately from OpenRouter requests.
 - No ChatGPT account login or subscription API is used by this protocol. The agent runs under its own supported environment and access.
-- Vidnets may refresh its delegated session. If it expires, is revoked, or cannot renew (including conflicts with desktop sign-in), sign in and pair again. Keep the desktop closed during headless work to avoid two independent queue managers accessing the same queue.
+- When paired, Vidnets may refresh its delegated session. If it expires, is revoked, or cannot renew (including conflicts with desktop sign-in), sign in and pair again. Keep the desktop closed during headless work to avoid two independent queue managers accessing the same queue. Unpaired local mode has no remote session to refresh.
 - Per-request expiry and video preparation deadlines remain enforced. Local Remotion rendering continues under resource and progress supervision. Use a complete packaged/unpackaged installation, not just the installer executable.
 
 ## Preserved records
