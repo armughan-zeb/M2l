@@ -284,10 +284,20 @@ class _LinkedCancellationEvent(threading.Event):
         return True
 
 
+def _env_seconds(name: str, default: float) -> float:
+    """Read a seconds-valued env var, falling back to ``default`` on junk."""
+    try:
+        return max(0.0, float(os.environ.get(name, '') or default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 class MediaResolutionCoordinator:
     """Run scene workers concurrently within one cooperative job deadline."""
 
-    def __init__(self, *, deadline_seconds: float = 210.0, max_workers: int = 12, drain_seconds: float = 5.0):
+    def __init__(self, *, deadline_seconds: float | None = None, max_workers: int = 12, drain_seconds: float = 5.0):
+        if deadline_seconds is None:
+            deadline_seconds = _env_seconds("VIDZEO_MEDIA_COORDINATOR_DEADLINE_SECONDS", 210.0)
         self.deadline_seconds = max(1.0, float(deadline_seconds))
         self.max_workers = max(1, int(max_workers))
         # A worker is expected to observe ``cancel_event``.  Keep a short,
@@ -562,12 +572,18 @@ def _youtube_frame_fallback_candidates(
             1,
             min(3, int(os.environ.get("VIDZEO_YT_FRAME_FALLBACK_SOURCES", "2") or 2)),
         )
+        # First pass sends 2 frames per source to vision (was 4): a rejected
+        # clip's best frames are the informative ones, and each frame costs
+        # a live vision read. If both are rejected the scene moves to the
+        # next recovery layer (cross-lane / stock) instead of spending more
+        # vision reads on the same rejected clip. Raise with
+        # VIDZEO_YT_FRAME_FALLBACK_FRAMES (cap 5) if a job needs more.
         max_frames = max(
             2,
-            min(5, int(os.environ.get("VIDZEO_YT_FRAME_FALLBACK_FRAMES", "4") or 4)),
+            min(5, int(os.environ.get("VIDZEO_YT_FRAME_FALLBACK_FRAMES", "2") or 2)),
         )
     except (TypeError, ValueError):
-        max_sources, max_frames = 2, 4
+        max_sources, max_frames = 2, 2
     ranked = sorted(
         [dict(candidate) for candidate in candidates if isinstance(candidate, Mapping)],
         key=lambda item: float(item.get("final_score") or item.get("score") or item.get("metadata_score") or 0.0),
@@ -969,6 +985,60 @@ def _is_moving_youtube_source(value: Any) -> bool:
         path = getattr(value, 'selected_path', '')
     return (str(kind).casefold() not in {'image', 'photo', 'still'}
             and Path(str(path)).suffix.casefold() in {'.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.ts'})
+
+
+def _vision_verdict_cache_key(candidate: Mapping[str, Any] | None) -> str:
+    """Stable identity for a candidate's vision verdict across rounds.
+
+    The same candidate (same web image URL, or the same YouTube clip at the
+    same timestamp) re-checked in a later round for the same scene gets the
+    same verdict without a second live vision read. The scene index is part
+    of the cache key at the call site: the same image can be right for one
+    scene and wrong for another.
+    """
+    if not isinstance(candidate, Mapping):
+        return ''
+    # YouTube extracted frame: same clip file + same timestamp = same verdict.
+    source_path = str(candidate.get('fallback_source_path') or '').strip()
+    frame_index = candidate.get('fallback_frame_index')
+    if source_path and frame_index is not None:
+        return f"yt-frame:{source_path}#{frame_index}"
+    # Web image: the origin URL is stable across re-downloads and rounds.
+    if _is_web_source(candidate):
+        for key in ('source_url', 'url', 'image_url', 'original_url'):
+            value = str(candidate.get(key) or '').strip()
+            if value:
+                return f"url:{value}"
+    # YouTube clip / other: the downloaded file (cut-specific) then the URL.
+    path = str(candidate.get('path') or candidate.get('selected_path') or '').strip()
+    if path:
+        return f"path:{path}"
+    for key in ('source_url', 'url'):
+        value = str(candidate.get(key) or '').strip()
+        if value:
+            return f"url:{value}"
+    return ''
+
+
+def _cached_verification_result(scene_index, scene, candidate, verifier, cache):
+    """Verify a candidate, reusing a live vision verdict for the same scene+candidate.
+
+    ``cache`` is a job-scoped dict keyed by (scene_index, candidate identity).
+    Only genuine live verdicts (visual_checked) are stored; deterministic and
+    error verdicts are recomputed (cheap, and must never be cached across a
+    transient verifier outage). Thread-safe enough for the gate pools: dict
+    get/set are atomic, and a rare duplicate verification is harmless.
+    """
+    key = (int(scene_index), _vision_verdict_cache_key(candidate))
+    if key[1]:
+        cached = cache.get(key)
+        if cached is not None:
+            accepted, reason, visual_score, verdict = cached
+            return accepted, reason, visual_score, dict(verdict) if isinstance(verdict, dict) else verdict
+    accepted, reason, visual_score, verdict = _verification_result(scene, dict(candidate), verifier)
+    if key[1] and isinstance(verdict, dict) and verdict.get('visual_checked') is True:
+        cache[key] = (accepted, reason, visual_score, dict(verdict))
+    return accepted, reason, visual_score, verdict
 
 
 def _web_asset_identity(value: Mapping[str, Any] | SceneResolution | None) -> str:
@@ -3264,6 +3334,18 @@ def resolve_storyboard_media_v2(
     web_recovery_cancel_event = _LinkedCancellationEvent(external_cancel_event)
     discovered: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(rows))}
     attempts: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(rows))}
+    # Scenes whose primary web lane failed on transport (timeout/error with
+    # zero candidates). Their web recovery lane is skipped: it would hit the
+    # same proxy/hosts and fail the same way. See consume_discovery and
+    # _compute_cross_lane_specs.
+    web_transport_failed: set = set()
+    # Live vision verdicts by (scene index, candidate identity). A candidate
+    # re-checked in a later round for the same scene reuses its verdict
+    # instead of spending a second live vision read. Job-scoped: discarded
+    # when this call returns. Only genuine live verdicts are stored (see
+    # verify_primary); deterministic and error verdicts are cheap to recompute
+    # and must never be cached across a transient verifier outage.
+    vision_verdict_cache: Dict[tuple, tuple] = {}
 
     # LazyBatchLane-backed providers perform one all-scenes network batch and
     # return indexed rows.  Treat that as a single discovery wave even when
@@ -3316,6 +3398,13 @@ def resolve_storyboard_media_v2(
             return True, None, error
         return True, box.get("value"), None
 
+    # Per-scene lane budgets (env-tunable). Web is the failure-prone lane on
+    # this install (403/timeout/circuit from the egress proxy): 60s is enough
+    # for a healthy web discovery, and a hung web lane must not eat the
+    # YouTube lane's budget for the same scene.
+    web_lane_cap = _env_seconds("VIDZEO_WEB_LANE_TIMEOUT_SECONDS", 60.0)
+    youtube_lane_cap = _env_seconds("VIDZEO_YOUTUBE_LANE_TIMEOUT_SECONDS", 120.0)
+
     def discover(index: int, source: str, lane):
         # Debugger advance: a scene the watchdog flagged as stuck stops
         # burning new discovery waves. Its resolution comes from media
@@ -3342,7 +3431,8 @@ def resolve_storyboard_media_v2(
             lane_event = _LinkedCancellationEvent(cancel_event)
             # Batch loaders share one all-scenes request; individual workers can
             # release their slot when a provider stalls, leaving other lanes active.
-            cap = remaining if getattr(lane, 'shared_batch', False) else min(remaining, 120.0 if source == 'youtube' else 60.0)
+            lane_cap = youtube_lane_cap if source == 'youtube' else web_lane_cap
+            cap = remaining if getattr(lane, 'shared_batch', False) else min(remaining, lane_cap)
             completed, value, error = _bounded_lane_call(lane, rows[index], lane_event, cap)
             if not completed:
                 lane_event.set()
@@ -3648,7 +3738,8 @@ def resolve_storyboard_media_v2(
             return None
         if visual_verifier is not None and time.monotonic() >= visual_gate_deadline_at:
             return None
-        accepted, reason, visual_score, verdict = _verification_result(rows[index], dict(candidate), visual_verifier)
+        accepted, reason, visual_score, verdict = _cached_verification_result(
+            index, rows[index], candidate, visual_verifier, vision_verdict_cache)
         return score, tie, accepted, reason, visual_score, verdict or {}
 
     def review_scene(items):
@@ -3711,6 +3802,13 @@ def resolve_storyboard_media_v2(
             "source": source, "stage": "discovery_result",
             "wave": wave_number, "status": status, "candidate_count": len(candidates),
         })
+        if source == "web" and not candidates and (
+            status == "provider_timeout_handoff" or status.startswith("error:")
+        ):
+            # Web transport failed (timeout / exception), not a content miss:
+            # the recovery web lane would hit the same proxy/hosts and fail
+            # the same way, so this scene falls through to YouTube only.
+            web_transport_failed.add(index)
         discovered[index].extend(candidates)
         finished_sources[index].add(source)
         if not adaptive_media_review:
@@ -3861,6 +3959,10 @@ def resolve_storyboard_media_v2(
             None if yt_primary_attempted and idx not in rejected_youtube_indices
             else youtube_fallback_lane
         )
+        if idx in web_transport_failed:
+            # Web transport failed for this scene: skip the web recovery lane
+            # (same proxy/hosts, same failure) and fall through to YouTube.
+            return (("youtube", yt_fallback),) if yt_fallback is not None else ()
         default_specs = (("youtube", yt_fallback), ("web", web_fallback_lane))
         if idx in rejected_youtube_indices and bool(_source_policy_value(rows[idx], "youtube_quota", False)):
             return default_specs
@@ -4104,7 +4206,8 @@ def resolve_storyboard_media_v2(
                     def _verify_recovery(item: tuple[int, Dict[str, Any], str]) -> tuple[int, tuple]:
                         candidate_index, candidate, source = item
                         if visual_budget_open("visual_gate_fallback_parallel", source):
-                            result = _verification_result(scene, candidate, visual_verifier)
+                            result = _cached_verification_result(
+                                index, scene, candidate, visual_verifier, vision_verdict_cache)
                         else:
                             result = (
                                 False,
