@@ -17,7 +17,7 @@ const { minimumVideoDurationSeconds } = require('../lib/mediaRules');
 const { sleep } = require('../lib/sleep');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { readRequestedWorkers } = require('../lib/remotionWorkers');
-const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry } = require('../lib/vidnetsSubmission');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs } = require('../lib/vidnetsSubmission');
 
 const MINUTE = 60 * 1000;
 
@@ -121,7 +121,7 @@ function buildRequest(job, scriptText, packageDir) {
   // is exhausted, Vidnets keeps the checkpoint for retry. MUSE_MEDIA_STRICT=1
   // requires visual verification for every scene.
   const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
-  const deliveryBudget = Math.max(600, Math.round((Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE) / 1000));
+  const deliveryBudget = Math.ceil(renderBudgetMs(job) / 1000);
 
   return {
     title: job.title,
@@ -368,7 +368,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   const handledInference = new Map();
   let lastProgress = -1;
   let lastDetail = '';
-  const deadline = Date.now() + Math.max(10 * MINUTE, Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE);
+  const deadline = Date.now() + renderBudgetMs(job);
   const pollMs = Math.max(1000, Number(process.env.MUSE_VIDNETS_POLL_MS) || 4000);
   let statusFailures = 0;
 

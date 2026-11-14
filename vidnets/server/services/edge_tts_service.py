@@ -11,6 +11,8 @@ import re
 import subprocess
 import sys
 import time
+import shutil
+import tempfile
 from pathlib import Path
 
 try:
@@ -465,7 +467,7 @@ def _concat_edge_chunks(chunk_paths: list[str], batch_start: float) -> tuple[str
                 '-c:a', 'pcm_s16le', output_path
             ],
             capture_output=True,
-            timeout=60,
+            timeout=max(60, int(cursor / 5) + 30),
             check=True
         )
 
@@ -563,6 +565,48 @@ def _generate_sapi_audio(text: str, output_path: str) -> tuple:
     path, duration = generate_local_speech(text, output_path)
     print(f"   [TTS] Generated offline spoken narration ({duration:.1f}s)")
     return path, duration
+
+
+def _generate_linux_tts_chunked(script: str) -> tuple:
+    """Keep completed speech chunks across retries and assemble them in order."""
+    chunks = _split_script_for_parallel_tts(script)
+    if not chunks:
+        raise ValueError("Cannot synthesize empty narration.")
+    cache_dir = Path(TEMP_DIR) / 'linux-tts-chunks'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    identity = '\0'.join([
+        os.environ.get('VIDZEO_LINUX_TTS_COMMAND', ''),
+        os.environ.get('VIDZEO_LINUX_TTS_VOICE', ''),
+        os.environ.get('VIDZEO_LINUX_TTS_SPEED', '100'),
+    ])
+    work_dir = Path(tempfile.mkdtemp(prefix='linux-tts-', dir=str(TEMP_DIR)))
+    assembled = []
+    try:
+        for index, text in enumerate(chunks):
+            digest = hashlib.sha256((identity + '\0' + text).encode('utf-8')).hexdigest()
+            cached = cache_dir / (digest + '.mp3')
+            try:
+                valid = cached.is_file() and cached.stat().st_size >= 128 and _get_audio_duration(str(cached)) > 0
+            except Exception:
+                valid = False
+            print(f"   [TTS] Narration chunk {index + 1}/{len(chunks)}" +
+                  (" (cached)" if valid else ""), flush=True)
+            if not valid:
+                # Generate in this invocation's private directory, then atomically
+                # publish the verified result without exposing partial cache files.
+                generated = work_dir / f'generated-{index}.mp3'
+                _generate_linux_tts_audio(text, str(generated))
+                os.replace(generated, cached)
+            local = work_dir / f'chunk-{index}.mp3'
+            shutil.copyfile(cached, local)
+            assembled.append(str(local))
+        if len(assembled) == 1:
+            final = Path(TEMP_DIR) / ('linux-tts-full-' + hashlib.sha256(os.urandom(32)).hexdigest()[:16] + '.mp3')
+            os.replace(assembled[0], final)
+            return str(final), _get_audio_duration(str(final))
+        return _concat_edge_chunks(assembled, time.time())
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _permanent_provider_error(error):
@@ -666,6 +710,9 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
     Retries with exponential backoff between ladder levels.
     Falls back to single-chunk generate_audio if all chunked attempts fail.
     """
+    if sys.platform != 'win32' and str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip():
+        return _generate_linux_tts_chunked(script)
+
     if not _EDGE_TTS_AVAILABLE:
         if _EDGE_TTS_FALLBACK_ENABLED:
             duration = max(1.0, len(script) / 15.0)
@@ -676,12 +723,6 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
             return _generate_sapi_audio(script, output_path)
         raise ValueError("Edge TTS package is not installed. Run `pip install -r requirements.txt`.")
     del speed, api_key
-
-    # A configured Linux offline TTS command handles the whole script at
-    # once; skip the chunked Edge TTS path (whose websocket attempts would
-    # just time out on a host where websockets are blocked).
-    if sys.platform != 'win32' and str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip():
-        return generate_audio(script, voice, edge_options=edge_options)
 
     if len(script) < _EDGE_TTS_CHUNK_TRIGGER_CHARS:
         return generate_audio(script, voice, edge_options=edge_options)

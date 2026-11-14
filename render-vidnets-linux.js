@@ -30,7 +30,7 @@ const { spawn } = require('child_process');
 const { bridgeRoot, checkMuseInferenceBridge } = require('./lib/museInference');
 const { pendingRequests } = require('./lib/museInbox');
 const { writeJsonAtomic } = require('./lib/config');
-const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry } = require('./lib/vidnetsSubmission');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs } = require('./lib/vidnetsSubmission');
 
 const VIDNETS_ROOT = String(process.env.MUSE_VIDNETS_ROOT || '').trim()
   || path.join(__dirname, 'vidnets');
@@ -345,8 +345,7 @@ async function main() {
     log(`Vidnets job ${vidnetsJobId} submitted for "${job.title}"`);
   }
 
-  const deadline = Date.now()
-    + Math.max(10 * MINUTE, Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE);
+  const deadline = Date.now() + renderBudgetMs(job);
   const pollMs = Math.max(2000, Number(process.env.MUSE_VIDNETS_POLL_MS) || 5000);
   let retries = Number(receipt.cmsAttempt) === cmsAttempt ? (Number(receipt.pausedRetries) || 0) : 0;
   // replanAttempted is declared above (restored from the saved job file on

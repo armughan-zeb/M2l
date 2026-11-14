@@ -94,7 +94,7 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
     input,
     cwd: workDir,
     signal,
-    timeoutMs: Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * 60 * 1000,
+    timeoutMs: require('../lib/vidnetsSubmission').renderBudgetMs(job),
     label: 'Muse render command',
     onStderrLine: line => {
       const parsed = parseRenderProgressLine(line);

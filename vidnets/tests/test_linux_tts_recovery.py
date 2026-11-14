@@ -47,3 +47,37 @@ def test_linux_tts_exhaustion_preserves_existing_output(tmp_path, monkeypatch):
     assert run.call_count == 3
     assert output.read_bytes() == b"existing" * 30
     assert not (tmp_path / "narration.attempt.mp3").exists()
+
+
+def test_linux_chunk_retry_reuses_completed_audio_in_original_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(tts, "TEMP_DIR", tmp_path)
+    monkeypatch.setenv("VIDZEO_LINUX_TTS_COMMAND", "tts --output {output}")
+    chunks = ["First sentence.", "Second sentence.", "Third sentence."]
+    calls = []
+    fail = [True]
+
+    def synthesize(text, output):
+        calls.append(text)
+        if text == chunks[1] and fail[0]:
+            raise subprocess.TimeoutExpired("tts", 1)
+        Path(output).write_bytes(text.encode() * 20)
+        return output, 1.0
+
+    def concat(paths, _start):
+        data = [Path(path).read_bytes() for path in paths]
+        return data, 3.0
+
+    with mock.patch.object(tts, "_split_script_for_parallel_tts", return_value=chunks), \
+         mock.patch.object(tts, "_generate_linux_tts_audio", side_effect=synthesize), \
+         mock.patch.object(tts, "_get_audio_duration", return_value=1.0), \
+         mock.patch.object(tts, "_concat_edge_chunks", side_effect=concat):
+        try:
+            tts._generate_linux_tts_chunked("narration")
+            assert False, "expected timeout"
+        except subprocess.TimeoutExpired:
+            pass
+        fail[0] = False
+        data, duration = tts._generate_linux_tts_chunked("narration")
+    assert calls == [chunks[0], chunks[1], chunks[1], chunks[2]]
+    assert data == [chunk.encode() * 20 for chunk in chunks]
+    assert duration == 3.0
