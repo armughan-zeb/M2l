@@ -511,32 +511,44 @@ def _generate_linux_tts_audio(text: str, output_path: str) -> tuple | None:
     voice = str(os.environ.get('VIDZEO_LINUX_TTS_VOICE', '') or '').strip()
     speed = str(os.environ.get('VIDZEO_LINUX_TTS_SPEED', '100') or '100').strip()
     text_file = Path(str(output_path) + '.txt')
+    destination = Path(output_path)
+    attempt_output = destination.with_name(destination.stem + '.attempt' + destination.suffix)
     try:
         text_file.write_text(text, encoding='utf-8')
         argv = [
-            part.format(text_file=str(text_file), output=str(output_path), voice=voice, speed=speed)
+            part.format(text_file=str(text_file), output=str(attempt_output), voice=voice, speed=speed)
             for part in shlex.split(template)
         ]
         timeout = float(os.environ.get('VIDZEO_LINUX_TTS_TIMEOUT_SECONDS', '300') or 300)
-        result = subprocess.run(
-            argv, input=text.encode('utf-8'),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-        )
+        for attempt in range(3):
+            attempt_output.unlink(missing_ok=True)
+            try:
+                result = subprocess.run(
+                    argv, input=text.encode('utf-8'),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                )
+                break
+            except subprocess.TimeoutExpired:
+                if attempt == 2:
+                    raise
+                print(f"   [TTS] Linux command timed out; retrying attempt {attempt + 2}/3", flush=True)
         if result.returncode != 0:
             raise RuntimeError(
                 f'Linux TTS command failed ({result.returncode}): '
                 f'{result.stderr.decode("utf-8", "replace").strip()[-400:]}'
             )
-        if not Path(output_path).is_file() or Path(output_path).stat().st_size < 128:
+        if not attempt_output.is_file() or attempt_output.stat().st_size < 128:
             raise RuntimeError('Linux TTS command produced no audio file.')
-        duration = _get_audio_duration(output_path)
+        duration = _get_audio_duration(str(attempt_output))
         if duration <= 0:
             raise RuntimeError('Linux TTS command produced unreadable audio.')
+        os.replace(attempt_output, destination)
         print(f"   [TTS] Generated Linux offline spoken narration ({duration:.1f}s)")
         return str(output_path), duration
     finally:
         try:
             text_file.unlink(missing_ok=True)
+            attempt_output.unlink(missing_ok=True)
         except Exception:
             pass
 
