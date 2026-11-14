@@ -3268,6 +3268,11 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
         # Still bounded by the job delivery allowance below.
         base = 1200.0
     normalized_mode = str(lane_mode or "").strip().casefold()
+    if normalized_mode == "mixed media" and not config.get("media_deadline_seconds"):
+        from .web_image.source_broker import long_form_web_budget
+        scene_count = int(config.get("_web_budget_scene_count") or 0)
+        if scene_count >= 32:
+            base = max(base, long_form_web_budget(scene_count, _mixed_web_scene_worker_limit(config)) + 60.0)
     if normalized_mode == "mixed media":
         yt_branch_wall = _effective_mixed_youtube_branch_wall_seconds(config)
 
@@ -5772,6 +5777,12 @@ def resolve_existing_provider_branches_v2(
                 web_wall_cap,
                 max(web_wall_floor, min(requested_web_wall, scaled_web_wall)),
             )
+            if len(active_indices) >= 32:
+                from .web_image.source_broker import long_form_web_budget
+                lane_config["web_stage_deadline_seconds"] = max(
+                    lane_config["web_stage_deadline_seconds"],
+                    long_form_web_budget(len(active_indices), int(lane_config["web_max_scene_workers"])),
+                )
             print(
                 f"   [budget] mixed web wall: {lane_config['web_stage_deadline_seconds']:.0f}s "
                 f"(scenes={len(active_indices)}, floor={web_wall_floor:.0f}s, cap={web_wall_cap:.0f}s)"
@@ -6686,7 +6697,8 @@ def resolve_existing_provider_branches_v2(
         row.setdefault("scene_index", index)
         coordinator_scenes.append(row)
 
-    deadline_config = {**config, '_youtube_budget_scene_count': len(primary_youtube_scene_indices)}
+    deadline_config = {**config, '_youtube_budget_scene_count': len(primary_youtube_scene_indices),
+                       '_web_budget_scene_count': len(coordinator_scenes)}
     media_deadline_seconds = _media_stage_deadline_seconds(deadline_config, lane_policy["mode"])
     web_recovery_grace_seconds = _web_fallback_coordinator_grace_seconds(
         config,

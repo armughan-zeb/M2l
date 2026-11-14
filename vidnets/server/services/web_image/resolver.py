@@ -2737,31 +2737,27 @@ def _download_candidate_batch(items, output_dir, max_concurrent, timeout_seconds
             if path and Path(path).is_file():
                 cache[url] = str(path)
             # Retain ownership while its preview rescue is still pending.
-    # Preview rescue is an optional second fetch wave to thumbnail CDNs
-    # (Bing tse1/2/3.mm.bing.net, ts3.mm.bing.net, Yandex
-    # avatars.mds.yandex.net) — up to 5 hosts that otherwise each cost a
-    # fresh per-host approval card, for a small low-res image. Only rescue
-    # from a preview host the pipeline has already fetched from (persistent
-    # seen-host store, or the sibling preferred-host defaults); otherwise
-    # the candidate stays failed and the next candidate is used instead.
-    try:
-        _seen_preview_hosts = load_seen_hosts() | _preferred_image_hosts()
-    except Exception:
-        _seen_preview_hosts = set()
+    # A publisher may deny its original URL while the search provider's
+    # preview remains accessible. The normal image validation and visual gate
+    # still decide whether the recovered pixels are usable for this scene.
     fallback = {}
     for url, path, error in results:
         item = by_url.get(url, {})
         preview = str(item.get("preview_url") or item.get("thumbnail_url") or "").strip()
         if not path and preview.startswith(("https://", "http://")) and preview != url:
             _preview_host = urllib.parse.urlparse(preview).netloc.lower()
-            if _preview_host and is_seen_host(_preview_host, _seen_preview_hosts):
+            if _preview_host:
                 fallback[url] = preview
     if fallback:
-        previews = download_bulk(
-            list(dict.fromkeys(fallback.values())), output_dir,
-            max_concurrent=max_concurrent, timeout_seconds=timeout_seconds,
-            headers_by_url=headers,
-        )
+        try:
+            previews = download_bulk(
+                list(dict.fromkeys(fallback.values())), output_dir,
+                max_concurrent=max_concurrent, timeout_seconds=timeout_seconds,
+                headers_by_url=headers,
+            )
+        except Exception as exc:
+            _web_log(f"preview recovery failed: {type(exc).__name__}: {str(exc)[:160]}")
+            previews = []
         preview_paths = {url: path for url, path, error in previews if path}
         recovered = []
         for url, path, error in results:
@@ -6268,10 +6264,11 @@ def resolve_web_images_for_video_fast(
     max_scene_workers = max(1, min(16, int(max_scene_workers)))
     api_worker_limit = max(1, min(12, int(api_worker_limit)))
     stage_started_at = time.monotonic()
-    # The 3-minute ceiling is part of the production stall contract. Smaller
-    # explicit delivery budgets still win, but configuration cannot disable
-    # the wall and recreate the reported 20+ minute image stage.
-    default_stage_deadline = max(45.0, min(_WEB_STAGE_HARD_CAP_SECONDS, len(scene_texts) * 12.0))
+    # Give queued scene waves a bounded allowance that grows with the job.
+    # The shared delivery budget and per-scene deadlines still apply.
+    from .source_broker import long_form_web_budget
+    stage_cap = long_form_web_budget(len(scene_texts), max_scene_workers)
+    default_stage_deadline = max(45.0, min(stage_cap, len(scene_texts) * 12.0))
     try:
         stage_deadline_seconds = _bounded_web_seconds(
             stage_deadline_seconds
@@ -6279,7 +6276,7 @@ def resolve_web_images_for_video_fast(
             else os.environ.get("VIDZEO_WEB_STAGE_DEADLINE_SECONDS", "")
             or default_stage_deadline,
             default_stage_deadline,
-            _WEB_STAGE_HARD_CAP_SECONDS,
+            stage_cap,
         )
     except Exception:
         stage_deadline_seconds = default_stage_deadline

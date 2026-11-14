@@ -230,7 +230,9 @@ class _IsolatedNativeClient:
                 'headers': headers, 'timeout': budget}), timeout=budget)
             check_job_active()
             data = json.loads(output[:2200000])
-            return SimpleNamespace(status_code=data['status_code'], text=data['text'])
+            body = data['text']
+            return SimpleNamespace(status_code=data['status_code'], text=body,
+                                   json=lambda: json.loads(body))
         finally:
             if process.poll() is None:
                 process.kill()
@@ -259,10 +261,10 @@ class YandexEngine(_Engine):
         if safe_search:
             url += "&family=yes"
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
+            response = self._get_client().get(url, headers=_HEADERS, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=300)
+            response = requests.get(url, headers=_HEADERS, timeout=15)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Yandex returned HTTP status {status}")
@@ -322,10 +324,10 @@ class BingEngine(_Engine):
             f"q={urllib.parse.quote(query)}&first={first}&count={limit}&mmasync=1&adlt={safe}"
         )
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
+            response = self._get_client().get(url, headers=_HEADERS, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=300)
+            response = requests.get(url, headers=_HEADERS, timeout=15)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Bing returned HTTP status {status}")
@@ -466,10 +468,10 @@ class BaiduEngine(_Engine):
             f"&pn={start}&rn={limit}"
         )
         try:
-            response = self._get_client().get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
+            response = self._get_client().get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=300)
+            response = requests.get(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Baidu returned HTTP status {status}")
@@ -525,10 +527,10 @@ class OpenverseEngine(_Engine):
             f"&page={max(1, page)}&page_size={min(limit, 50)}"
         )
         try:
-            response = self._get_client().get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
+            response = self._get_client().get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=300)
+            response = requests.get(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Openverse returned HTTP status {status}")
@@ -572,13 +574,19 @@ class FlickrEngine(_Engine):
 
     def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
         del safe_search
-        tags = urllib.parse.quote(query.replace(" ", ","))
-        url = f"https://www.flickr.com/services/feeds/photos_public.gne?tags={tags}&format=json&nojsoncallback=1"
+        terms = re.findall(r"[^\W_]+", query, re.UNICODE)
+        stopwords = {"the", "and", "for", "with", "from", "this", "that", "how", "what", "where", "when", "which", "about"}
+        tags = [term for term in terms if len(term) >= 3 and term.casefold() not in stopwords][:5]
+        if not tags:
+            return []
+        params = urllib.parse.urlencode({"tags": ",".join(tags), "tagmode": "any",
+                                         "format": "json", "nojsoncallback": "1"})
+        url = f"https://www.flickr.com/services/feeds/photos_public.gne?{params}"
         try:
-            response = self._get_client().get(url, headers=_HEADERS, timeout=300)
+            response = self._get_client().get(url, headers=_HEADERS, timeout=15)
         except Exception:
             self._local.client = None
-            response = requests.get(url, headers=_HEADERS, timeout=300)
+            response = requests.get(url, headers=_HEADERS, timeout=15)
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
             raise RuntimeError(f"Flickr returned HTTP status {status}")

@@ -7,10 +7,20 @@ contamination, and records a source-by-source retrieval funnel.
 from __future__ import annotations
 
 import re
+import math
 import threading
 import time
 from collections import Counter, defaultdict, deque
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+
+def long_form_web_budget(scene_count: int, workers: int) -> float:
+    """Allow each queued scene wave time to run, with a bounded stage wall."""
+    count = max(1, int(scene_count))
+    if count < 32:
+        return 180.0
+    waves = math.ceil(count / max(1, int(workers)))
+    return min(1800.0, max(180.0, 30.0 + waves * 75.0))
 
 
 # Canonical web-image provider map.  Keep this in the broker (the shared
