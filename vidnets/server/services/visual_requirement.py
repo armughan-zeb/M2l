@@ -472,6 +472,8 @@ _SCENE_COMMON_CAPITALS = {
     "turns", "turn", "starts", "start", "stops", "stop", "runs", "run",
     "stands", "stand", "sits", "sit", "climbs", "climb", "walks", "walk",
     "psi", "rpm", "mph", "kph", "hp", "kw", "mw", "volts", "amps",
+    "gauges", "gauge", "meters", "meter", "dials", "dial", "screens", "screen",
+    "sensors", "sensor", "cables", "cable", "wires", "wire", "pipes", "pipe", "valves", "valve",
     "looks", "look", "sees", "see", "watches", "watch",
     "german", "british", "american", "french", "italian", "spanish", "russian",
     "chinese", "japanese", "irish", "european", "world", "u", "boat", "liner",
@@ -614,7 +616,7 @@ def _scene_subject(scene_text: str) -> str:
             continue
         prefix = text[max(0, match.start() - 12):match.start()].casefold()
         score = 50 + min(18, (len(parts) - 1) * 8)
-        if re.search(r"\b(?:in|off|near|at|from|on)\s+$", prefix):
+        if re.search(r"\b(?:in|off|near|at|from|on|across|through|over|into|along|around|past|beyond)\s+$", prefix):
             score -= 18
         candidates.append((score, -match.start(), name))
 
@@ -1336,15 +1338,22 @@ def build_visual_requirement(
         and len(title_tokens & _TITLE_CONTAINER_WORDS) >= max(1, len(title_tokens) - 1)
     )
     from .documentary_subject import collection_title_subject
+    spec_title = bool(re.match(
+        r"^(?:(?:top|best|greatest|worst|most)\s+)?(?:\d+(?:\s+\d+)*|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(?:horsepower|hp|ton|tons|mile|miles|meter|meters|foot|feet|cc|liter|litre|rpm|psi|volt|volts|amp|amps|watt|watts|cylinder|valve|gauge|year|years|hour|hours|minute|minutes|day|days|mph|kph)\b",
+        _norm(title_subject),
+    ))
     title_is_container = bool(
-        collection_title_subject(title) or
-        re.match(
-            r"^(?:(?:top|best|greatest|worst|most)\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-            _norm(title_subject),
+        not spec_title and (
+            collection_title_subject(title) or
+            re.match(
+                r"^(?:(?:top|best|greatest|worst|most)\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+                _norm(title_subject),
+            )
+            or re.fullmatch(r"(?:\d{3,4}|\d{1,2}(?:st|nd|rd|th)?)", _norm(title_subject or title))
+            or title_is_broad_category
+            or not title_subject
         )
-        or re.fullmatch(r"(?:\d{3,4}|\d{1,2}(?:st|nd|rd|th)?)", _norm(title_subject or title))
-        or title_is_broad_category
-        or not title_subject
     )
     role_subject = _scene_role_subject(scene_text)
     # Intro/transition beats often contain only a pronoun (``Harry and
@@ -1729,6 +1738,10 @@ def provider_query_variants(requirement: Mapping[str, Any], *, provider: str) ->
         "depend", "remember", "remembering", "begins", "begin", "began", "becomes",
         "worth", "looking", "closely", "visible", "whole", "idea", "challenge",
         "changed", "changes", "explain", "explains", "practical", "experience",
+        "throws", "throw", "pulls", "pull", "pushes", "push", "sets", "set",
+        "turns", "turn", "starts", "start", "stops", "stop", "runs", "run",
+        "stands", "stand", "sits", "sit", "climbs", "climb", "walks", "walk",
+        "sees", "see", "watches", "watch", "slowly", "quickly", "draw", "draws",
     }
     identity_tokens = set(_tokens(identity))
     attribute_tokens = {
