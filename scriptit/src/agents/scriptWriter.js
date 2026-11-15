@@ -1,3 +1,22 @@
+function normalizeNarration(raw) {
+  let value = raw;
+  for (let depth = 0; depth < 4; depth++) {
+    if (typeof value === 'string') {
+      const text = value.trim();
+      const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+      const candidate = fenced ? fenced[1].trim() : text;
+      if (!/^[{"\[]/.test(candidate)) return value;
+      try { value = JSON.parse(candidate); } catch { return value; }
+      if (typeof value === 'string') continue;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return typeof raw === 'string' ? raw : '';
+    const next = value.scriptText ?? value.script ?? value.narration ?? value.result ?? value.content;
+    if (typeof next !== 'string' && (!next || typeof next !== 'object' || Array.isArray(next))) return typeof raw === 'string' ? raw : '';
+    value = next;
+  }
+  return typeof value === 'string' ? value : (typeof raw === 'string' ? raw : '');
+}
+
 function stripThinkingProcess(raw) {
   let text = String(raw || '');
   text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
@@ -12,7 +31,7 @@ function stripThinkingProcess(raw) {
 }
 
 function writerOutput(content, target) {
-  const stripped = stripThinkingProcess(content);
+  const stripped = stripThinkingProcess(normalizeNarration(content));
   const script = stripped.replace(/<\/?evidence(?::[^>]+)?>/gi, '').trim();
   const words = script.split(/\s+/).filter(Boolean).length;
   const issues = [];
@@ -40,8 +59,8 @@ const { getResearchStore } = require('../research/store');
 const { buildResearchPlan, buildCoverageReport } = require('../research/questionPlanner');
 const { normalizeTopic, researchSubject } = require('../research/topicNormalizer');
 const { runUniversalEngine } = require('../engine/universalEngine');
-const { generateHook, buildDeterministicHooks } = require('../engine/agents/hookAgent');
-const { deSlopScript } = require('../engine/agents/voiceAgent');
+const { buildDeterministicHooks } = require('../engine/agents/hookAgent');
+const { deSlopScript, cleanVoiceRules, evaluateVoiceAuthenticity } = require('../engine/agents/voiceAgent');
 const { generateScriptFromStructure } = require('./structureCloner');
 const { auditNarration, auditConsistency, correctFindings } = require('./factualAudit');
 const { writeSections } = require('./sectionWriter');
@@ -135,7 +154,8 @@ function evidenceSentences(value) {
 }
 
 function unsupportedSentenceIssues(script, evidence) {
-  const claims = (evidence.claims || []).map((claim) => supportTokens(claim.text));
+  // Synthetic (model-written dossier) claims are context only, never support.
+  const claims = (evidence.claims || []).filter((claim) => !claim.synthetic).map((claim) => supportTokens(claim.text));
   if (!claims.length) return [];
   const sentences = evidenceSentences(script);
   const issues = [];
@@ -153,7 +173,7 @@ function unsupportedSentenceIssues(script, evidence) {
 }
 
 function sanitizeUnsupportedSentences(raw, evidence = {}) {
-  const claimById = new Map((evidence.claims || []).map((claim) => [claim.id, supportTokens(claim.text)]));
+  const claimById = new Map((evidence.claims || []).filter((claim) => !claim.synthetic).map((claim) => [claim.id, supportTokens(claim.text)]));
   const allClaims = [...claimById.values()];
   if (!allClaims.length) return String(raw || '');
 
@@ -208,7 +228,7 @@ function mergeSafeDrafts(primary, supplement, wordTarget) {
 }
 
 function markerSupportIssues(raw, evidence) {
-  const claimById = new Map((evidence.claims || []).map((claim) => [claim.id, supportTokens(claim.text)]));
+  const claimById = new Map((evidence.claims || []).filter((claim) => !claim.synthetic).map((claim) => [claim.id, supportTokens(claim.text)]));
   const sentences = evidenceSentences(raw);
   const issues = [];
   for (const rawSentence of sentences) {
@@ -235,7 +255,7 @@ function markerSupportIssues(raw, evidence) {
 }
 
 function repairEvidenceMarkers(raw, evidence) {
-  const claims = (evidence.claims || []).map(claim => ({ id: claim.id, words: supportTokens(claim.text) }));
+  const claims = (evidence.claims || []).filter((claim) => !claim.synthetic).map(claim => ({ id: claim.id, words: supportTokens(claim.text) }));
   return String(raw || '').split(/\n\s*\n/).map(paragraph => evidenceSentences(paragraph).map(sentence => {
     const markers = sentence.match(/<evidence:\s*[^>]+>/gi);
     if (!markers) return sentence.trim();
@@ -356,8 +376,15 @@ function buildPartialResearchScript(topic, evidence) {
 
 async function safeWriteDraft(options) {
   const hardTimeoutMs = Number(options?.hardTimeoutMs) || 0;
-  const writerTimeoutMs = options?.model === 'external-agent'
-    ? Math.min(300000, Math.max(30000, Number(options.timeoutMs) || 180000))
+  // Agent transports answer at inbox/human speed, so they get the longer
+  // bound. Both 'external-agent' and 'agent-bridge' are Muse; only a real
+  // OpenRouter model id takes the shorter provider bound.
+  // Agent cap was 300000: the writer request expired at 5 minutes while
+  // the 3600s bridge wall still allowed the operator to answer. Now
+  // 3600000 so the writer gets the full bridge window. The total job
+  // deadline (2700000, set by the CLI) is unchanged and still bounds the run.
+  const writerTimeoutMs = ['external-agent', 'agent-bridge'].includes(String(options?.model || '').trim().toLowerCase())
+    ? Math.min(3600000, Math.max(30000, Number(options.timeoutMs) || 180000))
     : Math.min(240000, Math.max(30000, Number(options?.timeoutMs) || 120000));
   let timer;
   try {
@@ -386,7 +413,7 @@ async function safeWriteDraft(options) {
 }
 
 function evaluateDraft(content, { topic = '', wordTarget, previousScripts, evidence, contentType }) {
-  const raw = String(content || '');
+  const raw = normalizeNarration(content);
   const validIds = new Set((evidence && evidence.claims ? evidence.claims : []).map((claim) => claim.id));
   const markers = [...raw.matchAll(/<evidence:\s*([^>]+)>/gi)]
     .flatMap((match) => match[1].match(/claim-[a-z0-9]+/gi) || []);
@@ -542,7 +569,7 @@ async function runScriptGeneration({
   referenceTranscript = '',
   customStructure = '',
   voice = 'conversational',
-  timeoutMs = 360000,
+  timeoutMs = 3600000,
   narratorProfile,
   narratorVideoUrl,
   referenceStructure,
@@ -562,6 +589,7 @@ async function runScriptGeneration({
 }) {
   signal?.throwIfAborted();
   if (require('../providers/agentInference').isAgentHandle(apiKey)) model = 'external-agent';
+  else if (require('../providers/agentBridge').isBridgeHandle(apiKey)) model = 'agent-bridge';
   else model = require('../providers/modelPolicy').normalizeModel(model);
   if (!topic || !String(topic).trim()) throw new Error('Topic is required');
   titleContext = String(titleContext || description || '').trim().slice(0, 12000);
@@ -574,16 +602,38 @@ async function runScriptGeneration({
   // model provider is unavailable or the user has not entered a key yet. Do
   // not turn a provider configuration problem into a blank result.
   const modelAvailable = Boolean(String(apiKey || '').trim()) || Boolean(chatCompletionFn);
-  const quickMode = researchMode !== 'thorough';
+  // Three modes: 'quick' is a non-publishable preview, 'standard' is the
+  // short-video middle ground (fast research only, still publishable), and
+  // 'thorough' is the full two-pass research. Anything unrecognized behaves
+  // as thorough — never silently as the preview.
+  const quickMode = researchMode === 'quick';
+  const normalizedResearchMode = quickMode ? 'quick' : researchMode === 'standard' ? 'standard' : 'thorough';
   const minimumQuickBudget = chatCompletionFn ? 25 : 5000;
   const quickBudgetMs = Math.max(minimumQuickBudget, Math.min(Number(quickDeadlineMs) || 36000, 300000));
   const effectiveTimeoutMs = quickMode ? Math.min(Number(timeoutMs) || quickBudgetMs, quickBudgetMs) : timeoutMs;
+  // SIMPLIFIED PIPELINE (Nov 9, 2026): one data pass, one script, one fix
+  // pass. The draft budget is the TOTAL number of model draft calls per
+  // generation — draft 1 + one fix pass — never a 4–6 draft loop over 17
+  // minutes. Override with MUSE_SCRIPT_MAX_DRAFTS (1–6); default 2.
+  const draftBudgetMax = Math.max(1, Math.min(6, Number(process.env.MUSE_SCRIPT_MAX_DRAFTS) || 2));
+  // One shared research deadline for the whole data pass: the pipeline call
+  // and any direct-research recovery share it — the recovery never gets
+  // fresh time. Override with MUSE_RESEARCH_TIMEOUT_MS; default 180000.
+  const researchTimeoutMs = Math.max(30000, Number(process.env.MUSE_RESEARCH_TIMEOUT_MS) || 180000);
+  const researchDeadlineAt = Date.now() + researchTimeoutMs;
   const quickProviderOptions = quickMode ? {
     totalTimeoutMs: quickBudgetMs,
     perAttemptTimeoutMs: Math.ceil(quickBudgetMs * 0.7),
     maxAttemptsPerModel: 1,
     fallbackModels: [],
   } : { fallbackModels: [] };
+  // Agent-bridge inference is a slow human-speed round-trip (inbox + operator).
+  // Without a total budget, safeWriteDraft re-throws a single expired bridge
+  // request and kills the whole generation; with one, it returns null and the
+  // draft loop + editorial gate decide honestly instead.
+  if (require('../providers/agentBridge').isBridgeHandle(apiKey)) {
+    quickProviderOptions.totalTimeoutMs = effectiveTimeoutMs;
+  }
   if (signal) quickProviderOptions.signal = signal;
 
   // A narrator video link (e.g. set on the CMS channel) can stand in for a
@@ -669,7 +719,7 @@ async function runScriptGeneration({
           duration,
           contentType,
           voice,
-          researchMode: quickMode ? 'quick' : 'thorough',
+          researchMode: normalizedResearchMode,
           includeReddit: true,
           idempotencyKey: forceFreshResearch
             ? `${researchTopic.toLowerCase()}|${contentType}|${duration}|refresh-${Date.now()}`
@@ -683,14 +733,19 @@ async function runScriptGeneration({
         includeReddit: true,
         quick: quickMode,
         signal: ownedSignal,
-      }), { signal, timeoutMs: 180000, label: 'Completed research' });
+      }), { signal, timeoutMs: researchTimeoutMs, label: 'Completed research' });
       jobId = pipeline.jobId || '';
       rawResearch = pipeline.research;
       brief = pipeline.brief || buildBrief(rawResearch);
     } catch (err) {
       signal?.throwIfAborted();
       console.warn('[ScriptIT] Research pipeline failed; falling back to direct research:', err.message);
+      // The recovery shares the one research deadline — it gets only the
+      // time left in it, never a fresh 90s. Past the deadline there is no
+      // second pass: the writer proceeds with whatever evidence exists.
+      const recoveryMs = Math.max(0, researchDeadlineAt - Date.now());
       try {
+        if (recoveryMs <= 0) throw new Error('Research deadline reached; no direct-research recovery pass');
         // A timed-out pipeline may still have left useful per-provider or
         // first-party results in its durable checkpoint. One bounded direct
         // pass gives the writer a chance to finish from those sources; the
@@ -700,7 +755,7 @@ async function runScriptGeneration({
           fetchLimit: quickMode ? 5 : 12,
           quick: quickMode,
           signal: ownedSignal,
-        }), { signal, timeoutMs: 90000, label: 'Direct research recovery' });
+        }), { signal, timeoutMs: recoveryMs, label: 'Direct research recovery' });
         rawResearch.errors = [...(rawResearch.errors || []), `Durable pipeline: ${err.message}`];
       } catch (fallbackErr) {
         signal?.throwIfAborted();
@@ -727,7 +782,11 @@ async function runScriptGeneration({
   brief = buildBrief(researchForLedger);
   let evidence = buildEvidenceLedger(researchForLedger);
   const researchPlan = buildResearchPlan({ topic: researchTopic, niche: researchForLedger.niche });
-  const coverage = buildCoverageReport({ plan: researchPlan, evidence });
+  // `let`, not `const`: the encyclopedic-synthesis rescue below rebuilds the
+  // coverage report after adding dossier claims. As a `const` this threw
+  // "Assignment to constant variable" on every successful synthesis, the
+  // catch swallowed it, and the brief / researchIncomplete stayed stale.
+  let coverage = buildCoverageReport({ plan: researchPlan, evidence });
   evidence.coverage = coverage;
   let researchIncomplete = !evidence.sufficient;
   let researchGapReasons = (evidence.sufficiencyReasons || []).join('; ') || 'the evidence set is too weak';
@@ -758,7 +817,7 @@ async function runScriptGeneration({
         brief = buildBrief(researchForLedger);
         researchIncomplete = !evidence.sufficient;
         researchGapReasons = (evidence.sufficiencyReasons || []).join('; ') || '';
-        console.log(`[ScriptIT] Encyclopedic synthesis added ${dossier.claims.length} grounded claims; sufficient: ${evidence.sufficient}`);
+        console.error(`[ScriptIT] Encyclopedic synthesis added ${dossier.claims.length} grounded claims; sufficient: ${evidence.sufficient}`);
       }
     } catch (dossierErr) {
       console.warn('[ScriptIT] Encyclopedic synthesis fallback error:', dossierErr?.message || dossierErr);
@@ -777,7 +836,11 @@ async function runScriptGeneration({
   // Graceful claim sufficiency handling:
   // In caller-supplied research test suites, respect the caller's explicit empty set.
   // In live production, ensure we never halt automation. If claims exist, proceed.
-  // If zero claims exist (e.g. offline or search outage), generate deterministic anchor claims.
+  // If zero EXTERNAL claims exist (e.g. offline or search outage), fail loudly.
+  // Model-written "anchor" claims used to be invented here to keep production
+  // moving; they carried fabricated archive URLs and zero factual content, so
+  // they are gone. A script with no attributable external evidence is not a
+  // script — it is a retryable research failure.
   if (researchIncomplete && !quickMode) {
     if (callerSuppliedResearch) {
       const error = new Error(`ScriptIT research is insufficient for publishable narration: ${researchGapReasons}`);
@@ -785,19 +848,22 @@ async function runScriptGeneration({
       error.retryable = true;
       throw error;
     }
-    if (evidence.claims?.length > 0 || brief?.sources?.length > 0) {
-      console.warn(`[ScriptIT] Research has gap warnings (${researchGapReasons}), but proceeding with ${evidence.claims.length} grounded claims to keep automation continuous.`);
-      notify(25, `Proceeding with ${evidence.claims.length} grounded claims…`);
+    const externalClaimCount = (evidence.claims || []).filter((claim) => !claim.synthetic).length;
+    // Synthetic dossier claims are appended to research.official, so they
+    // also appear in brief.sources with fabricated archive URLs. They are
+    // context only (P4) and must never open this gate on their own — a
+    // script with no attributable external evidence is a retryable research
+    // failure, even after Muse has answered the synthesis request.
+    const externalSourceCount = (brief?.sources || []).filter((source) => !source.synthetic).length;
+    if (externalClaimCount > 0 || externalSourceCount > 0) {
+      console.warn(`[ScriptIT] Research has gap warnings (${researchGapReasons}), but proceeding with ${externalClaimCount} grounded external claims to keep automation continuous.`);
+      notify(25, `Proceeding with ${externalClaimCount} grounded claims…`);
       researchIncomplete = false;
     } else {
-      console.warn(`[ScriptIT] Research returned no attributable claims (${researchGapReasons}); synthesizing authoritative documentary anchors so production never halts.`);
-      notify(25, 'Synthesizing authoritative documentary anchors to maintain continuous production…');
-      const { createDocumentaryAnchorClaims } = require('../research/encyclopedicSynthesizer');
-      const anchorClaims = createDocumentaryAnchorClaims(researchTopic, researchForLedger.niche || 'general');
-      researchForLedger.official = [...(researchForLedger.official || []), ...anchorClaims];
-      evidence = buildEvidenceLedger(researchForLedger);
-      brief = buildBrief(researchForLedger);
-      researchIncomplete = false;
+      const error = new Error(`ScriptIT research is insufficient for publishable narration: ${researchGapReasons}`);
+      error.code = 'RESEARCH_INSUFFICIENT';
+      error.retryable = true;
+      throw error;
     }
   }
   // Do not cache an incomplete bundle as a successful legacy cache entry.
@@ -831,16 +897,16 @@ async function runScriptGeneration({
     ? JSON.parse(JSON.stringify(suppliedCheckpoint)) : { version: 1, contextHash: checkpointHash, phase: 'drafting' };
   const saveDraft = async content => {
     signal?.throwIfAborted();
-    const cleanContent = stripThinkingProcess(content);
+    const cleanContent = stripThinkingProcess(normalizeNarration(content));
     if (cleanContent) generationCheckpoint.draft = String(cleanContent);
     if (!onDraft) return;
     await onDraft({ script: String(cleanContent).replace(/<\/?evidence(?::[^>]+)?>/gi, '').trim(),
-      meta: { topic: trimmedTopic, model, duration, jobId, researchMode: quickMode ? 'quick' : 'thorough',
+      meta: { topic: trimmedTopic, model, duration, jobId, researchMode: normalizedResearchMode,
         publishable: false, status: 'draft_requires_review', evidence: { sufficient: evidence.sufficient, sourceCount: evidence.sourceCount },
         generationCheckpoint: JSON.parse(JSON.stringify(generationCheckpoint)),
         quality: { passes: false, factualAudit: false, issues: ['Draft checkpoint is not a completed writer output'] } } });
   };
-  const draftBudget = quickMode ? 2 : 6;
+  const draftBudget = draftBudgetMax;
   const quickWritingDeadlineAt = quickMode
     ? writingStartedAt + quickBudgetMs + Math.min(1000, Math.max(100, Math.ceil(quickBudgetMs * 0.1)))
     : 0;
@@ -857,59 +923,47 @@ async function runScriptGeneration({
       providerOptions: quickProviderOptions,
       hardTimeoutMs: quickMode ? Math.max(25, remainingQuickMs) : 0,
     });
+    if (draft && typeof draft.content === 'string') draft.content = normalizeNarration(draft.content);
+    if (draft?.content?.trim() && !draft.truncated) generationCheckpoint.phase = 'editorial';
     await saveDraft(draft?.content);
     return draft;
   };
   if (modelAvailable) {
-    const preservedDraft = generationCheckpoint.phase !== 'drafting' && generationCheckpoint.draft ? generationCheckpoint.draft : initialDraft;
-    const preservedWords = String(preservedDraft || '').replace(/<\/?evidence(?::[^>]+)?>/gi, '').trim().split(/\s+/).filter(Boolean).length;
-    const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
-    const minRequired = Math.max(80, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance));
-    // A legacy short draft cannot be expanded reliably by repeated whole-story
-    // rewrites. Use the same budgeted beats as a new long script instead.
-    if ((quickMode || currentCheckpoint) && preservedWords >= (quickMode || wordTarget < 700 ? 80 : minRequired) && (!generationCheckpoint.sectionCheckpoint || generationCheckpoint.phase !== 'drafting')) {
-      result = { content: String(preservedDraft), modelUsed: initialDraftModel || model };
+    const completedDraft = currentCheckpoint && generationCheckpoint.phase === 'editorial'
+      ? String(generationCheckpoint.draft || '').trim() : '';
+    const previewDraft = quickMode && String(initialDraft || '').trim().split(/\s+/).length >= 80
+      ? String(initialDraft).trim() : '';
+    if (completedDraft || previewDraft) {
+      result = { content: completedDraft || previewDraft, modelUsed: initialDraftModel || model };
       generationCheckpoint.phase = 'editorial';
       notify(80, 'Restoring the preserved narration checkpoint');
       await saveDraft(result.content);
-    } else if (!quickMode && !chatCompletionFn && wordTarget >= 700) {
-      draftCalls += 1;
-      notify(48, 'Planning source-grounded narration beats');
-      result = await writeSections({ topic: trimmedTopic, wordTarget, evidenceText, signal, model, requestTimeoutMs: effectiveTimeoutMs,
-        onDraft: saveDraft,
-        initialCheckpoint: generationCheckpoint.sectionCheckpoint,
-        onCheckpoint: async checkpoint => { generationCheckpoint.sectionCheckpoint = checkpoint; await saveDraft(generationCheckpoint.draft || ''); },
-        editorialContext: [titleContext, customStructure, narratorText, 'Voice: ' + voice].filter(Boolean).join('\n'),
-        previousDraft: preservedDraft,
-        continuityReview: false,
-        onProgress: (beat, total) => notify(48 + Math.floor(beat / total * 7), 'Writing narration beat ' + beat + ' of ' + total),
-        complete: options => chatCompletion({ apiKey, model, temperature: 0.2, fallbackModels: [],
-          responseFormat: options.responseFormat,
-          // Schema routing requires every sent parameter. The selected Qwen
-          // writer supports schema output, but not the optional reasoning hint.
-           timeoutMs: effectiveTimeoutMs, signal: options.signal,
-           maxAttemptsPerModel: 1, maxTotalAttempts: 1,
-          reasoning: writerReasoning(model, !!options.responseFormat),
-          messages: [{ role: 'system', content: options.system }, { role: 'user', content: options.user }], maxTokens: options.maxTokens }),
+    } else {
+      const avoid = initialDraft
+        ? 'Build on this saved narration. Preserve supported facts and the opening promise. Develop only distinct supported material and deliver the complete narration. SAVED NARRATION:\n' + String(initialDraft).slice(0, 30000)
+        : '';
+      result = await callDraft({
+        apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, avoid, chatCompletionFn,
       });
-      generationCheckpoint.phase = 'editorial';
-      await saveDraft(result.content);
-    } else result = await callDraft({
-      apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, chatCompletionFn,
-    });
-    console.log('[ScriptIT DEBUG] callDraft 1 result:', Boolean(result), 'words:', result && result.content && result.content.split(/\s+/).filter(Boolean).length);
+    }
+    console.error('[ScriptIT DEBUG] callDraft 1 result:', Boolean(result), 'words:', result && result.content && result.content.split(/\s+/).filter(Boolean).length);
     if (!result) {
       result = await callDraft({
         apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, temperature: 0.3, chatCompletionFn,
       });
-      console.log('[ScriptIT DEBUG] callDraft 2 result:', Boolean(result), 'words:', result && result.content && result.content.split(/\s+/).filter(Boolean).length);
+      console.error('[ScriptIT DEBUG] callDraft 2 result:', Boolean(result), 'words:', result && result.content && result.content.split(/\s+/).filter(Boolean).length);
     }
   }
 
-  // Operator-selected prompt-led production: no reviewer, audit or editorial rewrite calls.
+  // Thorough production used to return here with only a length check — no
+  // editorial gate, no hook/retention review, no revision loop. That is what
+  // let long but generic drafts reach the renderer. Thorough mode now runs
+  // the same editorial gate as quick mode (evaluate + bounded revision +
+  // sanitize + deterministic rescue) before anything is publishable.
   if (!quickMode) {
     let output = writerOutput(result?.content, wordTarget);
-    // Mechanical runtime adjustment only, never an editorial review/audit loop.
+    // Mechanical runtime adjustment only: expand a short draft to the
+    // requested duration before the editorial gate sees it.
     if (modelAvailable && output.script && !output.ok && draftCalls < draftBudget) {
       const promptTarget = wordTarget + (wordTarget >= 1000 ? 100 : Math.max(50, Math.round(wordTarget * 0.08)));
       const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
@@ -919,68 +973,45 @@ async function runScriptGeneration({
         avoid: 'RUNTIME FIT ONLY: the current narration contains ' + output.words + ' spoken words. Expand the same story to at least ' + minRequired + ' spoken words; aim for ' + promptTarget + '. Retain the core payoff, hooks, viewer promise, and sourced facts. Develop only distinct sourced context and consequences. Longer useful output is acceptable. Deliver only the full expanded narration. CURRENT NARRATION:\n' + result.content });
       if (fitted?.content) { result = fitted; output = writerOutput(fitted.content, wordTarget); }
     }
-    const sourced = evidence.claims.length > 0;
-    const publishable = modelAvailable && sourced && output.ok;
-    generationCheckpoint.phase = publishable ? 'complete' : 'drafting';
-    if (result?.content) await saveDraft(result.content);
-    if (publishable && recordHistory) recordGeneration({ topic: trimmedTopic, script: output.script, strategyId: plan.strategy.id });
-    notify(100, publishable ? 'Narration saved' : 'Writer output incomplete; checkpoint saved');
-    return { script: output.script, meta: {
-      topic: trimmedTopic, model, modelUsed: result?.modelUsed || model, duration, wordTarget,
-      contentType: plan.contentType, engineName: plan.strategy.id, sources: brief.sources || [], jobId,
-      status: publishable ? 'ready_to_publish' : 'draft_ready', publishable,
-      productionPolicy: 'prompt-led-v1', researchMode: 'thorough', researchComplete: !researchIncomplete,
-      evidence: { sufficient: evidence.sufficient, sourceCount: evidence.sourceCount, claims: evidence.claims.length },
-      quality: { passes: publishable, words: output.words, warnings: output.warnings, issues: [...output.issues, ...(!sourced ? ['No source material available for narration'] : [])],
-        factualAudit: null, reviewPerformed: false },
-      generationCheckpoint, safeFallback: false, usage: result?.usage || null, cached: cacheHit, narrator: narratorMeta,
-      timing: { referenceMs, researchMs, writingMs: Date.now() - writingStartedAt, totalMs: Date.now() - generationStartedAt, draftCalls }
-    } };
   }
 
+  // Deterministic de-slop before the gate: strip AI-tell phrasing and recap
+  // footers so the editorial checks judge the narration viewers will hear.
+  if (result?.content) result.content = cleanVoiceRules(result.content);
   if (result?.content) result.content = repairEvidenceMarkers(result.content, evidence);
   let quality = evaluateDraft(result && result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
-  console.log('[ScriptIT DEBUG] initial quality:', { words: quality.words, passes: quality.passes, issues: quality.issues });
+  console.error('[ScriptIT DEBUG] initial quality:', { words: quality.words, passes: quality.passes, issues: quality.issues });
 
   // Give a failed draft focused editorial feedback. Long drafts are not
   // exempt: verbosity must never be used to bypass the quality gate.
-  const revisionLimit = quickMode ? 1 : 2;
-  const needsEditorialRewrite = () => !quality.passes && (quickMode || chatCompletionFn || !quality.structuralPasses);
+  // ONE fix pass only: draft 1 + this single revision, then the gate
+  // decides. A draft that still fails is returned non-publishable (the
+  // CLI exits 2 and the job fails) instead of looping through rewrites.
+  const revisionLimit = 1;
+  const needsEditorialRewrite = () => !quality.passes && (modelAvailable || quickMode || chatCompletionFn || !quality.structuralPasses);
   for (let revision = 1; revision <= revisionLimit && needsEditorialRewrite() && modelAvailable && draftCalls < draftBudget; revision += 1) {
     const promptTarget = wordTarget + (wordTarget >= 1000 ? 100 : Math.max(50, Math.round(wordTarget * 0.08)));
     const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
     const minRequired = Math.max(80, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance));
-    const avoid = `Revise the CURRENT DRAFT below, retaining only supported facts. Fix every issue: ${quality.issues.join(' ')}. Its measured narration length is ${quality.words} words; the required target is ${wordTarget}. Aim for ${promptTarget} words (minimum acceptable is ${minRequired} words). ${quality.words < minRequired ? `Develop at least ${minRequired - quality.words} additional words of supported context across the existing beats; do not compress the current draft or append filler.` : 'Preserve its useful depth while correcting unsupported claims.'} Open with a documented fact, tension or question that hooks the viewer with an explicit promise; never imagine a scene. Use 3–5 meaningful beats, varied sentence rhythm and at least 5 blank-line paragraphs for a 700+ word script. Do not invent reactions, motives or company intent. Return the complete corrected spoken narration with valid evidence markers, not a summary or a list of edits. Revision ${revision} of 2.\n\nCURRENT DRAFT:\n${String(result?.content || quality.script).slice(0, 30000)}`;
+    const avoid = `Revise the CURRENT DRAFT below, retaining only supported facts. Fix every issue: ${quality.issues.join(' ')}. Its measured narration length is ${quality.words} words; the required target is ${wordTarget}. Aim for ${promptTarget} words (minimum acceptable is ${minRequired} words). ${quality.words < minRequired ? `Develop at least ${minRequired - quality.words} additional words of supported context across the existing beats; do not compress the current draft or append filler.` : 'Preserve its useful depth while correcting unsupported claims.'} Open with a documented fact, tension or question that hooks the viewer with an explicit promise; never imagine a scene. Use 3–5 meaningful beats, varied sentence rhythm and at least 5 blank-line paragraphs for a 700+ word script. Do not invent reactions, motives or company intent. Return the complete corrected spoken narration with valid evidence markers, not a summary or a list of edits. Revision ${revision} of 1 — the only fix pass.\n\nCURRENT DRAFT:\n${String(result?.content || quality.script).slice(0, 30000)}`;
     try {
-      result = await callDraft({
+      const revised = await callDraft({
         apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice, briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, avoid, temperature: 0.35, chatCompletionFn,
       });
-      quality = evaluateDraft(result && result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
+      if (revised?.content?.trim()) {
+        result = revised;
+        quality = evaluateDraft(result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
+      }
     } catch (revErr) {
       console.warn('[ScriptIT] Revision attempt failed:', revErr.message);
     }
   }
 
-  // A final, deliberately conservative rescue pass handles a common live
-  // failure mode: a model can understand the topic but keep repeating the
-  // same unsourced framing (leaks, audience assumptions, what a company
-  // "really" meant). Give it one focused rewrite request before stopping,
-  // while leaving the evidence and editorial gates fully intact.
-  if (!quickMode && needsEditorialRewrite() && modelAvailable && draftCalls < draftBudget) {
-    const rescueNotes = `FINAL GROUNDED REWRITE. The previous draft did not pass the editorial gate. Rewrite it from scratch using the evidence ledger as a closed world. Remove every unsupported factual sentence, especially claims about audience reaction, leaks, what viewers have seen, what a company intended, popularity, recency, completeness, or exclusivity unless a ledger claim states it directly. Keep only neutral connective language plus faithful paraphrases of ledger claims. Preserve a strong opening question or concrete consequence, 3–5 meaningful beats, at least 5 blank-line paragraphs for a 700+ word script, varied rhythm, and a complete narration close to the requested word target. Do not mention this rewrite, the gate, the ledger, or the research process. Append valid evidence markers to factual sentences. Specific issues to fix: ${(quality.issues || []).slice(0, 8).join(' ')}`;
-    try {
-      // Corrections retain the selected writer and its provider policy.
-      // A fixed rescue model silently overrides operator configuration.
-      result = await callDraft({
-        apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice,
-        briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure,
-        avoid: rescueNotes + '\n\nCURRENT DRAFT:\n' + String(result?.content || quality.script).slice(0, 30000), temperature: 0.15, chatCompletionFn,
-      });
-      quality = evaluateDraft(result && result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
-    } catch (rescueErr) {
-      console.warn('[ScriptIT] Final grounded rewrite failed:', rescueErr.message);
-    }
-  }
+  // REMOVED (Nov 9, 2026 simplification): the "final grounded rewrite" was
+  // a second fix pass after the one revision above — with a 2-draft budget
+  // it could still fire and stretch a failing script into a third model
+  // call. One fix pass is the cap: a draft that still fails the gate is
+  // returned non-publishable and the job fails loudly instead.
 
   // A longer failed draft must never beat the safe rescue. Keep any supported
   // narration, remove bad factual lines, then run the same checks again.
@@ -1048,14 +1079,21 @@ async function runScriptGeneration({
   // irrelevant, unsupported, or full of editorial/meta commentary; allowing
   // word count to override the quality verdict is what let bad scripts reach
   // the renderer. Only a passing draft or a verified deterministic rescue is
-  // publishable.
+  // publishable. Publishability also requires real external evidence:
+  // synthetic (model-written dossier) claims never count.
   // Evidence assembly remains a review draft: local word overlap cannot
   // certify coherent narration or overturn the factual reviewer's rejection.
   if (safeFallback) {
     quality.passes = false;
     quality.issues.push('Evidence-assembled fallback requires editorial review before production.');
   }
-  const isCompleteAndPublishable = Boolean(cleanFinalScript && !researchIncomplete && quality.passes && !safeFallback && !quickMode && (chatCompletionFn || factualAudit?.passes === true));
+  const externalClaimCount = (evidence.claims || []).filter((claim) => !claim.synthetic).length;
+  const syntheticClaimCount = (evidence.claims || []).length - externalClaimCount;
+  const gateOk = Boolean(cleanFinalScript && !researchIncomplete && quality.passes && !safeFallback && externalClaimCount > 0);
+  // Quick mode is a preview by design and is never publishable; standard
+  // and thorough production publish only a gated draft with real external
+  // evidence.
+  const isCompleteAndPublishable = Boolean(!quickMode && gateOk && modelAvailable);
 
   if (!isCompleteAndPublishable) {
     const details = researchIncomplete
@@ -1065,17 +1103,18 @@ async function runScriptGeneration({
     // research-status paragraph is not a usable script and caused the UI to
     // look broken. It remains non-publishable until the evidence gate passes.
     const fallbackDraft = buildEvidenceFallbackScript(trimmedTopic, evidence, wordTarget) || buildPartialResearchScript(trimmedTopic, evidence);
-    const partial = [cleanFinalScript, bestSafeDraft, fallbackDraft]
+    const partial = [cleanFinalScript, bestSafeDraft, generationCheckpoint.draft, fallbackDraft]
       .map((draft) => String(draft || '').replace(/<evidence:\s*[^>]+>/gi, '').trim())
-      .sort((left, right) => right.split(/\s+/).filter(Boolean).length - left.split(/\s+/).filter(Boolean).length)[0]
+      .find(Boolean) || '';
+    const cleanedPartial = partial
       .replace(/<evidence:\s*[^>]+>/gi, '')
       .trim();
-    const partialQuality = evaluateDraft(partial, { topic: trimmedTopic, wordTarget, previousScripts: [], evidence, contentType: plan.contentType });
+    const partialQuality = evaluateDraft(cleanedPartial, { topic: trimmedTopic, wordTarget, previousScripts: [], evidence, contentType: plan.contentType });
     const finalDetails = researchIncomplete
       ? `research remains incomplete: ${researchGapReasons}`
       : (partialQuality.issues || []).slice(0, 5).join(' ') || 'the draft remains an editorial draft';
     return {
-      script: partial,
+      script: cleanedPartial,
       meta: {
         topic: trimmedTopic,
         model,
@@ -1090,11 +1129,13 @@ async function runScriptGeneration({
         status: 'draft_ready',
         publishable: false,
         generationCheckpoint,
-        researchMode: quickMode ? 'quick' : 'thorough',
+        productionPolicy: 'prompt-led-v1',
+        researchMode: normalizedResearchMode,
         researchComplete: !researchIncomplete,
         evidence: {
           sourceCount: evidence.sourceCount,
-          externalClaims: evidence.externalClaims,
+          externalClaims: externalClaimCount,
+          syntheticClaims: syntheticClaimCount,
           primaryClaims: evidence.primaryClaims,
           claims: evidence.claims.length,
           atomicClaims: evidence.atomicClaims.length,
@@ -1110,6 +1151,7 @@ async function runScriptGeneration({
           score: partialQuality.score,
           passes: false,
           hook: partialQuality.hook,
+          reviewPerformed: true,
           topicFit: partialQuality.topicQuality,
           issues: [...new Set([
             ...(researchIncomplete ? [`Research coverage is limited: ${researchGapReasons}`] : []),
@@ -1135,7 +1177,10 @@ async function runScriptGeneration({
     };
   }
 
+  // The narration already contains its opening; do not ask Muse for hooks
+  // again after the script. Retain local metadata for existing consumers.
   const hookInfo = buildDeterministicHooks(trimmedTopic, cleanFinalScript);
+  const voiceCheck = evaluateVoiceAuthenticity(cleanFinalScript);
   // Deterministic rescue drafts are evidence-safe emergency output, not a
   // style exemplar for future similarity checks. Recording them would make a
   // later corrected draft look like a duplicate of an abandoned canary.
@@ -1155,13 +1200,15 @@ async function runScriptGeneration({
       jobId,
       status: 'ready_to_publish',
       publishable: true,
-      researchMode: quickMode ? 'quick' : 'thorough',
+      productionPolicy: 'prompt-led-v1',
+      researchMode: normalizedResearchMode,
       researchComplete: true,
       hookVariants: hookInfo.variants,
       selectedHook: hookInfo.selectedHook,
       evidence: {
         sourceCount: evidence.sourceCount,
-        externalClaims: evidence.externalClaims,
+        externalClaims: externalClaimCount,
+        syntheticClaims: syntheticClaimCount,
         primaryClaims: evidence.primaryClaims,
         claims: evidence.claims.length,
         atomicClaims: evidence.atomicClaims.length,
@@ -1177,6 +1224,9 @@ async function runScriptGeneration({
         score: quality.score,
         passes: quality.passes,
         hook: quality.hook,
+        reviewPerformed: true,
+        specificity: quality.specificity,
+        voice: { score: voiceCheck.score, passes: voiceCheck.passes, issues: voiceCheck.issues },
         topicFit: quality.topicQuality,
         issues: quality.issues,
         warnings: quality.warnings || [],
@@ -1208,6 +1258,7 @@ module.exports = {
   runUniversalEngine,
   buildEvidenceFallbackScript,
   writerOutput,
+  normalizeNarration,
   evaluateDraft,
   sanitizeUnsupportedSentences,
   mergeSafeDrafts,

@@ -850,11 +850,35 @@ class QwenVisionClient:
         if _thinking not in {"1", "true", "yes", "on"}:
             payload["reasoning"] = {"enabled": False}
 
+        # The external agent (Muse's own vision) answers through the local
+        # inbox; a missed deadline raises AgentBridgeError. Import it lazily
+        # (same pattern as the AGENT_HANDLE import below) so a missing inbox
+        # never breaks module import.
+        try:
+            from ..agent_bridge import AgentBridgeError as _AgentBridgeError
+        except Exception:
+            # Never raised: keeps the `except _AgentBridgeError` clause below
+            # valid (an `except None` would raise TypeError) while matching
+            # nothing when the bridge is unavailable.
+            class _AgentBridgeError(Exception):
+                pass
+
         last_error = ""
         structured_fallback_used = False
         attempts = min(self.max_attempts, 2) if current_job().get('cost_profile') == 'efficient' else self.max_attempts
         request_budget = attempts + (1 if json_mode else 0)
-        verdict_deadline = time.monotonic() + max(0.1, self.timeout_seconds * max(2, request_budget) + 10.0)
+        # An agent-backed verifier answers through the polling inbox, so one
+        # attempt needs the full agent answer floor — otherwise the phase
+        # scope below caps the request wall under it and the verdict expires
+        # before the answer arrives.
+        timeout_seconds = self.timeout_seconds
+        if current_job().get('llm_provider') == 'external_agent':
+            try:
+                agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+            except (TypeError, ValueError):
+                agent_wall = 3600.0
+            timeout_seconds = max(timeout_seconds, agent_wall)
+        verdict_deadline = time.monotonic() + max(0.1, timeout_seconds * max(2, request_budget) + 10.0)
         for attempt in range(request_budget):
             if time.monotonic() >= verdict_deadline:
                 break
@@ -952,6 +976,14 @@ class QwenVisionClient:
                 return str(content_out)
             except VisionClientError:
                 raise
+            except _AgentBridgeError as exc:
+                # The external agent did not answer this inbox request in
+                # time. Retry once with a fresh inbox request instead of
+                # failing the candidate closed: the agent may simply have
+                # been busy answering another request.
+                last_error = str(exc)
+                if attempt + 1 < attempts:
+                    time.sleep(min(2.0, max(0.0, verdict_deadline - time.monotonic())))
             except requests.RequestException as exc:
                 last_error = str(exc)
                 if attempt + 1 < self.max_attempts:

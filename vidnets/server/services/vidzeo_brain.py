@@ -8,12 +8,15 @@ Single entry point for:
 
 Mechanical fallback only when OpenRouter is unavailable.
 """
+import hashlib
 import json
 import os
 import re
+import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, as_completed
-from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
+from pathlib import Path
+from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor, current_job
 from typing import List, Dict, Optional, Any
 
 from .openrouter_llm import (
@@ -460,15 +463,26 @@ _GENERIC_ANCHOR = {
 def _mechanical_scene_plan(scene_text: str, scene_number: int, section_subject: str = "",
                             topic: str = "") -> Dict:
     """Ultra-minimal mechanical fallback when Brain completely fails."""
+    # A section label is not a searchable subject: "In February" is a
+    # calendar marker, not the thing on screen. Fall back to the film topic
+    # (compacted) instead of building queries around the label, which is how
+    # scenes ended up searching "In February February Amtrak departures".
+    _SECTION_LABEL_MONTHS = (
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+    )
     subject = section_subject or topic or "topic"
+    if any(month in subject.lower() for month in _SECTION_LABEL_MONTHS):
+        subject = topic or subject
     words = re.findall(r'[a-zA-Z]{4,}', scene_text or "")
+    subject_words = {w.lower() for w in re.findall(r'[a-zA-Z]+', subject or "")}
     visual_words = [w for w in words if w.lower() not in {
         "the", "this", "that", "with", "from", "they", "have", "been", "were",
         "what", "when", "where", "which", "their", "them", "about", "into",
         "could", "would", "should", "there", "these", "those", "because",
         "just", "also", "very", "more", "than", "then", "some", "made",
         "make", "like", "than", "even", "still", "after", "before",
-    }][:3]
+    } and w.lower() not in subject_words][:3]
     base = " ".join(visual_words) if visual_words else subject
 
     return {
@@ -615,6 +629,136 @@ def _mechanical_container_map(topic: str, scene_texts: List[str]) -> Dict[str, A
 
 # ── Brain Orchestrator ────────────────────────────────────────────────
 
+# --- Persisted scene plan (script-time pre-compute, resume reuse) --------
+
+# Scene direction + web/YT/stock queries are computed once, when the script
+# is made, by VidzeoBrain.plan_scenes — each plan row carries the direction
+# (container_subject / scene_subject / visual_intent) and the queries for
+# all three sources. Until now the rows lived only in memory (and in the
+# app-level temp cache, which only stores FULLY directed plans): a resumed
+# job re-filed every direction/query bridge request, even for scenes the
+# first attempt had already directed. The Hindenburg job is the proof: its
+# checkpoint source_query_plan.json holds only planner provenance (status
+# "partial", 32 directed / 25 fallback of 57 scenes) — the query rows
+# themselves were never persisted, and the temp cache refused the partial
+# plan, so a resume would re-file all 57 scenes.
+#
+# The plan is therefore persisted on the job record, beside the other
+# checkpoints (package/checkpoints/scene_plan.json), on EVERY plan_scenes
+# completion — including partial ones. On load, only DIRECTED rows are
+# reused (same validation as the fresh path: non-empty direction + a usable
+# query for every source, no _query_fallback); mechanical/fallback rows are
+# re-planned. A resumed job files zero new direction/query requests for its
+# already-directed scenes. The media branches consume the plan through the
+# existing prebuilt-queries path: they all funnel through plan_scenes, so
+# no branch changes are needed.
+_SCENE_PLAN_STORE_SCHEMA = "vidzeo_scene_plan_v1"
+_SCENE_PLAN_STORE_FILENAME = "scene_plan.json"
+
+
+def _scene_plan_digest(topic: str, script: str, scene_texts: List[str]) -> str:
+    material = "\x1f".join([str(topic or ""), str(script or ""), *[str(t or "") for t in (scene_texts or [])]])
+    return hashlib.sha1(material.encode("utf-8")).hexdigest()
+
+
+def _scene_plan_store_path() -> Optional[Path]:
+    """Job-checkpoint path for the persisted scene plan, or None outside a job.
+
+    Derived from the job context's llm_cache_dir (package/checkpoints/
+    model-cache). Without a job there is no job record to persist on, so
+    persistence is skipped entirely — never write to a shared temp dir.
+    """
+    try:
+        cache_dir = current_job().get("llm_cache_dir")
+    except Exception:
+        return None
+    if not cache_dir:
+        return None
+    return Path(str(cache_dir)).expanduser().parent / _SCENE_PLAN_STORE_FILENAME
+
+
+def _is_directed_scene_row(row: Any) -> bool:
+    """True when a stored plan row was LLM-directed (reusable on resume).
+
+    Mirrors the fresh-path validation in _plan_scenes_impl: non-empty
+    direction fields, a usable query for every source, and no
+    _query_fallback marker. Mechanical rows are never served as directed —
+    that is how word-salad queries were once cached and reused forever.
+    """
+    if not isinstance(row, dict) or row.get("_query_fallback"):
+        return False
+    if any(not str(row.get(field) or "").strip()
+           for field in ("container_subject", "scene_subject", "visual_intent")):
+        return False
+    query_fields = {
+        "youtube": ("primary", "supporting", "fallback"),
+        "web": ("primary", "supporting", "fallback"),
+        "stock": ("primary_query", "alt_query", "fallback_query"),
+    }
+    for source, fields in query_fields.items():
+        queries = row.get(source)
+        if not isinstance(queries, dict):
+            return False
+        if not any(str(queries.get(field) or "").strip() for field in fields):
+            return False
+    return True
+
+
+def load_persisted_scene_plan(topic: str, script: str, scene_texts: List[str]) -> Optional[List[Dict]]:
+    """Return the persisted plan rows for these exact inputs, or None.
+
+    The digest covers topic + script + every scene text, so a changed
+    script or re-cut scene list never reuses a stale plan. Returns the
+    stored rows as-is (directed and fallback alike); the caller filters
+    with _is_directed_scene_row.
+    """
+    path = _scene_plan_store_path()
+    if path is None or not path.is_file():
+        return None
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stored, dict) or stored.get("_schema") != _SCENE_PLAN_STORE_SCHEMA:
+        return None
+    if stored.get("digest") != _scene_plan_digest(topic, script, scene_texts):
+        return None
+    rows = stored.get("scenes")
+    if not isinstance(rows, list) or len(rows) != len(scene_texts or []):
+        return None
+    return [dict(row) if isinstance(row, dict) else {} for row in rows]
+
+
+def store_persisted_scene_plan(topic: str, script: str, scene_texts: List[str], rows: List[Dict]) -> bool:
+    """Atomically persist plan rows on the job record. Best-effort: a
+    persistence failure must never break planning. Returns True on success."""
+    path = _scene_plan_store_path()
+    if path is None or not isinstance(rows, list):
+        return False
+    payload = {
+        "_schema": _SCENE_PLAN_STORE_SCHEMA,
+        "digest": _scene_plan_digest(topic, script, scene_texts),
+        "topic": str(topic or ""),
+        "scene_count": len(scene_texts or []),
+        "scenes": [dict(row) if isinstance(row, dict) else {} for row in rows],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.part")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
 class VidzeoBrain:
     """Central brain orchestrator for scene planning.
 
@@ -672,11 +816,64 @@ class VidzeoBrain:
     def plan_scenes(self, topic: str, script: str, scene_texts: List[str],
                     section_subjects: List[str] = None, is_listicle: bool = False,
                     pipeline_type: str = "mixed") -> List[Dict]:
-        """Generate full scene plans for all scenes."""
+        """Generate full scene plans for all scenes.
+
+        Scene direction + queries are computed once and persisted on the job
+        record (see load/store_persisted_scene_plan): a resumed call reuses
+        its already-directed rows and files new bridge requests only for
+        the scenes the persisted plan never directed.
+        """
         self._last_scene_model_routes = []
+        persisted = load_persisted_scene_plan(topic, script, scene_texts)
+        if persisted is not None:
+            reusable = {index: row for index, row in enumerate(persisted)
+                        if _is_directed_scene_row(row)}
+            missing = [index for index in range(len(scene_texts)) if index not in reusable]
+            if not missing:
+                print(f"   [brain] persisted scene plan reused: {len(reusable)} directed scene(s), 0 new requests")
+                self._last_scene_model_routes = [self._route_snapshot(
+                    status="directed", reason="persisted_scene_plan")]
+                return [dict(reusable[index]) for index in range(len(scene_texts))]
+            sub_texts = [scene_texts[index] for index in missing]
+            sub_subjects = [
+                section_subjects[index]
+                if section_subjects and index < len(section_subjects) else ""
+                for index in missing
+            ]
+            fresh = self._plan_scenes_impl(
+                topic, script, sub_texts, sub_subjects, is_listicle, pipeline_type, extra_hint="",
+            )
+            fresh_by_index: Dict[int, Dict] = {}
+            if isinstance(fresh, list):
+                for offset, index in enumerate(missing):
+                    plan = fresh[offset] if offset < len(fresh) else None
+                    if isinstance(plan, dict) and plan:
+                        plan = dict(plan)
+                        plan["scene_number"] = index + 1
+                        fresh_by_index[index] = plan
+            merged: List[Dict] = []
+            for index, text in enumerate(scene_texts):
+                if index in reusable:
+                    merged.append(dict(reusable[index]))
+                elif index in fresh_by_index:
+                    merged.append(fresh_by_index[index])
+                else:
+                    subject = section_subjects[index] if section_subjects and index < len(section_subjects) else ""
+                    plan = _mechanical_scene_plan(text, index + 1, subject, topic)
+                    plan['_query_fallback'] = 'persisted_plan_missing_chunk'
+                    merged.append(plan)
+            if not self._last_scene_model_routes:
+                self._last_scene_model_routes = [self._route_snapshot(
+                    status="directed" if reusable or fresh_by_index else "failed",
+                    reason="persisted_scene_plan_partial" if missing else "",
+                )]
+            store_persisted_scene_plan(topic, script, scene_texts, merged)
+            return merged
         rows = self._plan_scenes_impl(
             topic, script, scene_texts, section_subjects, is_listicle, pipeline_type, extra_hint="",
         )
+        if isinstance(rows, list) and rows:
+            store_persisted_scene_plan(topic, script, scene_texts, rows)
         if not self._last_scene_model_routes:
             self._last_scene_model_routes = [self._route_snapshot(
                 status="directed" if rows else "failed",
@@ -1039,9 +1236,9 @@ Return one container row for every scene in order."""
             _global_forbidden_hint = f"\nGLOBAL FORBIDDEN SUBJECTS across all sections: {', '.join(sorted(_all_section_words))}. NEVER include any of these words in queries for scenes from OTHER sections."
 
         try:
-            chunk_size = int(os.environ.get("VIDZEO_BRAIN_SCENE_CHUNK_SIZE", "8") or 8)
+            chunk_size = int(os.environ.get("VIDZEO_BRAIN_SCENE_CHUNK_SIZE", "12") or 12)
         except Exception:
-            chunk_size = 8
+            chunk_size = 12
         chunk_size = max(3, min(12, chunk_size))
         if len(scene_texts) > chunk_size:
             chunks = [
@@ -1054,7 +1251,18 @@ Return one container row for every scene in order."""
                 worker_limit = 4
             from .media_query_strategy import query_planning_budget
             if deadline_monotonic is None:
-                deadline_monotonic = time.monotonic() + query_planning_budget(len(chunks), worker_limit)
+                # Queries are the foundation of the whole video: they get a
+                # full agent round-trip per wave, not a 120s cut-off. An agent
+                # answer needs the hook wake (~4.5 min) plus composition, so
+                # a 120s wave expired before the first answer arrived and the
+                # chunk was filled with mechanical word-salad queries.
+                per_wave = None
+                if getattr(getattr(self, "_client", None), "provider", "") == "external_agent":
+                    try:
+                        per_wave = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+                    except (TypeError, ValueError):
+                        per_wave = 3600.0
+                deadline_monotonic = time.monotonic() + query_planning_budget(len(chunks), worker_limit, per_wave_seconds=per_wave)
 
             def _plan_scene_chunk(chunk):
                 start, chunk_texts, chunk_subjects = chunk

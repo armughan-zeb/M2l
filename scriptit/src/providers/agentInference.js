@@ -8,9 +8,16 @@ function baseUrl() {
   if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Agent inference requires a localhost CMS URL');
   return url.origin;
 }
-async function agentChat({ apiKey, messages, responseFormat, maxTokens, tools, toolChoice, signal, timeoutMs = 120000, operation = 'tool-completion', kind = 'text' }) {
+const REQUEST_WALL_MS = 3600000; // matches the Vidnets bridge 3600s floor
+
+async function agentChat({ apiKey, messages, responseFormat, maxTokens, tools, toolChoice, signal, timeoutMs = 3600000, operation = 'tool-completion', kind = 'text' }) {
   if (!isAgentHandle(apiKey) || !String(apiKey).slice(PREFIX.length).trim()) throw new Error('A paired external agent is required');
-  const budget = Math.max(100, Math.min(600000, Number(timeoutMs) || 120000));
+  // Default budget is one full 3600s wall: the CMS forwards the call to the
+  // Vidnets agent bridge, which floors its own wall at
+  // VIDZEO_AGENT_MIN_WALL_SECONDS (default 3600s). A shorter client budget
+  // would abort the fetch while the server was still waiting for the
+  // operator's answer, and the answer would arrive to nobody.
+  const budget = Math.max(100, Math.min(3600000, Number(timeoutMs) || 3600000));
   const deadline = AbortSignal.timeout(budget + 1000);
   const response = await fetch(baseUrl() + '/api/agent/inference', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Vidzeo-Agent-Key': String(apiKey).slice(PREFIX.length) },
@@ -28,4 +35,4 @@ async function agentChat({ apiKey, messages, responseFormat, maxTokens, tools, t
     choices: [{ message, finish_reason: reply.tool_calls ? 'tool_calls' : 'stop' }], usage: {} };
   return { content: message.content, raw, modelUsed: 'external-agent', attempts: 1 };
 }
-module.exports = { PREFIX, isAgentHandle, agentChat, baseUrl };
+module.exports = { PREFIX, REQUEST_WALL_MS, isAgentHandle, agentChat, baseUrl };

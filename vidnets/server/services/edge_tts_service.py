@@ -11,11 +11,22 @@ import re
 import subprocess
 import sys
 import time
+import shutil
+import tempfile
 from pathlib import Path
 
 try:
     import edge_tts
     _EDGE_TTS_AVAILABLE = True
+    # edge-tts pins its websocket TLS to certifi's CA bundle, which does
+    # not include a TLS-intercepting proxy's CA, so synthesis fails
+    # certificate verification on a host behind such a proxy. Point the
+    # library's module-global context at the system one instead: it
+    # honours SSL_CERT_FILE and the OS trust store, and on Windows/macOS
+    # it loads the native store, so this is safe there too.
+    import ssl as _ssl
+
+    edge_tts.communicate._SSL_CTX = _ssl.create_default_context()
 except Exception:
     edge_tts = None
     _EDGE_TTS_AVAILABLE = False
@@ -47,6 +58,22 @@ _EDGE_TTS_TARGET_CHUNK_CHARS = max(220, int(os.environ.get("VIDZEO_EDGE_TTS_TARG
 _EDGE_TTS_MAX_RETRIES = max(3, int(os.environ.get("VIDZEO_EDGE_TTS_MAX_RETRIES", "6") or 6))
 _EDGE_TTS_BACKOFF_BASE = float(os.environ.get("VIDZEO_EDGE_TTS_BACKOFF_BASE", "2.0") or 2.0)
 _EDGE_TTS_FALLBACK_ENABLED = str(os.environ.get("VIDZEO_EDGE_TTS_FALLBACK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _edge_tts_proxy() -> str:
+    """Proxy for the Edge TTS websocket, if the host needs one.
+
+    Sandboxed / proxied Linux hosts have no direct internet: edge-tts
+    connects straight to wss://speech.platform.bing.com unless a proxy is
+    passed, and the connection just times out. Read the standard proxy
+    env vars (explicit VIDZEO_EDGE_TTS_PROXY wins) so the same code also
+    works on an unproxied machine (no vars -> direct, as before).
+    """
+    for name in ('VIDZEO_EDGE_TTS_PROXY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'):
+        value = str(os.environ.get(name, '') or '').strip()
+        if value:
+            return value
+    return ''
 
 
 def is_available() -> bool:
@@ -161,7 +188,8 @@ def _refresh_voice_catalog():
         return list(fallback_catalog)
 
     try:
-        raw_voices = _run_async(asyncio.wait_for(edge_tts.list_voices(), timeout=15))
+        proxy = _edge_tts_proxy() or None
+        raw_voices = _run_async(asyncio.wait_for(edge_tts.list_voices(proxy=proxy), timeout=15))
         # Keep strictly English voices (en-* locale) and remove other languages
         en_raw_voices = [
             raw_voice for raw_voice in (raw_voices or [])
@@ -268,6 +296,7 @@ async def _generate_edge_tts(text: str, voice_id: str, output_path: str, edge_op
         volume=speak_options['volume'],
         pitch=speak_options['pitch'],
         boundary='WordBoundary',
+        proxy=_edge_tts_proxy() or None,
     )
     words = []
     with open(output_path, 'wb') as audio:
@@ -438,12 +467,22 @@ def _concat_edge_chunks(chunk_paths: list[str], batch_start: float) -> tuple[str
                 '-c:a', 'pcm_s16le', output_path
             ],
             capture_output=True,
-            timeout=60,
+            timeout=max(60, int(cursor / 5) + 30),
             check=True
         )
 
         if timing_complete and merged_words:
-            save_speech_timing(output_path, merged_words)
+            # S8: keep the script-timing label when every chunk's timings
+            # were script-derived (the Linux TTS path); real provider
+            # boundaries keep the default label. The caption step reports
+            # the label, so a script-derived clock is never mistaken for
+            # measured word boundaries.
+            merged_source = (
+                'tts_script_timing'
+                if all(row.get('timing_source') == 'tts_script_timing' for row in merged_words)
+                else 'tts_word_boundary'
+            )
+            save_speech_timing(output_path, merged_words, source=merged_source)
 
         try:
             os.remove(concat_file)
@@ -461,12 +500,255 @@ def _concat_edge_chunks(chunk_paths: list[str], batch_start: float) -> tuple[str
         raise RuntimeError(f"Edge TTS chunk concatenation failed: {exc}") from exc
 
 
+def _generate_linux_tts_audio(text: str, output_path: str, timeout_seconds: float | None = None,
+                              deadline: float | None = None) -> tuple | None:
+    """Linux offline fallback: shell out to a configured TTS command.
+
+    Edge TTS needs a websocket, which sandboxed/proxied Linux hosts often
+    block, and the SAPI fallback is Windows-only. When the operator sets
+    VIDZEO_LINUX_TTS_COMMAND, run it instead. The command is a template
+    with {text_file}, {output}, {voice} and {speed} placeholders; the
+    script text is also piped on stdin. Example for this VM's Shortwave
+    CLI (set in vidnets-runtime/.env):
+        VIDZEO_LINUX_TTS_COMMAND=/opt/hatch/bin/tts speak --text-stdin --voice {voice} --speed {speed} --format mp3 --output {output}
+        VIDZEO_LINUX_TTS_VOICE=avocado_v2:MAI_03
+        VIDZEO_LINUX_TTS_SPEED=100
+    Each attempt gets 60s by default (VIDZEO_LINUX_TTS_TIMEOUT_SECONDS
+    overrides; was 300s — a single hung chunk then killed the whole render
+    at video 60% on 2026-11-14). A caller may pass timeout_seconds for one
+    call and a deadline (epoch seconds) that bounds all 3 attempts together.
+    Returns None when no command is configured, so callers keep the
+    previous behaviour (SAPI on Windows, clear platform error elsewhere).
+    """
+    import shlex
+
+    template = str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip()
+    if not template:
+        return None
+    voice = str(os.environ.get('VIDZEO_LINUX_TTS_VOICE', '') or '').strip()
+    speed = str(os.environ.get('VIDZEO_LINUX_TTS_SPEED', '100') or '100').strip()
+    text_file = Path(str(output_path) + '.txt')
+    destination = Path(output_path)
+    attempt_output = destination.with_name(destination.stem + '.attempt' + destination.suffix)
+    try:
+        text_file.write_text(text, encoding='utf-8')
+        argv = [
+            part.format(text_file=str(text_file), output=str(attempt_output), voice=voice, speed=speed)
+            for part in shlex.split(template)
+        ]
+        timeout = float(timeout_seconds if timeout_seconds is not None
+                        else os.environ.get('VIDZEO_LINUX_TTS_TIMEOUT_SECONDS', '60') or 60)
+        for attempt in range(3):
+            attempt_output.unlink(missing_ok=True)
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(f'Linux TTS chunk budget exhausted before attempt {attempt + 1}/3')
+                attempt_timeout = min(timeout, remaining)
+            else:
+                attempt_timeout = timeout
+            try:
+                result = subprocess.run(
+                    argv, input=text.encode('utf-8'),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=attempt_timeout,
+                )
+                break
+            except subprocess.TimeoutExpired:
+                if attempt == 2:
+                    raise
+                print(f"   [TTS] Linux command timed out; retrying attempt {attempt + 2}/3", flush=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f'Linux TTS command failed ({result.returncode}): '
+                f'{result.stderr.decode("utf-8", "replace").strip()[-400:]}'
+            )
+        if not attempt_output.is_file() or attempt_output.stat().st_size < 128:
+            raise RuntimeError('Linux TTS command produced no audio file.')
+        duration = _get_audio_duration(str(attempt_output))
+        if duration <= 0:
+            raise RuntimeError('Linux TTS command produced unreadable audio.')
+        os.replace(attempt_output, destination)
+        print(f"   [TTS] Generated Linux offline spoken narration ({duration:.1f}s)")
+        return str(output_path), duration
+    finally:
+        try:
+            text_file.unlink(missing_ok=True)
+            attempt_output.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _generate_sapi_audio(text: str, output_path: str) -> tuple:
     """Recover real speech without requiring pywin32 or an online service."""
+    if sys.platform != 'win32':
+        linux = _generate_linux_tts_audio(text, output_path)
+        if linux is not None:
+            return linux
     from .local_speech_service import generate_audio as generate_local_speech
     path, duration = generate_local_speech(text, output_path)
     print(f"   [TTS] Generated offline spoken narration ({duration:.1f}s)")
     return path, duration
+
+
+# One narration chunk gets at most 4 minutes all-in (never-fail plan): up
+# to 3 attempts at 60s for the whole chunk, then (once) a re-split into
+# halves, each with its own attempts inside the same 240s deadline.
+_LINUX_TTS_CHUNK_BUDGET_SECONDS = 240.0
+
+
+def _split_chunk_half(text: str) -> list[str]:
+    """Split a narration chunk in half at a sentence boundary if possible.
+
+    Used when a whole chunk fails to synthesize: each half is a fresh cache
+    entry with its own attempts, so one bad sentence cannot kill the whole
+    chunk (and the whole render). Falls back to a word midpoint when the
+    chunk is a single sentence.
+    """
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', str(text or '').strip()) if s.strip()]
+    if len(sentences) >= 2:
+        half = len(sentences) // 2
+        return [' '.join(sentences[:half]).strip(), ' '.join(sentences[half:]).strip()]
+    words = str(text or '').split()
+    if len(words) < 2:
+        return [str(text or '').strip()]
+    half = len(words) // 2
+    return [' '.join(words[:half]).strip(), ' '.join(words[half:]).strip()]
+
+
+def _linux_chunk_cache_path(cache_dir, identity, text):
+    digest = hashlib.sha256((identity + '\0' + text).encode('utf-8')).hexdigest()
+    return cache_dir / (digest + '.mp3')
+
+
+def _linux_chunk_is_valid(path):
+    try:
+        return path.is_file() and path.stat().st_size >= 128 and _get_audio_duration(str(path)) > 0
+    except Exception:
+        return False
+
+
+def _synthesize_linux_chunk(text, cache_dir, identity, work_dir, index, total, chunk_start,
+                            *, sub=None, allow_split=True):
+    """Synthesize one narration chunk; return its work-dir file(s), in order.
+
+    Normally one file. When the whole chunk fails after its 3 attempts and
+    at least one full attempt of budget is left, it is re-split into halves
+    (each its own cache entry, own attempts, same 240s deadline) and the two
+    half files are returned instead — the caller assembles them in order,
+    so the narration keeps its word order. A half that fails after its
+    attempts raises: at ~30–40 words a further failure means the TTS
+    backend itself is down, not the chunk.
+    """
+    label = f"{index + 1}" + (f".{sub + 1}" if sub is not None else "") + f"/{total}"
+    suffix = f'-{sub}' if sub is not None else ''
+    cached = _linux_chunk_cache_path(cache_dir, identity, text)
+    valid = _linux_chunk_is_valid(cached)
+    print(f"   [TTS] Narration chunk {label}" + (" (cached)" if valid else ""), flush=True)
+    if not valid:
+        deadline = chunk_start + _LINUX_TTS_CHUNK_BUDGET_SECONDS
+        generated = work_dir / f'generated-{index}{suffix}.mp3'
+        try:
+            _generate_linux_tts_audio(text, str(generated), timeout_seconds=60.0, deadline=deadline)
+            os.replace(generated, cached)
+        except Exception:
+            if not allow_split:
+                raise
+            halves = _split_chunk_half(text)
+            if len(halves) < 2 or deadline - time.time() < 60.0:
+                raise
+            print(f"   [TTS] Narration chunk {label} failed; re-splitting into halves", flush=True)
+            parts = []
+            for half_index, half in enumerate(halves):
+                parts.extend(_synthesize_linux_chunk(
+                    half, cache_dir, identity, work_dir, index, total, chunk_start,
+                    sub=half_index, allow_split=False))
+            return parts
+    local = work_dir / f'chunk-{index}{suffix}.mp3'
+    shutil.copyfile(cached, local)
+    # S8: the Linux TTS binary writes no word timings, so without this the
+    # caption step falls back to slow local Whisper. The chunk text is
+    # known and its duration is measured, so write a script-derived timing
+    # sidecar for this chunk file; _concat_edge_chunks merges them (each
+    # chunk re-anchors at its own measured start, so no drift accumulates)
+    # and the caption step then uses them instead of Whisper. Best effort:
+    # a missing sidecar only costs a Whisper run, never the narration.
+    try:
+        from .speech_timing import save_speech_timing, script_words_for_audio
+        chunk_duration = _get_audio_duration(str(local))
+        rows = script_words_for_audio(text, chunk_duration)
+        if rows:
+            save_speech_timing(str(local), rows, source='tts_script_timing')
+    except Exception:
+        pass
+    return [str(local)]
+
+
+def _linux_tts_workers() -> int:
+    """Bounded parallelism for Linux TTS chunks (default 2).
+
+    The box has 4 cores and ~8 GB RAM; the TTS subprocess is the worker, so
+    2 concurrent keeps headroom for the Vidnets server and the render.
+    VIDZEO_LINUX_TTS_WORKERS overrides (clamped to 1–4).
+    """
+    try:
+        workers = int(os.environ.get("VIDZEO_LINUX_TTS_WORKERS", "") or 2)
+    except (TypeError, ValueError):
+        workers = 2
+    return max(1, min(4, workers))
+
+
+def _generate_linux_tts_chunked(script: str) -> tuple:
+    """Keep completed speech chunks across retries and assemble them in order."""
+    chunks = _split_script_for_parallel_tts(script)
+    if not chunks:
+        raise ValueError("Cannot synthesize empty narration.")
+    cache_dir = Path(TEMP_DIR) / 'linux-tts-chunks'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    identity = '\0'.join([
+        os.environ.get('VIDZEO_LINUX_TTS_COMMAND', ''),
+        os.environ.get('VIDZEO_LINUX_TTS_VOICE', ''),
+        os.environ.get('VIDZEO_LINUX_TTS_SPEED', '100'),
+    ])
+    work_dir = Path(tempfile.mkdtemp(prefix='linux-tts-', dir=str(TEMP_DIR)))
+    assembled = []
+    try:
+        def _run(args):
+            index, text = args
+            return _synthesize_linux_chunk(
+                text, cache_dir, identity, work_dir, index, len(chunks), time.time())
+
+        workers = _linux_tts_workers()
+        if workers <= 1 or len(chunks) <= 1:
+            for index, text in enumerate(chunks):
+                assembled.extend(_run((index, text)))
+        else:
+            from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
+            # pool.map preserves chunk order in its results, so the assembled
+            # narration keeps word order while chunks synthesize concurrently.
+            # Each chunk writes distinct cache/work files, so no locking is
+            # needed; a failed chunk raises after its siblings drain.
+            with ThreadPoolExecutor(max_workers=min(workers, len(chunks)),
+                                    thread_name_prefix="linux-tts") as pool:
+                for parts in pool.map(_run, enumerate(chunks)):
+                    assembled.extend(parts)
+        if len(assembled) == 1:
+            final = Path(TEMP_DIR) / ('linux-tts-full-' + hashlib.sha256(os.urandom(32)).hexdigest()[:16] + '.mp3')
+            old = assembled[0]
+            os.replace(old, final)
+            # S8: keep the per-chunk timing sidecar with the audio when the
+            # single chunk is renamed, so the caption step can still use it.
+            # The fingerprint is unchanged (same bytes, just a new name).
+            try:
+                from .speech_timing import timing_path
+                old_sidecar = timing_path(old)
+                if old_sidecar.is_file():
+                    os.replace(old_sidecar, timing_path(str(final)))
+            except Exception:
+                pass
+            return str(final), _get_audio_duration(str(final))
+        return _concat_edge_chunks(assembled, time.time())
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _permanent_provider_error(error):
@@ -497,6 +779,32 @@ def generate_audio(script: str, voice: str = 'Brian (Male US)',
     hash_seed = f"{script}{voice_id}{speak_options}{time.time()}"
     hash_str = hashlib.sha256(hash_seed.encode()).hexdigest()[:12]
     output_path = str(TEMP_DIR / f"edge_tts_{hash_str}.mp3")
+
+    # On a Linux host where the operator configured an offline TTS command
+    # (e.g. Edge TTS websockets are blocked by the egress proxy), prefer
+    # it over Edge TTS instead of burning minutes on websocket timeouts
+    # first. If the command fails, fall through to Edge TTS as usual.
+    if sys.platform != 'win32':
+        try:
+            linux = _generate_linux_tts_audio(script, output_path)
+        except Exception as exc:
+            print(f"   Linux TTS command failed, trying Edge TTS: {exc}")
+            linux = None
+        if linux is not None:
+            linux_path, linux_duration = linux
+            from .narration_quality import validate_narration_audio
+            validate_narration_audio(linux_path)
+            # S8: the single-call Linux path also writes no timings; give
+            # the caption step a script-derived sidecar so it skips Whisper
+            # for short narrations too. Best effort only.
+            try:
+                from .speech_timing import save_speech_timing, script_words_for_audio
+                rows = script_words_for_audio(script, linux_duration)
+                if rows:
+                    save_speech_timing(linux_path, rows, source='tts_script_timing')
+            except Exception:
+                pass
+            return linux_path, linux_duration
 
     print(
         f"   Edge TTS: voice={voice_id}, rate={speak_options['rate']}, "
@@ -554,6 +862,9 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
     Retries with exponential backoff between ladder levels.
     Falls back to single-chunk generate_audio if all chunked attempts fail.
     """
+    if sys.platform != 'win32' and str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip():
+        return _generate_linux_tts_chunked(script)
+
     if not _EDGE_TTS_AVAILABLE:
         if _EDGE_TTS_FALLBACK_ENABLED:
             duration = max(1.0, len(script) / 15.0)
@@ -564,6 +875,12 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
             return _generate_sapi_audio(script, output_path)
         raise ValueError("Edge TTS package is not installed. Run `pip install -r requirements.txt`.")
     del speed, api_key
+
+    # A configured Linux offline TTS command handles the whole script at
+    # once; skip the chunked Edge TTS path (whose websocket attempts would
+    # just time out on a host where websockets are blocked).
+    if sys.platform != 'win32' and str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip():
+        return generate_audio(script, voice, edge_options=edge_options)
 
     if len(script) < _EDGE_TTS_CHUNK_TRIGGER_CHARS:
         return generate_audio(script, voice, edge_options=edge_options)

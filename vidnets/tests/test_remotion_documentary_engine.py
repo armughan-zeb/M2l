@@ -19,6 +19,7 @@ from services.editorial_director.director import (
     _director_story_map,
     _director_runtime_capabilities,
     _extract_numbers_from_text,
+    _min_director_call_budget,
     _recipe_is_grounded,
     _recipe_supports_visual_type,
     _validated_motion_cues,
@@ -351,6 +352,74 @@ def test_adaptive_director_budget_scales_with_parallel_scene_waves(monkeypatch):
     assert director_planning_budget(900)["total_seconds"] == 3600
     monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "0")
     assert director_planning_budget(60)["total_seconds"] == 90
+
+
+def test_external_agent_director_calls_last_at_least_the_agent_wall(monkeypatch):
+    from services.job_context import job_scope
+
+    monkeypatch.setenv("VIDZEO_AGENT_MIN_WALL_SECONDS", "600")
+    monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
+    with job_scope({"llm_provider": "external_agent"}):
+        budget = director_planning_budget(15)
+    # The phase scope caps the agent request wall, so a shorter director
+    # call budget expires the answer mid-composition (the inbox watcher
+    # alone needs ~4.5 min to wake a worker).
+    assert budget["scene_call_seconds"] >= 600
+    assert budget["art_seconds"] >= 600
+    assert budget["composition_seconds"] >= 600
+    assert budget["repair_seconds"] >= 600
+
+
+def test_external_agent_director_uses_eight_scene_four_worker_batches(monkeypatch):
+    # Nov 15 2026 speedup (item b): the external-agent override was 4 scenes
+    # / 2 workers; the response schema caps at maxItems 8
+    # (_DIRECTOR_RESPONSE_SCHEMA scenes), so 8 scenes / 4 workers is the
+    # widest batch the model may return — fewer waves, fewer bridge requests.
+    # 57 scenes: 8 waves at 4x2, 2 waves at 8x4.
+    from services.job_context import job_scope
+
+    monkeypatch.delenv("VIDZEO_AGENT_MIN_WALL_SECONDS", raising=False)
+    monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
+    with job_scope({"llm_provider": "external_agent"}):
+        budget = director_planning_budget(57)
+    assert budget["scene_batch_size"] == 8
+    assert budget["scene_workers"] == 4
+    assert budget["waves"] == 2
+    assert budget["agent_wall_seconds"] == 3600.0
+    # The 3600s wall must not zero the scene stage: with the default 3600s
+    # total cap, total - repair - 5 went negative and every scene batch was
+    # cancelled before it started. The cap now fits art + one scene wave +
+    # repair at the wall, so the stage keeps at least one full wave.
+    assert budget["scene_stage_seconds"] > 0
+    assert budget["scene_stage_seconds"] >= 3600.0
+    with job_scope({"llm_provider": "external_agent"}):
+        small = director_planning_budget(15)
+    assert small["scene_batch_size"] == 8
+    assert small["scene_workers"] == 4
+    assert small["waves"] == 1
+    assert small["scene_stage_seconds"] > 0
+
+
+def test_director_budget_exposes_agent_wall_seconds(monkeypatch):
+    monkeypatch.setenv("VIDZEO_AGENT_MIN_WALL_SECONDS", "600")
+    monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
+    assert director_planning_budget(15)["agent_wall_seconds"] == 0.0
+    from services.job_context import job_scope
+
+    with job_scope({"llm_provider": "external_agent"}):
+        budget = director_planning_budget(15)
+    assert budget["agent_wall_seconds"] == 600.0
+
+
+def test_director_call_budget_floor_is_the_agent_wall():
+    """A director call issued below the agent floor is guaranteed to
+    expire: job 75fa1baa lost a scene-72 composition repair issued with
+    77s and a scene-direction call with 38s, both far under the 600s
+    floor. The call sites skip instead of issuing a doomed request."""
+    assert _min_director_call_budget(0) == 6.0
+    assert _min_director_call_budget(None) == 6.0
+    assert _min_director_call_budget(600) == 600.0
+    assert _min_director_call_budget(1200) == 1200.0
 
 
 def test_director_defaults_to_eight_scene_parallel_chunks(monkeypatch):
@@ -947,7 +1016,26 @@ def test_edit_plan_preflight_rejects_missing_remotion_font(monkeypatch):
 
 
 def test_remotion_runtime_bundle_fonts_maps_and_icons_are_present():
-    assert server_app._remotion_runtime_asset_errors() == []
+    errors = server_app._remotion_runtime_asset_errors()
+    bundled_runtime_prefixes = (
+        "tools/node/node",
+        "node_modules/@remotion/renderer/",
+        "node_modules/@remotion/bundler/",
+        "node_modules/playwright-core/",
+        "node_modules/.remotion/chrome-headless-shell/",
+    )
+    normalized_errors = [str(Path(error)).replace("\\", "/") for error in errors]
+    missing_source_assets = [
+        error for error in normalized_errors
+        if not error.startswith(bundled_runtime_prefixes)
+    ]
+    assert missing_source_assets == []
+
+    packaged = os.environ.get("VIDZEO_PACKAGED", "").strip().lower() in {"1", "true", "yes"}
+    if packaged:
+        assert errors == []
+    elif errors:
+        pytest.skip("Packaged Node, Remotion, and Chromium assets are checked by the Windows release build")
 
 
 def test_person_profile_uses_only_supplied_alpha_cutouts_for_isolated_portrait_motion():
@@ -1099,7 +1187,9 @@ def test_verified_document_capture_routes_to_screenshot_highlight_renderer():
     assert "const imageSrc = capture.image_path || capture.image_url || '';" in document_highlight
 
 
-def test_render_plan_rejects_unverified_map_endpoints_and_accepts_catalogued_route():
+def test_render_plan_rejects_unverified_map_endpoints_and_accepts_catalogued_route(monkeypatch):
+    monkeypatch.setattr(server_app, "_remotion_runtime_asset_errors", lambda: [])
+
     def manifest_for(props):
         return {
             "edit_plan_schema_version": 3,
@@ -1178,6 +1268,7 @@ def test_verified_source_highlight_requires_existing_capture_file(tmp_path):
 def test_editor_manifest_export_is_remotion_and_reports_quality_checks(tmp_path, monkeypatch):
     monkeypatch.setenv('VIDZEO_AUTH_MODE', 'local')
     monkeypatch.setenv('VIDZEO_PACKAGED', '0')
+    monkeypatch.setattr(server_app, "_remotion_runtime_asset_errors", lambda: [])
     image = tmp_path / "editor-frame.png"
     image.write_bytes(b"test media placeholder")
     output_dir = tmp_path / "output"

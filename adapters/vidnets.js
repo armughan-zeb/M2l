@@ -15,8 +15,15 @@ const log = require('../lib/log');
 const { runCommand, parseJsonOutput, quoteArg } = require('../lib/command');
 const { minimumVideoDurationSeconds } = require('../lib/mediaRules');
 const { sleep } = require('../lib/sleep');
+const { assertNoOpenRouterKey } = require('../lib/museInference');
+const { readRequestedWorkers } = require('../lib/remotionWorkers');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs } = require('../lib/vidnetsSubmission');
 
 const MINUTE = 60 * 1000;
+
+function inferenceConcurrency() {
+  return Math.max(1, Math.min(8, Math.floor(Number(process.env.MUSE_INBOX_CONCURRENCY) || 8)));
+}
 
 function agentCommand() {
   const explicit = String(process.env.MUSE_VIDNETS_COMMAND || '').trim();
@@ -82,12 +89,46 @@ async function ensureReady({ signal } = {}) {
 }
 
 function buildRequest(job, scriptText, packageDir) {
+  // Muse inference is compulsory: an OpenRouter key in the environment
+  // must never be handed to Vidnets, even if the server would accept it.
+  assertNoOpenRouterKey(process.env);
   const options = job.channel?.videoOptions || {};
   const minutes = Math.max(1, Number(job.targetDurationMinutes) || 8);
-  const concurrency = Math.max(1, Math.min(8, Number(process.env.MUSE_RENDER_CONCURRENCY) || 4));
+  // Parallel Remotion workers: MUSE_RENDER_CONCURRENCY (aliases
+  // VIDZEO_REMOTION_WORKERS / MUSE_REMOTION_WORKERS /
+  // VIDZEO_REMOTION_CONCURRENCY), default 2 (tested safe on this VM).
+  // This is the REQUESTED count; the Vidnets server + render script
+  // auto-degrade it from CPU / available memory at render start
+  // (vidnets/scripts/render-remotion-manifest.js adaptiveConcurrency).
+  const concurrency = readRequestedWorkers(process.env);
   const coverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET);
-  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.4, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.6;
-  const deliveryBudget = Math.max(600, Math.round((Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE) / 1000));
+  // Floor 0.3, not 0.4: the Nov 10, 2026 media-speedups decision set the
+  // YouTube accepted-coverage target to 0.30 (web is the main source now;
+  // 0.8 was per-job values from before). The server default is 0.30 when
+  // no explicit target is sent, so the adapter must not clamp above it.
+  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.3, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.6;
+  // FILTER-BEST (Nov 9, 2026): Vidnets' native mixed-media design ranks
+  // candidates and keeps the best real media per scene — vision is ADVISORY
+  // by default ("an uncertain verdict must not prevent video delivery",
+  // app.py _visual_required_for_job). Our wiring used to force
+  // strict_retrieval_accuracy + visual_required, which flipped the whole
+  // job to hard-required mode: every web/YouTube asset needed a completed
+  // verdict before the renderer, and a strict job with ANY unresolved
+  // scene failed outright (app.py _repair_unresolved_media) instead of
+  // degrading. That is the misuse the user corrected: filter-best, not
+  // hard-reject. With both flags false, vision still RUNS (visual_
+  // understanding + final_visual_gate_mode) and still RANKS (final_score);
+  // only named-entity scenes (strict_identity) still require a live
+  // verdict, per scene_requires_visual_verification. The ONE hard rule
+  // lives in the render wrapper, not here: never DELIVER a video with 0
+  // real-media scenes. If real-media recovery is exhausted, Vidnets keeps
+  // the checkpoint for retry. MUSE_MEDIA_STRICT=1 restores the old strict
+  // flags (visual verification for every scene).
+  const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
+  // Render budget scales with the job (lib/vidnetsSubmission.renderBudgetMs:
+  // configured MUSE_RENDER_TIMEOUT_MS with a 600s floor, else duration-scaled
+  // with a 6h floor) instead of a fixed ceiling.
+  const deliveryBudget = Math.ceil(renderBudgetMs(job) / 1000);
 
   return {
     title: job.title,
@@ -98,7 +139,6 @@ function buildRequest(job, scriptText, packageDir) {
     channel_name: job.channel?.name || '',
     niche: job.channel?.niche || '',
     category: job.channel?.niche || '',
-    channel_profile_id: job.channel?.id || 'muse',
     // The local inbox is the only inference path for an external agent job.
     llm_provider: 'external_agent',
     minimum_duration_seconds: minimumVideoDurationSeconds(minutes),
@@ -116,18 +156,24 @@ function buildRequest(job, scriptText, packageDir) {
     allow_relevant_stock: true,
     allow_stock_last_resort: true,
     stock_last_resort_in_coordinator: true,
-    stock_video_only: true,
+    stock_video_only: false,
     visual_understanding: true,
-    visual_required: true,
+    visual_required: strictMedia,
     final_visual_gate_mode: 'run',
     media_sources: ['pexels', 'pixabay'],
     pexels_api_key: String(process.env.PEXELS_API_KEY || '').trim(),
     pixabay_api_key: String(process.env.PIXABAY_API_KEY || '').trim(),
-    strict_retrieval_accuracy: true,
+    // Muse inference is compulsory: never send an OpenRouter key to
+    // Vidnets. llm_provider=external_agent is the only provider, and the
+    // server must never select Qwen for an external_agent job.
+    openrouter_api_key: '',
+    strict_retrieval_accuracy: strictMedia,
     fail_on_unresolved_media: true,
-    allow_emergency_media: true,
-    emergency_visuals_advisory_only: true,
-    scene_mode: 'Adaptive',
+    allow_emergency_media: false,
+    allow_grounded_graphic_fallback: true,
+    allow_grounded_graphic_fallback_strict: true,
+    media_fallback_policy: process.env.MUSE_MEDIA_FALLBACK_POLICY || 'grounded_graphic',
+    scene_mode: 'Every Beat',
     captions_enabled: options.captionsEnabled !== false,
     font: 'Montserrat-Bold',
     fontsize: 48,
@@ -144,6 +190,7 @@ function buildRequest(job, scriptText, packageDir) {
     semantic_render_concurrency: concurrency,
     concurrency,
     continue_render_while_active: true,
+    preparation_stall_seconds: 300,
     output_package_dir: packageDir,
     delivery_budget_seconds: deliveryBudget,
     delivery_budget_max_cap_seconds: deliveryBudget
@@ -156,7 +203,7 @@ function requestId(value) {
   return id;
 }
 
-async function runInferenceCommand(command, request, workDir) {
+async function runInferenceCommand(command, request, workDir, { timeoutMs = 120000, signal } = {}) {
   const input = JSON.stringify({
     type: 'inference',
     request,
@@ -166,7 +213,8 @@ async function runInferenceCommand(command, request, workDir) {
   const result = await runCommand(command, {
     input,
     cwd: workDir,
-    timeoutMs: Number(process.env.MUSE_INFERENCE_TIMEOUT_MS) || 10 * MINUTE,
+    timeoutMs,
+    signal,
     label: 'Muse inference command',
     env: {
       MUSE_INFERENCE_REQUEST_ID: request.id,
@@ -174,35 +222,39 @@ async function runInferenceCommand(command, request, workDir) {
       MUSE_INFERENCE_OPERATION: String(request.operation || '')
     }
   });
-  const text = String(result.stdout || '').trim();
-  if (!text) throw new Error('The Muse inference command returned an empty answer');
-  return text;
+  return parseInferenceAnswer(result.stdout, request);
 }
 
-async function runInferenceHttp(url, request) {
+function parseInferenceAnswer(text, request) {
+  let data = text;
+  try { data = JSON.parse(text); } catch { /* plain text answer */ }
+  const structured = Boolean(request.response_format?.type || request.response_format?.json_schema);
+  if (data?.error && !structured) throw new Error('The Muse inference transport reported an error');
+  const content = structured
+    ? data?.content ?? data
+    : data?.content ?? data?.text ?? data?.answer ?? data;
+  if (content === undefined || content === null || String(content).trim() === '') {
+    throw new Error('The Muse inference transport returned no content');
+  }
+  return typeof content === 'string' ? content : JSON.stringify(content);
+}
+
+async function runInferenceHttp(url, request, { timeoutMs = 120000, signal } = {}) {
+  const timeout = AbortSignal.timeout(timeoutMs);
   let response;
   try {
     response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ type: 'inference', request, instructions: request.instructions || '', responseFormat: request.response_format || {} }),
-      signal: AbortSignal.timeout(Number(process.env.MUSE_INFERENCE_TIMEOUT_MS) || 10 * MINUTE),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       redirect: 'error'
     });
   } catch (error) {
     throw new Error('The Muse inference endpoint could not be reached: ' + error.message);
   }
-  const text = await response.text();
-  if (!response.ok) throw new Error(`The Muse inference endpoint returned HTTP ${response.status}: ${text.slice(0, 400)}`);
-  let data = text;
-  try { data = JSON.parse(text); } catch { /* plain text answer */ }
-  const content = data && typeof data === 'object'
-    ? data.content ?? data.text ?? data.answer
-    : data;
-  if (content === undefined || content === null || String(content).trim() === '') {
-    throw new Error('The Muse inference endpoint returned no content');
-  }
-  return typeof content === 'string' ? content : JSON.stringify(content);
+  if (!response.ok) throw new Error(`The Muse inference endpoint returned HTTP ${response.status}`);
+  return parseInferenceAnswer(await response.text(), request);
 }
 
 function inferenceTransport() {
@@ -218,39 +270,60 @@ function inferenceTransport() {
   return null;
 }
 
-async function answerOne(requestMeta, workDir, transport, signal) {
+async function answerOne(requestMeta, workDir, transport, signal, state) {
   if (signal?.aborted) throw new Error('Render cancelled by operator');
-  const request = await vidnets(`request ${requestId(requestMeta.id)}`, { timeoutMs: MINUTE, signal, label: 'Vidnets agent request read' });
+  const expiresAt = Number(requestMeta.expires_at) * 1000;
+  const remaining = () => Math.floor(expiresAt - Date.now());
+  if (!(remaining() > 0)) return;
+  const request = await vidnets(`request ${requestId(requestMeta.id)}`, { timeoutMs: Math.min(MINUTE, remaining()), signal, label: 'Vidnets agent request read' });
   request.id = requestMeta.id;
-  let content;
-  if (transport.kind === 'command') content = await runInferenceCommand(transport.command, request, workDir);
-  else content = await runInferenceHttp(transport.url, request);
-
-  const answerDir = path.join(workDir, 'inference');
-  fs.mkdirSync(answerDir, { recursive: true });
-  let parsedJson = null;
-  try { parsedJson = JSON.parse(content); } catch { /* text response */ }
-  const answerFile = path.join(answerDir, `${request.id}.${parsedJson ? 'json' : 'txt'}`);
-  fs.writeFileSync(answerFile, parsedJson ? JSON.stringify(parsedJson) : content, 'utf8');
-  await vidnets(`answer ${request.id} ${quoteArg(answerFile)}`, { timeoutMs: MINUTE, signal, label: 'Vidnets agent answer' });
+  if (!state.answerFile) {
+    const timeoutMs = remaining() - 5000;
+    if (timeoutMs <= 0 || signal?.aborted) return;
+    const content = transport.kind === 'command'
+      ? await runInferenceCommand(transport.command, request, workDir, { timeoutMs, signal })
+      : await runInferenceHttp(transport.url, request, { timeoutMs, signal });
+    if (remaining() <= 0 || signal?.aborted) return;
+    const answerDir = path.join(workDir, 'inference');
+    fs.mkdirSync(answerDir, { recursive: true });
+    let parsedJson = null;
+    try { parsedJson = JSON.parse(content); } catch { /* text response */ }
+    state.answerFile = path.join(answerDir, `${request.id}.${parsedJson ? 'json' : 'txt'}`);
+    fs.writeFileSync(state.answerFile, parsedJson ? JSON.stringify(parsedJson) : content, 'utf8');
+  }
+  await vidnets(`answer ${request.id} ${quoteArg(state.answerFile)}`, { timeoutMs: Math.max(1, Math.min(MINUTE, remaining())), signal, label: 'Vidnets agent answer' });
   log.info(`Answered Vidnets ${request.kind || 'text'} request${request.operation ? ` (${request.operation})` : ''}`);
 }
 
-async function serviceInbox(vidnetsJobId, workDir, transport, signal, active) {
+async function serviceInbox(vidnetsJobId, workDir, transport, signal, handled) {
   if (!transport || !vidnetsJobId) return;
   const pending = await vidnets('pending', { timeoutMs: MINUTE, signal, label: 'Vidnets agent inbox' });
+  const now = Date.now() / 1000;
+  for (const [id, state] of handled) if (state.expiry <= now) handled.delete(id);
   const rows = (Array.isArray(pending.requests) ? pending.requests : [])
     .filter(row => String(row.job_id || '') === String(vidnetsJobId))
-    .filter(row => !active.has(row.id));
-  for (const row of rows) active.add(row.id);
+    .filter(row => {
+      const state = handled.get(row.id);
+      return Number(row.expires_at) > now && (!state || (!state.done && state.attempts < 3 && state.retryAt <= now));
+    })
+    .sort((a, b) => Number(String(b.operation).startsWith('scriptit.')) -
+      Number(String(a.operation).startsWith('scriptit.')) || a.expires_at - b.expires_at)
+    .slice(0, inferenceConcurrency());
   await Promise.all(rows.map(async row => {
+    const state = handled.get(row.id) || { expiry: Number(row.expires_at), attempts: 0, retryAt: 0 };
+    handled.set(row.id, state);
+    state.attempts += 1;
     try {
-      await answerOne(row, workDir, transport, signal);
+      await answerOne(row, workDir, transport, signal, state);
+      state.done = true;
     } catch (error) {
+      if (/already answered|expired/i.test(error.message)) {
+        state.done = true;
+        return;
+      }
       if (signal?.aborted) throw error;
+      state.retryAt = Date.now() / 1000 + Math.min(8, 2 ** (state.attempts - 1));
       log.warn(`Vidnets inference request ${String(row.id).slice(0, 8)} failed: ${error.message}`);
-    } finally {
-      active.delete(row.id);
     }
   }));
 }
@@ -268,7 +341,24 @@ function resultVideoPath(item) {
   return candidates.map(value => String(value || '').trim()).find(value => value && fs.existsSync(value)) || '';
 }
 
-async function render(job, scriptText, workDir, { signal, onProgress } = {}) {
+function progressReportForPoll({ progress, detail, lastProgress, lastDetail, lastReportAt, now, heartbeatMs, renderStartedAt }) {
+  if (progress !== lastProgress || detail !== lastDetail) {
+    return { progress, detail, changed: true };
+  }
+  if (now - lastReportAt >= heartbeatMs) {
+    // Silent phase heartbeat: same % and detail, but the work is live.
+    // The elapsed seconds make the detail change every time, so the CMS
+    // sees it as advancement rather than a repeat.
+    const elapsedSec = Math.floor((now - renderStartedAt) / 1000);
+    return { progress, detail: `${detail} (still working, ${elapsedSec}s elapsed)`, changed: false };
+  }
+  return null;
+}
+
+async function render(job, scriptText, workDir, { signal, onProgress, attempt } = {}) {
+  // Muse inference is compulsory: refuse before any Vidnets call if an
+  // OpenRouter key is present in the environment.
+  assertNoOpenRouterKey(process.env);
   const transport = inferenceTransport();
   if (!transport) {
     throw new Error(
@@ -279,66 +369,136 @@ async function render(job, scriptText, workDir, { signal, onProgress } = {}) {
 
   const packageDir = path.join(workDir, 'vidnets');
   fs.mkdirSync(packageDir, { recursive: true });
-  await ensureReady({ signal });
-  onProgress?.(2, 'Vidnets service ready');
-
   const requestFile = path.join(workDir, 'vidnets-request.json');
-  fs.writeFileSync(requestFile, JSON.stringify(buildRequest(job, scriptText, packageDir), null, 2) + '\n', 'utf8');
-  const submitted = await vidnets(`submit ${quoteArg(requestFile)}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets generation submit' });
-  const vidnetsJobId = String(submitted.item?.id || '').trim();
-  if (!vidnetsJobId) throw new Error('Vidnets did not return a queue job id');
-  fs.writeFileSync(path.join(workDir, 'vidnets-job.json'), JSON.stringify({
-    id: vidnetsJobId,
-    packageDir,
-    submittedAt: new Date().toISOString()
-  }, null, 2) + '\n', 'utf8');
-  log.info(`Vidnets job ${vidnetsJobId} submitted for "${job.title}"`);
+  const jobFile = path.join(workDir, 'vidnets-job.json');
+  let receipt = readRenderReceipt(jobFile, job.jobId);
+  const cmsAttempt = Math.max(1, Number(attempt) || 1);
+  let vidnetsJobId = receipt?.id;
+  const saveReceipt = fields => {
+    receipt = { ...receipt, ...fields, id: vidnetsJobId, jobId: job.jobId, packageDir };
+    config.writeJsonAtomic(jobFile, receipt);
+  };
+  if (!vidnetsJobId) {
+    await ensureReady({ signal });
+    onProgress?.(2, 'Vidnets service ready');
+    vidnetsJobId = await submitRender({
+      jobId: job.jobId,
+      filePath: requestFile,
+      request: buildRequest(job, scriptText, packageDir),
+      signal,
+      submit: file => vidnets(`submit ${quoteArg(file)}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets generation submit' })
+    });
+    saveReceipt({ cmsAttempt, submittedAt: new Date().toISOString() });
+  }
+  log.info(`Following Vidnets job ${vidnetsJobId} for "${job.title}"`);
 
-  const activeInference = new Set();
+  const handledInference = new Map();
   let lastProgress = -1;
   let lastDetail = '';
-  const deadline = Date.now() + Math.max(10 * MINUTE, Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 6 * 60 * MINUTE);
-  const pollMs = Math.max(1000, Number(process.env.MUSE_VIDNETS_POLL_MS) || 4000);
+  const renderStartedAt = Date.now();
+  let lastReportAt = 0;
+  // A long silent phase (same % and same detail, e.g. the relevance check
+  // sitting at 61% for ~28 min on Broken Rail attempt 3) sends no advancing
+  // progress, and the CMS stall timer kills the job after 20 min — the
+  // keepalive in jobRunner sends advancing=false, which explicitly never
+  // counts as advancement. So when nothing has changed for this long, send
+  // an advancing update anyway, with a detail that changes every time
+  // (elapsed seconds) so it is not deduped as a repeat.
+  const heartbeatMs = Math.max(60000, Number(process.env.MUSE_PROGRESS_HEARTBEAT_MS) || 300000);
+  const deadline = Date.now() + renderBudgetMs(job);
+  const pollMs = Math.max(500, Number(process.env.MUSE_VIDNETS_POLL_MS) || 1000);
+  let statusFailures = 0;
 
   while (true) {
     if (signal?.aborted) throw new Error('Render cancelled by operator');
     if (Date.now() > deadline) throw new Error('Vidnets render exceeded the configured Muse render budget');
 
-    await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(error => {
+    if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, handledInference).catch(error => {
       if (signal?.aborted) throw error;
       log.warn('Vidnets inbox poll failed; retrying: ' + error.message);
     });
 
-    const snapshot = await vidnets(`job ${vidnetsJobId}`, { timeoutMs: MINUTE, signal, label: 'Vidnets job status' });
-    const item = snapshot.item || {};
+    let item;
+    try {
+      const snapshot = await vidnets(`job ${vidnetsJobId}`, { timeoutMs: MINUTE, signal, label: 'Vidnets job status' });
+      item = snapshot.item;
+      if (!item?.status) throw new Error('Vidnets returned no job status');
+      statusFailures = 0;
+    } catch (error) {
+      if (signal?.aborted || /returned (400|401|403|404)\b/i.test(error.message)) throw error;
+      statusFailures += 1;
+      if (shouldRecoverService(error, statusFailures)) {
+        try {
+          await vidnets('start --recover', { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets service recovery' });
+        } catch (recoveryError) {
+          if (signal?.aborted) throw recoveryError;
+          log.warn(`Vidnets service recovery deferred: ${recoveryError.message}`);
+        }
+      }
+      log.warn(`Vidnets status unavailable for ${vidnetsJobId}: ${error.message}`);
+      await sleep(Math.min(30000, pollMs * 2 ** Math.min(statusFailures - 1, 5)), signal);
+      continue;
+    }
     const progress = Math.max(0, Math.min(100, Number(item.progress) || 0));
     const detail = String(item.progress_text || item.status || '').replace(/\s+/g, ' ').trim().slice(0, 400) || 'Rendering';
-    if (progress !== lastProgress || detail !== lastDetail) {
-      lastProgress = progress;
-      lastDetail = detail;
-      onProgress?.(progress, detail);
+    const report = progressReportForPoll({
+      progress, detail, lastProgress, lastDetail, lastReportAt,
+      now: Date.now(), heartbeatMs, renderStartedAt,
+    });
+    if (report) {
+      if (report.changed) {
+        lastProgress = progress;
+        lastDetail = detail;
+      }
+      lastReportAt = Date.now();
+      onProgress?.(report.progress, report.detail);
     }
 
     if (item.status === 'completed') {
       const videoPath = resultVideoPath(item);
       if (!videoPath) throw new Error('Vidnets completed the job without a readable video_path');
-      await serviceInbox(vidnetsJobId, workDir, transport, signal, activeInference).catch(() => {});
+      const mediaCount = require('../render-vidnets-linux').completedMediaCount(item, videoPath);
+      const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
+      if (!mediaCount || mediaCount.real === 0) {
+        throw new Error('Vidnets completed without evidence of accepted real media in any scene');
+      }
+      if (strictMedia && mediaCount.real !== mediaCount.total) {
+        throw new Error(`Vidnets completed without evidence of accepted real media in every scene (${mediaCount.real}/${mediaCount.total} real)`);
+      }
       onProgress?.(100, 'Vidnets render complete');
-      return { videoPath, vidnetsJobId, packageDir, meta: { engine: 'vidnets', vidnetsJobId } };
+      return { videoPath, vidnetsJobId, packageDir, meta: {
+        engine: 'vidnets', vidnetsJobId, realScenes: mediaCount.real, totalScenes: mediaCount.total, graphicScenes: mediaCount.graphic
+      } };
     }
-    if (['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
+    const cleanupPending = item.status === 'shutdown_timeout' && item.retryable === true && !item.cancel_requested;
+    if (!cleanupPending && ['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
+      if (item.status !== 'cancelled' && cmsAttempt > Number(receipt.cmsAttempt || 1)) {
+        await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
+        saveReceipt({ cmsAttempt, pausedRetries: 0 });
+        continue;
+      }
       const reason = item.error || item.paused_reason || item.progress_text || `status ${item.status}`;
       throw new Error('Vidnets render failed: ' + String(reason).slice(0, 700));
     }
-    if (item.status === 'paused') {
-      // A paused retained queue can be resumed safely; the saved checkpoint is
-      // preserved. Retry once automatically, then report the failure.
-      await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
-      log.info(`Resumed saved Vidnets job ${vidnetsJobId}`);
+    if (cleanupPending || item.status === 'paused') {
+      const pausedRetries = Number(receipt.cmsAttempt) === cmsAttempt ? Number(receipt.pausedRetries) || 0 : 0;
+      if (pausedRetries >= 3) throw new Error(`Vidnets job ${vidnetsJobId} remained paused after three retries: ${detail}`);
+      try {
+        await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
+        log.info(`Resumed saved Vidnets job ${vidnetsJobId}`);
+      } catch (error) {
+        if (signal?.aborted || !shouldRecheckRetry(error)) throw error;
+        if (cleanupPending && /returned 409\b/i.test(error.message)) {
+          await sleep(Math.max(pollMs, 15000), signal);
+          continue;
+        }
+        log.warn(`Vidnets retry response is uncertain; rechecking job ${vidnetsJobId}: ${error.message}`);
+      }
+      saveReceipt({ cmsAttempt, pausedRetries: pausedRetries + 1 });
     }
 
     await sleep(pollMs, signal);
   }
 }
 
-module.exports = { render, buildRequest, ensureReady, agentCommand };
+module.exports = { render, buildRequest, ensureReady, agentCommand, inferenceTransport, inferenceConcurrency, runInferenceCommand, runInferenceHttp, progressReportForPoll };

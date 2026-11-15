@@ -373,12 +373,18 @@ check_ffmpeg()
 def run_startup_maintenance():
     """Heavy init deferred here, light init done at import time."""
     auto_requeue = str(os.environ.get("VIDZEO_AUTO_REQUEUE_INTERRUPTED", "0")).strip().lower() in {"1", "true", "yes", "on"}
-    if auto_requeue:
+    if auto_requeue or os.environ.get('VIDZEO_AGENT_RECOVER_QUEUE') == '1':
         try:
             qm = get_queue_manager()
+            # Jobs paused by a backend restart (not by the user) resume
+            # automatically, so a rebooted machine picks up where it left off
+            # instead of leaving jobs parked until someone clicks Resume.
+            for item in list(qm.queue):
+                if item.get("status") == "paused" and item.get("paused_reason") in {"backend_restart", "cancellation_cleanup_timeout"}:
+                    qm.resume_item(item.get("id"))
             has_queued = any(item.get("status") == "queued" for item in qm.queue)
             if has_queued and not qm.worker_running:
-                print("[Startup] Auto-requeue enabled; auto-starting queue worker for queued job...")
+                print("[Startup] Starting queue worker for saved queued jobs...")
                 qm.start_worker(_queue_generation_callback)
         except Exception as e:
             print(f"[Startup] Failed to auto-start queue worker: {e}")
@@ -468,14 +474,20 @@ def _get_authenticated_state():
         request.vidzeo_agent_owner = delegated['owner_id']
         agent_key = token
         token = delegated['access_token']
-    mode = str(os.environ.get('VIDZEO_AUTH_MODE', '')).strip().lower()
+    mode = str(os.environ.get('VIDZEO_AUTH_MODE', '')).strip().lower() or 'local'
     packaged = str(os.environ.get('VIDZEO_PACKAGED', '0')).strip() == '1'
     allowed = mode in {'local', 'offline', 'byok'} and (
-        not packaged or os.environ.get('VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH') == '1'
+        not packaged or os.environ.get('VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH') == '1' or mode == 'local'
     )
     if token in {'', 'local-bypass', 'local-dev-token'} and allowed and _is_local_request() and _is_trusted_browser_origin():
         if delegated and delegated['owner_id'] != 'local-user':
             raise AuthServiceError('Agent account identity did not match.', status_code=403)
+        if token == 'local-bypass' and not delegated:
+            # Sign-in-free worker build: CLI subcommands authenticate with the
+            # fixed 'local-bypass' token and no paired account. Treat that as a
+            # local agent owner so external_agent LLM jobs remain admissible.
+            request.vidzeo_agent = True
+            request.vidzeo_agent_owner = 'local-user'
         return "local-dev-token", {
             "access_state": "active",
             "email": "local@vidzeo.app",
@@ -1115,7 +1127,7 @@ def serve_temp(filename):
 @app.route('/api/status')
 def api_status():
     auth_config = public_auth_config()
-    auth_config["mode"] = "supabase"
+    auth_config["mode"] = str(os.environ.get('VIDZEO_AUTH_MODE', '')).strip().lower() or 'supabase'
     try:
         from services.transcription_service import whisper_runtime_status
         whisper_status = whisper_runtime_status()
@@ -2123,7 +2135,13 @@ def _sanitize_user_progress_message_base(fraction, raw_msg):
     # Its count is still a scene-asset phase and must not be mislabeled as a
     # rendered video merely because another worker has advanced the fraction.
     if any(k in msg_lower for k in ['youtube', 'yt-v2', 'yt clips', 'web', 'image', 'stock']):
-        if count_match:
+        # A "retrying N/M unresolved" count is work still to do, not
+        # scenes already checked. Presenting it as "Finding scene N/M"
+        # faked a completed count and poisoned the reporter's per-wave
+        # baseline with a number no wave had reached. (Guarded on
+        # "unresolved" only: a plain "retrying" label keeps its count
+        # per test_progress_does_not_label_failed_image_searches_ready.)
+        if count_match and 'unresolved' not in msg_lower:
             return f"Finding scene {count_match.group(1)}/{count_match.group(2)}"
         return "Finding YouTube footage" if any(k in msg_lower for k in ['youtube', 'yt-v2', 'yt clips']) else ("Finding stock media" if 'stock' in msg_lower else "Finding web images")
     if f >= 0.70 or any(k in msg_lower for k in ['rendering video', 'ffmpeg assembly', 'final mux', 'encoding final', 'finaliz']):
@@ -2225,22 +2243,37 @@ def _make_progress_reporter(raw_callback=None):
         with state_lock:
             stage, detail = _stage_detail(clean_msg)
             if stage and detail:
-                previous = last_stage_detail.get(stage)
-                # Shadow/fallback branches report their own subset counts.
-                # Ignore stale scene counts while allowing a different active
-                # phase (such as captions) to remain visible.
-                if previous and (
-                    detail[0] < previous[0]
-                    or detail[2] < previous[2]
-                ):
-                    return
-                if previous:
+                # A wave is one run of a scene-counting stage, identified
+                # by its scene total. The primary web wave and a later
+                # recovery wave have different totals (121 vs 120 scenes),
+                # and a recovery wave restarts its counter at 1. The old
+                # single-max filter read every report from the new wave
+                # as a stale subset count and dropped it for the whole
+                # wave, so a working 1,440s collection looked idle.
+                # Key the baseline per wave so a new wave reports from 1.
+                key = (stage, detail[1])
+                previous = last_stage_detail.get(key)
+                if previous and (detail[0] < previous[0] or detail[2] < previous[2]):
+                    # A wave that already ran to its total has finished;
+                    # a smaller count after that is the next wave, not a
+                    # shadow branch of the finished one.
+                    if previous[0] >= previous[1]:
+                        last_stage_detail[key] = detail
+                    else:
+                        # Shadow/fallback branches report their own subset
+                        # counts. Ignore stale scene counts while allowing
+                        # a different active phase (such as captions) to
+                        # remain visible.
+                        return
+                elif previous:
                     detail = (
                         max(detail[0], previous[0]),
                         max(detail[1], previous[1]),
                         max(detail[2], previous[2]),
                     )
-                last_stage_detail[stage] = detail
+                    last_stage_detail[key] = detail
+                else:
+                    last_stage_detail[key] = detail
 
             # Never discard a real phase update just because another parallel
             # branch has a larger local fraction. Preserve a monotonic public
@@ -2401,6 +2434,11 @@ def _prepare_video_output_package(config, name):
             "package_type": "vidnets-documentary-generation",
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "name": str(name or "Video"),
+            # Job identity (Nov 10, 2026 BNSF incident): two jobs can share
+            # a title, so the package dir name alone cannot tell them apart.
+            # The marker pins the package to its producing job.
+            "job_id": str(config.get("_queue_job_id") or config.get("job_id") or ""),
+            "run_id": str(config.get("_pipeline_run_id") or config.get("_queue_run_id") or config.get("run_id") or ""),
             "status": "checkpointing",
         }
         marker.write_text(json.dumps(_checkpoint_safe(payload), indent=2), encoding="utf-8")
@@ -2441,12 +2479,27 @@ def _write_generation_checkpoint(config, filename, payload, *, stage=None, statu
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "checkpoint": str(target),
     }
+    # state.json is the resume pointer (_resume_checkpointed_remotion_render
+    # gates on state["stage"]/state["status"]): a torn write here used to
+    # make a checkpointed job look unresumable after a crash. Write it with
+    # the same temp + fsync + atomic replace as the checkpoint itself.
+    # A failed pointer write must never fail the checkpoint save.
+    state_target = package_dir / "checkpoints" / "state.json"
+    state_temp = state_target.with_name(f".{state_target.name}.{secrets.token_hex(4)}.part")
     try:
-        (package_dir / "checkpoints" / "state.json").write_text(
-            json.dumps(_checkpoint_safe(state), indent=2), encoding="utf-8"
-        )
+        with state_temp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(_checkpoint_safe(state), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(state_temp, state_target)
     except OSError:
         pass
+    finally:
+        try:
+            state_temp.unlink(missing_ok=True)
+        except OSError:
+            pass
     return str(target)
 
 
@@ -6351,7 +6404,12 @@ def _subject_safe_scene_brain_query(value, fallback, active_subject, domain_anch
         query_terms = {token.rstrip('s') for token in _scene_brain_query_tokens(query)}
         if core & query_terms:
             domain = ''
-            if active.casefold() in {str(domain_anchor).casefold(), collection.casefold()}:
+            if active.casefold() in {str(domain_anchor).casefold(), collection.casefold()} or (
+                not local_section and re.match(
+                    rf"^{re.escape(collection)}\s+(?:from|in|across|around|during)\b",
+                    active, re.IGNORECASE,
+                )
+            ):
                 active = ''
     if not query:
         return query
@@ -6603,6 +6661,11 @@ def _adapt_scene_brain_plans(plans, scene_texts, title, section_subjects=None, s
             "_llm": True,
             "_brain": True,
             "_shared_scene_brain": True,
+            # Preserve the brain's fallback marker: a plan it filled
+            # mechanically for a timed-out chunk must stay visible as one,
+            # so the route below can count it and keep it out of the cache
+            # instead of laundering it as a directed plan.
+            "_query_fallback": str(plan.get("_query_fallback") or ""),
             **{key: str(plan.get(key) or '').strip() for key in
                ('visual_subject', 'visual_subject_type', 'subject_evidence', 'visible_target', 'identity_scope')},
         }
@@ -7102,20 +7165,32 @@ def _generate_shared_scene_brain_bundle(script, title, scene_texts, config):
         (route.get("selected_model") for route in reversed(route_rows) if route.get("selected_model")),
         model,
     )
+    # Scenes the brain filled mechanically for timed-out chunks carry
+    # _query_fallback on their rows. Count them honestly: a plan with any
+    # is not a directed plan, and the cache loader must not serve it as one
+    # (that is how word-salad queries were cached and reused forever).
+    fallback_scenes = 0
+    for source in required_sources:
+        rows = adapted.get(source) if isinstance(adapted, dict) else []
+        fallback_scenes = max(
+            fallback_scenes,
+            sum(1 for row in (rows or []) if isinstance(row, dict) and row.get("_query_fallback")),
+        )
     route = {
         "provider": provider,
-        "status": "directed",
+        "status": "directed" if fallback_scenes == 0 else "partial",
         "requested_model": model,
         "selected_model": selected_model,
         "configured_chain": list(brain._client.model_chain),
         "attempted_models": attempted_models,
         "attempts": [attempt for row in route_rows for attempt in (row.get("attempts") or [])],
-        "directed_scenes": expected,
-        "fallback_scenes": 0,
+        "directed_scenes": expected - fallback_scenes,
+        "fallback_scenes": fallback_scenes,
         "scene_routes": route_rows,
     }
-    adapted = _attach_source_planner_metadata(adapted, status="directed", route=route)
-    _store_shared_plan_cache(script, title, scene_texts, adapted)
+    adapted = _attach_source_planner_metadata(adapted, status=route["status"], route=route)
+    if fallback_scenes == 0:
+        _store_shared_plan_cache(script, title, scene_texts, adapted)
     print(
         f"   [brain] complete OpenRouter scene plan ready: scenes={expected}, "
         f"selected={selected_model}, routes={' -> '.join(route['configured_chain'])}"
@@ -7165,6 +7240,70 @@ def _generate_mechanical_shared_scene_bundle(script, title, scene_texts):
     )
 
 
+def _source_query_stage_seconds(config, scene_count, fast_lane=False):
+    """How long the source-query planner may wait for its answers.
+
+    Queries are the foundation of the whole video, so for agent jobs there
+    is no artificial cut-off: the planner gets everything the job has left
+    except the render reserve, and the agent wall is the floor when the
+    budget is already spent. A shorter wall expires before the agent's
+    first answer arrives and the job falls back to mechanical queries that
+    find nothing.
+    """
+    config = config or {}
+    config_deadline = config.get("query_plan_stage_deadline_seconds")
+    if config_deadline is not None:
+        try:
+            stage_seconds = float(config_deadline)
+        except (TypeError, ValueError):
+            stage_seconds = _default_source_query_stage_seconds(scene_count, fast_lane=fast_lane)
+    else:
+        stage_seconds = _default_source_query_stage_seconds(scene_count, fast_lane=fast_lane)
+
+    if fast_lane:
+        stage_seconds = min(45.0, stage_seconds)
+    stage_seconds = max(0.05, stage_seconds)
+    try:
+        from services.delivery_budget import get_delivery_budget
+        delivery_budget = get_delivery_budget(config)
+    except Exception:
+        delivery_budget = None
+    if delivery_budget is not None:
+        try:
+            reserve_after = float(
+                config.get("_render_reserve_seconds")
+                or delivery_budget.render_reserve_seconds
+            )
+        except (TypeError, ValueError):
+            reserve_after = 0.0
+        stage_seconds = min(stage_seconds, float(delivery_budget.allowance(
+            stage_seconds,
+            reserve_after_seconds=reserve_after,
+        )))
+    if str(config.get('llm_provider') or '') == 'external_agent':
+        try:
+            agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+        except (TypeError, ValueError):
+            agent_wall = 3600.0
+        if delivery_budget is not None:
+            try:
+                reserve_after = float(
+                    config.get("_render_reserve_seconds")
+                    or delivery_budget.render_reserve_seconds
+                )
+            except (TypeError, ValueError):
+                reserve_after = 0.0
+            stage_seconds = max(
+                stage_seconds,
+                float(delivery_budget.allowance(
+                    None,
+                    reserve_after_seconds=reserve_after,
+                )),
+            )
+        stage_seconds = max(stage_seconds, agent_wall)
+    return stage_seconds, delivery_budget
+
+
 def _generate_source_query_bundle_parallel(
     script, title, scene_texts, config, needs_web=False, needs_yt=False,
     needs_stock=False, progress_callback=None,
@@ -7184,33 +7323,8 @@ def _generate_source_query_bundle_parallel(
         return _attach_source_planner_metadata(bundle, status="not_required")
 
     fast_lane = bool(config.get("_query_plan_fast_lane"))
-    config_deadline = config.get("query_plan_stage_deadline_seconds")
-    if config_deadline is not None:
-        try:
-            stage_seconds = float(config_deadline)
-        except (TypeError, ValueError):
-            stage_seconds = _default_source_query_stage_seconds(len(scene_texts), fast_lane=fast_lane)
-    else:
-        stage_seconds = _default_source_query_stage_seconds(len(scene_texts), fast_lane=fast_lane)
-
-    if fast_lane:
-        stage_seconds = min(45.0, stage_seconds)
-    stage_seconds = max(0.05, stage_seconds)
     stage_started = time.monotonic()
-    try:
-        from services.delivery_budget import get_delivery_budget
-        delivery_budget = get_delivery_budget(config)
-    except Exception:
-        delivery_budget = None
-    if delivery_budget is not None:
-        reserve_after = float(
-            config.get("_render_reserve_seconds")
-            or delivery_budget.render_reserve_seconds
-        )
-        stage_seconds = min(stage_seconds, float(delivery_budget.allowance(
-            stage_seconds,
-            reserve_after_seconds=reserve_after,
-        )))
+    stage_seconds, delivery_budget = _source_query_stage_seconds(config, len(scene_texts), fast_lane=fast_lane)
 
     config["_query_plan_deadline_monotonic"] = stage_started + stage_seconds
     topic_title = title or ""
@@ -8556,7 +8670,12 @@ def _warm_local_whisper_if_needed(config):
 def _start_whisper_warmup(config):
     # Edge supplies its own audio-bound word clock; loading extra ASR models
     # before those boundaries arrive wastes RAM. ASR can still load on demand.
-    if str(config.get('tts_model') or 'audiogram').lower() in {'audiogram', 'edge', 'edge-tts', 'edge_tts'}:
+    # EXCEPT the offline Linux TTS command: it produces plain audio with no
+    # provider word timings, so captions still need Whisper — warm it even
+    # for edge/audiogram jobs when that command is configured, or captions
+    # load the model cold (~11 min stall on Broken Rail attempt 1).
+    linux_tts = bool(str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip())
+    if not linux_tts and str(config.get('tts_model') or 'audiogram').lower() in {'audiogram', 'edge', 'edge-tts', 'edge_tts'}:
         return None
     try:
         from services.transcription_service import start_whisper_job_warmup
@@ -8783,8 +8902,8 @@ def _build_audio_scene_plan(config, report_progress, expected_scene_plan=None, w
         memory = psutil.virtual_memory()
         if memory.total < 12 * 1024 ** 3 or memory.available < 1536 * 1024 ** 2:
             from services.transcription_service import unload_whisper_model
-            unload_whisper_model()
-            print("   [flow] audio: idle ASR cache released before media verification")
+            if unload_whisper_model():
+                print("   [flow] audio: idle ASR cache released before media verification")
     except (ImportError, OSError, AttributeError):
         pass
 
@@ -9483,6 +9602,7 @@ def _run_web_media_branch(scene_texts, scene_durations, config, title, script,
             # process environment here silently restored the legacy 240s web
             # ceiling and made a six-scene rescue reopen a full crawl.
             stage_deadline_seconds=config.get('web_stage_deadline_seconds'),
+            wait_until_complete=bool(config.get('web_wait_until_complete', False)),
             query_deadline_seconds=config.get('web_query_deadline_seconds'),
             batch_discovery_seconds=config.get('web_batch_discovery_seconds'),
             enable_gallery_dl=config.get('web_enable_gallery_dl')
@@ -10190,7 +10310,7 @@ def _mixed_youtube_branch_wall_cap_seconds(config=None, scene_count=0):
                 requested,
                 settings.get("yt_search_timeout_seconds", os.environ.get("VIDZEO_MIXED_YT_SEARCH_TIMEOUT", 150)),
                 download_workers=_mixed_youtube_download_worker_capacity(settings),
-                coverage_target=1.0 if settings.get('_youtube_quota_preselected') else 0.60,
+                coverage_target=1.0 if settings.get('_youtube_quota_preselected') else 0.30,
             )
         except Exception:
             requested = min(requested, 360.0 if int(scene_count) <= 12 else 600.0)
@@ -14527,7 +14647,7 @@ def _fill_strict_visual_delivery_fallback(
         _config_bool((job_config or {}).get("strict_retrieval_accuracy"), False)
         or _config_bool((job_config or {}).get("visual_required"), False)
     )
-    if (
+    if not grounded_graphics_allowed(job_config) and (
         (strict_real_media_job and not _config_bool(
             (job_config or {}).get("allow_grounded_graphic_fallback_strict"), False
         ))
@@ -19797,6 +19917,13 @@ def _render_video_with_semantic_editing(
         path = media_paths[index] if index < len(media_paths) else None
         resolved_path = str(Path(path).resolve()) if path else ""
         resolution_row = resolution_rows[index] if index < len(resolution_rows) and isinstance(resolution_rows[index], dict) else {}
+        decision = resolution_row.get('visual_decision') or {}
+        accepted_media = (
+            bool(resolved_path)
+            and str(resolution_row.get('status') or '').casefold() in {'accepted', 'downloaded'}
+            and str(resolution_row.get('verification_status') or '').casefold() not in {'rejected', 'failed', 'blocked'}
+            and decision.get('accepted') is not False and decision.get('fatal_mismatch') is not True
+        )
         media_items.append({
             "path": resolved_path,
             "src": resolved_path,
@@ -19817,7 +19944,8 @@ def _render_video_with_semantic_editing(
             if isinstance(resolution_row.get('graphic_fallback'), Mapping) else {},
             "source_url": resolution_row.get('source_url') or '',
             "rights_status": resolution_row.get('rights_status') or 'unknown',
-            "visual_decision": resolution_row.get('visual_decision') or {},
+            "visual_decision": decision,
+            "verified": accepted_media,
             "resolution": resolution_row,
             "render_clip_start": resolution_row.get('render_clip_start'),
             "visual_requirement": (
@@ -19837,11 +19965,40 @@ def _render_video_with_semantic_editing(
     }
     music = {}
     music_path = job_config.get('music_path')
-    if music_path:
+    if not (music_path and Path(music_path).is_file()):
+        try:
+            from services.bgm_service import resolve_channel_music
+            channel_val = (
+                str(job_config.get('channel_name')
+                    or job_config.get('channel')
+                    or job_config.get('channel_profile_id')
+                    or job_config.get('channel_id')
+                    or '')
+            )
+            resolved_bgm = resolve_channel_music(
+                channel_name=channel_val,
+                niche=str(job_config.get('niche') or job_config.get('category') or ''),
+                genre=str(job_config.get('genre') or ''),
+                explicit_path=str(music_path or '').strip() or None,
+            )
+            if resolved_bgm:
+                music_path = resolved_bgm['path']
+                job_config['music_path'] = music_path
+        except Exception as bgm_err:
+            print(f"[bgm_service] Music resolution notice: {bgm_err}")
+    if music_path and Path(music_path).is_file():
+        raw_vol = job_config.get('music_volume')
+        if raw_vol is None and isinstance(job_config.get('music'), dict):
+            raw_vol = job_config['music'].get('volume')
+        try:
+            raw_num = float(raw_vol if raw_vol is not None else 20)
+            norm_vol = max(0.0, min(1.0, raw_num / 100.0 if raw_num > 1.0 else raw_num))
+        except (ValueError, TypeError):
+            norm_vol = 0.20
         music = {
             "path": str(Path(music_path).resolve()),
             "src": str(Path(music_path).resolve()),
-            "volume": float(int(job_config.get('music_volume', 20) or 20) / 100.0),
+            "volume": norm_vol,
         }
 
     width, height = render_resolution
@@ -20696,6 +20853,7 @@ def _render_video_with_semantic_editing(
             "semantic_render_crf": job_config.get('semantic_render_crf'),
             "semantic_render_required": True,
             "semantic_variation_required": False,
+            "llm_provider": job_config.get('llm_provider'),
             "openrouter_api_key": job_config.get('openrouter_api_key') or '',
             "semantic_render_timeout_seconds": semantic_budget,
             "semantic_render_budget_seconds": semantic_budget,
@@ -21929,14 +22087,12 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
     )
     package_raw = job_config.get("_output_package_dir") or job_config.get("output_package_dir")
     if package_raw:
-        media_manifest = {
-            "schema_version": 1,
-            "asset_count": len(media_plan.get("media_paths") or []) if isinstance(media_plan, dict) else 0,
-            "media_paths": list(media_plan.get("media_paths") or []) if isinstance(media_plan, dict) else [],
-            "source_labels": list(media_plan.get("source_labels") or []) if isinstance(media_plan, dict) else [],
-            "metadata": media_metadata if isinstance(media_metadata, dict) else {},
-            "note": "Source media remains in the shared media cache; paths and provenance are preserved here for retry and audit.",
-        }
+        # Stamp the producing job id into the manifest (Nov 10, 2026 BNSF
+        # incident): a manifest self-identifies its job, so a delivery
+        # guard can refuse a master whose manifest belongs to another job
+        # instead of trusting a title match in the output folder.
+        from services.media_manifest import build_media_manifest
+        media_manifest = build_media_manifest(media_plan, job_config)
         media_manifest_path = Path(str(package_raw)).expanduser().resolve() / "media" / "manifest.json"
         try:
             media_manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -22648,6 +22804,7 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
         'status': 'complete',
         'selected_backend': 'remotion',
         'output_path': str(final_path),
+        'edit_plan_path': str(job_config.get('_remotion_plan_path') or ''),
         'quality': str(job_config.get('quality') or 'standard'),
         'output_package_dir': str(job_config.get('_output_package_dir') or ''),
         'checkpoint_dir': str(Path(job_config.get('_output_package_dir') or OUTPUT_DIR) / 'checkpoints'),
@@ -22987,6 +23144,31 @@ def api_upload_music():
     return jsonify({"error": "Invalid"}), 400
 
 
+@app.route('/api/music/catalog', methods=['GET'])
+def api_music_catalog():
+    from services.bgm_service import get_bgm_catalog
+    return jsonify({"success": True, "catalog": get_bgm_catalog()})
+
+
+@app.route('/api/music/resolve', methods=['POST', 'GET'])
+def api_music_resolve():
+    from services.bgm_service import resolve_channel_music
+    data = (request.get_json(silent=True) if request.is_json else None) or request.args or {}
+    channel_name = data.get('channel_name') or data.get('channel') or ''
+    niche = data.get('niche') or data.get('category') or ''
+    genre = data.get('genre') or ''
+    explicit_path = data.get('music_path') or data.get('path') or ''
+    resolved = resolve_channel_music(
+        channel_name=str(channel_name),
+        niche=str(niche),
+        genre=str(genre),
+        explicit_path=str(explicit_path).strip() or None,
+    )
+    if not resolved:
+        return jsonify({"success": False, "error": "No matching music track found"}), 404
+    return jsonify({"success": True, "music": resolved})
+
+
 # =============================================================================
 # API - QUEUE
 # =============================================================================
@@ -23077,7 +23259,16 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
 
     pre_render = _read_json(checkpoint_dir / 'pre_render.json')
     from services.media_asset_policy import excess_media_reuse_indices
-    if excess_media_reuse_indices(_read_json(checkpoint_dir / 'media_plan.json')):
+    saved_media_plan = _read_json(checkpoint_dir / 'media_plan.json')
+    if config.get('media_fallback_policy') == 'real_media_only':
+        from services.media_delivery_gate import validate_documentary_coverage
+        try:
+            saved_durations = _read_json(checkpoint_dir / 'audio_plan.json').get('scene_durations') or []
+            validate_documentary_coverage(saved_media_plan, saved_durations, config)
+        except MediaContractError as error:
+            print(f'   [retry] saved media requires repair: {error}', flush=True)
+            return None
+    if excess_media_reuse_indices(saved_media_plan):
         print('   [retry] saved media exceeds physical reuse limits; repairing affected scenes before rendering', flush=True)
         return None
     if str(pre_render.get('backend') or '').strip().lower() not in {'remotion', 'react'}:
@@ -23252,7 +23443,12 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
                 if isinstance(value, list):
                     return [_replace_saved_video_paths(item) for item in value]
                 if isinstance(value, dict):
-                    return {key: _replace_saved_video_paths(item) for key, item in value.items()}
+                    # render_transform is a provenance record, not a render
+                    # input: its source_path must keep pointing at the
+                    # verified original. Rewriting it to the transcode
+                    # breaks the verification hash chain on resume
+                    # (verified_shot_changed_after_review).
+                    return {key: (item if key == 'render_transform' else _replace_saved_video_paths(item)) for key, item in value.items()}
                 return value
 
             manifest = _replace_saved_video_paths(manifest)
@@ -23447,6 +23643,7 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
     render_config.update({
         'render_backend': 'remotion',
         'semantic_render_required': True,
+        'llm_provider': config.get('llm_provider'),
         'job_type': str(config.get('type') or 'long'),
         '_creative_media_repair': lambda film, findings, budget: _repair_creative_media(
             film, findings, budget, config, cancellation
@@ -23846,6 +24043,14 @@ def api_queue_add():
         incoming = normalize_request(request.get_json(silent=True))
     except ValueError as exc:
         return _json_error(str(exc), 400)
+    if getattr(request, 'vidzeo_agent', False) and str(incoming.get('llm_provider') or '') == 'external_agent':
+        # A paired local agent submitted this job (local-bypass carries owner
+        # 'local-user'): stamp its owner on the config so the brain, vision
+        # and director can post agent-bridge requests. Without it agent_post
+        # refuses with "Pair a local agent..." and the job silently falls back
+        # to mechanical queries that find nothing — every /api/queue/add
+        # external_agent job before this fix finished 0 real media.
+        incoming['agent_owner_id'] = request.vidzeo_agent_owner
     data = _apply_env_api_key_defaults(_attach_plan_constraints(incoming, request.vidzeo_user))
     data = _coerce_media_source_from_weights(data)
     from services.generation_cost_policy import apply_generation_cost_policy
@@ -24013,6 +24218,47 @@ def api_queue_resume():
     if not resumed:
         return jsonify({"error": "Unable to resume job"}), 400
     return jsonify({"success": True, "needs_start": not qm.worker_running})
+
+@app.route('/api/queue/advance-scene', methods=['POST'])
+@require_active_access
+def api_queue_advance_scene():
+    """Debugger scene advance: resolve a stuck scene from media already on
+    disk instead of hunting further. Body: {id, scene_number, reason}.
+    The media coordinator honors the flag between waves / at resolution
+    time (tier 1: on-disk reuse, then the existing same-job reuse and
+    graphic tiers). Does not duplicate or restart the job."""
+    data = request.json or {}
+    job_id = data.get('id')
+    if not job_id:
+        return jsonify({"error": "id required"}), 400
+    qm = get_queue_manager()
+    if not qm.get_item_snapshot(job_id, owner_id=request.vidzeo_user.get('user_id')):
+        return _json_error('Job not found.', 404)
+    try:
+        scene_number = int(data.get('scene_number') or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "scene_number must be an integer"}), 400
+    if scene_number <= 0:
+        return jsonify({"error": "scene_number must be a positive scene number"}), 400
+    item = qm.get_item(job_id) or {}
+    if str(item.get('status') or '').strip().lower() != 'processing':
+        return _json_error('Job is not processing.', 409)
+    reason = str(data.get('reason') or 'manual advance-scene request')
+    if not qm.request_scene_advance(job_id, scene_number, reason):
+        return jsonify({"error": "Unable to request scene advance"}), 400
+    return jsonify({"success": True, "job_id": job_id, "scene_number": scene_number})
+
+@app.route('/api/queue/debugger/status', methods=['GET'])
+@require_active_access
+def api_queue_debugger_status():
+    """Stuck-job debugger state: thresholds, per-job observations, actions
+    taken, restart counts, flagged jobs, pending scene advances."""
+    try:
+        from services.job_debugger import get_debugger
+
+        return jsonify({"success": True, **get_debugger().status()})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 @app.route('/api/queue/clear', methods=['POST'])
 @require_active_access

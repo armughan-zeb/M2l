@@ -1,8 +1,8 @@
 # Vidzeo Muse Worker
 
 An authenticated worker for the Vidzeo CMS **Muse mode**. It pairs with the CMS,
-claims one production job at a time, produces narration plus a 1080p master and
-thumbnail, and uploads the artifacts. The CMS validates every artifact again
+claims one production job at a time, produces narration plus a 1080p master,
+and uploads the artifacts (thumbnails are generated locally by Pikgen). The CMS validates every artifact again
 before packaging and publishing.
 
 The worker is fully Linux/Ubuntu native (also compatible with Boost cloud, VPS,
@@ -10,6 +10,60 @@ containers, and Windows). It never uses an OpenRouter key or any provider
 fallback for agent jobs. Reasoning, writing and vision belong to the Muse
 environment; this repository only transports jobs, runs the operator's commands,
 and performs objective media checks.
+
+**Muse inference is compulsory.** Every vision call, script-writing call and
+Vidnets brain / LLM call must go through Muse via the `external_agent`
+agent-bridge inbox, answered by the `vidnets-inbox-watch` hook operator.
+`node muse-agent.js start` refuses to run unless the bridge is verified
+(Vidnets server healthy, agent-bridge inbox writable, hook enabled and recently
+observed running, no
+OpenRouter key in the environment — see `lib/museInference.js`), and
+`MUSE_AUTO_LOOP=1` never exempts that check. `node muse-agent.js doctor`
+checks the same bridge and FAILS when it is absent. A job whose inference
+goes unanswered fails closed; a job with 0 real-media scenes is never
+delivered as graphics. Before failing for 0 real-media scenes the
+render wrapper attempts one bounded media re-plan with fresh queries (see
+`render-vidnets-linux.js`).
+
+**Filter-best (Nov 9, 2026).** Vidnets' native mixed-media flow is used
+as built: LLM writes queries from the scenes → search YouTube clips +
+web images → filter the BEST (rank, keep the best real media; reject
+only clearly-wrong footage) → Remotion edits. Vision is advisory by
+default (`MUSE_MEDIA_STRICT=0`); the only hard rule is the delivery
+rule above. See `rules.md`, `workflow.md`, and `HYBRID_WIRING.md`
+("Filter-best").
+
+**Simplified pipeline (Nov 9, 2026).** One data pass (all research
+providers in parallel once, one shared deadline
+`MUSE_RESEARCH_TIMEOUT_MS`, default 180s), one script (at most
+`MUSE_SCRIPT_MAX_DRAFTS` model calls, default 2: draft 1 + one fix
+pass — a draft that still fails the gate is returned non-publishable
+and the job fails loudly), one media pass per scene (YouTube clips
+first, then web images, then stock; one bounded re-plan per job
+before a 0-real-media fail), one monitor. All knobs live in
+`.env` / `.env.example`. Full flow and settings:
+`HYBRID_WIRING.md` ("Simplified pipeline").
+
+**Health monitor.** Running `setup.sh` installs the `vidnets-health-monitor`
+cron at `~/hooks/scripts/vidnets-health-monitor.sh` and schedules it every
+minute, so inbox age is checked well inside the 600-second agent-bridge
+request floor. It checks
+the daemon (alive + connected), Vidnets `:5010` (healthy + memory
+admission), the CMS (reachable + outage duration), the inbox-watch hook
+(enabled), stale/past-half-TTL inbox requests, and disk/tmp space. It
+fixes what it can itself (restart a dead daemon via `start-daemon.sh`,
+restart a dead Vidnets server, mark expired inbox requests) and only
+messages the user when it cannot fix something or a job is affected.
+It never claims, delivers, or restarts a job mid-render. Existing installs
+must rerun setup to install or refresh the monitor. It is the
+only monitor — the old `vidnets-recovery-watch` self-removed on Nov 9.
+Full rules: `HYBRID_WIRING.md` ("CMS-outage resilience + health monitor").
+
+**Daemon resilience.** The daemon survives CMS 502/530 outages
+in-process (`lib/cmsRetry.js`: transient errors retry with exponential
+backoff, capped at 60s; a saved job's resume is deferred, never dropped
+on a transient error). systemd is not used as a supervisor — see
+`HYBRID_WIRING.md` for why.
 
 ## Requirements
 
@@ -68,15 +122,18 @@ node muse-agent.js start
 `start` registers a heartbeat, resumes a saved job after a crash, claims jobs,
 reports progress and uploads each finished job. Use `--once` to process at most
 one job and exit. Before it heartbeats or claims anything, the automated loop
-checks that its script and render/inference adapters are configured. This keeps
-an incomplete worker from taking CMS jobs and immediately failing them.
+verifies the compulsory Muse inference bridge (see above). This keeps a worker
+with no inference from taking CMS jobs and delivering graphics-only videos.
 
-The automated loop requires `MUSE_SCRIPT_COMMAND` plus either
-`MUSE_RENDER_COMMAND`, or the built-in Vidnets path with
-`MUSE_INFERENCE_COMMAND` / `MUSE_INFERENCE_URL`. If the Muse agent itself writes
-the narration and renders in its own environment, use the agent-driven
+The automated loop requires the Muse inference bridge: `MUSE_RENDER_COMMAND`
+set to `render-vidnets-linux.js` (Vidnets + Muse agent-bridge inbox) with the
+`vidnets-inbox-watch` hook enabled, or the built-in Vidnets path with
+`MUSE_INFERENCE_COMMAND` / `MUSE_INFERENCE_URL`. An OpenRouter key anywhere in
+the environment refuses to start. If the Muse agent itself writes the narration
+and renders in its own environment, use the agent-driven
 `claim` → write/render into the returned work folder → `deliver` flow instead
-of `start`.
+of `start` (that flow is a human agent in the loop, so the start gate does not
+apply to it).
 
 If the CMS address changes, update the saved endpoint without replacing the
 worker credential:
@@ -104,21 +161,19 @@ The command prints JSON with the job and its exact paths:
 ```text
 work/<jobId>/script.txt      write the complete narration here
 work/<jobId>/video.mp4       render the 1080p master with audio here
-work/<jobId>/thumbnail.jpg   optional 16:9 thumbnail
 work/<jobId>/inference/      Vidnets reasoning/vision requests (built-in renderer)
 ```
 
 After the files exist:
 
 ```bash
-node muse-agent.js deliver --job <jobId>
+node muse-agent.js deliver --job <jobId> --skip-thumbnail
 ```
 
-`deliver` validates the narration length, the master duration/1080p/audio/full
-decode, and the thumbnail size/aspect, then uploads and completes the job.
-Pass `--script`, `--video` or `--thumbnail` to deliver files produced elsewhere;
-they are copied into the job checkpoint. If no thumbnail is supplied, a real
-frame is extracted from the finished master.
+`deliver` validates the narration length and the master duration/1080p/audio/full
+decode, then uploads and completes the job. Thumbnails are generated locally on the
+CMS using Pikgen, so the worker delivers script + video only. Pass `--script` or
+`--video` to deliver files produced elsewhere; they are copied into the job checkpoint.
 
 If the work cannot be finished, report an actionable reason:
 
@@ -133,22 +188,63 @@ Use this when the Muse environment exposes commands. Configure the adapters in
 
 | Adapter | Variable | Contract |
 | --- | --- | --- |
-| Narration | `MUSE_SCRIPT_COMMAND` | Job JSON on stdin; print narration text or `{"scriptText":"..."}` |
+| Narration | `MUSE_SCRIPT_COMMAND` (optional — defaults to ScriptIT) | Job JSON on stdin; print narration text or `{"scriptText":"..."}` |
 | Renderer | `MUSE_RENDER_COMMAND` | JSON on stdin (`job`, `scriptText`, `scriptPath`, `workDir`, `outputPath`); print `{"videoPath":"...","thumbnailPath":"..."}` |
 | Thumbnail | `MUSE_THUMBNAIL_COMMAND` | JSON on stdin (`job`, `scriptText`, `videoPath`, `workDir`); print `{"thumbnailPath":"..."}` |
 | Vidnets inference | `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` | One Vidnets request JSON on stdin (or POSTed); return the exact text/JSON answer |
 
-Without a render command, the worker uses **Vidnets**:
+With either inference transport configured, the daemon owns one resident dispatcher for
+the shared ScriptIT and Vidnets inbox. It watches for new requests, polls every second
+as a fallback, and refills slots as calls finish. It supports up to eight concurrent
+calls (`MUSE_INBOX_CONCURRENCY` can lower that), and agent-bridge requests
+keep the 600-second floor (`VIDZEO_AGENT_MIN_WALL_SECONDS`) — the polling
+inbox watcher alone needs ~4.5 min to wake a worker, so a shorter wall would
+expire answers mid-composition. Run `node muse-agent.js doctor` with the worker
+running to verify that the configured Muse transport actually answers a probe.
+Unanswered probes pause new claims. Saved jobs still reconnect and report progress.
+
+Set `VIDNETS_AGENT_BRIDGE_DIR` to the same shared directory for the worker and Vidnets
+server when they run in different processes. For a hook-only installation, update the host
+hook script and definition from `docker/hooks/` so it can answer the probe. The hook
+uses its legacy wake-up flow when no resident dispatcher is active; its wake latency
+still counts against the request lifetime.
+
+**Narration defaults to ScriptIT** (`scriptit/cli/generate.js`, see
+`scriptit/CLI.md`): it researches the title, writes narration through an
+editorial gate (hook, pacing, topic fit, evidence support, concrete-entity
+specificity), and scores opening-hook variants. It needs no OpenRouter key —
+Muse answers its inference requests through the Vidnets agent-bridge inbox
+(the `vidnets-inbox-watch` hook wakes an operator for each request). A script
+is publishable only if the gate passes and at least one external evidence
+claim supports it; a failed draft is left in `script-draft.json` and the job
+fails honestly instead of shipping generic narration. Set
+`MUSE_SCRIPT_COMMAND` to use a different writer, or
+`MUSE_SCRIPT_ALLOW_TEMPLATE_FALLBACK=1` to bring back the old template
+synthesizer (opt-in only, labelled generic).
+
+Production renders use **Vidnets through `render-vidnets-linux.js`**
+(`MUSE_RENDER_COMMAND`):
 - Vidnets is started through `VIDNETS_AGENT.sh` (Linux) or `VIDNETS_AGENT.cmd` (Windows) and runs with
-  `llm_provider: external_agent`; it never receives an OpenRouter key.
-- While the render runs, the worker polls Vidnets' local inference inbox and
-  answers every writing, director, query and vision request through
-  `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL`.
+  `llm_provider: external_agent`; it never receives an OpenRouter key
+  (`adapters/vidnets.js` sends `openrouter_api_key: ''`, and the server's
+  visual verifier discards any environment key for external_agent jobs).
+- While the render runs, every writing, director, query and vision request
+  is posted to Vidnets' local agent-bridge inbox, and the
+  `vidnets-inbox-watch` hook wakes a Muse operator to answer it. That is
+  the only inference path in production — `MUSE_INFERENCE_COMMAND` /
+  `MUSE_INFERENCE_URL` are an alternate transport and are deliberately
+  unset in the production wiring (a second answerer would double-answer).
+- The wrapper fails the job instead of delivering graphics if the finished
+  edit plan has no Muse-verified real-media scene, or no Muse-answered
+  vision verdict at all.
 - Set `MUSE_VIDNETS_ROOT` if Vidnets lives outside `./vidnets`.
 - Built-in Vidnets needs `PEXELS_API_KEY` and `PIXABAY_API_KEY` for stock rescue.
 
-Without `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL`, external-agent Vidnets
-jobs cannot answer their scene requests; `doctor` reports this as blocking.
+There is no fallback to the native Remotion engine: it fetches no media and
+uses no Muse inference, so `adapters/video.js` throws instead of rendering
+graphics when no Muse-inference render path is configured. Without a
+verified bridge, external-agent Vidnets jobs cannot answer their scene
+requests; `doctor` reports this as blocking (`Muse inference (compulsory)`).
 
 ---
 

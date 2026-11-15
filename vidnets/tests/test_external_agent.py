@@ -2,8 +2,10 @@
 import ast
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 import tempfile
@@ -42,15 +44,19 @@ class AgentTests(unittest.TestCase):
             time.sleep(.01)
         self.fail('No agent inference request was published.')
 
-    def test_manual_all_models_and_fallbacks_are_qwen_even_custom(self):
+    def test_manual_rejects_uncatalogued_models_and_pins_saved_selection(self):
         for profile in ('efficient', 'custom'):
-            cfg = normalize_provider_config(apply_generation_cost_policy({'cost_profile': profile,
-                'llm_model': 'expensive', 'qwen_vision_model': 'expensive',
-                'scene_brain_fallback_models': ['expensive']}))
-            for name in ('llm_model', 'director_model', 'scene_brain_model', 'query_llm_model',
-                         'vision_model', 'qwen_vision_model', 'research_model', 'composition_model'):
-                self.assertEqual(cfg[name], OPENROUTER_MODEL)
-            self.assertEqual(cfg['scene_brain_fallback_models'], [OPENROUTER_MODEL])
+            with self.assertRaises(ValueError):
+                normalize_provider_config(apply_generation_cost_policy({'cost_profile': profile,
+                    'llm_model': 'expensive', 'qwen_vision_model': 'expensive',
+                    'scene_brain_fallback_models': ['expensive']}))
+        # The saved catalog selection is admitted unchanged and pinned to every role.
+        cfg = normalize_provider_config(apply_generation_cost_policy({'cost_profile': 'custom',
+            'llm_model': OPENROUTER_MODEL, 'qwen_vision_model': OPENROUTER_MODEL}))
+        for name in ('llm_model', 'director_model', 'scene_brain_model', 'query_llm_model',
+                     'vision_model', 'qwen_vision_model', 'research_model', 'composition_model'):
+            self.assertEqual(cfg[name], OPENROUTER_MODEL)
+        self.assertEqual(cfg['scene_brain_fallback_models'], [OPENROUTER_MODEL])
 
     def test_external_normalization_removes_paid_and_subscription_credentials(self):
         cfg = normalize_provider_config({'llm_provider': 'external_agent', 'agent_owner_id': 'alice',
@@ -109,14 +115,55 @@ class AgentTests(unittest.TestCase):
 
     def test_timeout_is_bounded_and_late_answer_is_rejected(self):
         start = time.monotonic()
-        with self.assertRaises(agent_bridge.AgentBridgeError):
-            agent_bridge.agent_post({'messages': []}, .08, handle='external-agent:alice')
+        # The agent wall has a 600s floor by default; shrink it here so this
+        # bounded-timeout check still runs fast.
+        with patch.dict(os.environ, {'VIDZEO_AGENT_MIN_WALL_SECONDS': '0.05'}):
+            with self.assertRaisesRegex(agent_bridge.AgentBridgeError, r'Muse request [a-f0-9]{32}'):
+                agent_bridge.agent_post({'messages': []}, .08, handle='external-agent:alice')
         self.assertLess(time.monotonic() - start, 1)
         row = json.loads(next((self.root / 'bridge').glob('*/request.json')).read_text())
         self.assertEqual(row['state'], 'expired')
         self.assertEqual(agent_bridge.pending_requests('alice'), [])
         with self.assertRaises(ValueError):
             agent_bridge.complete_request(row['id'], 'alice', 'late')
+
+    def test_agent_requests_get_a_minimum_answer_window(self):
+        # Callers pass fast-API timeouts (classification asks for 20s); the
+        # polling inbox needs minutes, so the bridge floors the wall.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(agent_bridge.agent_post, {'messages': []}, 20,
+                                 operation='vidnets_response', handle='external-agent:alice')
+            row = self.wait_request()
+            self.assertGreaterEqual(row['expires_at'] - row['created_at'], 599)
+            agent_bridge.complete_request(row['id'], 'alice', {'ok': True})
+            reply = future.result(timeout=5).json()
+            self.assertEqual(json.loads(reply['choices'][0]['message']['content']), {'ok': True})
+
+    def test_vision_requests_get_the_same_minimum_answer_window(self):
+        # Vision verdicts need the same minutes-long window as text: the
+        # floor applies regardless of kind, not just to text callers.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(agent_bridge.agent_post, {'messages': []}, 20,
+                                 operation='vidnets_vision', kind='vision',
+                                 handle='external-agent:alice')
+            row = self.wait_request()
+            self.assertEqual(row['kind'], 'vision')
+            self.assertGreaterEqual(row['expires_at'] - row['created_at'], 599)
+            agent_bridge.complete_request(row['id'], 'alice', {'ok': True})
+            reply = future.result(timeout=5).json()
+            self.assertEqual(reply['provider'], 'external_agent')
+
+    def test_minimum_answer_window_is_tunable_by_environment(self):
+        # The floor is VIDZEO_AGENT_MIN_WALL_SECONDS, not a hardcoded 600:
+        # raising it must lengthen the window a 20s caller gets.
+        with patch.dict(os.environ, {'VIDZEO_AGENT_MIN_WALL_SECONDS': '900'}):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(agent_bridge.agent_post, {'messages': []}, 20,
+                                     operation='vidnets_response', handle='external-agent:alice')
+                row = self.wait_request()
+                self.assertGreaterEqual(row['expires_at'] - row['created_at'], 899)
+                agent_bridge.complete_request(row['id'], 'alice', {'ok': True})
+                future.result(timeout=5)
 
     def test_missing_owner_and_paid_voice_never_use_network(self):
         from services.bounded_http import provider_post
@@ -146,8 +193,13 @@ class AgentTests(unittest.TestCase):
         response._content = b'{"choices":[]}'
         network = Mock(return_value=response)
         with job_scope({'llm_provider': 'openrouter', 'cost_profile': 'custom'}):
+            with self.assertRaises(ValueError):
+                provider_post(network, 'https://openrouter.ai/api/v1/chat/completions', headers={},
+                    json={'model': 'expensive', 'models': ['expensive-2']}, timeout=1)
+            network.assert_not_called()
+            # An omitted model is admitted only as the saved catalog selection.
             provider_post(network, 'https://openrouter.ai/api/v1/chat/completions', headers={},
-                json={'model': 'expensive', 'models': ['expensive-2']}, timeout=1)
+                json={}, timeout=1)
             self.assertEqual(network.call_args.kwargs['json']['model'], OPENROUTER_MODEL)
             self.assertNotIn('models', network.call_args.kwargs['json'])
             with self.assertRaises(ValueError):
@@ -217,7 +269,8 @@ class EndpointTests(AgentTests):
         from config import normalize_generation_config
         wanted = {'_json_error', '_extract_bearer_token', '_extract_device_context', '_get_authenticated_state',
             '_is_local_request', '_is_trusted_browser_origin', 'require_authenticated_user', 'require_active_access',
-            'api_agent_access', 'api_agent_bridge', 'api_generate', '_apply_env_api_key_defaults'}
+            'api_agent_access', 'api_agent_bridge', 'api_generate', '_apply_env_api_key_defaults',
+            '_parse_duration_to_seconds', '_estimate_script_duration_seconds'}
         tree = ast.parse((ROOT / 'server/app.py').read_text(encoding='utf-8'))
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
         app = Flask(__name__)
@@ -228,6 +281,8 @@ class EndpointTests(AgentTests):
         namespace = {'app': app, 'request': request, 'jsonify': jsonify, 'os': os, 'json': json,
             'urllib': __import__('urllib'), 'wraps': wraps, 'AuthServiceError': AuthServiceError,
             'sync_authenticated_user': self.sync, 'secrets': secrets, 'Path': Path,
+            're': re, 'math': math,
+            'OpenRouterScenePlanningError': type('OpenRouterScenePlanningError', (Exception,), {}),
             'TEMP_DIR': self.root, 'OUTPUT_DIR': self.root, 'normalize_generation_config': normalize_generation_config,
             '_attach_plan_constraints': lambda data, user: data, '_coerce_media_source_from_weights': lambda data: data,
             '_enforce_generation_plan_limits': lambda data, user: data, '_validate_media_request_config': lambda data: None,
@@ -239,28 +294,30 @@ class EndpointTests(AgentTests):
         return app.test_client()
 
     def test_agent_generate_pins_owner_and_routes_to_same_queue_api(self):
+        from services import export_entitlements
         key = self.seed_access()
         client = self.make_api()
-        response = client.post('/api/generate', json={'script': 'Grounded script', 'agent_owner_id': 'spoofed',
-            'llm_model': 'expensive', 'openrouter_api_key': 'paid-secret'}, headers={'Authorization': 'Bearer ' + key})
-        self.assertEqual(response.status_code, 202, response.get_json())
-        cfg = self.enqueue.call_args.args[0]
-        self.assertEqual(cfg['agent_owner_id'], 'alice')
-        self.assertEqual(cfg['llm_provider'], 'external_agent')
-        self.assertEqual(cfg['openrouter_api_key'], 'external-agent:alice')
-        self.assertEqual(cfg['tts_model'], 'audiogram')
-        self.assertEqual(self.sync.call_args.kwargs['device_fingerprint'], 'paired-device')
-        denied = client.post('/api/generate', json={'script': 'script', 'llm_provider': 'openrouter'}, headers={'Authorization': 'Bearer ' + key})
-        self.assertEqual(denied.status_code, 400)
+        with patch.object(export_entitlements, 'reserve_generation_export', lambda *args, **kwargs: {'allowed': True}), \
+                patch.object(export_entitlements, 'finish_generation_export', lambda *args, **kwargs: None):
+            response = client.post('/api/generate', json={'script': 'Grounded script', 'agent_owner_id': 'spoofed',
+                'llm_model': 'expensive', 'openrouter_api_key': 'paid-secret'}, headers={'Authorization': 'Bearer ' + key})
+            self.assertEqual(response.status_code, 202, response.get_json())
+            cfg = self.enqueue.call_args.args[0]
+            self.assertEqual(cfg['agent_owner_id'], 'alice')
+            self.assertEqual(cfg['llm_provider'], 'external_agent')
+            self.assertEqual(cfg['openrouter_api_key'], 'external-agent:alice')
+            self.assertEqual(cfg['tts_model'], 'audiogram')
+            self.assertEqual(self.sync.call_args.kwargs['device_fingerprint'], 'paired-device')
+            denied = client.post('/api/generate', json={'script': 'script', 'llm_provider': 'openrouter'}, headers={'Authorization': 'Bearer ' + key})
+            self.assertEqual(denied.status_code, 400)
 
-    def test_manual_cannot_spoof_agent_and_uses_qwen(self):
+    def test_manual_cannot_spoof_agent_or_paid_models(self):
         client = self.make_api()
         headers = {'Authorization': 'Bearer user-session'}
         denied = client.post('/api/generate', json={'llm_provider': 'external_agent', 'agent_owner_id': 'alice'}, headers=headers)
         self.assertEqual(denied.status_code, 400)
-        success = client.post('/api/generate', json={'script': 'script', 'llm_model': 'expensive', 'cost_profile': 'custom'}, headers=headers)
-        self.assertEqual(success.status_code, 200, success.get_json())
-        self.assertEqual(success.get_json()['model'], OPENROUTER_MODEL)
+        uncatalogued = client.post('/api/generate', json={'script': 'script', 'llm_model': 'expensive', 'cost_profile': 'custom'}, headers=headers)
+        self.assertEqual(uncatalogued.status_code, 400, uncatalogued.get_json())
 
     def test_key_remote_bad_origin_inactive_and_wrong_identity_are_rejected(self):
         key = self.seed_access()

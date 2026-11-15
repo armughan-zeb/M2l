@@ -339,6 +339,32 @@ class _ContextClient:
         )
 
 
+def external_agent_vision_concurrency():
+    """In-flight vision calls for an external-agent (inbox) verifier.
+
+    The resident inbox answers with concurrency 8, so 4 in flight is inside
+    it and matches the context default of 4. Tunable via
+    VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY (clamped 1-8).
+    """
+    try:
+        return max(1, min(8, int(os.environ.get("VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY", "4") or 4)))
+    except (TypeError, ValueError):
+        return 4
+
+
+def external_agent_vision_wall_seconds():
+    """Per-call wait for an external-agent (inbox) vision verdict.
+
+    A vision verdict answers through the polling inbox, so one attempt needs
+    the full agent answer floor (VIDZEO_AGENT_MIN_WALL_SECONDS, default
+    3600s) — the old 300s cap expired the verdict before the answer arrived.
+    """
+    try:
+        return max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+    except (TypeError, ValueError):
+        return 3600.0
+
+
 @dataclass
 class VisualDecisionContext:
     enabled: bool
@@ -404,16 +430,35 @@ class VisualDecisionContext:
             or os.environ.get("VIDZEO_OPENROUTER_API_KEY")
             or ""
         ).strip()
-        raw_enabled = config.get("visual_understanding")
-        if raw_enabled is None:
-            enabled = bool(key) or _as_bool(os.environ.get("VIDZEO_VISUAL_UNDERSTANDING", "1"))
+        from ..job_context import current_job
+        cur = current_job()
+        is_external_agent = (
+            str(config.get("llm_provider") or "").strip().lower() == "external_agent"
+            or str(cur.get("llm_provider") or "").strip().lower() == "external_agent"
+            or str(key).startswith("external-agent:")
+        )
+        if is_external_agent:
+            from ..agent_bridge import AGENT_HANDLE, AGENT_MODEL
+            agent_owner = str(
+                config.get("agent_owner_id")
+                or cur.get("agent_owner_id")
+                or (key[len(AGENT_HANDLE):] if str(key).startswith(AGENT_HANDLE) else "")
+                or "local-user"
+            ).strip()
+            key = AGENT_HANDLE + agent_owner
+            model = AGENT_MODEL
+            enabled = True
         else:
-            enabled = _as_bool(raw_enabled)
-        model = str(
-            config.get("qwen_vision_model")
-            or os.environ.get("VIDZEO_QWEN_VISION_MODEL")
-            or DEFAULT_QWEN_VISION_MODEL
-        ).strip() or DEFAULT_QWEN_VISION_MODEL
+            raw_enabled = config.get("visual_understanding")
+            if raw_enabled is None:
+                enabled = bool(key) or _as_bool(os.environ.get("VIDZEO_VISUAL_UNDERSTANDING", "1"))
+            else:
+                enabled = _as_bool(raw_enabled)
+            model = str(
+                config.get("qwen_vision_model")
+                or os.environ.get("VIDZEO_QWEN_VISION_MODEL")
+                or DEFAULT_QWEN_VISION_MODEL
+            ).strip() or DEFAULT_QWEN_VISION_MODEL
         count = max(1, int(scene_count or 1))
         required_raw = config.get("visual_required")
         if required_raw is None:
@@ -578,9 +623,9 @@ class VisualDecisionContext:
             ),
         )
         if str(config.get('llm_provider') or '') == 'external_agent' or str(key).startswith('external-agent:'):
-            max_concurrent = min(2, max_concurrent)
-            call_timeout_seconds = 300.0
-            call_max_attempts = 1
+            max_concurrent = min(external_agent_vision_concurrency(), max_concurrent)
+            call_timeout_seconds = external_agent_vision_wall_seconds()
+            call_max_attempts = 2
         fast_mode = _as_bool(config.get("visual_fast_mode"))
         context = cls(
             enabled=enabled,
@@ -599,12 +644,12 @@ class VisualDecisionContext:
             call_max_attempts=call_max_attempts,
             fast_mode=fast_mode,
         )
-        if enabled and not key:
+        if enabled and not key and not is_external_agent:
             context.degraded_reason = "missing_openrouter_key"
         return context
 
     def get_client(self) -> Optional[_ContextClient]:
-        if not self.enabled or not self.api_key or self.degraded_reason:
+        if not self.enabled or not self.api_key or (self.degraded_reason and not str(self.api_key).startswith("external-agent:")):
             return None
         with self._lock:
             if self._client is None:
