@@ -475,6 +475,14 @@ _SCENE_COMMON_CAPITALS = {
     "gauges", "gauge", "meters", "meter", "dials", "dial", "screens", "screen",
     "sensors", "sensor", "cables", "cable", "wires", "wire", "pipes", "pipe", "valves", "valve",
     "looks", "look", "sees", "see", "watches", "watch",
+    "covers", "cover", "charges", "charge", "powers", "power", "sweeps", "sweep",
+    "presses", "press", "drops", "drop", "rises", "rise", "flows", "flow",
+    "enters", "enter", "leaves", "leave", "builds", "build", "cuts", "cut",
+    "holds", "hold", "blows", "blow", "freezes", "freeze", "cranks", "crank",
+    "spins", "spin", "roars", "roar", "hums", "hum", "idles", "idle",
+    "primes", "prime", "clears", "clear", "catches", "catch", "stabilizes", "stabilize",
+    "charging", "climbing", "rolling", "starting", "procedure", "crew", "members",
+    "walkway", "temperature", "temperatures",
     "german", "british", "american", "french", "italian", "spanish", "russian",
     "chinese", "japanese", "irish", "european", "world", "u", "boat", "liner",
     "ship", "ships", "vessel", "vessels", "boat", "boats", "car", "cars",
@@ -613,6 +621,9 @@ def _scene_subject(scene_text: str) -> str:
         if not name or all(part.casefold() in _SCENE_COMMON_CAPITALS for part in parts):
             continue
         if len(parts) == 1 and parts[0].casefold() in _SCENE_COMMON_CAPITALS:
+            continue
+        is_sentence_start = match.start() == 0 or bool(re.search(r"[.!?]\s+$", text[:match.start()]))
+        if is_sentence_start and (parts[0].casefold() in _SCENE_COMMON_CAPITALS or _norm(parts[0]) in _STOPWORDS):
             continue
         prefix = text[max(0, match.start() - 12):match.start()].casefold()
         score = 50 + min(18, (len(parts) - 1) * 8)

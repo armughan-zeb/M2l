@@ -74,7 +74,12 @@ def configure(runtime_root=None):
     return resources, root, env
 
 
-def _json_http(url, *, key='', body=None, timeout=20):
+def _json_http(url, *, key='', body=None, timeout=None):
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("VIDZEO_AGENT_HTTP_TIMEOUT", "60") or 60)
+        except (ValueError, TypeError):
+            timeout = 60
     headers = {'Content-Type': 'application/json'}
     if key:
         headers['Authorization'] = 'Bearer ' + key
@@ -225,7 +230,7 @@ def main(argv=None):
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
         url = service_url(root)
-        status = _json_http(url + '/api/status', timeout=5)
+        status = _json_http(url + '/api/status', timeout=float(os.environ.get("VIDZEO_AGENT_STATUS_TIMEOUT", "30") or 30))
         if status.get('pipeline_build_id') != BUILD_ID or Path(status.get('resource_root', '')).resolve() != resources:
             raise RuntimeError('The local service belongs to a different installation. Run start again.')
         if args.command == 'submit':

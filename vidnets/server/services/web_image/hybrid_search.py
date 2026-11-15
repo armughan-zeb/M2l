@@ -534,17 +534,17 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
     try:
         r = _request_get_with_retries(session, DUCKDUCKGO_HOMEPAGE, params={"q": q, "kp": "1"}, timeout=10)
     except Exception as exc:
-        _ddg_down_until = time.monotonic() + 600.0
+        _ddg_down_until = time.monotonic() + 30.0
         raise RuntimeError(f"DDG homepage unreachable: {type(exc).__name__}: {exc}") from exc
     if r is None:
-        _ddg_down_until = time.monotonic() + 600.0
+        _ddg_down_until = time.monotonic() + 30.0
         raise RuntimeError("DDG homepage unreachable after retries")
     token_match = (
         re.search(r"vqd=['\"]?([0-9A-Za-z\-_]+)['\"]?", r.text)
         or re.search(r"vqd=([0-9A-Za-z\-_]+)&", r.text)
     )
     if not token_match:
-        _ddg_down_until = time.monotonic() + 600.0
+        _ddg_down_until = time.monotonic() + 30.0
         raise RuntimeError("DDG vqd token unavailable (bot check or markup change)")
     vqd = token_match.group(1)
 
@@ -562,15 +562,15 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
             timeout=10,
         )
     except Exception as exc:
-        _ddg_down_until = time.monotonic() + 600.0
+        _ddg_down_until = time.monotonic() + 30.0
         raise RuntimeError(f"DDG image API failed: {type(exc).__name__}: {exc}") from exc
     if r is None:
-        _ddg_down_until = time.monotonic() + 600.0
+        _ddg_down_until = time.monotonic() + 30.0
         raise RuntimeError("DDG image API unreachable after retries")
     try:
         payload = r.json()
     except Exception as exc:
-        _ddg_down_until = time.monotonic() + 600.0
+        _ddg_down_until = time.monotonic() + 30.0
         raise RuntimeError(f"DDG image API returned unparseable JSON: {type(exc).__name__}: {exc}") from exc
 
     results = []

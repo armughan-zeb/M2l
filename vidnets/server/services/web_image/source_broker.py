@@ -308,7 +308,7 @@ class SourceHealth:
             if self._down_until.get(source, 0.0) > now:
                 return
             self._failures.pop(source, None)
-            cooldown = max(300.0, self.cooldown_seconds)
+            cooldown = max(20.0, min(45.0, self.cooldown_seconds))
             self._down_until[source] = now + cooldown
             print(
                 f"   [web] provider '{source}' temporarily disabled "

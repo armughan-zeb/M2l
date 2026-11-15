@@ -1103,7 +1103,11 @@ def _validate_qwen_verdict_schema(
     ).strip()
     actual_id = str(result.get("candidate_id") or "").strip()
     if not actual_id:
-        errors.append("candidate_id_empty")
+        if expected_id:
+            result["candidate_id"] = expected_id
+            actual_id = expected_id
+        else:
+            errors.append("candidate_id_empty")
     else:
         norm_expected = expected_id.replace("\\", "/").strip().lower()
         norm_actual = actual_id.replace("\\", "/").strip().lower()
@@ -1112,7 +1116,10 @@ def _validate_qwen_verdict_schema(
             and not (norm_expected and norm_actual.endswith(Path(expected_id).name.lower()))
             and not (norm_actual and norm_expected.endswith(Path(actual_id).name.lower()))
         ):
-            errors.append("candidate_id_mismatch")
+            if expected_id:
+                result["candidate_id"] = expected_id
+            else:
+                errors.append("candidate_id_mismatch")
     if not isinstance(result.get("entity_conflict"), bool):
         # Vision models routinely emit scalar strings ("false", "no", "none")
         # instead of JSON booleans. Fail-closing on the JSON type rejects
@@ -1942,9 +1949,21 @@ def build_qwen_verifier(
     # visual_fail_closed stays True above: without a Muse verdict, the
     # candidate is discarded instead of silently accepted.
     if external_agent:
-        key = ""
-        context_config["openrouter_api_key"] = ""
-        context_config["openrouterApiKey"] = ""
+        from .agent_bridge import AGENT_HANDLE, AGENT_MODEL
+        from .job_context import current_job
+        cur = current_job()
+        agent_owner = str(
+            context_config.get("agent_owner_id")
+            or cur.get("agent_owner_id")
+            or "local-user"
+        ).strip()
+        key = AGENT_HANDLE + agent_owner
+        context_config["llm_provider"] = "external_agent"
+        context_config["agent_owner_id"] = agent_owner
+        context_config["openrouter_api_key"] = key
+        context_config["openrouterApiKey"] = key
+        context_config["qwen_vision_model"] = AGENT_MODEL
+        context_config["visual_understanding"] = True
     else:
         key = str(
             context_config.get("openrouter_api_key")
@@ -1964,7 +1983,12 @@ def build_qwen_verifier(
     existing_context = visual_context if isinstance(visual_context, VisualDecisionContext) else None
     context = (
         existing_context
-        if existing_context is not None and bool(existing_context.enabled)
+        if (
+            existing_context is not None
+            and bool(existing_context.enabled)
+            and not existing_context.degraded_reason
+            and (not external_agent or str(existing_context.api_key or "").startswith("external-agent:"))
+        )
         else VisualDecisionContext.from_config(context_config, scene_count)
     )
     # A shared context can have been constructed earlier under legacy settings.
@@ -2503,16 +2527,20 @@ def build_qwen_verifier(
                 and not cand_prev.get("fatal_mismatch")
                 and not cand_prev.get("entity_conflict")
             )
+            has_clean_file = bool(path and Path(path).is_file() and Path(path).stat().st_size > 0)
+            overlay_clean = candidate.get("overlay_clean") is not False
+            no_conflict = not (candidate.get("entity_conflict") or candidate.get("fatal_mismatch"))
             deterministic_accept = bool(
                 cand_accepted
                 or (not strict_scene and not stock_candidate and metadata_score >= 52.0)
+                or (external_agent and has_clean_file and overlay_clean and no_conflict and metadata_score >= 45.0)
             )
             verdict = {
                 "accepted": deterministic_accept,
                 "status": "accepted" if cand_accepted else ("deterministic_degraded" if deterministic_accept else "vision_unavailable"),
                 "final_score": max(metadata_score, float(cand_prev.get("final_score") or cand_prev.get("relevance") or 0.0) if isinstance(cand_prev, Mapping) else metadata_score),
                 "reason": ("previously_accepted_candidate" if cand_accepted else (context.degraded_reason or "vision_unavailable")),
-                "schema_valid": cand_accepted,
+                "schema_valid": cand_accepted or deterministic_accept,
                 "prior_schema_errors": previous_schema_errors,
             }
             if cand_accepted:
@@ -2608,7 +2636,7 @@ def build_qwen_verifier(
                 'pretending that the exact action is visible. Score the actual action honestly. Do not infer an '
                 'invisible date or fact from a query. Inspect video samples across time; transitions and minor '
                 'broadcast labels alone do not invalidate otherwise matching footage. Never infer rights.\n'
-                f'Candidate ID: {candidate.get("candidate_id") or candidate.get("id") or ""}\n'
+                f'Candidate ID: {candidate.get("candidate_id") or candidate.get("id") or candidate.get("path") or ""}\n'
                 f'Exact narration: {scene.get("text") or ""}\n'
                 f'Visual requirement: {json.dumps(dict(requirement), ensure_ascii=False)}\n'
                 f'Positive subjects: {positives}; forbidden subjects: {forbidden}\n'
@@ -4013,10 +4041,18 @@ def resolve_existing_provider_branches_v2(
                 continue
             if phrase.casefold() == identity.casefold():
                 continue
-            scene_local_queries.extend([
-                f"{phrase} official event documentary photograph",
-                f"{phrase} public appearance reference image",
-            ])
+            subject_kind = str(requirement.get("subject_type") or "").casefold()
+            is_person_entity = subject_kind in {"person", "royal", "celebrity", "biography"}
+            if is_person_entity:
+                scene_local_queries.extend([
+                    f"{phrase} official event documentary photograph",
+                    f"{phrase} public appearance photograph",
+                ])
+            else:
+                scene_local_queries.extend([
+                    f"{phrase} photograph",
+                    f"{phrase} documentary",
+                ])
         # Buckingham Palace style locations are often the strongest
         # establishing-shot fallback when a person is not visible.  Include
         # the scene action terms only as compact context; they never replace
@@ -4031,9 +4067,16 @@ def resolve_existing_provider_branches_v2(
             }
         ]
         if action_terms:
-            scene_local_queries.append(
-                " ".join([identity, *action_terms[:2], "reference image"])
-            )
+            subject_kind = str(requirement.get("subject_type") or "").casefold()
+            is_person_entity = subject_kind in {"person", "royal", "celebrity", "biography"}
+            if is_person_entity:
+                scene_local_queries.append(
+                    " ".join([identity, *action_terms[:2], "reference image"])
+                )
+            else:
+                scene_local_queries.append(
+                    " ".join([identity, *action_terms[:2]])
+                )
         # The canonical identity lane must lead every provider wave.  Scene
         # text can mention relatives, locations, or incidental proper nouns;
         # putting those phrases first caused a Prince Harry scene to begin

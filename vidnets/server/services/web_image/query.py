@@ -563,6 +563,9 @@ _WEAK_SINGLE_SUBJECTS = {
     "iran", "usa", "us", "canada", "mexico", "qatar", "argentina", "senegal",
     "welcome", "message", "tel", "aviv", "ivory", "coast", "cape", "verde",
     "saudi", "arabia", "algeria", "tunisia",
+    "snow", "covers", "throws", "pulls", "gauges", "temperatures", "temperature",
+    "inside", "outside", "cold", "start", "starting", "procedure", "members", "crew",
+    "minute", "minutes", "hours", "they", "he", "she", "massive",
 }
 
 _QUERY_LEAK_TERMS = {
@@ -968,8 +971,14 @@ def _should_switch_topic_subject(candidate: str, main_subject: str, scene_text: 
         "rms", "hms", "uss", "mv", "ss", "titanic", "ship", "ships",
         "liner", "vessel", "ferry", "steamship", "airship", "submarine",
     }
+    _RAIL_ANCHOR_TERMS = {
+        "locomotive", "locomotives", "train", "trains", "railway", "railroad",
+        "sd70ace", "diesel", "freight", "engine",
+    }
     main_tokens = set(re.findall(r"[a-z0-9]+", main_lower)) | {main_lower}
     if main_tokens & _VESSEL_ANCHOR_TERMS:
+        return False
+    if (main_tokens & _RAIL_ANCHOR_TERMS) and not (set(re.findall(r"[a-z0-9]+", str(candidate).lower())) & (_RAIL_ANCHOR_TERMS | {"cab", "switch", "pump", "prime", "mover", "cabinet", "starter", "air", "gauges", "rail yard"})):
         return False
     main_words = [w for w in re.findall(r"[a-z0-9]+", main_lower) if w not in STOPWORDS]
     candidate_words = [w for w in re.findall(r"[a-z0-9]+", str(candidate).lower()) if w not in STOPWORDS]
@@ -1269,6 +1278,9 @@ _NON_NAME_WORDS = {
 _WEAK_SUBJECT_PHRASES = {
     "quietly pulled", "country quietly", "nation quietly", "pulled fans",
     "country pulled", "fans quietly", "didn lose", "didn fail",
+    "snow covers", "snow cover", "throws the", "throws primary", "gauges sweep",
+    "temperatures drop", "temperature drops", "crew members", "climb aboard",
+    "cold start", "cold procedure", "massive cylinder",
 }
 
 
@@ -2055,9 +2067,9 @@ def _generate_queries_mechanical(script: str, title: str, scene_texts: List[str]
                 ]
             elif entity_kind == "object":
                 fallback_queries = [
-                    f"{active_subject} product photograph",
-                    f"{active_subject} detail photo",
-                    f"{active_subject} reference image",
+                    f"{active_subject} documentary photograph",
+                    f"{active_subject} archival photo",
+                    f"{active_subject} photograph",
                 ]
             elif entity_kind == "food":
                 fallback_queries = [
@@ -2110,9 +2122,9 @@ def _generate_queries_mechanical(script: str, title: str, scene_texts: List[str]
                     ]
                 elif entity_kind == "object":
                     extra_fallbacks = [
-                        f"{active_subject} detail photo",
-                        f"{active_subject} product photograph",
-                        f"{active_subject} official reference image",
+                        f"{active_subject} documentary photograph",
+                        f"{active_subject} archival photo",
+                        f"{active_subject} photograph",
                     ]
                 elif entity_kind == "food":
                     extra_fallbacks = [
@@ -2166,7 +2178,7 @@ def _generate_queries_mechanical(script: str, title: str, scene_texts: List[str]
                         [f"{active_subject} landmark photograph", f"{active_subject} location photo", f"{active_subject} travel photograph"]
                         if entity_kind == "place"
                         else (
-                            [f"{active_subject} product photograph", f"{active_subject} detail photo", f"{active_subject} reference image"]
+                            [f"{active_subject} documentary photograph", f"{active_subject} archival photo", f"{active_subject} photograph"]
                             if entity_kind == "object"
                             else (
                                 [f"{active_subject} food photograph", f"{active_subject} fresh produce photo", f"{active_subject} recipe ingredient photograph"]

@@ -404,16 +404,35 @@ class VisualDecisionContext:
             or os.environ.get("VIDZEO_OPENROUTER_API_KEY")
             or ""
         ).strip()
-        raw_enabled = config.get("visual_understanding")
-        if raw_enabled is None:
-            enabled = bool(key) or _as_bool(os.environ.get("VIDZEO_VISUAL_UNDERSTANDING", "1"))
+        from ..job_context import current_job
+        cur = current_job()
+        is_external_agent = (
+            str(config.get("llm_provider") or "").strip().lower() == "external_agent"
+            or str(cur.get("llm_provider") or "").strip().lower() == "external_agent"
+            or str(key).startswith("external-agent:")
+        )
+        if is_external_agent:
+            from ..agent_bridge import AGENT_HANDLE, AGENT_MODEL
+            agent_owner = str(
+                config.get("agent_owner_id")
+                or cur.get("agent_owner_id")
+                or (key[len(AGENT_HANDLE):] if str(key).startswith(AGENT_HANDLE) else "")
+                or "local-user"
+            ).strip()
+            key = AGENT_HANDLE + agent_owner
+            model = AGENT_MODEL
+            enabled = True
         else:
-            enabled = _as_bool(raw_enabled)
-        model = str(
-            config.get("qwen_vision_model")
-            or os.environ.get("VIDZEO_QWEN_VISION_MODEL")
-            or DEFAULT_QWEN_VISION_MODEL
-        ).strip() or DEFAULT_QWEN_VISION_MODEL
+            raw_enabled = config.get("visual_understanding")
+            if raw_enabled is None:
+                enabled = bool(key) or _as_bool(os.environ.get("VIDZEO_VISUAL_UNDERSTANDING", "1"))
+            else:
+                enabled = _as_bool(raw_enabled)
+            model = str(
+                config.get("qwen_vision_model")
+                or os.environ.get("VIDZEO_QWEN_VISION_MODEL")
+                or DEFAULT_QWEN_VISION_MODEL
+            ).strip() or DEFAULT_QWEN_VISION_MODEL
         count = max(1, int(scene_count or 1))
         required_raw = config.get("visual_required")
         if required_raw is None:
@@ -599,12 +618,12 @@ class VisualDecisionContext:
             call_max_attempts=call_max_attempts,
             fast_mode=fast_mode,
         )
-        if enabled and not key:
+        if enabled and not key and not is_external_agent:
             context.degraded_reason = "missing_openrouter_key"
         return context
 
     def get_client(self) -> Optional[_ContextClient]:
-        if not self.enabled or not self.api_key or self.degraded_reason:
+        if not self.enabled or not self.api_key or (self.degraded_reason and not str(self.api_key).startswith("external-agent:")):
             return None
         with self._lock:
             if self._client is None:

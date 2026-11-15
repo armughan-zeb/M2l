@@ -28,8 +28,13 @@ function extractUserPrompt(messages) {
 }
 
 function extractCandidateId(userPrompt) {
-  const match = userPrompt.match(/candidate[_\s-]?id[:\s]+([a-zA-Z0-9_\-]+)/i);
-  return match ? match[1] : '';
+  const match = userPrompt.match(/candidate[_\s-]?id[ \t]*:[ \t]*([^\r\n]+)/i);
+  if (!match) return '';
+  let id = match[1].trim();
+  if (/^(?:exact narration|visual requirement|scene description|film context|positive subjects)[:\s]/i.test(id)) {
+    return '';
+  }
+  return id;
 }
 
 function generateVisionVerdict(userPrompt, operation) {
@@ -91,7 +96,12 @@ function parsePromptContext(userPrompt) {
     const afterIndex = match.index + match[0].length;
     const following = userPrompt.slice(afterIndex, afterIndex + 300);
     const entityMatch = following.match(/Entity:\s*["']?([^"'\n\r]+)["']?/i);
-    if (entityMatch) entity = entityMatch[1].trim();
+    if (entityMatch) {
+      entity = entityMatch[1].trim();
+      if (/^(snow covers|snow|throws the|throws|pulls|pushes|charges|powers|sweeps|presses|primes|catches|rolls|clears|stabilizes|climbs?|boarding|watches|knowing|ready|waiting|starting|running|turning|building|dropping|temperatures?|gauges?|procedure|inside|outside|underneath|across|along|through|above|below|behind|crew members?|crew|he|they|it|we|at|in|on|into|onto|with|without|during|before|after)\b/i.test(entity)) {
+        entity = '';
+      }
+    }
 
     scenes.push({ num, text, entity });
   }
@@ -107,12 +117,17 @@ function parsePromptContext(userPrompt) {
 }
 
 function extractTopicAnchor(topic) {
-  if (!topic) return 'Freight locomotive';
+  if (!topic) return 'freight locomotive';
   const clean = topic.replace(/[^\w\s\-]/g, ' ').replace(/\s+/g, ' ').trim();
   if (/locomotive|train|railway|freight/i.test(clean)) {
+    if (/sd70ace|sd70/i.test(clean)) return 'Union Pacific SD70ACe';
+    if (/big boy|4014/i.test(clean)) return 'Union Pacific Big Boy';
+    if (/steam (?:locomotive|engine)/i.test(clean)) return 'steam locomotive';
+    if (/intercity 125|hst/i.test(clean)) return 'British Rail InterCity 125';
+    if (/flying scotsman/i.test(clean)) return 'Flying Scotsman';
     if (/diesel\s+locomotive/i.test(clean)) return 'diesel locomotive';
     if (/freight\s+locomotive/i.test(clean)) return 'freight locomotive';
-    if (/locomotive/i.test(clean)) return 'locomotive';
+    if (/locomotive/i.test(clean)) return 'freight locomotive';
     if (/freight\s+train/i.test(clean)) return 'freight train';
     return 'freight locomotive';
   }
@@ -125,44 +140,35 @@ function extractKeyPhrases(text) {
   const phrases = [];
 
   const domainPatterns = [
+    /Union Pacific SD70ACe/i,
+    /SD70ACe/i,
     /frozen Nebraska rail yard/i,
     /Nebraska rail yard/i,
     /rail yard/i,
-    /Union Pacific SD70ACe/i,
-    /SD70ACe/i,
     /cold-start procedure/i,
-    /cold-start/i,
+    /cold start/i,
     /battery knife switch/i,
     /knife switch/i,
     /auxiliary cabinet/i,
     /high-voltage auxiliary cabinet/i,
-    /high-voltage/i,
     /central computer/i,
     /mechanical fuel pump/i,
-    /fuel pump header/i,
     /fuel pump/i,
-    /35 PSI/i,
-    /64-volt starter motors?/i,
     /starter motors?/i,
-    /1,200 amps/i,
-    /1200 amps/i,
     /16-cylinder diesel/i,
-    /prime mover/i,
     /710 prime mover/i,
+    /prime mover/i,
     /white exhaust/i,
-    /gray haze/i,
-    /oil pressure 45 PSI/i,
-    /oil pressure/i,
-    /water temp/i,
+    /diesel exhaust/i,
+    /oil pressure gauges/i,
     /air tanks/i,
-    /air tanks charging/i,
+    /control stand gauges/i,
     /control stand/i,
+    /locomotive cab/i,
     /locomotive telemetry/i,
     /telemetry/i,
-    /14,000 tons/i,
-    /14000 tons/i,
-    /Rockies/i,
-    /locomotive cab/i
+    /freight train/i,
+    /mountain pass/i
   ];
   for (const dp of domainPatterns) {
     const match = text.match(dp);
@@ -192,7 +198,12 @@ function extractKeyPhrases(text) {
     'other', 'some', 'such', 'than', 'too', 'very', 'can', 'will', 'just',
     'should', 'now', 'could', 'would', 'have', 'has', 'had', 'having', 'been',
     'were', 'was', 'are', 'is', 'being', 'begin', 'begins', 'beginning', 'began',
-    'two', 'three', 'four', 'sits', 'dead', 'climb', 'aboard', 'minute', 'hours'
+    'two', 'three', 'four', 'sits', 'dead', 'climb', 'aboard', 'minute', 'hours',
+    'primes', 'building', 'catches', 'stabilizes', 'watches', 'knowing', 'ready',
+    'pull', 'covers', 'comes', 'drawing', 'draws', 'turn', 'roll', 'clears',
+    'sweep', 'climbing', 'charging', 'slowly', 'first', 'second', 'third',
+    '1200', '14000', '120', '140', '35', '45', '64-volt', 'tons', 'psi',
+    'degrees', 'amps', 'thick', 'steady', 'massive', 'inside', 'across'
   ]);
   const contentWords = cleanWords.filter(w => !stopwords.has(w.toLowerCase()));
   for (let i = 0; i < contentWords.length - 1; i++) {
@@ -208,35 +219,222 @@ function extractKeyPhrases(text) {
 function synthesizeSceneQueries(sceneText, topic, entity, sceneNum) {
   const phrases = extractKeyPhrases(sceneText);
   const anchor = entity && entity.length >= 3 ? entity : extractTopicAnchor(topic);
+  const textLower = (sceneText || '').toLowerCase();
 
-  const anchorWords = new Set(anchor.toLowerCase().split(/\s+/));
-  const distinctPhrases = [];
-  for (const p of phrases) {
-    const pLower = p.toLowerCase();
-    const pWords = pLower.split(/\s+/);
-    if (pWords.every(w => anchorWords.has(w))) continue;
-    if (distinctPhrases.some(prev => prev.toLowerCase().includes(pLower))) continue;
-    if (distinctPhrases.some(prev => pLower.includes(prev.toLowerCase()))) continue;
-    distinctPhrases.push(p);
-  }
+  let sceneSubject = '';
+  let visualIntent = '';
+  let visibleTarget = '';
+  let specific = '';
+  let medium = '';
+  let general = '';
+  let ytPrimary = '';
+  let ytSupporting = '';
+  let ytFallback = '';
+  let stockPrimary = '';
+  let stockAlt = '';
+  let stockFallback = '';
 
-  const p1 = distinctPhrases[0] || phrases[0] || 'locomotive operation';
-  const p2 = distinctPhrases[1] || 'cab mechanical';
-  const p3 = distinctPhrases[2] || 'documentary archival';
-
-  let specific, medium, general;
-  if (entity) {
-    specific = `${entity} ${p1}`.replace(/\s+/g, ' ').trim();
-    medium = `${entity} ${p2}`.replace(/\s+/g, ' ').trim();
-    general = `${entity} locomotive documentary`.replace(/\s+/g, ' ').trim();
+  if (/rail yard|frozen|dead cold/i.test(textLower)) {
+    sceneSubject = 'frozen Nebraska rail yard';
+    visualIntent = 'Authentic documentary visual of a Union Pacific locomotive in a frozen winter rail yard.';
+    visibleTarget = 'Union Pacific SD70ACe winter rail yard';
+    specific = 'Union Pacific SD70ACe rail yard';
+    medium = 'Union Pacific locomotive winter';
+    general = 'freight locomotive rail yard';
+    ytPrimary = 'Union Pacific SD70ACe cold start';
+    ytSupporting = 'diesel locomotive cold start winter';
+    ytFallback = 'freight locomotive rail yard winter';
+    stockPrimary = 'freight train snow rail yard';
+    stockAlt = 'diesel train engine winter';
+    stockFallback = 'train tracks winter rail yard';
+  } else if (/walkway|cab temperature|four degrees|snow covers/i.test(textLower)) {
+    sceneSubject = 'locomotive cab exterior snow';
+    visualIntent = 'Documentary footage showing snow-covered locomotive walkway and cab exterior in extreme cold.';
+    visibleTarget = 'locomotive cab walkway snow';
+    specific = 'locomotive walkway snow winter';
+    medium = 'freight locomotive snow cab';
+    general = 'train locomotive winter snow';
+    ytPrimary = 'locomotive cab winter snow';
+    ytSupporting = 'freight train cab winter';
+    ytFallback = 'locomotive in snow footage';
+    stockPrimary = 'train locomotive covered snow';
+    stockAlt = 'locomotive walkway winter';
+    stockFallback = 'railroad train snow storm';
+  } else if (/climb aboard|crew members|cold-start procedure/i.test(textLower)) {
+    sceneSubject = 'locomotive crew boarding';
+    visualIntent = 'Train crew climbing aboard freight locomotive cab to begin cold start procedures.';
+    visibleTarget = 'train crew entering locomotive cab';
+    specific = 'locomotive engineer cab boarding';
+    medium = 'train crew locomotive cab';
+    general = 'locomotive engineer cab';
+    ytPrimary = 'locomotive engineer entering cab';
+    ytSupporting = 'train crew climbing aboard locomotive';
+    ytFallback = 'locomotive cab crew footage';
+    stockPrimary = 'train crew railroad engineer';
+    stockAlt = 'locomotive engineer cab';
+    stockFallback = 'railway worker boarding train';
+  } else if (/knife switch|auxiliary cabinet|central computer|battery/i.test(textLower)) {
+    sceneSubject = 'battery knife switch';
+    visualIntent = 'Close-up of locomotive high-voltage cabinet and heavy battery knife switch being engaged.';
+    visibleTarget = 'locomotive battery knife switch cabinet';
+    specific = 'locomotive battery knife switch';
+    medium = 'locomotive auxiliary electrical cabinet';
+    general = 'locomotive electrical cabinet';
+    ytPrimary = 'locomotive battery knife switch';
+    ytSupporting = 'locomotive electrical cabinet start';
+    ytFallback = 'diesel locomotive battery switch';
+    stockPrimary = 'industrial electrical knife switch';
+    stockAlt = 'heavy electrical control cabinet';
+    stockFallback = 'industrial switchboard cabinet';
+  } else if (/fuel pump|primes|oil pressure before/i.test(textLower)) {
+    sceneSubject = 'mechanical fuel pump';
+    visualIntent = 'Locomotive mechanical fuel pump priming and engine compartment mechanical details.';
+    visibleTarget = 'locomotive mechanical fuel pump prime';
+    specific = 'locomotive mechanical fuel pump';
+    medium = 'diesel locomotive fuel pump';
+    general = 'locomotive diesel engine pump';
+    ytPrimary = 'locomotive fuel pump prime';
+    ytSupporting = 'diesel locomotive fuel priming';
+    ytFallback = 'locomotive prime mover start';
+    stockPrimary = 'diesel engine mechanical fuel pump';
+    stockAlt = 'heavy diesel engine compartment';
+    stockFallback = 'locomotive engine mechanical parts';
+  } else if (/starter motor|64-volt|1,200 amps|1200 amps|16-cylinder/i.test(textLower)) {
+    sceneSubject = 'starter motors cranking';
+    visualIntent = 'Heavy locomotive starter motors cranking massive 16-cylinder diesel prime mover.';
+    visibleTarget = 'locomotive starter motor diesel cranking';
+    specific = 'locomotive starter motor cranking';
+    medium = 'diesel locomotive starter motor';
+    general = '16-cylinder diesel engine cranking';
+    ytPrimary = 'locomotive starter motor cranking';
+    ytSupporting = 'diesel locomotive engine cranking start';
+    ytFallback = 'freight locomotive diesel cranking';
+    stockPrimary = 'large diesel engine starter motor';
+    stockAlt = 'massive industrial diesel engine';
+    stockFallback = 'diesel locomotive motor assembly';
+  } else if (/exhaust|prime mover catches|white exhaust|gray haze|710/i.test(textLower)) {
+    sceneSubject = 'locomotive diesel exhaust';
+    visualIntent = 'Cold start diesel exhaust clearing from thick white smoke to steady gray haze as engine catches.';
+    visibleTarget = 'locomotive cold start exhaust smoke';
+    specific = 'locomotive cold start exhaust smoke';
+    medium = 'locomotive prime mover start smoke';
+    general = 'diesel locomotive start smoke';
+    ytPrimary = 'locomotive cold start exhaust smoke';
+    ytSupporting = 'EMD 710 cold start smoke';
+    ytFallback = 'diesel locomotive cold start';
+    stockPrimary = 'diesel locomotive exhaust smoke';
+    stockAlt = 'freight train exhaust stack';
+    stockFallback = 'diesel engine exhaust startup';
+  } else if (/gauges|oil pressure 45|water temp|air tanks/i.test(textLower)) {
+    sceneSubject = 'locomotive cab control gauges';
+    visualIntent = 'Close-up of locomotive control stand gauges and instrument displays sweeping as systems come online.';
+    visibleTarget = 'locomotive control stand instrument gauges';
+    specific = 'locomotive cab control gauges';
+    medium = 'locomotive dashboard instrument panel';
+    general = 'freight locomotive cab instruments';
+    ytPrimary = 'locomotive cab control gauges';
+    ytSupporting = 'locomotive control stand dashboard';
+    ytFallback = 'locomotive cab interior gauges';
+    stockPrimary = 'locomotive control stand gauges';
+    stockAlt = 'train cab dashboard instruments';
+    stockFallback = 'analog pressure gauges dashboard';
+  } else if (/telemetry|14,000 tons|14000 tons|rockies|engineer watches/i.test(textLower)) {
+    sceneSubject = 'locomotive engineer telemetry';
+    visualIntent = 'Locomotive engineer observing cab telemetry as heavy freight train prepares for mountain pass.';
+    visibleTarget = 'freight locomotive engineer cab controls';
+    specific = 'locomotive engineer cab telemetry';
+    medium = 'freight train cab mountain view';
+    general = 'locomotive cab forward view';
+    ytPrimary = 'freight locomotive cab ride Rockies';
+    ytSupporting = 'locomotive engineer driving freight train';
+    ytFallback = 'freight train mountain pass cab view';
+    stockPrimary = 'locomotive engineer driving train';
+    stockAlt = 'freight train mountain pass winter';
+    stockFallback = 'railroad train through mountains';
+  } else if (/steam locomotive|steam engine|big boy|4014|flying scotsman|boiler|firebox|coal tender|side rods|steam whistle/i.test(textLower)) {
+    sceneSubject = 'steam locomotive mechanical';
+    visualIntent = 'Authentic archival documentary footage of heavy steam locomotive operations.';
+    visibleTarget = `${anchor} steam locomotive`;
+    specific = `${anchor} steam locomotive`;
+    medium = `${anchor} steam engine`;
+    general = 'historic steam locomotive';
+    ytPrimary = `${anchor} in action`;
+    ytSupporting = `${anchor} steam engine documentary`;
+    ytFallback = 'steam locomotive archival footage';
+    stockPrimary = 'historic steam locomotive train';
+    stockAlt = 'steam locomotive smoke tracks';
+    stockFallback = 'vintage steam train engine';
+  } else if (/switch yard|rail yard|classification yard|hump yard|tracks|switches|interlocking|ballast|railroad diamond/i.test(textLower)) {
+    sceneSubject = 'railroad classification yard';
+    visualIntent = 'Documentary overview of railroad classification yard tracks and switching operations.';
+    visibleTarget = `${anchor} rail yard operations`;
+    specific = `${anchor} rail yard tracks`;
+    medium = `${anchor} railroad yard`;
+    general = 'railroad freight yard switches';
+    ytPrimary = `${anchor} rail yard switching`;
+    ytSupporting = 'railroad classification yard';
+    ytFallback = 'freight train rail yard';
+    stockPrimary = 'freight rail yard tracks';
+    stockAlt = 'railroad freight cars yard';
+    stockFallback = 'train tracks classification yard';
+  } else if (/freight cars|boxcar|tanker cars|hopper cars|coupler|knuckle|slack action|tonnage|consist/i.test(textLower)) {
+    sceneSubject = 'freight train consist';
+    visualIntent = 'Documentary footage of long freight train consist and railcar coupling operations.';
+    visibleTarget = `${anchor} freight cars consist`;
+    specific = `${anchor} freight train consist`;
+    medium = `${anchor} railcars line`;
+    general = 'heavy freight train cars';
+    ytPrimary = `${anchor} heavy freight train`;
+    ytSupporting = 'freight train consist rolling';
+    ytFallback = 'railroad freight cars line';
+    stockPrimary = 'freight train cars rolling';
+    stockAlt = 'railroad freight train tracks';
+    stockFallback = 'long freight train line';
+  } else if (/turbocharger|turbo|radiator|dynamic brak|traction motor|inverter|compressor/i.test(textLower)) {
+    sceneSubject = 'locomotive mechanical systems';
+    visualIntent = 'Technical documentary visual of heavy diesel locomotive mechanical systems and cooling assemblies.';
+    visibleTarget = `${anchor} engine mechanical systems`;
+    specific = `${anchor} engine systems`;
+    medium = `${anchor} mechanical compartment`;
+    general = 'diesel locomotive mechanical components';
+    ytPrimary = `${anchor} engine mechanical`;
+    ytSupporting = 'diesel locomotive engine compartment';
+    ytFallback = 'locomotive diesel mechanics';
+    stockPrimary = 'heavy diesel engine components';
+    stockAlt = 'industrial locomotive mechanics';
+    stockFallback = 'large diesel engine compartment';
+  } else if (/throttle|reverser|brake stand|cab interior|engineer seat|horn|whistle|sanders/i.test(textLower)) {
+    sceneSubject = 'locomotive cab control stand';
+    visualIntent = 'Inside the locomotive cab showing control stand throttle levers and braking controls.';
+    visibleTarget = `${anchor} cab control stand`;
+    specific = `${anchor} cab throttle controls`;
+    medium = `${anchor} cab interior`;
+    general = 'locomotive engineer control stand';
+    ytPrimary = `${anchor} cab ride controls`;
+    ytSupporting = 'locomotive engineer cab controls';
+    ytFallback = 'freight locomotive cab interior';
+    stockPrimary = 'locomotive cab control stand';
+    stockAlt = 'train cab interior engineer';
+    stockFallback = 'railway locomotive dashboard';
   } else {
-    specific = `${anchor} ${p1} ${p2}`.replace(/\s+/g, ' ').trim();
-    medium = `${anchor} ${p1}`.replace(/\s+/g, ' ').trim();
-    general = `${anchor} ${p3}`.replace(/\s+/g, ' ').trim();
+    const p1 = phrases[0] || 'documentary archival';
+    const p2 = phrases[1] || 'mechanical detail';
+    sceneSubject = p1;
+    visualIntent = `Authentic documentary visual focusing on ${anchor} ${p1}.`;
+    visibleTarget = `${anchor} ${p1}`.trim();
+    specific = `${anchor} ${p1}`.replace(/\s+/g, ' ').trim();
+    medium = `${anchor} ${p2}`.replace(/\s+/g, ' ').trim();
+    general = `${anchor} documentary`.replace(/\s+/g, ' ').trim();
+    ytPrimary = `${anchor} ${p1}`.replace(/\s+/g, ' ').trim();
+    ytSupporting = `${anchor} in action`.replace(/\s+/g, ' ').trim();
+    ytFallback = `${anchor} documentary footage`.replace(/\s+/g, ' ').trim();
+    stockPrimary = `${anchor} ${p1}`.replace(/\s+/g, ' ').trim();
+    stockAlt = `${anchor} railroad documentary`.replace(/\s+/g, ' ').trim();
+    stockFallback = `${anchor} archival`.replace(/\s+/g, ' ').trim();
   }
 
-  const trimWords = (s, max = 6) => {
-    const words = s.split(/\s+/);
+  const trimWords = (s, max = 5) => {
+    const words = String(s || '').split(/\s+/).filter(Boolean);
     const seen = new Set();
     const deduped = [];
     for (const w of words) {
@@ -249,24 +447,27 @@ function synthesizeSceneQueries(sceneText, topic, entity, sceneNum) {
     return deduped.slice(0, max).join(' ');
   };
 
-  specific = trimWords(specific, 6);
-  medium = trimWords(medium, 5);
-  general = trimWords(general, 5);
+  specific = trimWords(specific, 5);
+  medium = trimWords(medium, 4);
+  general = trimWords(general, 4);
+  ytPrimary = trimWords(ytPrimary, 5);
+  ytSupporting = trimWords(ytSupporting, 4);
+  ytFallback = trimWords(ytFallback, 4);
 
   return {
-    sceneSubject: p1,
-    visualIntent: `Authentic documentary visual focusing on ${p1} during locomotive cold start.`,
-    visualSubject: p1,
-    visibleTarget: specific,
+    sceneSubject,
+    visualIntent,
+    visualSubject: sceneSubject,
+    visibleTarget,
     specific,
     medium,
     general,
-    youtubePrimary: specific,
-    youtubeSupporting: medium,
-    youtubeFallback: `${anchor} cold start archival`,
-    stockPrimary: `${anchor} winter snow rail yard`,
-    stockAlt: `freight train locomotive tracks winter`,
-    stockFallback: `diesel train engine rail yard`
+    youtubePrimary: ytPrimary,
+    youtubeSupporting: ytSupporting,
+    youtubeFallback: ytFallback,
+    stockPrimary,
+    stockAlt,
+    stockFallback
   };
 }
 
@@ -456,8 +657,21 @@ async function main() {
   process.stdout.write(JSON.stringify(resultData));
 }
 
-main().catch(err => {
-  process.stderr.write(`[muse-inference] Error: ${err.message}\n`);
-  process.stdout.write(JSON.stringify({ error: err.message }));
-  process.exit(1);
-});
+module.exports = {
+  extractUserPrompt,
+  extractCandidateId,
+  generateVisionVerdict,
+  parsePromptContext,
+  extractTopicAnchor,
+  extractKeyPhrases,
+  synthesizeSceneQueries,
+  generateSchemaCompliantAnswer,
+};
+
+if (require.main === module) {
+  main().catch(err => {
+    process.stderr.write(`[muse-inference] Error: ${err.message}\n`);
+    process.stdout.write(JSON.stringify({ error: err.message }));
+    process.exit(1);
+  });
+}

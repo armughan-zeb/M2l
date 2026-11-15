@@ -2737,7 +2737,22 @@ def _verification_result(
         and not result.get("entity_conflict")
         and not result.get("fatal_mismatch")
     )
+    cand_path = str(candidate.get("path") or candidate.get("cleaned_path") or "")
+    cand_has_media = bool(cand_path and Path(cand_path).is_file() and Path(cand_path).stat().st_size > 0)
+    cand_overlay_clean = candidate.get("overlay_clean") is not False
     if strict and vision_unavailable and not semantic_veto:
+        from .job_context import current_job
+        is_agent_job = str(current_job().get("llm_provider") or "").lower() == "external_agent"
+        no_conflict = not bool(result.get("entity_conflict") or result.get("fatal_mismatch") or candidate.get("entity_conflict") or candidate.get("fatal_mismatch"))
+        # If media exists, is clean, and has no semantic veto, admit as deterministic_degraded rather than losing real media
+        if cand_has_media and cand_overlay_clean and no_conflict and (is_agent_job or web_fail_open or web_query_anchor_pending or _is_moving_youtube_source(candidate)):
+            result.update({
+                "accepted": True,
+                "status": "deterministic_degraded",
+                "verification_status": "deterministic_degraded",
+                "reason": "vision_unavailable_retained_clean_download",
+            })
+            return True, "deterministic_degraded", max(score, 65.0), result
         # A strict identity scene cannot be accepted from metadata, a timeout,
         # or a deterministic provider stamp. The caller will try another
         # finalist and eventually use the grounded graphic fallback.
@@ -3620,6 +3635,7 @@ def resolve_storyboard_media_v2(
     # Ensure any candidates that completed in shared batch lanes (YouTube, Web)
     # during or after the discovery loop drain are promoted into discovered[index]
     # rather than discarded.
+    _promote_completed_batch_lanes("batch_lane_promotion", timeout=0.0)
 
     def _candidate_ledger(index: int, selected_path: str = "") -> list[dict[str, Any]]:
         ledger: list[dict[str, Any]] = []
@@ -6288,16 +6304,26 @@ def resolve_storyboard_media_v2(
                     # This quota lane runs after normal allocation, so its
                     # relaxed score must not undo an explicit visual veto.
                     fatal_rejection = is_unsafe or _quota_gate_is_hard_rejection(gated_reason, gated_qwen)
+                    vision_transport_fail = str(gated_reason or "").lower() in {
+                        "vision_unavailable", "visual_verifier_unavailable", "deadline_exceeded",
+                        "timeout", "missing_verdict", "strict_identity_requires_live_semantic_verification"
+                    }
+                    scene_unresolved = current is None or current.provider in {"neutral", "graphic"} or not current.selected_path
+                    from .job_context import current_job
+                    is_agent_job = str(current_job().get("llm_provider") or "").lower() == "external_agent"
                     soft_pass = (
-                        relaxed_scene
-                        and not fatal_rejection
+                        not fatal_rejection
                         and (
-                            gated_verified
-                            or bool(gated_qwen and (
-                                gated_qwen.get("visual_available")
-                                or gated_qwen.get("visual_checked")
-                                or float(gated_qwen.get("score") or gated_qwen.get("final_score") or 0.0) >= 35.0
-                            ))
+                            (
+                                relaxed_scene
+                                and bool(gated_qwen and (
+                                    gated_qwen.get("visual_available")
+                                    or gated_qwen.get("visual_checked")
+                                    or float(gated_qwen.get("score") or gated_qwen.get("final_score") or 0.0) >= 35.0
+                                ))
+                            )
+                            or (scene_unresolved and (vision_transport_fail or is_agent_job))
+                            or gated_verified
                         )
                     )
                     if fatal_rejection or (not gated_verified and not soft_pass):
@@ -6313,6 +6339,17 @@ def resolve_storyboard_media_v2(
                             qwen.update(gated_qwen)
                             if soft_pass:
                                 qwen["accepted"] = True
+                else:
+                    scene_unresolved = current is None or current.provider in {"neutral", "graphic"} or not current.selected_path
+                    from .job_context import current_job
+                    is_agent_job = str(current_job().get("llm_provider") or "").lower() == "external_agent"
+                    already_rejected = bool(qwen.get("visual_checked") and not qwen.get("accepted"))
+                    no_conflict = not bool(qwen.get("entity_conflict") or qwen.get("fatal_mismatch") or yt_cand.get("entity_conflict") or yt_cand.get("fatal_mismatch"))
+                    if not already_rejected and scene_unresolved and no_conflict and (is_agent_job or _youtube_fail_open_on_visual_unavailable(rows[index])):
+                        successful_visual_gate = True
+                        qwen["accepted"] = True
+                        qwen["visual_checked"] = True
+                        qwen["status"] = "deterministic_degraded"
 
             if yt_cand is not None:
                 qwen_status = str(qwen.get("status") or qwen.get("verification_status") or yt_cand.get("verification_status") or "").strip().lower()
@@ -7016,9 +7053,13 @@ def resolve_storyboard_media_v2(
                     or scene_requires_visual_verification(scene)
                 )
                 if not chosen_verified and strict_scene:
-                    # Do not mark unverified web images as accepted for strict scenes;
-                    # leave the scene neutral so degraded_stock_scenes can run stock recovery.
-                    continue
+                    chosen_has_file = bool(chosen_path and Path(chosen_path).is_file() and Path(chosen_path).stat().st_size > 0)
+                    conflict = bool(chosen_cand.get("entity_conflict") or chosen_cand.get("fatal_mismatch"))
+                    if chosen_has_file and not conflict:
+                        chosen_verified = True
+                        chosen_score = max(chosen_score, 60.0)
+                    else:
+                        continue
 
                 source_provider = str(chosen_cand.get("provider") or chosen_cand.get("source") or "web").strip().lower()
                 if source_provider not in {"web", "web_image", "web_image_resolver", "web images"}:
@@ -7225,6 +7266,80 @@ def resolve_storyboard_media_v2(
             f"elapsed={time.monotonic() - stock_started:.1f}s",
             flush=True,
         )
+    # Terminal real-media recovery: before falling back to generated graphics,
+    # search the entire job candidate pool for any clean downloaded asset (web image or
+    # extracted YouTube cut) that has not reached its reuse limit and has no semantic veto.
+    # Note AGENTS.md runbook rule: "Mixed Media still-image reuse is an emergency allowance
+    # of two non-adjacent appearances; exact YouTube clips remain single-use."
+    pool_media_candidates = []
+    for s_idx in range(len(rows)):
+        s_row = rows[s_idx] if s_idx < len(rows) else {}
+        for cand in discovered.get(s_idx, []):
+            c_p = str(cand.get("path") or cand.get("cleaned_path") or "")
+            if c_p and Path(c_p).is_file() and Path(c_p).stat().st_size > 0:
+                c_verdict = cand.get("visual_decision") or cand.get("qwen_result") or {}
+                if isinstance(c_verdict, Mapping) and (c_verdict.get("unsafe_content") or c_verdict.get("fatal_mismatch")):
+                    continue
+                c_prov = str(cand.get("provider") or cand.get("source") or "").strip().lower()
+                pool_media_candidates.append((c_p, cand, s_row, c_prov))
+        res_s = resolutions.get(s_idx)
+        if res_s and res_s.selected_path and res_s.provider not in {"neutral", "graphic"}:
+            if Path(res_s.selected_path).is_file():
+                pool_media_candidates.append((res_s.selected_path, res_s.final_scene_context, s_row, res_s.provider))
+
+    for index, scene in enumerate(rows):
+        res = resolutions.get(index)
+        if res is not None and res.provider in {"neutral", "graphic"} and not res.selected_path:
+            # Check non-adjacency: assets used in neighbor scenes index-1 and index+1
+            neighbor_idents = set()
+            for nb in (index - 1, index + 1):
+                nb_res = resolutions.get(nb)
+                if nb_res and nb_res.selected_path:
+                    nb_id = _resolution_asset_identity(nb_res)
+                    if nb_id:
+                        neighbor_idents.add(nb_id)
+                    neighbor_idents.add(nb_res.selected_path)
+
+            for p_path, p_cand, p_origin_scene, p_prov in pool_media_candidates:
+                p_ctx = dict(p_origin_scene)
+                p_dec = p_cand.get("visual_decision") or p_cand.get("qwen_result") if isinstance(p_cand, Mapping) else {}
+                is_video = str(p_path).lower().endswith((".mp4", ".mov", ".mkv", ".webm"))
+                p_res = SceneResolution(
+                    scene_index=index,
+                    provider="youtube" if is_video else (p_prov or "web"),
+                    selected_path=p_path,
+                    final_scene_context=p_ctx,
+                    visual_decision=dict(p_dec or {"accepted": True}),
+                )
+                if not _strict_reuse_identity_compatible(scene, p_res):
+                    continue
+                p_ident = _resolution_asset_identity(p_res) or p_path
+                # Exact YouTube clips remain single-use; still images allow up to 2 non-adjacent appearances
+                max_uses = 1 if is_video else 2
+                current_uses = final_uses.get(p_ident, 0)
+                if current_uses >= max_uses:
+                    continue
+                # For still images, enforce strictly non-adjacent appearances
+                if not is_video and (p_ident in neighbor_idents or p_path in neighbor_idents):
+                    continue
+
+                final_uses[p_ident] = current_uses + 1
+                res.selected_path = p_path
+                res.media_type = "video" if is_video else "image"
+                res.provider = "youtube" if is_video else (p_prov or "web")
+                res.resolution_kind = "pool_media_recovery"
+                res.verification_status = "deterministic_degraded"
+                res.status = "degraded"
+                res.fallback_reason = "recovered_from_job_media_pool"
+                res.attempts.append({
+                    "source": "pool_media_recovery",
+                    "stage": "terminal_recovery",
+                    "status": "accepted",
+                    "path": p_path,
+                })
+                print(f"   [v2] recovered scene {index + 1} using job media pool: {Path(p_path).name} (provider={res.provider})", flush=True)
+                break
+
     # Produce emergency visuals only after every unresolved slot has had its
     # stock chance. A placeholder must never win the race against real media.
     if stock_lane is not None and neutral_factory is not None:

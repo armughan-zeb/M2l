@@ -858,13 +858,12 @@ def _report_provider_failure(source_name: str, exc: BaseException) -> None:
         status = re.search(r"\b(?:HTTP(?: status)?\s*|status\s*)(\d{3})\b", str(exc), re.I)
         status_code = int(status.group(1)) if status else 0
         is_definitive = (
-            status_code in {401, 403, 404, 410, 429, 451, 500, 502, 503, 504}
+            status_code in {401, 403, 410, 451}
             or "flickr 100" in text
             or any(marker in text for marker in (
                 "bot-gate", "bot check", "bot challenge", "robot check",
-                "smartcaptcha", "captcha", "unparseable json", "vqd token",
-                "invalid api key", "key not found", "unauthorized", "forbidden",
-                "circuit open", "ratelimit", "rate limit"
+                "smartcaptcha", "captcha",
+                "invalid api key", "key not found", "unauthorized", "forbidden"
             ))
         )
         if is_definitive:
@@ -3947,13 +3946,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         # Starting all 12 lanes for every scene/query created hundreds of live
         # requests and left every worker waiting at the shared stage deadline.
         if exhaustive_fallback:
-            # After the primary wave has had first refusal, keep the
-            # secondary tier available for every later query. Restricting it
-            # to exactly query index 1 meant a useful Openverse/Wikimedia row
-            # on the final canonical query was never searched at all.
-            source_rows = list(
-                _FAST_SOURCES[5:] if q_idx > 0 else _FAST_SOURCES[:5]
-            )
+            # The first concrete query fans out to the fast high-recall tier
+            # (_FAST_SOURCES[:5]: Universal, Yandex, Flickr, Bing, DDG);
+            # subsequent variants unlock all enabled fast sources without partitioning
+            # away the primary engines, maximizing real image discovery.
+            source_rows = _FAST_SOURCES[:5] if q_idx == 0 else _enabled_fast_sources()
         else:
             source_rows = _enabled_fast_sources()
         for src_name, src_type in source_rows:
@@ -5488,38 +5485,49 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     break
 
     # Emergency Rescue Fallback:
-    # If all query options failed, run an immediate emergency subject search on Flickr API
-    # to guarantee we find a valid image (e.g. searching "[Subject] portrait", "[Subject] photo", "[Subject]")
+    # If all query options failed, run an immediate emergency subject search across multi-engine
+    # providers to guarantee we find a valid image before considering any graphic fallback.
+    is_strict_person = bool(
+        semantic_requirement
+        and (
+            str(semantic_requirement.get("subject_type") or "").strip().lower() in {"person", "royal", "celebrity"}
+            or str(semantic_requirement.get("domain") or "").strip().lower() in {"person", "royal", "celebrity"}
+        )
+        and bool(semantic_requirement.get("strict_identity"))
+    )
+    rescue_subject = str((semantic_requirement.get("canonical_entity") if semantic_requirement else None) or main_subject or "").strip()
     if (
         selected_candidate is None
-        and main_subject
-        and not semantic_requirement
+        and rescue_subject
+        and not is_strict_person
         and not shared_pool_candidates
         and scene_downloaded_candidates < scene_download_budget
     ):
         if _web_verbose():
-            _web_log(f"scene {idx + 1} trigger EMERGENCY SUBJECT FALLBACK search for subject '{main_subject}'...")
+            _web_log(f"scene {idx + 1} trigger EMERGENCY SUBJECT FALLBACK search for subject '{rescue_subject}'...")
         try:
             from .query import _is_person_fallback_subject, _topic_fallback_queries
         except Exception:
             _is_person_fallback_subject = None
             _topic_fallback_queries = None
-        is_person_subject = bool(_is_person_fallback_subject and _is_person_fallback_subject(main_subject))
-        if is_person_subject and any(w in str(main_subject).lower() for w in ("train", "freight", "locomotive", "railway", "railroad", "diesel", "car", "engine")):
+        is_person_subject = bool(_is_person_fallback_subject and _is_person_fallback_subject(rescue_subject))
+        if is_person_subject and any(w in str(rescue_subject).lower() for w in ("train", "freight", "locomotive", "railway", "railroad", "diesel", "car", "engine")):
             is_person_subject = False
         if is_person_subject:
-            emergency_queries = [f"{main_subject} portrait", f"{main_subject} photo", main_subject]
+            emergency_queries = [f"{rescue_subject} portrait", f"{rescue_subject} photo", rescue_subject]
         else:
             scene_kws = _scene_visual_keywords(scene_text, max_kws=4) if _scene_visual_keywords else []
             emergency_queries = []
             if _topic_fallback_queries:
-                emergency_queries.extend(_topic_fallback_queries(main_subject, scene_text, limit=6))
+                emergency_queries.extend(_topic_fallback_queries(rescue_subject, scene_text, limit=6))
             if len(scene_kws) >= 2:
-                emergency_queries.append(f"{main_subject} {' '.join(scene_kws[:2])}")
+                emergency_queries.append(f"{rescue_subject} {' '.join(scene_kws[:2])}")
             if scene_kws:
-                emergency_queries.append(f"{main_subject} {scene_kws[0]}")
-            if main_subject:
-                emergency_queries.append(main_subject)
+                emergency_queries.append(f"{rescue_subject} {scene_kws[0]}")
+            emergency_queries.append(f"{rescue_subject} photograph")
+            emergency_queries.append(f"{rescue_subject} documentary")
+            if rescue_subject:
+                emergency_queries.append(rescue_subject)
         
         # De-duplicate queries we already tried
         emergency_queries = [eq for eq in emergency_queries if eq.lower() not in [q.lower() for q in queries]]
@@ -5763,27 +5771,47 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     f"(score={duplicate_score:.2f})"
                 )
 
-    # Absolute last resort: try bare main_subject + generic suffix on Flickr API
-    # This bypasses all query normalization/truncation and hits Flickr directly
-    if selected_candidate is None and main_subject and not semantic_requirement and not shared_pool_candidates:
+    # Absolute last resort: try bare rescue_subject across multi-engine web sources
+    # (Bing, Universal Scraper, Wikimedia, Openverse, Flickr API)
+    # to guarantee a real image is found before falling back to graphic placeholders.
+    if (
+        selected_candidate is None
+        and rescue_subject
+        and not is_strict_person
+        and not shared_pool_candidates
+    ):
         _bare_queries = [
-            f"{main_subject} photo",
-            f"{main_subject} photography",
-            main_subject,
+            f"{rescue_subject} photograph",
+            f"{rescue_subject} documentary",
+            rescue_subject,
         ]
         for _bq in _bare_queries:
             if _deadline_reached():
                 break
             if _web_verbose():
                 _web_log(f"scene {idx + 1} absolute last resort query: '{_bq}'")
-            _bq_cached = _fetch_source_query("flickr_api", "flickr_api", _bq)
-            if _bq_cached:
-                _bc = _bq_cached[0]
-                _sel = _download_and_accept_single_candidate(_bc, scene_dir, idx, scene_text,
-                    identity_terms, main_subject, global_phashes, global_md5s, used_files,
-                    phash_lock, md5_lock, file_lock, weak_terms)
-                if _sel:
-                    selected_candidate = _sel
+            _found_candidates = []
+            for _prov_name, _prov_type in (
+                ("bing_hybrid", "hybrid"),
+                ("universal_scraper", "universal"),
+                ("wikimedia", "api"),
+                ("openverse", "api"),
+                ("flickr_api", "flickr_api"),
+            ):
+                _bq_cached = _fetch_source_query(_prov_name, _prov_type, _bq)
+                if _bq_cached:
+                    _found_candidates.extend(_bq_cached)
+            if _found_candidates:
+                for _bc in _found_candidates[:4]:
+                    _sel = _download_and_accept_single_candidate(
+                        _bc, scene_dir, idx, scene_text,
+                        identity_terms, rescue_subject, global_phashes, global_md5s, used_files,
+                        phash_lock, md5_lock, file_lock, weak_terms
+                    )
+                    if _sel:
+                        selected_candidate = _sel
+                        break
+                if selected_candidate:
                     break
 
     if selected_candidate is None:
