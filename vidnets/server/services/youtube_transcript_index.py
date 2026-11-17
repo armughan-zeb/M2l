@@ -21,6 +21,56 @@ _FLIGHT_LOCK = threading.Lock()
 _FLIGHTS: Dict[str, threading.Event] = {}
 
 
+def _cookie_opener(session_jar: Any) -> Any:
+    """URL opener that sends the shared YouTube session cookies, or None.
+
+    Caption URLs are pre-signed, but the session still belongs on the
+    request: an authenticated fetch survives the anonymous 429/IP-block
+    that otherwise kills this lane.  The jar is copied, never written.
+    """
+    if session_jar is None:
+        return None
+    try:
+        import copy as _copy
+        import http.cookiejar as _cookiejar
+        import urllib.request as _urlrequest
+
+        jar = _cookiejar.CookieJar()
+        for cookie in session_jar:
+            if hasattr(cookie, "name"):
+                jar.set_cookie(_copy.copy(cookie))
+        if sum(1 for _ in jar) == 0:
+            return None
+        return _urlrequest.build_opener(_urlrequest.HTTPCookieProcessor(jar))
+    except Exception:
+        return None
+
+
+def _transcript_api_client(session_jar: Any) -> Any:
+    """A ``requests`` session carrying the shared cookies for youtube-transcript-api.
+
+    The library's ``YouTubeTranscriptApi(http_client=...)`` accepts a
+    requests session, so the transcript API call can run authenticated
+    instead of anonymous.  Returns None when there is no session.
+    """
+    if session_jar is None:
+        return None
+    try:
+        import copy as _copy
+
+        import requests
+
+        client = requests.Session()
+        for cookie in session_jar:
+            if hasattr(cookie, "name"):
+                client.cookies.set_cookie(_copy.copy(cookie))
+        if len(client.cookies) == 0:
+            return None
+        return client
+    except Exception:
+        return None
+
+
 def _cache_ttl_seconds(status: str) -> float:
     """Return status-aware transcript freshness.
 
@@ -558,7 +608,12 @@ class YouTubeTranscriptIndex:
                     url = (target or {}).get("url")
                     if not url:
                         continue
-                    with _urlrequest.urlopen(url, timeout=caption_timeout) as response:
+                    opener = _cookie_opener(session_jar)
+                    if opener is not None:
+                        response_cm = opener.open(url, timeout=caption_timeout)
+                    else:
+                        response_cm = _urlrequest.urlopen(url, timeout=caption_timeout)
+                    with response_cm as response:
                         payload = _json.loads(response.read().decode("utf-8", "replace"))
                     rows = []
                     for event in payload.get("events") or []:
@@ -587,7 +642,14 @@ class YouTubeTranscriptIndex:
                 errors.append(f"yt-dlp-auth:{type(exc).__name__}:{exc}")
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
-            transcript = YouTubeTranscriptApi().fetch(video_id, languages=_transcript_languages())
+
+            api_client = _transcript_api_client(session_jar)
+            api = (
+                YouTubeTranscriptApi(http_client=api_client)
+                if api_client is not None
+                else YouTubeTranscriptApi()
+            )
+            transcript = api.fetch(video_id, languages=_transcript_languages())
             return {"source": "youtube_transcript_api", "language": "en", "segments": transcript.to_raw_data()}
         except Exception as exc:
             errors.append(f"{type(exc).__name__}:{exc}")
@@ -633,6 +695,11 @@ class YouTubeTranscriptIndex:
                             "compat_opts": {"no-certifi"},
                             "extractor_args": {"youtube": {"player_client": [client]}},
                         }) as ydl:
+                            # Anonymous spot (fixed Nov 17): this fallback
+                            # ran without the session even when one was
+                            # configured. Attach it like the primary path.
+                            if session_jar is not None:
+                                ydl.cookiejar = session_jar
                             info = ydl.extract_info(video_id, download=False)
                         break
                     except Exception as exc:
@@ -659,7 +726,12 @@ class YouTubeTranscriptIndex:
                             )
                         except (TypeError, ValueError):
                             caption_timeout = 8.0
-                        with urllib.request.urlopen(url, timeout=caption_timeout) as response:
+                        caption_opener = _cookie_opener(session_jar)
+                        if caption_opener is not None:
+                            response_cm = caption_opener.open(url, timeout=caption_timeout)
+                        else:
+                            response_cm = urllib.request.urlopen(url, timeout=caption_timeout)
+                        with response_cm as response:
                             payload = _json.loads(response.read().decode("utf-8", "replace"))
                         rows = []
                         for event in payload.get("events") or []:

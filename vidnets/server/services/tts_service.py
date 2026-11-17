@@ -17,7 +17,11 @@ def init_tts():
 def is_available():
     """Report a real online or offline speech capability."""
     import sys
-    return edge_tts_service.is_available() or sys.platform == 'win32'
+    return (
+        edge_tts_service.linux_tts_config() is not None
+        or edge_tts_service.is_available()
+        or sys.platform == 'win32'
+    )
 
 
 def get_voices():

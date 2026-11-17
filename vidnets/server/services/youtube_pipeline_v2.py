@@ -2173,11 +2173,15 @@ def _get_authenticated_youtube_session(
         return _adapt_youtube_cookie_jar(youtube_session)
     if not enabled:
         return None
-    cookie_files = str(os.environ.get("VIDZEO_YT_COOKIE_FILES") or "").strip()
-    if cookie_files:
-        from services.youtube_session import ConfiguredYouTubeSessions
-        pool = ConfiguredYouTubeSessions(cookie_files)
-        index, jar = pool.next_verified()
+    # Configured pool: VIDZEO_YT_COOKIE_FILES list + cookies directory,
+    # shared per process so rotation and per-account health survive
+    # across searches and downloads. next_healthy() round-robins across
+    # verified accounts and skips signed-out / throttled ones; zero
+    # healthy accounts falls back to public access below.
+    from services.youtube_session import get_configured_pool
+    pool = get_configured_pool()
+    if pool.paths:
+        index, jar = pool.next_healthy()
         adapted = _adapt_youtube_cookie_jar(jar)
         if adapted is not None:
             adapted._vidzeo_session_pool = pool
@@ -2244,6 +2248,28 @@ def _adapt_youtube_cookie_jar(session_jar: Any) -> Any:
         return None
 
 
+def _install_shared_youtube_session(ydl: Any) -> bool:
+    """Resolve the shared pool session and attach it to an existing YoutubeDL.
+
+    One-line accessor for call sites that build their own YoutubeDL
+    (notably the chapter-metadata subprocess, which runs in a fresh
+    process and previously ran anonymous).  Never raises and never
+    writes cookies to disk: no session means public access, exactly
+    like every other entry point.
+    """
+    try:
+        session_jar = _get_authenticated_youtube_session()
+    except Exception:
+        return False
+    if session_jar is None:
+        return False
+    try:
+        _install_youtube_session(ydl, session_jar)
+    except Exception:
+        return False
+    return True
+
+
 def _install_youtube_session(ydl: Any, session_jar: Any) -> None:
     """Attach the broker's in-memory cookie jar without writing plaintext cookies."""
     if getattr(session_jar, "_vidzeo_session_pool", None) is not None:
@@ -2287,11 +2313,27 @@ def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation,
             "sign in to confirm your age", "age-restricted", "login required",
             "sign in to view", "sign in to watch",
         ))
+        throttled = any(phrase in detail for phrase in (
+            "too many requests", "http error 429", "429", "ipblocked",
+            "confirm you're not a bot",
+        ))
+        _raw_index = getattr(session_jar, "_vidzeo_session_index", None)
+        try:
+            _pool_index = int(_raw_index) if _raw_index is not None else -1
+        except (TypeError, ValueError):
+            _pool_index = -1
+        if pool is not None and throttled and not sign_in:
+            # Record the throttle so the pool skips this account until
+            # its cooldown elapses; the next call rotates to a healthy one.
+            try:
+                pool.mark_throttled(_pool_index, reason="youtube-throttled")
+            except (TypeError, ValueError):
+                pass
         if pool is None or not sign_in or "not a bot" in detail:
             raise
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-        index, backup = pool.next_verified(session_jar._vidzeo_session_index)
+        index, backup = pool.next_verified(_pool_index)
         if backup is None:
             raise
         for stale in output_dir.glob(raw_prefix + "*"):
@@ -4169,6 +4211,28 @@ def _youtube_transport_timeout_defaults() -> Tuple[int, int, int, int]:
     )
 
 
+def _youtube_format_retry_is_futile(error_text: str, runtime_categories) -> bool:
+    """True when another format rung cannot rescue a failed download.
+
+    yt-dlp reports an age-gated video as "Requested format is not
+    available" on the first rung while separately logging a sign-in
+    warning — the exception text alone does not say age-gate, so the old
+    code burned a second full extraction on the fallback rung. The
+    session does not unlock age-gated videos (proven live: identical
+    failure with and without cookies), so when the runtime log already
+    carries an authentication warning, the next rung is pointless and
+    the caller should try the next ranked candidate instead.
+    """
+    text = str(error_text or "").lower()
+    if "requested format is not available" not in text:
+        return False
+    try:
+        categories = list(runtime_categories or ())
+    except TypeError:
+        return False
+    return "authentication" in categories
+
+
 def _download_clip(
     candidate: Dict[str, Any],
     output_path: Path,
@@ -4396,6 +4460,18 @@ def _download_clip(
                     )
                     print(
                         "   [yt-v2] non-selector download failure; "
+                        "skipping format retries for this candidate",
+                        flush=True,
+                    )
+                    raise
+                if _youtube_format_retry_is_futile(str(exc or ""), runtime_log.categories):
+                    # The extraction already logged a sign-in/age-gate
+                    # warning: no format rung can succeed on this video.
+                    # Skip the remaining rungs and let the caller try the
+                    # next ranked candidate.
+                    candidate['_transport_failure'] = 'youtube_access_required'
+                    print(
+                        "   [yt-v2] format unavailable with an authentication warning; "
                         "skipping format retries for this candidate",
                         flush=True,
                     )
@@ -7507,12 +7583,21 @@ def get_youtube_clips(
     )
 
 
-def select_best_youtube_candidate(scene_text: str, title: str = "", api_key: str = "", niche: str = "general", **_) -> Dict[str, Any]:
+def select_best_youtube_candidate(scene_text: str, title: str = "", api_key: str = "", niche: str = "general", session_jar: Any = None, youtube_session: Any = None, use_authenticated_session: bool = True, **_) -> Dict[str, Any]:
     del api_key, niche
     subject = (_scene_subject_terms(scene_text, title) or _scene_subject_terms(title, ""))[:1]
     active = subject[0] if subject else title
     query = f"{active} highlights footage"
-    candidates = _search_youtube(query, int(os.environ.get("VIDZEO_YT_RESULTS_PER_QUERY", "12") or 12))
+    # Anonymous spot (fixed Nov 17): this helper used to call
+    # _search_youtube with no session at all, so its search ran
+    # anonymous even when accounts were configured. Resolve the shared
+    # authenticated session exactly like every other search entry point.
+    authenticated_session = _get_authenticated_youtube_session(
+        session_jar=session_jar,
+        youtube_session=youtube_session,
+        enabled=use_authenticated_session,
+    )
+    candidates = _search_youtube(query, int(os.environ.get("VIDZEO_YT_RESULTS_PER_QUERY", "12") or 12), session_jar=authenticated_session)
     ranked = sorted(candidates, key=lambda c: _score_candidate(c, active, scene_text, query), reverse=True)
     selected = ranked[0] if ranked else None
     return {"selected_video": selected, "ranked_candidates": ranked, "query": query}

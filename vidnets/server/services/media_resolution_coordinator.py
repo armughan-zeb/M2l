@@ -183,6 +183,212 @@ def _verdict_has_vision_evidence(decision: Any) -> bool:
     return False
 
 
+def _verdict_conflicts_module():
+    """The file-ledger module, or None when it is unavailable.
+
+    Imported lazily: the coordinator must keep working (without the
+    file-ledger seed) if the module is absent, and the ledger module
+    must never import the coordinator back.
+    """
+    try:
+        from . import verdict_conflicts as module
+
+        return module
+    except Exception:
+        return None
+
+
+def _fatal_candidate_identifier(candidate: Any, verdict: Any = None) -> Optional[str]:
+    """Content identifier for a candidate, using the ledger's own rule.
+
+    Video id first (``"youtube:<id>"`` / ``"yt:<id>"`` prefix, or the
+    verdict's ``video_id`` field), then the verified asset SHA, then the
+    candidate id.  The local path is never an identifier.  This mirrors
+    ``verdict_conflicts.parse_video_id`` / ``content_key_for`` exactly so
+    a record filed by the bridge half matches the same candidate here.
+    """
+    row = candidate if isinstance(candidate, Mapping) else {}
+    decision = verdict if isinstance(verdict, Mapping) else {}
+    candidate_id = str(
+        row.get("candidate_id") or row.get("id") or decision.get("candidate_id") or ""
+    ).strip()
+    video_id: Optional[str] = None
+    module = _verdict_conflicts_module()
+    if module is not None:
+        try:
+            video_id = module.parse_video_id(candidate_id or None, decision or None)
+        except Exception:
+            video_id = None
+    if not video_id and candidate_id.startswith("youtube:"):
+        video_id = candidate_id[len("youtube:"):].strip() or None
+    if not video_id and candidate_id.startswith("yt:"):
+        video_id = candidate_id[len("yt:"):].strip() or None
+    if video_id:
+        return video_id
+    for source in (decision, row):
+        for field in (
+            "verified_asset_sha256",
+            "asset_sha256",
+            "sha256",
+            "content_sha256",
+            "asset_hash",
+        ):
+            value = str(source.get(field) or "").strip()
+            if value:
+                return value
+    return candidate_id or None
+
+
+def _fatal_scene_index(
+    scene_index: Any, scene: Any = None, candidate: Any = None
+) -> Optional[int]:
+    """Coerce a scene index from the explicit value, scene row, or candidate."""
+    for value in (
+        scene_index,
+        scene.get("scene_index") if isinstance(scene, Mapping) else None,
+        scene.get("order") if isinstance(scene, Mapping) else None,
+        candidate.get("scene_index") if isinstance(candidate, Mapping) else None,
+    ):
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _fatal_ledger_lookup(
+    scene_index: Any,
+    candidate: Any,
+    scene: Any,
+    fatal_rejections: Any,
+    fatal_reject_verdicts: Any,
+    verdict: Any = None,
+) -> tuple:
+    """Return ``(key, stored_verdict)`` when the candidate is fatally rejected.
+
+    ``fatal_rejections`` is the key set seeded from the file ledger via
+    ``verdict_conflicts.fatal_content_keys``; ``fatal_reject_verdicts``
+    maps those keys to the stored reject verdict.  A scene-less record
+    matches through its requirement hash (key
+    ``("requirement_hash", hash, identifier)``) or, with no hash at all,
+    through ``(None, identifier)``.  Returns ``(None, None)`` otherwise.
+    """
+    if not fatal_rejections:
+        return None, None
+    identifier = _fatal_candidate_identifier(candidate, verdict)
+    if not identifier:
+        return None, None
+    index = _fatal_scene_index(scene_index, scene, candidate)
+    requirement_hash = ""
+    if isinstance(scene, Mapping):
+        requirement = scene.get("visual_requirement")
+        if isinstance(requirement, Mapping):
+            requirement_hash = str(requirement.get("requirement_hash") or "").strip()
+    keys: list = []
+    if index is not None:
+        keys.append((index, identifier))
+    if requirement_hash:
+        keys.append(("requirement_hash", requirement_hash, identifier))
+    keys.append((None, identifier))
+    for key in keys:
+        if key in fatal_rejections:
+            stored = (fatal_reject_verdicts or {}).get(key)
+            return key, stored
+    return None, None
+
+
+def _fatal_ledger_record(
+    scene_index: Any,
+    candidate: Any,
+    verdict: Any,
+    scene: Any,
+    fatal_rejections: Any,
+    fatal_reject_verdicts: Any,
+) -> Optional[tuple]:
+    """Add one fatal verdict to the job-scoped in-memory ledger."""
+    if not isinstance(verdict, Mapping):
+        return None
+    identifier = _fatal_candidate_identifier(candidate, verdict)
+    index = _fatal_scene_index(scene_index, scene, candidate)
+    if not identifier or index is None:
+        return None
+    key = (index, identifier)
+    if fatal_rejections is not None:
+        fatal_rejections.add(key)
+    if fatal_reject_verdicts is not None:
+        fatal_reject_verdicts[key] = dict(verdict)
+    return key
+
+
+def _is_fatal_vision_verdict(verdict: Any, scene: Any = None) -> bool:
+    """True when a live vision verdict fatally rejects its candidate.
+
+    The verdict must carry real pixel evidence (``visual_checked``) and
+    either state ``fatal_mismatch`` or carry an ``entity_conflict`` that
+    the semantic guard confirms as an explicit scene conflict.  A bare
+    ``entity_conflict`` without supporting conflict evidence does not
+    count: degraded/unavailable verdicts must not poison the ledger.
+    """
+    if not isinstance(verdict, Mapping):
+        return False
+    if verdict.get("visual_checked") is not True:
+        return False
+    if bool(verdict.get("fatal_mismatch")):
+        return True
+    if not bool(verdict.get("entity_conflict")):
+        return False
+    try:
+        from .visual_intelligence.semantic_guard import explicit_scene_conflict
+
+        return bool(explicit_scene_conflict(verdict, scene=scene))
+    except Exception:
+        return False
+
+
+def _seed_fatal_rejections() -> tuple:
+    """``(fatal_rejections, fatal_reject_verdicts)`` seeded from the file ledger.
+
+    ``fatal_rejections`` is the key set from
+    ``verdict_conflicts.fatal_content_keys``; ``fatal_reject_verdicts``
+    maps each key to the stored reject verdict so enforcement can return
+    the actual fatal verdict instead of a synthesized one.  A missing or
+    unreadable ledger seeds an empty ledger — a ledger problem must never
+    fail a job.
+    """
+    fatal_rejections: set = set()
+    fatal_reject_verdicts: dict = {}
+    try:
+        module = _verdict_conflicts_module()
+        if module is None:
+            return fatal_rejections, fatal_reject_verdicts
+        from .agent_bridge import bridge_root as _bridge_root
+
+        records = module.load_fatal_rejects(_bridge_root())
+        if not isinstance(records, list):
+            return fatal_rejections, fatal_reject_verdicts
+        try:
+            fatal_rejections = set(module.fatal_content_keys(records))
+        except Exception:
+            fatal_rejections = set()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            verdict = record.get("verdict")
+            if not isinstance(verdict, Mapping):
+                continue
+            try:
+                key = module.content_key_for(record)
+            except Exception:
+                key = None
+            if key is not None:
+                fatal_reject_verdicts.setdefault(key, dict(verdict))
+    except Exception:
+        return set(), {}
+    return fatal_rejections, fatal_reject_verdicts
+
+
 def _semantic_reuse_compatible(scene: Mapping[str, Any], resolution: SceneResolution) -> bool:
     """Reuse only an asset verified for the same immutable identity contract.
 
@@ -1139,7 +1345,7 @@ class _BatchedVerifier:
         return dict(self._verdict) if isinstance(self._verdict, dict) else self._verdict
 
 
-def _cached_verification_result(scene_index, scene, candidate, verifier, cache, unavailable=None):
+def _cached_verification_result(scene_index, scene, candidate, verifier, cache, unavailable=None, *, fatal_rejections=None, fatal_reject_verdicts=None):
     """Verify a candidate, reusing a live vision verdict for the same scene+candidate.
 
     ``cache`` is a job-scoped dict keyed by (scene_index, candidate identity).
@@ -1153,12 +1359,39 @@ def _cached_verification_result(scene_index, scene, candidate, verifier, cache, 
     re-issued for the same scene+candidate until its short TTL expires. The
     answerer may have caught up by then; until then the stored outage
     verdict is returned without spending another live vision read.
+
+    ``fatal_rejections`` / ``fatal_reject_verdicts`` are the job-scoped
+    fatal-consensus ledger (see ``_seed_fatal_rejections``).  It is
+    consulted BEFORE the verdict cache: a cached ACCEPT for this content
+    must not win over a fatal rejection recorded later in the same job —
+    the same clip under a different local path has a different cache key,
+    so the cache alone cannot see the conflict.  A fatal verdict returned
+    by the live call is recorded into the ledger here, so a later
+    re-verification of the same content for this scene is vetoed even
+    when it arrives under yet another path.
     """
+    _fatal_key, _fatal_verdict = _fatal_ledger_lookup(
+        scene_index, candidate, scene, fatal_rejections, fatal_reject_verdicts
+    )
+    if _fatal_key is not None:
+        _stored = dict(_fatal_verdict) if isinstance(_fatal_verdict, Mapping) else {}
+        _stored["accepted"] = False
+        _stored["status"] = "rejected"
+        _stored["fatal_mismatch"] = True
+        _stored["visual_checked"] = True
+        _stored.setdefault("reason", "prior_fatal_mismatch_rejection")
+        _stored["prior_fatal_mismatch_rejection"] = True
+        return False, "prior_fatal_mismatch_rejection", 0.0, _stored
     key = (int(scene_index), _vision_verdict_cache_key(candidate))
     if key[1]:
         cached = cache.get(key)
         if cached is not None:
             accepted, reason, visual_score, verdict = cached
+            if isinstance(verdict, Mapping) and _is_fatal_vision_verdict(verdict, scene):
+                _fatal_ledger_record(
+                    scene_index, candidate, verdict, scene,
+                    fatal_rejections, fatal_reject_verdicts,
+                )
             return accepted, reason, visual_score, dict(verdict) if isinstance(verdict, dict) else verdict
         if unavailable is not None:
             entry = unavailable.get(key)
@@ -1168,7 +1401,17 @@ def _cached_verification_result(scene_index, scene, candidate, verifier, cache, 
                     accepted, reason, visual_score, verdict = stored
                     return accepted, reason, visual_score, dict(verdict) if isinstance(verdict, dict) else verdict
                 del unavailable[key]
-    accepted, reason, visual_score, verdict = _verification_result(scene, dict(candidate), verifier)
+    accepted, reason, visual_score, verdict = _verification_result(
+        scene, dict(candidate), verifier,
+        scene_index=scene_index,
+        fatal_rejections=fatal_rejections,
+        fatal_reject_verdicts=fatal_reject_verdicts,
+    )
+    if isinstance(verdict, dict) and _is_fatal_vision_verdict(verdict, scene):
+        _fatal_ledger_record(
+            scene_index, candidate, verdict, scene,
+            fatal_rejections, fatal_reject_verdicts,
+        )
     if key[1] and isinstance(verdict, dict) and verdict.get('visual_checked') is True:
         cache[key] = (accepted, reason, visual_score, dict(verdict))
     if (
@@ -2403,6 +2646,10 @@ def _verification_result(
     scene: Mapping[str, Any],
     candidate: Dict[str, Any],
     verifier: Optional[Callable[[Mapping[str, Any], Dict[str, Any]], Any]],
+    *,
+    scene_index: Any = None,
+    fatal_rejections: Any = None,
+    fatal_reject_verdicts: Any = None,
 ) -> tuple[bool, str, float, Optional[Dict[str, Any]]]:
     from .visual_intelligence.context import scene_requires_visual_verification
 
@@ -2410,6 +2657,27 @@ def _verification_result(
         candidate = {}
     if not isinstance(scene, Mapping):
         scene = {}
+    # Fatal-consensus ledger (vision-consensus fix): a candidate one vision
+    # verdict already fatally rejected for this scene is never re-admitted
+    # because a lenient verdict for the same content arrived first or sits
+    # on the row.  This check runs BEFORE the branch-verdict reuse shortcut
+    # below, before any live verifier call, and before the verifier-is-None
+    # reuse path: a prior fatal mismatch is a veto, not a vote.  It is
+    # keyed on content (video id / asset hash / candidate id), never the
+    # local path, so copies of one clip under different paths share it.
+    _fatal_key, _fatal_verdict = _fatal_ledger_lookup(
+        scene_index, candidate, scene, fatal_rejections, fatal_reject_verdicts,
+        candidate.get("qwen_result") or candidate.get("visual_decision"),
+    )
+    if _fatal_key is not None:
+        _stored = dict(_fatal_verdict) if isinstance(_fatal_verdict, Mapping) else {}
+        _stored["accepted"] = False
+        _stored["status"] = "rejected"
+        _stored["fatal_mismatch"] = True
+        _stored["visual_checked"] = True
+        _stored.setdefault("reason", "prior_fatal_mismatch_rejection")
+        _stored["prior_fatal_mismatch_rejection"] = True
+        return False, "prior_fatal_mismatch_rejection", 0.0, _stored
     strict = scene_requires_visual_verification(scene)
     raw_source_hint = str(candidate.get("source") or candidate.get("provider") or "").strip().lower()
     source_hint = "web" if _is_web_source(candidate) else raw_source_hint
@@ -3508,6 +3776,26 @@ def _scene_finalist_limit() -> int:
         return 3
 
 
+def _finalists_for_storyboard(rows, configured):
+    """Avoid checking several candidates per scene for a short video.
+
+    Unusable or missing duration data keeps the configured limit. Rejected
+    candidates still use the existing bounded expansion/recovery path.
+    """
+    try:
+        durations = []
+        for row in rows:
+            value = row.get("duration")
+            if value is None and row.get("start_seconds") is not None and row.get("end_seconds") is not None:
+                value = float(row["end_seconds"]) - float(row["start_seconds"])
+            durations.append(float(value or 0))
+        if durations and all(0 < value < 600 for value in durations) and sum(durations) <= 120:
+            return min(configured, 1)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return configured
+
+
 def _visual_gate_workers(primary_count: int) -> int:
     """Parallel vision checks in the primary gate (default 12, cap 24).
 
@@ -3860,6 +4148,18 @@ def resolve_storyboard_media_v2(
     # _cached_verification_result). Genuine rejections are never recorded
     # here; they stay in the verdict cache above.
     vision_unavailable: Dict[tuple, tuple] = {}
+    # Fatal-consensus ledger (job-scoped, discarded when this call
+    # returns): (scene_index, content_key) pairs vision already fatally
+    # rejected, plus the stored reject verdict per key.  Seeded from the
+    # file ledger (``_verdict_conflicts.json`` at the bridge root) so a
+    # late fatal verdict that arrived after a lenient one — job 4f61cc9e,
+    # youtube:F4yOVIKCZpw — vetoes the content from the start of the job;
+    # updated live by ``_cached_verification_result`` as new fatal
+    # verdicts land.  ``resolve_storyboard_media_v2`` is a module-level
+    # function, not a coordinator method, so the ledger lives here as a
+    # job-scoped local and is threaded through the verification calls
+    # below rather than on ``self``.
+    fatal_rejections, fatal_reject_verdicts = _seed_fatal_rejections()
     # Per-scene verification budget (F2). The clock starts when a scene's
     # verification phase starts (queue_review) and bounds review +
     # finalists + recovery. When it expires the scene resolves with the best
@@ -4231,7 +4531,8 @@ def resolve_storyboard_media_v2(
     primary_top_pool_keys: Dict[int, set[str]] = {index: set() for index in range(len(rows))}
     gate_lock = threading.Lock()
     primary_work: List[tuple] = []
-    finalist_limit = _scene_finalist_limit()
+    finalist_limit = (_scene_finalist_limit() if adaptive_media_review
+                      else _finalists_for_storyboard(rows, _scene_finalist_limit()))
 
     def rank_scene(index, *, record=True):
         scene = rows[index]
@@ -4325,7 +4626,9 @@ def resolve_storyboard_media_v2(
             verifier = _BatchedVerifier(batched)
         accepted, reason, visual_score, verdict = _cached_verification_result(
             index, rows[index], candidate, verifier, vision_verdict_cache,
-            vision_unavailable)
+            vision_unavailable,
+            fatal_rejections=fatal_rejections,
+            fatal_reject_verdicts=fatal_reject_verdicts)
         return score, tie, accepted, reason, visual_score, verdict or {}
 
     def _run_scene_batch(index, items):
@@ -4912,6 +5215,8 @@ def resolve_storyboard_media_v2(
                         _batched[_ci] = _cached_verification_result(
                             index, scene, _cand, _BatchedVerifier(_verdict),
                             vision_verdict_cache, vision_unavailable,
+                            fatal_rejections=fatal_rejections,
+                            fatal_reject_verdicts=fatal_reject_verdicts,
                         )
                 if _batched:
                     note_vision_start(index)
@@ -4961,6 +5266,16 @@ def resolve_storyboard_media_v2(
                             and isinstance(cached[3], dict)
                             and cached[3].get("visual_checked") is True
                         ):
+                            continue
+                        # A cached ACCEPT must not resurrect a candidate
+                        # vision fatally rejected for this scene under
+                        # another path (same clip, different cache key).
+                        _fatal_key, _ = _fatal_ledger_lookup(
+                            index, candidate, scene, fatal_rejections,
+                            fatal_reject_verdicts,
+                            cached[3] if isinstance(cached, tuple) and len(cached) > 3 else None,
+                        )
+                        if _fatal_key is not None:
                             continue
                         passed, _reason = _candidate_hard_gate(scene, candidate)
                         if not passed:
@@ -5027,7 +5342,9 @@ def resolve_storyboard_media_v2(
                             note_vision_start(index)
                             result = _cached_verification_result(
                                 index, scene, candidate, visual_verifier, vision_verdict_cache,
-                                vision_unavailable)
+                                vision_unavailable,
+                                fatal_rejections=fatal_rejections,
+                                fatal_reject_verdicts=fatal_reject_verdicts)
                         else:
                             result = (
                                 False,
@@ -5155,6 +5472,8 @@ def resolve_storyboard_media_v2(
                             if scene_budget_open(index) and visual_budget_open("visual_gate_quota_inline", source):
                                 visual_verified, visual_reason, visual_score, inline_qwen = _verification_result(
                                     scene, candidate, visual_verifier,
+                                    fatal_rejections=fatal_rejections,
+                                    fatal_reject_verdicts=fatal_reject_verdicts,
                                 )
                             else:
                                 visual_verified, visual_reason, visual_score, inline_qwen = (
@@ -5193,6 +5512,8 @@ def resolve_storyboard_media_v2(
                             if scene_budget_open(index) and visual_budget_open("visual_gate_inline", source):
                                 visual_verified, visual_reason, visual_score, inline_qwen = _verification_result(
                                     scene, candidate, visual_verifier,
+                                    fatal_rejections=fatal_rejections,
+                                    fatal_reject_verdicts=fatal_reject_verdicts,
                                 )
                             else:
                                 visual_verified, visual_reason, visual_score, inline_qwen = (
@@ -5253,6 +5574,8 @@ def resolve_storyboard_media_v2(
                         note_vision_start(index)
                         verified, verify_reason, visual_score, qwen = _verification_result(
                             scene, candidate, visual_verifier,
+                            fatal_rejections=fatal_rejections,
+                            fatal_reject_verdicts=fatal_reject_verdicts,
                         )
                     else:
                         verified, verify_reason, visual_score, qwen = (
@@ -5299,6 +5622,23 @@ def resolve_storyboard_media_v2(
             )
             for metadata_score, source_tie, candidate, source, verified, verify_reason, visual_score, qwen in viable[:6]:
                 if verified:
+                    # Fatal-consensus defence in depth: a candidate vision
+                    # already fatally rejected for this scene must not be
+                    # selected even when it reaches here with a verified
+                    # flag — e.g. via the branch-reuse shortcut or a
+                    # verify_batch winner that bypassed _verification_result.
+                    _fatal_key, _fatal_verdict = _fatal_ledger_lookup(
+                        index, candidate, scene, fatal_rejections,
+                        fatal_reject_verdicts, qwen,
+                    )
+                    if _fatal_key is not None:
+                        attempts[index].append({
+                            "source": source,
+                            "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or ""),
+                            "stage": "fatal_verdict_ledger",
+                            "status": "prior_fatal_mismatch_rejection",
+                        })
+                        continue
                     if source == "youtube" and not _youtube_candidate_is_valid_after_master_reuse(
                         candidate,
                         qwen,
@@ -5516,6 +5856,8 @@ def resolve_storyboard_media_v2(
                     note_vision_start(index)
                     verified, reason, _score, target_decision = _verification_result(
                         scene, check_candidate, visual_verifier,
+                        fatal_rejections=fatal_rejections,
+                        fatal_reject_verdicts=fatal_reject_verdicts,
                     )
                     review.visual_decision = target_decision
                     approved = verified and _review_bound_to_scene(scene, review)
@@ -6076,7 +6418,9 @@ def resolve_storyboard_media_v2(
                 reuse_candidate.pop("visual_decision", None)
                 reuse_candidate.pop("qwen_result", None)
                 okay, reuse_reason, reuse_score, target_review = _verification_result(
-                    scene, reuse_candidate, visual_verifier)
+                    scene, reuse_candidate, visual_verifier,
+                    fatal_rejections=fatal_rejections,
+                    fatal_reject_verdicts=fatal_reject_verdicts)
                 attempts[index].append({"source": variant_provider, "stage": "target_scene_reuse_verification",
                                         "status": reuse_reason, "score": reuse_score})
                 review_resolution = SceneResolution(scene_index=index, selected_path=variant_path,
@@ -6717,6 +7061,8 @@ def resolve_storyboard_media_v2(
             else:
                 verified, verify_reason, visual_score, qwen = _verification_result(
                     scene, candidate, visual_verifier,
+                    fatal_rejections=fatal_rejections,
+                    fatal_reject_verdicts=fatal_reject_verdicts,
                 )
             candidate["visual_decision"] = dict(qwen or {})
             attempts[index].append({
@@ -7008,7 +7354,10 @@ def resolve_storyboard_media_v2(
 
             def _verify_late_quota_candidate(item: tuple[int, Dict[str, Any]]) -> tuple[int, Dict[str, Any], tuple]:
                 index, candidate = item
-                return index, candidate, _verification_result(rows[index], candidate, visual_verifier)
+                return index, candidate, _verification_result(
+                    rows[index], candidate, visual_verifier,
+                    fatal_rejections=fatal_rejections,
+                    fatal_reject_verdicts=fatal_reject_verdicts)
 
             quota_gate_pool = ThreadPoolExecutor(
                 max_workers=max(1, min(6, len(late_quota_work))),
@@ -7046,6 +7395,31 @@ def resolve_storyboard_media_v2(
             if current is not None and _is_moving_youtube_source(current):
                 continue
             yt_cand = _quota_youtube_candidate(index)
+            if yt_cand is not None:
+                # Fatal-consensus veto: quota retention mints acceptance
+                # from a downloaded file plus the candidate's own branch
+                # verdict, without calling the verifier — so the ledger
+                # check in _verification_result never runs here.  A
+                # candidate vision fatally rejected for this scene must
+                # not be upgraded on that basis.
+                _fatal_key, _ = _fatal_ledger_lookup(
+                    index, yt_cand, rows[index], fatal_rejections,
+                    fatal_reject_verdicts,
+                    yt_cand.get("visual_decision") or yt_cand.get("qwen_result"),
+                )
+                if _fatal_key is not None:
+                    print(
+                        f"   [v2] quota retention skipped scene {index + 1}: "
+                        "YouTube cut was fatally rejected by vision (prior_fatal_mismatch_rejection)",
+                        flush=True,
+                    )
+                    attempts[index].append({
+                        "source": "youtube",
+                        "candidate_id": str(yt_cand.get("candidate_id") or yt_cand.get("id") or ""),
+                        "stage": "fatal_verdict_ledger",
+                        "status": "prior_fatal_mismatch_rejection",
+                    })
+                    yt_cand = None
             if yt_cand is not None:
                 qwen = dict(yt_cand.get("visual_decision") or yt_cand.get("qwen_result") or {})
                 # A bound pixel review is a live vision verdict (or live
@@ -8036,7 +8410,10 @@ def resolve_storyboard_media_v2(
                 # If candidate not yet verified, try verifying with visual_verifier if available
                 if not chosen_verified and visual_verifier is not None:
                     try:
-                        v_ok, v_reason, v_sc, v_qw = _verification_result(scene, chosen_cand, visual_verifier)
+                        v_ok, v_reason, v_sc, v_qw = _verification_result(
+                            scene, chosen_cand, visual_verifier,
+                            fatal_rejections=fatal_rejections,
+                            fatal_reject_verdicts=fatal_reject_verdicts)
                         if v_ok and isinstance(v_qw, Mapping):
                             chosen_verified = True
                             chosen_score = float(v_sc or 0.0)
@@ -8500,6 +8877,8 @@ def resolve_storyboard_media_v2(
             _rec_accepted, _rec_reason, _rec_score, _rec_verdict = _cached_verification_result(
                 _rec_index, rows[_rec_index], _rec_candidate, visual_verifier,
                 vision_verdict_cache, vision_unavailable,
+                fatal_rejections=fatal_rejections,
+                fatal_reject_verdicts=fatal_reject_verdicts,
             )
         except Exception as exc:
             _rec_accepted, _rec_reason, _rec_score, _rec_verdict = (

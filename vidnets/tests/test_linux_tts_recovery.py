@@ -7,6 +7,60 @@ from unittest import mock
 from services import edge_tts_service as tts
 
 
+def test_linux_tts_config_defaults_to_muse_cli_when_env_unset(monkeypatch):
+    # Muse TTS is the primary on Linux even with no env configured: the
+    # bundled CLI is the default whenever it exists.
+    monkeypatch.delenv("VIDZEO_LINUX_TTS_COMMAND", raising=False)
+    monkeypatch.delenv("VIDZEO_LINUX_TTS_VOICE", raising=False)
+    monkeypatch.delenv("VIDZEO_LINUX_TTS_SPEED", raising=False)
+    command, voice, speed = tts.linux_tts_config()
+    assert command == tts._MUSE_TTS_COMMAND_TEMPLATE
+    assert voice == tts._MUSE_TTS_DEFAULT_VOICE
+    assert speed == tts._MUSE_TTS_DEFAULT_SPEED
+
+
+def test_linux_tts_config_env_override_wins(monkeypatch):
+    monkeypatch.setenv("VIDZEO_LINUX_TTS_COMMAND", "my-tts --output {output}")
+    monkeypatch.delenv("VIDZEO_LINUX_TTS_VOICE", raising=False)
+    command, voice, speed = tts.linux_tts_config()
+    assert command == "my-tts --output {output}"
+    assert voice == ""
+    assert speed == "100"
+
+
+def test_linux_tts_config_returns_none_on_windows(monkeypatch):
+    monkeypatch.setattr(tts.sys, "platform", "win32")
+    assert tts.linux_tts_config() is None
+
+
+def test_generate_audio_chunked_falls_back_to_edge_when_muse_tts_fails(monkeypatch, tmp_path):
+    # Edge TTS stays the fallback: a Muse failure must reach the Edge
+    # ladder instead of killing the narration.
+    monkeypatch.setattr(tts, "TEMP_DIR", tmp_path)
+    script = " ".join(["The coal train rolls through the valley at dawn."] * 40)
+    chunks = ["Chunk one here.", "Chunk two here."]
+    attempts = []
+
+    def failing_linux(_script):
+        attempts.append(_script)
+        raise RuntimeError("muse tts down")
+
+    def concat(paths, _start):
+        return [Path(path).read_bytes() for path in paths], 2.0
+
+    with mock.patch.object(tts, "_generate_linux_tts_chunked", side_effect=failing_linux), \
+         mock.patch.object(tts, "_split_script_for_parallel_tts", return_value=chunks), \
+         mock.patch.object(tts, "_generate_edge_tts_chunk_batch", return_value=None), \
+         mock.patch.object(tts, "_run_async", return_value=[(0, str(tmp_path / "c0.mp3"), None), (1, str(tmp_path / "c1.mp3"), None)]), \
+         mock.patch.object(tts, "_concat_edge_chunks", side_effect=concat):
+        (tmp_path / "c0.mp3").write_bytes(b"audio" * 40)
+        (tmp_path / "c1.mp3").write_bytes(b"audio" * 40)
+        data, duration = tts.generate_audio_chunked(script)
+    assert attempts == [script]
+    assert data == [b"audio" * 40, b"audio" * 40]
+    assert duration == 2.0
+
+
 def test_linux_tts_retries_timeout_without_accepting_partial_output(tmp_path, monkeypatch):
     output = tmp_path / "narration.mp3"
     output.write_bytes(b"old audio" * 30)

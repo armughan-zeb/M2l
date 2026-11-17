@@ -63,7 +63,8 @@ def run_audio_first_pipeline(config: dict, progress_callback=None) -> dict:
     # The offline Linux TTS command supplies no provider word timings, so
     # captions still need Whisper: warm it even for edge/audiogram jobs when
     # that command is configured (see _start_whisper_warmup in app.py).
-    _linux_tts = bool(str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip())
+    from services.edge_tts_service import linux_tts_config
+    _linux_tts = linux_tts_config() is not None
     _provider_supplies_clock = str(tts_model or 'audiogram').lower() in {'audiogram', 'edge', 'edge-tts', 'edge_tts'} and not _linux_tts
     whisper_handle = None if _provider_supplies_clock else start_whisper_job_warmup(preload_workers=True)
 

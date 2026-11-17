@@ -1,10 +1,11 @@
-"""Grand Theft Auto VI 1-minute full video production test (YouTube-only).
+"""Grand Theft Auto VI 1-minute full video production test (YouTube-first, web fallback).
 
 Tests the complete end-to-end pipeline:
 1. Script & TTS (Edge TTS neural voice)
 2. Local Whisper word alignment & caption timing
 3. YouTube clip search, ranking, stream download, and precise moment cutting
-4. Bounded YouTube retries and verification of moving footage for each scene
+4. One YouTube pass; scenes YouTube cannot cover fall back to web images
+   (no second YouTube pass, no hard failure on YouTube coverage)
 5. 1080p documentary rendering and final MP4 delivery
 """
 
@@ -50,8 +51,8 @@ def main():
     t0 = time.time()
     word_count = len(SCRIPT.split())
     print("=" * 80)
-    print(f"GTA VI 1-MINUTE VIDEO PRODUCTION TEST (YOUTUBE CLIPS ONLY)")
-    print(f"Scenes: {len(SCENE_TEXTS)} | Words: {word_count} | Mode: YouTube Clips Exclusive")
+    print(f"GTA VI 1-MINUTE VIDEO PRODUCTION TEST (YOUTUBE-FIRST, WEB FALLBACK)")
+    print(f"Scenes: {len(SCENE_TEXTS)} | Words: {word_count} | Mode: YouTube Clips First, Web Fallback")
     print("=" * 80, flush=True)
 
     # YouTube-only environment tuning
@@ -60,8 +61,8 @@ def main():
     os.environ["VIDZEO_YT_LENIENT_ACCEPTANCE"] = "1"
     os.environ["VIDZEO_YT_MIN_SOURCE_DURATION"] = "10"
     os.environ["VIDZEO_YT_POOL_FIRST"] = "0"
-    os.environ["VIDZEO_YT_ALLOW_WEB_FALLBACK"] = "0"
-    os.environ["VIDZEO_WEB_SOURCES_ENABLED"] = "0"
+    os.environ["VIDZEO_YT_ALLOW_WEB_FALLBACK"] = "1"
+    os.environ["VIDZEO_WEB_SOURCES_ENABLED"] = "1"
     os.environ["VIDZEO_STOCK_ENABLED"] = "0"
     os.environ["VIDZEO_ALLOW_LEGACY_RENDER_FALLBACK"] = "1"
     os.environ["VIDZEO_YT_V2_RESULTS_PER_QUERY"] = "15"
@@ -97,9 +98,9 @@ def main():
         "llm_provider": "external_agent",
         "visual_understanding": True,
         "visual_required": True,
-        "fail_on_unresolved_media": True,
-        "allow_web_fallback_after_youtube_exhausted": False,
-        "web_sources_enabled": False,
+        "fail_on_unresolved_media": False,
+        "allow_web_fallback_after_youtube_exhausted": True,
+        "web_sources_enabled": True,
         "allow_stock_last_resort": False,
         "allow_grounded_graphic_fallback": False,
         "allow_emergency_media": False,

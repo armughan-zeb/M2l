@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import base64
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -17,6 +18,13 @@ import requests
 
 from .job_context import current_job, check_job_active, remaining_seconds
 from .pipeline_activity import record_activity
+from .verdict_conflicts import (
+    build_late_fatal_record,
+    is_fatal_reject,
+    record_late_fatal_reject,
+)
+
+logger = logging.getLogger(__name__)
 
 AGENT_HANDLE = 'external-agent:'
 AGENT_MODEL = 'external-agent'
@@ -282,6 +290,45 @@ def pending_requests(owner_id):
     return sorted(rows, key=lambda row: row['created_at'])
 
 
+def _record_late_fatal_reject(request_id, row, path, content):
+    """Preserve a late fatal vision verdict in the conflict ledger.
+
+    First-write-wins for the response itself is unchanged — the late answer
+    is still refused. But a late verdict that fatally rejects the candidate
+    (job 4f61cc9e: a REJECT arrived after an ACCEPT had already been stored
+    and was silently dropped) is now recorded in _verdict_conflicts.json so
+    the coordinator can veto the contested content later. Best-effort: any
+    failure here is logged and swallowed, never breaking answer submission.
+    """
+    try:
+        if isinstance(content, dict):
+            verdict = content
+        elif isinstance(content, str):
+            parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                return
+            verdict = parsed
+        else:
+            return
+        if not is_fatal_reject(verdict):
+            return
+        winner = None
+        reply_path = path.with_name('response.json')
+        if reply_path.exists():
+            try:
+                reply = json.loads(reply_path.read_text(encoding='utf-8'))
+                raw_winner = reply.get('content')
+                winner = json.loads(raw_winner) if isinstance(raw_winner, str) else raw_winner
+                if not isinstance(winner, dict):
+                    winner = None
+            except (OSError, ValueError):
+                winner = None
+        record = build_late_fatal_record(request_id, row, verdict, winner=winner)
+        record_late_fatal_reject(bridge_root(), record)
+    except Exception:
+        logger.warning('verdict-conflict ledger write failed for %s', request_id, exc_info=True)
+
+
 def complete_request(request_id, owner_id, content, error=''):
     path = _request_path(request_id)
     if not path.exists():
@@ -289,6 +336,12 @@ def complete_request(request_id, owner_id, content, error=''):
     with _request_lock(path):
         row = read_request(request_id, owner_id, locked=True)
         if row['state'] != 'pending' or path.with_name('response.json').exists():
+            # A late fatal vision verdict is preserved in the conflict
+            # ledger before the refusal below — first-write-wins for the
+            # response is preserved, only the discarded verdict is saved.
+            # This runs for both already-answered and expired requests.
+            if not error and content is not None:
+                _record_late_fatal_reject(request_id, row, path, content)
             # A late answer is not wasted: if it is valid content for an
             # expired (not already-answered) request, cache it so the next
             # re-issue of the same payload reuses it immediately instead of

@@ -10551,6 +10551,69 @@ def _mixed_youtube_branch_wall_cap_seconds(config=None, scene_count=0):
     return requested
 
 
+def _youtube_only_wall_without_branch_cap(config=None, wall_seconds=0.0):
+    """Return the YouTube-only branch wall with no fixed branch cap.
+
+    User order (Nov 17, 2026): a YouTube-only agent job has no artificial
+    branch wall — the shared delivery budget (which scales with the job)
+    is the only bound. A 900s cap killed a worker still producing clips
+    while the job had ~2000s of coordinator budget left. When a delivery
+    budget exists the wall is its remaining allowance (render reserve
+    preserved); without one the caller's wall stands unchanged.
+    """
+    try:
+        wall = float(wall_seconds or 0.0)
+    except (TypeError, ValueError):
+        wall = 0.0
+    try:
+        from services.delivery_budget import get_delivery_budget
+        budget = get_delivery_budget(config)
+    except Exception:
+        budget = None
+    if budget is None:
+        return wall
+    try:
+        reserve = float(
+            (config or {}).get('_render_reserve_seconds')
+            or budget.render_reserve_seconds
+        )
+    except (TypeError, ValueError):
+        reserve = float(budget.render_reserve_seconds)
+    return max(wall, budget.allowance(None, reserve_after_seconds=reserve))
+
+
+def _load_yt_attempt_audit_from_disk(config):
+    """Load per-scene YouTube attempt rows the clip worker wrote to disk.
+
+    The timeout/salvage path returns clips without the worker's in-memory
+    attempt ledger, so the printed audit was {} even though
+    youtube_scene_*.attempts.json files exist in the run folder — and the
+    recovery lane re-tried videos the first stage had already failed.
+    Returns {scene_index: [attempt, ...]} ({} when nothing is on disk).
+    """
+    attempts = {}
+    try:
+        run_root = config.get('_run_temp_dir') if isinstance(config, dict) else None
+        if not run_root:
+            return attempts
+        run_dir = Path(run_root)
+        if not run_dir.is_dir():
+            return attempts
+        for path in sorted(run_dir.glob('youtube_scene_*.attempts.json')):
+            match = re.search(r'youtube_scene_(\d+)\.attempts\.json$', path.name)
+            if not match:
+                continue
+            try:
+                rows = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            if isinstance(rows, list) and rows:
+                attempts[int(match.group(1)) - 1] = rows
+    except Exception:
+        return attempts
+    return attempts
+
+
 def _mixed_media_pool_first_enabled(config, scene_count, env_value=None):
     """Select the bounded YouTube retrieval strategy for Mixed Media jobs.
 
@@ -11460,6 +11523,21 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                 print(f"   [budget] Mixed Media transfer waves: {yt_wall_seconds:.0f}s -> {mixed_hard_cap:.0f}s", flush=True)
             yt_wall_seconds = mixed_hard_cap
 
+        if is_youtube_only_branch:
+            # No fixed branch wall for a YouTube-only agent job (see
+            # _youtube_only_wall_without_branch_cap): the delivery
+            # budget is the only bound. The clamp below still enforces
+            # the render reserve, so this only ever extends the wall to
+            # the time the job actually has left.
+            uncapped_wall = _youtube_only_wall_without_branch_cap(config, yt_wall_seconds)
+            if uncapped_wall > yt_wall_seconds:
+                print(
+                    f"   [budget] YouTube-only branch wall {yt_wall_seconds:.0f}s -> "
+                    f"{uncapped_wall:.0f}s (delivery budget; no fixed branch wall)",
+                    flush=True,
+                )
+            yt_wall_seconds = uncapped_wall
+
         # Clamp the branch against the job-wide clock.  Per-stage timeout
         # ceilings are not additive: retrieval must hand control back while
         # there is still enough wall time to assemble the final video.
@@ -11807,6 +11885,15 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                         flush=True,
                     )
             attempts = yt_paths.audit.get("attempts") or {}
+            if not attempts:
+                # The timeout/salvage path returns clips without the
+                # worker's in-memory attempt ledger. Load the per-scene
+                # rows the worker wrote to disk so the audit — and the
+                # recovery lane's exclusion list, which reads it — see
+                # what actually happened.
+                attempts = _load_yt_attempt_audit_from_disk(config)
+                if attempts:
+                    yt_paths.audit["attempts"] = attempts
             failure_counts = {}
             for rows in attempts.values():
                 for attempt in rows:
@@ -11820,6 +11907,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             # receipt instead of a zero that never ran.
             from services.youtube_pipeline_v2 import YouTubeClipResults
             _audit_workers = _mixed_youtube_download_worker_capacity(config)
+            _disk_attempts = _load_yt_attempt_audit_from_disk(config)
             yt_paths = YouTubeClipResults(
                 list(yt_paths),
                 audit={
@@ -11827,6 +11915,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                     "resolved": resolved,
                     "download_workers": _audit_workers,
                     "requested_download_workers": _audit_workers,
+                    "attempts": _disk_attempts,
                 },
             )
             if isinstance(config, dict):
@@ -13503,6 +13592,25 @@ def _enforce_media_adjacency(final_paths, source_labels, scene_texts, render_res
 def _run_youtube_render_repair(final_paths, source_labels, unresolved_indices, scene_texts, scene_durations, render_resolution, title, script, config):
     if not unresolved_indices:
         return 0
+    if _youtube_web_fallback_enabled(config) and not _is_disaster_script_context(title, script, scene_texts):
+        # Web is the fallback: one YouTube pass is enough. Do not spend a
+        # second proxy-bound YouTube pass on scenes the web lane can cover.
+        # Disaster scripts keep the YouTube-only repair (explicit contract).
+        print(
+            f"   [media] YouTube repair skipped for {len(unresolved_indices)} scene(s): "
+            "web fallback enabled, filling with web images instead of a second YouTube pass"
+        )
+        return _fill_unresolved_with_general_web_fallback(
+            final_paths=final_paths,
+            source_labels=source_labels,
+            unresolved_indices=list(unresolved_indices),
+            scene_texts=scene_texts,
+            render_resolution=render_resolution,
+            title=title,
+            script=script,
+            config=config,
+            force_web=True,
+        )
     attempts = 0
     if isinstance(config, dict):
         try:
@@ -13979,6 +14087,7 @@ def _validate_final_v2_media_plan(media_plan, *, audio_plan, job_config, render_
             run_root=job_config.get('_run_temp_dir'),
             allow_emergency_media=emergency_media_allowed(job_config, default=False),
             allow_grounded_graphics=grounded_graphics_allowed(job_config),
+            allow_web_fallback=_youtube_web_fallback_enabled(job_config),
         )
 
     def recover_contract_failure(error):
@@ -22531,7 +22640,7 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
         # integrity gate. This never creates blank cards or synthetic plates.
         # If the rescue still cannot find usable media, validation below keeps
         # failing with the original actionable contract error.
-        if raw_image_source not in {'YouTube Clips', 'Custom Images', 'Custom Media', 'Custom'} or (raw_image_source == 'YouTube Clips' and grounded_graphics_allowed(job_config)):
+        if raw_image_source not in {'YouTube Clips', 'Custom Images', 'Custom Media', 'Custom'} or (raw_image_source == 'YouTube Clips' and (grounded_graphics_allowed(job_config) or _youtube_web_fallback_enabled(job_config))):
             v2_paths = list(media_plan.get('media_paths') or [])
             v2_labels = _align_scene_media_count(
                 list(media_plan.get('source_labels') or []),

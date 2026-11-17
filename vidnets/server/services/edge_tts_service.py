@@ -59,6 +59,44 @@ _EDGE_TTS_MAX_RETRIES = max(3, int(os.environ.get("VIDZEO_EDGE_TTS_MAX_RETRIES",
 _EDGE_TTS_BACKOFF_BASE = float(os.environ.get("VIDZEO_EDGE_TTS_BACKOFF_BASE", "2.0") or 2.0)
 _EDGE_TTS_FALLBACK_ENABLED = str(os.environ.get("VIDZEO_EDGE_TTS_FALLBACK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
+# Muse TTS is the PRIMARY narration voice on Linux: this VM's Shortwave
+# CLI (/opt/hatch/bin/tts). Edge TTS websockets are blocked by the egress
+# proxy on this host, so Edge is only the fallback. The operator can
+# override the command/voice/speed with VIDZEO_LINUX_TTS_*; otherwise the
+# bundled Muse CLI below is the default whenever it exists.
+_MUSE_TTS_BINARY = "/opt/hatch/bin/tts"
+_MUSE_TTS_COMMAND_TEMPLATE = (
+    "/opt/hatch/bin/tts speak --text-stdin --voice {voice} "
+    "--speed {speed} --format mp3 --output {output}"
+)
+_MUSE_TTS_DEFAULT_VOICE = "avocado_v2:MAI_03"
+_MUSE_TTS_DEFAULT_SPEED = "100"
+
+
+def linux_tts_config():
+    """Resolve the primary (Muse) TTS command for this host.
+
+    Returns (command_template, voice, speed), or None when no Linux TTS
+    is available (Windows, or no command configured and no Muse CLI).
+    VIDZEO_LINUX_TTS_COMMAND wins when set; otherwise the bundled Muse
+    CLI is the default on Linux. The Muse default voice applies only to
+    the Muse command; a custom command keeps the old empty-voice
+    behaviour unless VIDZEO_LINUX_TTS_VOICE is set.
+    """
+    if sys.platform == 'win32':
+        return None
+    command = str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip()
+    if not command:
+        if os.path.isfile(_MUSE_TTS_BINARY) and os.access(_MUSE_TTS_BINARY, os.X_OK):
+            command = _MUSE_TTS_COMMAND_TEMPLATE
+        else:
+            return None
+    voice = str(os.environ.get('VIDZEO_LINUX_TTS_VOICE', '') or '').strip()
+    if not voice and command == _MUSE_TTS_COMMAND_TEMPLATE:
+        voice = _MUSE_TTS_DEFAULT_VOICE
+    speed = str(os.environ.get('VIDZEO_LINUX_TTS_SPEED', '') or '').strip() or _MUSE_TTS_DEFAULT_SPEED
+    return command, voice, speed
+
 
 def _edge_tts_proxy() -> str:
     """Proxy for the Edge TTS websocket, if the host needs one.
@@ -502,14 +540,15 @@ def _concat_edge_chunks(chunk_paths: list[str], batch_start: float) -> tuple[str
 
 def _generate_linux_tts_audio(text: str, output_path: str, timeout_seconds: float | None = None,
                               deadline: float | None = None) -> tuple | None:
-    """Linux offline fallback: shell out to a configured TTS command.
+    """Primary narration on Linux: shell out to the Muse TTS command.
 
     Edge TTS needs a websocket, which sandboxed/proxied Linux hosts often
-    block, and the SAPI fallback is Windows-only. When the operator sets
-    VIDZEO_LINUX_TTS_COMMAND, run it instead. The command is a template
-    with {text_file}, {output}, {voice} and {speed} placeholders; the
-    script text is also piped on stdin. Example for this VM's Shortwave
-    CLI (set in vidnets-runtime/.env):
+    block, and the SAPI fallback is Windows-only. The command is resolved
+    by linux_tts_config(): VIDZEO_LINUX_TTS_COMMAND wins, otherwise the
+    bundled Muse CLI (/opt/hatch/bin/tts) is the default on Linux. The
+    command is a template with {text_file}, {output}, {voice} and {speed}
+    placeholders; the script text is also piped on stdin. Example (also
+    what vidnets-runtime/.env sets):
         VIDZEO_LINUX_TTS_COMMAND=/opt/hatch/bin/tts speak --text-stdin --voice {voice} --speed {speed} --format mp3 --output {output}
         VIDZEO_LINUX_TTS_VOICE=avocado_v2:MAI_03
         VIDZEO_LINUX_TTS_SPEED=100
@@ -518,15 +557,14 @@ def _generate_linux_tts_audio(text: str, output_path: str, timeout_seconds: floa
     at video 60% on 2026-11-14). A caller may pass timeout_seconds for one
     call and a deadline (epoch seconds) that bounds all 3 attempts together.
     Returns None when no command is configured, so callers keep the
-    previous behaviour (SAPI on Windows, clear platform error elsewhere).
+    previous behaviour (Edge TTS, then SAPI on Windows / offline speech).
     """
     import shlex
 
-    template = str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip()
-    if not template:
+    resolved = linux_tts_config()
+    if resolved is None:
         return None
-    voice = str(os.environ.get('VIDZEO_LINUX_TTS_VOICE', '') or '').strip()
-    speed = str(os.environ.get('VIDZEO_LINUX_TTS_SPEED', '100') or '100').strip()
+    template, voice, speed = resolved
     text_file = Path(str(output_path) + '.txt')
     destination = Path(output_path)
     attempt_output = destination.with_name(destination.stem + '.attempt' + destination.suffix)
@@ -704,11 +742,10 @@ def _generate_linux_tts_chunked(script: str) -> tuple:
         raise ValueError("Cannot synthesize empty narration.")
     cache_dir = Path(TEMP_DIR) / 'linux-tts-chunks'
     cache_dir.mkdir(parents=True, exist_ok=True)
-    identity = '\0'.join([
-        os.environ.get('VIDZEO_LINUX_TTS_COMMAND', ''),
-        os.environ.get('VIDZEO_LINUX_TTS_VOICE', ''),
-        os.environ.get('VIDZEO_LINUX_TTS_SPEED', '100'),
-    ])
+    resolved = linux_tts_config()
+    if resolved is None:
+        raise ValueError("No Linux TTS command available.")
+    identity = '\0'.join(resolved)
     work_dir = Path(tempfile.mkdtemp(prefix='linux-tts-', dir=str(TEMP_DIR)))
     assembled = []
     try:
@@ -760,8 +797,10 @@ def generate_audio(script: str, voice: str = 'Brian (Male US)',
                    speed: float = 1.0, api_key: str = None, edge_options=None,
                    request_timeout_seconds=None, max_attempts=None, allow_offline_fallback=True):
     """
-    Generate audio from text using Edge TTS with exponential backoff retries.
-    Recovers with offline spoken narration if the online provider fails.
+    Generate audio from text. On Linux the Muse TTS command goes first
+    (see _generate_linux_tts_audio); Edge TTS is the fallback, with
+    exponential backoff retries. Recovers with offline spoken narration
+    if the online provider fails.
     """
     if not _EDGE_TTS_AVAILABLE:
         if _EDGE_TTS_FALLBACK_ENABLED and allow_offline_fallback:
@@ -859,11 +898,19 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
                            max_workers: int = 2, edge_options=None):
     """
     Generate audio in chunks for long scripts, then concatenate.
-    Retries with exponential backoff between ladder levels.
-    Falls back to single-chunk generate_audio if all chunked attempts fail.
+    Primary narration on Linux is Muse TTS (chunked, in parallel);
+    Edge TTS is only the fallback — its websockets are blocked by the
+    egress proxy on this host. Retries with exponential backoff between
+    ladder levels. Falls back to single-chunk generate_audio if all
+    chunked attempts fail.
     """
-    if sys.platform != 'win32' and str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip():
-        return _generate_linux_tts_chunked(script)
+    # Muse TTS first; a failure here falls through to the Edge ladder
+    # below instead of killing the narration.
+    if linux_tts_config() is not None:
+        try:
+            return _generate_linux_tts_chunked(script)
+        except Exception as exc:
+            print(f"   Muse TTS (chunked) failed, falling back to Edge TTS: {exc}", flush=True)
 
     if not _EDGE_TTS_AVAILABLE:
         if _EDGE_TTS_FALLBACK_ENABLED:
@@ -875,12 +922,6 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
             return _generate_sapi_audio(script, output_path)
         raise ValueError("Edge TTS package is not installed. Run `pip install -r requirements.txt`.")
     del speed, api_key
-
-    # A configured Linux offline TTS command handles the whole script at
-    # once; skip the chunked Edge TTS path (whose websocket attempts would
-    # just time out on a host where websockets are blocked).
-    if sys.platform != 'win32' and str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip():
-        return generate_audio(script, voice, edge_options=edge_options)
 
     if len(script) < _EDGE_TTS_CHUNK_TRIGGER_CHARS:
         return generate_audio(script, voice, edge_options=edge_options)

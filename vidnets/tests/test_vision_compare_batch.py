@@ -116,6 +116,114 @@ def _build_verifier(tmp_path, config=None):
     return verifier, context, calls
 
 
+def test_batched_gate_keeps_all_rejected_hard_fatals(tmp_path):
+    """All-rejected compare (job 31f5bfec): the compare judged every
+    finalist and rejected them, so verify_batch used to return {} and the
+    gate re-verified each loser singly — 4 extra vision requests per
+    scene. The hard-rejected rows are now returned as checked
+    compare_rejected verdicts; non-fatal rows are still omitted so they
+    fall back to per-candidate verify(). No full verify() runs here."""
+    verifier, context, calls = _build_verifier(tmp_path)
+    client = context.get_client()
+
+    def all_rejected(_paths, _prompt):
+        calls["compare"] += 1
+        return {
+            "selected_index": -1,
+            "confidence": 80.0,
+            "reason": "all four candidates are GTA V frames, no GTA VI content",
+            "acceptable": False,
+            "candidates": [
+                {"relevance": 25, "quality": 60, "fatal_mismatch": True,
+                 "watermark": False, "scene_description": "GTA V jet over water"},
+                {"relevance": 30, "quality": 65, "fatal_mismatch": False,
+                 "watermark": True, "scene_description": "city skyline, watermarked"},
+                {"relevance": 55, "quality": 70, "fatal_mismatch": False,
+                 "watermark": False, "scene_description": "a night street"},
+            ],
+        }
+
+    client._client.compare_images = all_rejected
+    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(3)]
+    results = verifier.verify_batch(SCENE, candidates)
+    assert calls["compare"] == 1, calls
+    assert calls["analyze"] == 0, "no winner to fully verify, no single re-check"
+    # Only the hard-rejected rows come back, as checked verdicts.
+    assert set(results) == {candidates[0]["path"], candidates[1]["path"]}
+    fatal = results[candidates[0]["path"]]
+    assert fatal["accepted"] is False
+    assert fatal["status"] == "compare_rejected"
+    assert fatal["fatal_mismatch"] is True
+    assert fatal["visual_checked"] is True
+    assert fatal["visual_available"] is True
+    assert fatal["schema_valid"] is False  # no invented identity scores
+    watermarked = results[candidates[1]["path"]]
+    assert watermarked["status"] == "compare_rejected"
+    assert watermarked["watermark"] is True
+    assert watermarked["visual_checked"] is True
+
+
+def test_batched_gate_all_rejected_without_hard_flags_falls_back(tmp_path):
+    """All-rejected compare with no confident hard rejection: nothing is
+    trusted, verify_batch returns {} and the caller falls back to
+    per-candidate verify() exactly as before."""
+    verifier, context, calls = _build_verifier(tmp_path)
+    client = context.get_client()
+
+    def all_clean_rejected(_paths, _prompt):
+        calls["compare"] += 1
+        return {
+            "selected_index": -1,
+            "confidence": 60.0,
+            "reason": "none of the candidates shows the required subject",
+            "acceptable": False,
+            "candidates": [
+                {"relevance": 40, "quality": 60, "fatal_mismatch": False,
+                 "watermark": False, "scene_description": "a quiet road"},
+                {"relevance": 45, "quality": 62, "fatal_mismatch": False,
+                 "watermark": False, "scene_description": "another road"},
+            ],
+        }
+
+    client._client.compare_images = all_clean_rejected
+    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(2)]
+    assert verifier.verify_batch(SCENE, candidates) == {}
+    assert calls["compare"] == 1, calls
+    assert calls["analyze"] == 0
+
+
+def test_batched_gate_all_rows_hard_rejected_returns_all(tmp_path):
+    """Selected index is valid but every row is hard-rejected: previously
+    verify_batch returned {} (not usable) and the gate spent one single
+    verify per finalist. Now all rows come back as checked rejects."""
+    verifier, context, calls = _build_verifier(tmp_path)
+    client = context.get_client()
+
+    def all_fatal(_paths, _prompt):
+        calls["compare"] += 1
+        return {
+            "selected_index": 0,
+            "confidence": 85.0,
+            "reason": "every candidate is the wrong game",
+            "acceptable": False,
+            "candidates": [
+                {"relevance": 20, "quality": 60, "fatal_mismatch": True,
+                 "watermark": False, "scene_description": "GTA V jet"},
+                {"relevance": 22, "quality": 61, "fatal_mismatch": True,
+                 "watermark": False, "scene_description": "GTA V skyline"},
+            ],
+        }
+
+    client._client.compare_images = all_fatal
+    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(2)]
+    results = verifier.verify_batch(SCENE, candidates)
+    assert calls["compare"] == 1, calls
+    assert calls["analyze"] == 0
+    assert set(results) == {c["path"] for c in candidates}
+    assert all(v["status"] == "compare_rejected" and v["visual_checked"] is True
+               for v in results.values())
+
+
 def test_batched_gate_judges_four_finalists_in_one_request(tmp_path):
     verifier, _context, calls = _build_verifier(tmp_path)
     candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(3)]

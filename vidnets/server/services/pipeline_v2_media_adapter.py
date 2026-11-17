@@ -1945,6 +1945,64 @@ def _explicit_metadata_scene_conflict(
     return ""
 
 
+def _record_raw_fatal_verdict(scene: Mapping[str, Any], candidate: Mapping[str, Any], verdict: Mapping[str, Any], asset_sha256: str = "") -> Optional[dict]:
+    """Record a raw fatal vision verdict in the file ledger, best-effort.
+
+    Called BEFORE ``_score_verdict`` can soften the verdict (action-only
+    normalisation, establishing-shot downgrade, relaxed-gate clearing):
+    the ledger keeps the model's original fatal call so the coordinator
+    can veto the content even when the scored verdict ends up accepted.
+    ``verdict`` here is the schema-validated raw model verdict, not the
+    scored one.  Never raises: a ledger failure must not fail verification.
+    The record carries a deterministic ``adapter-fatal:<scene>:<content>``
+    request id (the adapter has no bridge request id of its own) so a
+    re-record of the same content dedupes instead of duplicating.
+    """
+    try:
+        if not isinstance(verdict, Mapping) or not _as_bool(verdict.get("fatal_mismatch")):
+            return None
+        from .agent_bridge import bridge_root
+        from .verdict_conflicts import parse_video_id, record_late_fatal_reject
+
+        scene_row = scene if isinstance(scene, Mapping) else {}
+        try:
+            scene_index = scene_row.get("scene_index")
+            scene_index = int(scene_index) if scene_index is not None else None
+        except (TypeError, ValueError):
+            scene_index = None
+        candidate_id = str(
+            candidate.get("candidate_id")
+            or candidate.get("id")
+            or verdict.get("candidate_id")
+            or ""
+        ).strip() or None
+        video_id = parse_video_id(candidate_id, verdict)
+        requirement = scene_row.get("visual_requirement")
+        requirement_hash = (
+            str((requirement or {}).get("requirement_hash") or "").strip()
+            if isinstance(requirement, Mapping)
+            else ""
+        )
+        identifier = video_id or str(asset_sha256 or "").strip() or (candidate_id or "")
+        request_id = "adapter-fatal:%s:%s" % (
+            scene_index if scene_index is not None else requirement_hash or "unknown",
+            identifier,
+        )
+        record = {
+            "request_id": request_id,
+            "candidate_id": candidate_id,
+            "video_id": video_id,
+            "asset_sha256": str(asset_sha256 or "").strip() or None,
+            "scene_index": scene_index,
+            "requirement_hash": requirement_hash or None,
+            "verdict": dict(verdict),
+            "winner": None,
+        }
+        return record_late_fatal_reject(bridge_root(), record)
+    except Exception:
+        return None
+
+
 def build_qwen_verifier(
     config: Mapping[str, Any],
     scenes: Sequence[Any],
@@ -2257,7 +2315,6 @@ def build_qwen_verifier(
         reuse_key = (
             actual_digest,
             str(candidate.get("candidate_id") or candidate.get("path") or ""),
-            str(candidate.get("path") or ""),
             str(scene.get("text") or ""),
             str((scene.get("visual_requirement") or {}).get("requirement_hash") or ""),
             tuple(sorted(str(value) for value in scene.get("positive_subjects") or [])),
@@ -2265,6 +2322,12 @@ def build_qwen_verifier(
             str(scene.get("visual_intent") or ""),
             str(candidate.get("media_type") or ""),
         )
+        # The bare local path is deliberately NOT part of the reuse key:
+        # copies of one clip under different paths are the same content
+        # (same digest, same candidate id, same scene contract) and must
+        # share one cache entry, so a fatal reject cached for one copy is
+        # honoured for the other.  When no candidate id exists the path
+        # still identifies the candidate through the element above.
         cached = _verdict_cache.get(reuse_key)
         if cached is not None:
             publish_visual_progress(scene, actual_digest, cached)
@@ -2490,6 +2553,20 @@ def build_qwen_verifier(
                 value = dict(value, accepted=False, status='rejected', verification_status='rejected',
                              fatal_mismatch=True, semantic_verified=False,
                              rejection_reason='unrequested_text_heavy_slide')
+            existing_cached = _verdict_cache.get(reuse_key)
+            if (
+                isinstance(existing_cached, Mapping)
+                and _as_bool(existing_cached.get("fatal_mismatch"))
+                and existing_cached.get("accepted") is not True
+                and bool(value.get("accepted"))
+            ):
+                # A cached fatal reject for this exact content must never
+                # be overwritten by a later accepted verdict for the same
+                # (digest, candidate, requirement) — e.g. two threads
+                # verifying copies of one clip concurrently, where the
+                # fatal verdict lands first.  Keep the reject.
+                publish_visual_progress(scene, actual_digest, existing_cached)
+                return dict(existing_cached)
             _verdict_cache[reuse_key] = value
             publish_visual_progress(scene, actual_digest, value)
             return value
@@ -2803,6 +2880,9 @@ def build_qwen_verifier(
                         "visual_checked": True,
                         "visual_available": True,
                     })
+                    # Record the RAW fatal verdict before _score_verdict
+                    # can soften it (action-only normalisation et al.).
+                    _record_raw_fatal_verdict(scene, candidate, primary_result, actual_digest)
                     return done(_score_verdict(scene, primary_result))
             except Exception as exc:
                 primary_errors.append(f"primary_error:{type(exc).__name__}")
@@ -2853,6 +2933,9 @@ def build_qwen_verifier(
                 "visual_checked": True,
                 "visual_available": True,
             })
+            # Record the RAW fatal verdict before _score_verdict can
+            # soften it — same rule as the primary return site above.
+            _record_raw_fatal_verdict(scene, candidate, fallback_result, actual_digest)
             return done(_score_verdict(scene, fallback_result))
         finally:
             if frames and cleanup_frames is not None:
@@ -2875,10 +2958,29 @@ def build_qwen_verifier(
         them if the winner fails. The winner's verdict is the authoritative
         full verify() result, cached like any other.
 
+        All-rejected compares keep their hard rejections instead of
+        discarding them: when the compare selects no winner
+        (``selected_index`` -1 / ``acceptable`` false) or every row is
+        hard-rejected, the hard-rejected rows are returned as
+        ``compare_rejected`` verdicts with ``visual_checked`` True — the
+        compare worker looked at the pixels and flagged a confident fatal
+        mismatch, watermark, or unsafe content, so the coordinator caches
+        and ledgers that verdict for this scene instead of re-verifying
+        each loser singly (job 31f5bfec: one all-rejected compare per scene
+        was followed by 4 single-frame verifications of the same frames,
+        28 wasted vision requests across 7 scenes). Non-fatal rows are
+        still omitted in that case, so they fall back to per-candidate
+        verify() as today — the compare stays a ranking aid, never the
+        rejection authority, for anything less than a confident hard
+        rejection. The veto is scene-scoped (the coordinator's fatal
+        ledger keys on scene + content), so a frame rejected for one
+        scene is still judged fresh for another.
+
         Returns {candidate path: verdict} for the batched candidates, or {}
         when batching does not apply (fewer than 2 image finalists, a video
-        finalist, no client, an all-rejected compare, or any compare error):
-        the caller then falls back to one verify() call per finalist, as today.
+        finalist, no client, or any compare error): the caller then falls
+        back to one verify() call per finalist, as today. An all-rejected
+        compare returns only its hard-rejected rows (see above), never {}.
         """
         rows = [row for row in (candidates or []) if isinstance(row, Mapping)]
         if len(rows) < 2:
@@ -2931,9 +3033,11 @@ def build_qwen_verifier(
         if not model_rows:
             return {}
         selected = comparison.get("selected_index")
-        if not isinstance(selected, int) or isinstance(selected, bool) or not 0 <= selected < len(eligible):
-            return {}
-
+        has_winner = (
+            isinstance(selected, int)
+            and not isinstance(selected, bool)
+            and 0 <= selected < len(eligible)
+        )
         def _row_number(row: Mapping[str, Any], keys: Sequence[str], default: float = 0.0) -> float:
             for key in keys:
                 value = row.get(key)
@@ -2981,11 +3085,28 @@ def build_qwen_verifier(
                 "visual_available": False,
                 "schema_valid": False,
             }
-        if not usable:
-            # The compare is confident every finalist is wrong. It is a
-            # ranking aid, not the rejection authority: fall back so the
-            # authoritative per-candidate path records the real reasons.
-            return {}
+        if not has_winner or not usable:
+            # No winner to fully verify (all-rejected compare), or every
+            # row is hard-rejected. Return ONLY the hard-rejected rows as
+            # checked verdicts: the compare worker inspected the pixels and
+            # flagged a confident fatal mismatch / watermark / unsafe
+            # content, so the coordinator caches and ledgers that verdict
+            # for this scene instead of spending a single-frame vision
+            # request per loser. Non-fatal rows are omitted, so they fall
+            # back to per-candidate verify() as today — the compare never
+            # rejects on a mere ranking judgement. When no row is
+            # hard-rejected this returns {} and the caller falls back
+            # exactly as before.
+            hard_rejected = {}
+            for path, verdict in results.items():
+                if verdict.get("fatal_mismatch") or verdict.get("watermark") or verdict.get("unsafe_content"):
+                    hard_rejected[path] = dict(
+                        verdict,
+                        status="compare_rejected",
+                        visual_checked=True,
+                        visual_available=True,
+                    )
+            return hard_rejected
         winner = eligible[selected]
         winner_verdict = verify(scene_row, dict(winner))
         results[str(winner.get("path") or "")] = dict(winner_verdict, compare_selected=True)
@@ -4901,8 +5022,11 @@ def resolve_existing_provider_branches_v2(
             # of scene downloads: a flat 90s ceiling routinely expired while
             # four parallel ranged downloads were still finishing on slow
             # connections, causing needless shadow-web work and a second
-            # YouTube pass. Keep a bounded cap so a broken transport cannot
-            # consume the render reserve.
+            # YouTube pass. User order (Nov 17, 2026): no fixed branch wall
+            # — the delivery budget is the only bound. A 360s cap killed a
+            # worker still producing clips while the job had ~2000s of
+            # coordinator budget left; the allowance below is still bounded
+            # by the render reserve, so a broken transport cannot consume it.
             try:
                 configured_fallback_wall = config.get("yt_fallback_branch_wall_timeout_seconds")
                 fallback_default = max(
@@ -4915,7 +5039,25 @@ def resolve_existing_provider_branches_v2(
                     180.0,
                     min(360.0, 60.0 * max(1, len(youtube_scene_indices))),
                 )
-            lane_config["yt_branch_wall_timeout_seconds"] = max(60.0, min(360.0, fallback_wall))
+            recovery_wall = max(60.0, min(360.0, fallback_wall))
+            try:
+                from .delivery_budget import get_delivery_budget
+                _recovery_budget = get_delivery_budget(config)
+            except Exception:
+                _recovery_budget = None
+            if _recovery_budget is not None:
+                try:
+                    _recovery_reserve = float(
+                        config.get("_render_reserve_seconds")
+                        or _recovery_budget.render_reserve_seconds
+                    )
+                except (TypeError, ValueError):
+                    _recovery_reserve = float(_recovery_budget.render_reserve_seconds)
+                recovery_wall = max(
+                    recovery_wall,
+                    _recovery_budget.allowance(None, reserve_after_seconds=_recovery_reserve),
+                )
+            lane_config["yt_branch_wall_timeout_seconds"] = recovery_wall
             lane_config["yt_fallback_mode"] = True
         def _safe_scene_start(scene_index: int) -> float:
             value: Any = 0.0
@@ -8183,6 +8325,7 @@ def validate_media_plan_for_render_v2(
     run_root: str | os.PathLike[str] | None = None,
     allow_emergency_media: bool | None = None,
     allow_grounded_graphics: bool = False,
+    allow_web_fallback: bool = False,
 ) -> dict[str, Any]:
     """Final fail-closed integrity gate without global remap or repair."""
 
@@ -8387,10 +8530,19 @@ def validate_media_plan_for_render_v2(
                 (overlay_types & {"caption", "subtitle", "subtitles", "large_text_band"})
                 and not source_overlays_preserved(policy_evidence)
             )
+            # A verified web image satisfies a YouTube-only scene when web
+            # fallback is enabled: the scene has real, verified media, and
+            # the fallback exists precisely so a missing clip does not kill
+            # the video. Without the flag the YouTube-only contract stands.
+            web_fallback_image = (
+                allow_web_fallback
+                and provider == "web"
+                and media_type == "image"
+            )
             if (
                 not valid
-                or provider not in {"youtube", "youtube clips", "yt"}
-                or media_type != "video"
+                or (provider not in {"youtube", "youtube clips", "yt"} and not web_fallback_image)
+                or (media_type != "video" and not web_fallback_image)
                 or verification not in {
                     "verified",
                     "verified_reuse",

@@ -718,38 +718,328 @@ def _verify_youtube_session(
         return None, f"youtube-probe-{type(exc).__name__}"
 
 
-class ConfiguredYouTubeSessions:
-    """Verify operator-supplied accounts on demand, separately from browser login."""
+def _parse_cookie_file_setting(setting: Any) -> List[Path]:
+    """Parse a cookie-file list from env or config.
 
-    def __init__(self, setting: str):
-        paths = (part.strip().strip('"') for part in setting.split(os.pathsep))
-        self.paths = tuple(dict.fromkeys(Path(path).expanduser() for path in paths if path))[:8]
+    Accepts a single path, an ``os.pathsep``-separated list, a
+    comma-separated list, or an iterable of paths.  Duplicates are
+    removed, order is preserved, and the list is capped so one bad
+    operator paste cannot fan out into dozens of probes.
+    """
+    if setting is None:
+        return []
+    if isinstance(setting, (str, os.PathLike)):
+        raw_parts: List[str] = [str(setting)]
+    else:
+        try:
+            raw_parts = [str(part) for part in setting]
+        except TypeError:
+            return []
+    paths: List[Path] = []
+    seen = set()
+    for raw in raw_parts:
+        for chunk in str(raw).replace(os.pathsep, ",").split(","):
+            candidate = chunk.strip().strip('"').strip("'")
+            if not candidate:
+                continue
+            resolved = Path(candidate).expanduser()
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(resolved)
+    return paths[:16]
+
+
+def _discover_cookie_dir_paths(cookie_dir: Any = None) -> List[Path]:
+    """Cookie files dropped into a directory auto-register as accounts.
+
+    Sources, in order: ``VIDZEO_YT_COOKIE_DIR`` (or the explicit
+    ``cookie_dir`` argument) and ``<repo>/cookies.d/`` when it exists.
+    Only ``*.json`` (Cookie-Editor style) and ``*.txt`` (Netscape)
+    exports are picked up, sorted by file name so registration order
+    is deterministic.  A directory is rescanned whenever a pool is
+    (re)built, so a newly dropped file is live for the next job
+    without a server restart.
+    """
+    roots: List[Path] = []
+    configured = str(cookie_dir or os.environ.get("VIDZEO_YT_COOKIE_DIR") or "").strip()
+    if configured:
+        roots.append(Path(configured).expanduser())
+    try:
+        repo_root = Path(__file__).resolve().parents[3]
+        roots.append(repo_root / "cookies.d")
+    except (IndexError, RuntimeError):
+        pass
+    found: List[Path] = []
+    seen = set()
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            for candidate in sorted(root.iterdir(), key=lambda item: item.name):
+                if candidate.is_file() and candidate.suffix.lower() in {".json", ".txt"}:
+                    key = str(candidate.resolve())
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(candidate)
+        except OSError:
+            continue
+    return found
+
+
+def _cookie_pool_verify_ttl_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("VIDZEO_YT_POOL_VERIFY_TTL_SECONDS", "1800") or 1800))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _cookie_pool_retry_delay_seconds(status: str) -> float:
+    env_name = {
+        "throttled": "VIDZEO_YT_POOL_THROTTLE_COOLDOWN_SECONDS",
+        "unverified": "VIDZEO_YT_POOL_UNVERIFIED_RETRY_SECONDS",
+    }.get(status, "")
+    default = 900.0 if status == "throttled" else 120.0
+    if not env_name:
+        return 0.0
+    try:
+        return max(0.0, float(os.environ.get(env_name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+class ConfiguredYouTubeSessions:
+    """Verify operator-supplied accounts on demand, separately from browser login.
+
+    The pool is the single place configured cookie files become
+    authenticated sessions.  It accepts a LIST of files (not one file),
+    plus a cookies directory, tracks per-account health
+    (verified / signed_out / throttled / unverified / load_error),
+    rotates across healthy accounts, and degrades gracefully: one bad
+    file never kills the pool, and zero healthy accounts means the
+    caller falls back to public access.
+    """
+
+    def __init__(self, setting: str = "", *, cookie_dir: Any = None):
+        paths = _parse_cookie_file_setting(setting)
+        for candidate in _discover_cookie_dir_paths(cookie_dir):
+            if str(candidate) not in {str(path) for path in paths}:
+                paths.append(candidate)
+        self.paths = tuple(paths[:16])
         self._lock = RLock()
         self._checked: Dict[int, Optional[http.cookiejar.CookieJar]] = {}
+        self._health: Dict[int, Dict[str, Any]] = {}
+        self._cursor = 0
+
+    # -- health ---------------------------------------------------------
+    def _health_entry(self, index: int) -> Dict[str, Any]:
+        entry = self._health.get(index)
+        if entry is None:
+            entry = {
+                "status": "unknown",
+                "reason": "",
+                "cookie_count": 0,
+                "auth_cookie_count": 0,
+                "failures": 0,
+                "last_checked": 0.0,
+                "verified_at": 0.0,
+            }
+            self._health[index] = entry
+        return entry
+
+    def health_snapshot(self) -> List[Dict[str, Any]]:
+        """Redacted per-account health: file names and counts only, never values."""
+        with self._lock:
+            snapshot = []
+            for index, path in enumerate(self.paths):
+                entry = self._health_entry(index)
+                snapshot.append({
+                    "account": index + 1,
+                    "file": path.name,
+                    "status": str(entry.get("status") or "unknown"),
+                    "reason": str(entry.get("reason") or "")[:120],
+                    "cookie_count": int(entry.get("cookie_count") or 0),
+                    "auth_cookie_count": int(entry.get("auth_cookie_count") or 0),
+                    "failures": int(entry.get("failures") or 0),
+                })
+            return snapshot
+
+    def mark_throttled(self, index: int, reason: str = "") -> None:
+        """Record that YouTube throttled this account; it is skipped until cooldown."""
+        with self._lock:
+            if 0 <= index < len(self.paths):
+                entry = self._health_entry(index)
+                entry["status"] = "throttled"
+                entry["reason"] = str(reason or "youtube-throttled")[:120]
+                entry["failures"] = int(entry.get("failures") or 0) + 1
+                entry["last_checked"] = time.time()
+                self._checked[index] = None
+
+    def mark_signed_out(self, index: int, reason: str = "") -> None:
+        with self._lock:
+            if 0 <= index < len(self.paths):
+                entry = self._health_entry(index)
+                entry["status"] = "signed_out"
+                entry["reason"] = str(reason or "youtube-reported-signed-out")[:120]
+                entry["failures"] = int(entry.get("failures") or 0) + 1
+                entry["last_checked"] = time.time()
+                self._checked[index] = None
+
+    def refresh(self) -> None:
+        """Rescan the cookies directory; new files join the pool, removed ones leave."""
+        with self._lock:
+            current = list(self.paths)
+            discovered = _discover_cookie_dir_paths()
+            if discovered and any(str(path) not in {str(item) for item in current} for path in discovered):
+                merged = list(current)
+                for candidate in discovered:
+                    if str(candidate) not in {str(item) for item in merged}:
+                        merged.append(candidate)
+                self.paths = tuple(merged[:16])
+                self._checked = {
+                    index: jar for index, jar in self._checked.items()
+                    if index < len(self.paths)
+                }
+                self._health = {
+                    index: entry for index, entry in self._health.items()
+                    if index < len(self.paths)
+                }
+
+    # -- verification ---------------------------------------------------
+    def _check_account(self, index: int) -> Optional[http.cookiejar.CookieJar]:
+        """Load + verify one account file; cache the verdict, not the probe."""
+        now = time.time()
+        entry = self._health_entry(index)
+        status = str(entry.get("status") or "unknown")
+        if status == "verified" and self._checked.get(index) is not None:
+            if now - float(entry.get("verified_at") or 0) < _cookie_pool_verify_ttl_seconds():
+                return self._checked[index]
+        if status in {"throttled", "unverified", "signed_out", "load_error"}:
+            if now - float(entry.get("last_checked") or 0) < _cookie_pool_retry_delay_seconds(status):
+                return None
+            if status == "signed_out":
+                # A signed-out export stays signed-out until the operator
+                # replaces the file; re-probing it on every call only burns
+                # the search wall. Re-check at most once per verify TTL.
+                if now - float(entry.get("last_checked") or 0) < _cookie_pool_verify_ttl_seconds():
+                    return None
+        try:
+            jar = _filtered_jar(
+                cookie for cookie in _load_explicit_cookie_file(self.paths[index])
+                if cookie.domain.lstrip(".").lower() == "youtube.com"
+                or cookie.domain.lower().endswith(".youtube.com")
+            )
+        except (OSError, ValueError, http.cookiejar.LoadError) as exc:
+            entry.update({
+                "status": "load_error",
+                "reason": f"unreadable-cookie-file:{type(exc).__name__}",
+                "cookie_count": 0,
+                "auth_cookie_count": 0,
+                "failures": int(entry.get("failures") or 0) + 1,
+                "last_checked": now,
+            })
+            self._checked[index] = None
+            print(f"   [yt-session] configured account {index + 1}: load_error ({type(exc).__name__})", flush=True)
+            return None
+        entry["cookie_count"] = sum(1 for _ in jar)
+        entry["auth_cookie_count"] = _auth_cookie_count(jar)
+        if not _jar_is_authenticated(jar):
+            entry.update({
+                "status": "signed_out",
+                "reason": "no-auth-cookies",
+                "failures": int(entry.get("failures") or 0) + 1,
+                "last_checked": now,
+            })
+            self._checked[index] = None
+            print(f"   [yt-session] configured account {index + 1}: signed_out (no-auth-cookies)", flush=True)
+            return None
+        verified, reason = _verify_youtube_session(jar, explicit_sign_in_only=True)
+        entry["last_checked"] = now
+        if verified is True:
+            entry.update({"status": "verified", "reason": "youtube-confirmed", "verified_at": now})
+            self._checked[index] = jar
+            print(f"   [yt-session] configured account {index + 1}: verified", flush=True)
+            return jar
+        if verified is False:
+            entry.update({
+                "status": "signed_out",
+                "reason": str(reason or "youtube-reported-signed-out")[:120],
+                "failures": int(entry.get("failures") or 0) + 1,
+            })
+            self._checked[index] = None
+            print(f"   [yt-session] configured account {index + 1}: signed_out ({entry['reason']})", flush=True)
+            return None
+        entry.update({
+            "status": "unverified",
+            "reason": str(reason or "youtube-probe-inconclusive")[:120],
+        })
+        self._checked[index] = None
+        print(f"   [yt-session] configured account {index + 1}: unverified ({entry['reason']})", flush=True)
+        return None
 
     def next_verified(self, after: int = -1) -> Tuple[int, Optional[http.cookiejar.CookieJar]]:
+        """First verified account after ``after`` (``-1`` = from the start)."""
         with self._lock:
             for index in range(after + 1, len(self.paths)):
-                if index not in self._checked:
-                    self._checked[index] = None
-                    try:
-                        jar = _filtered_jar(
-                            cookie for cookie in _load_explicit_cookie_file(self.paths[index])
-                            if cookie.domain.lstrip(".").lower() == "youtube.com"
-                            or cookie.domain.lower().endswith(".youtube.com")
-                        )
-                        if _jar_is_authenticated(jar):
-                            verified, _reason = _verify_youtube_session(jar, explicit_sign_in_only=True)
-                            if verified is True:
-                                self._checked[index] = jar
-                    except (OSError, ValueError, http.cookiejar.LoadError):
-                        pass
-                    status = "verified" if self._checked[index] is not None else "unavailable"
-                    print(f"   [yt-session] configured account {index + 1}: {status}", flush=True)
-                jar = self._checked[index]
+                jar = self._check_account(index)
                 if jar is not None:
                     return index, _clone_jar(jar)
         return -1, None
+
+    def next_healthy(self) -> Tuple[int, Optional[http.cookiejar.CookieJar]]:
+        """Round-robin across verified accounts; skips dead/throttled ones.
+
+        Successive calls rotate so one account does not absorb every
+        search and download.  Zero healthy accounts returns (-1, None)
+        and the caller falls back to public access.
+        """
+        with self._lock:
+            total = len(self.paths)
+            if total == 0:
+                return -1, None
+            for step in range(total):
+                index = (self._cursor + step) % total
+                jar = self._check_account(index)
+                if jar is not None:
+                    self._cursor = (index + 1) % total
+                    return index, _clone_jar(jar)
+            return -1, None
+
+
+_CONFIGURED_POOL: Optional[ConfiguredYouTubeSessions] = None
+_CONFIGURED_POOL_KEY: Optional[Tuple[str, Tuple[str, ...]]] = None
+
+
+def get_configured_pool(setting: Any = None) -> ConfiguredYouTubeSessions:
+    """Process-shared pool so rotation survives across searches/downloads.
+
+    The pool is rebuilt when the configured file list or the cookies
+    directory listing changes, so a newly dropped file is picked up by
+    the next job without a server restart.  Health is kept on the
+    shared instance: an account marked throttled mid-job stays
+    skipped for the rest of its cooldown.
+    """
+    global _CONFIGURED_POOL, _CONFIGURED_POOL_KEY
+    with _LOCK:
+        raw_setting = "" if setting is None else str(setting)
+        if setting is None:
+            raw_setting = str(os.environ.get("VIDZEO_YT_COOKIE_FILES") or "").strip()
+        dir_files = tuple(str(path) for path in _discover_cookie_dir_paths())
+        key = (raw_setting, dir_files)
+        if _CONFIGURED_POOL is None or _CONFIGURED_POOL_KEY != key:
+            _CONFIGURED_POOL = ConfiguredYouTubeSessions(raw_setting)
+            _CONFIGURED_POOL_KEY = key
+        else:
+            _CONFIGURED_POOL.refresh()
+        return _CONFIGURED_POOL
+
+
+def reset_configured_pool() -> None:
+    global _CONFIGURED_POOL, _CONFIGURED_POOL_KEY
+    with _LOCK:
+        _CONFIGURED_POOL = None
+        _CONFIGURED_POOL_KEY = None
 
 
 def _classify_extraction_error(profile: BrowserProfile, exc: Exception) -> str:
@@ -1078,9 +1368,27 @@ def _write_netscape_cookies(jar: http.cookiejar.CookieJar) -> List[Path]:
         lines.append(f"{domain}\t{include_sub}\t{path}\t{secure}\t{expires}\t{c.name}\t{c.value}\n")
 
     content = "".join(lines)
+    new_count = sum(1 for _ in jar)
     written: List[Path] = []
     for target in targets:
         try:
+            # Never downgrade a cookie file: a 2-cookie test jar must not
+            # overwrite the operator's real 16-cookie export (Nov 17 the
+            # session tests clobbered both generated cookies.txt files
+            # this way). A larger jar still replaces a smaller one.
+            if target.is_file():
+                try:
+                    existing = http.cookiejar.MozillaCookieJar(str(target))
+                    existing.load(ignore_discard=True, ignore_expires=True)
+                    if sum(1 for _ in existing) > new_count:
+                        print(
+                            f"   [yt-session] keeping existing {target.name} "
+                            f"({sum(1 for _ in existing)} cookies) over smaller install "
+                            f"({new_count} cookies)"
+                        )
+                        continue
+                except (OSError, http.cookiejar.LoadError, ValueError):
+                    pass
             target.parent.mkdir(parents=True, exist_ok=True)
             temp = target.with_suffix(f".tmp.{os.getpid()}")
             temp.write_text(content, encoding="utf-8")
@@ -1128,19 +1436,12 @@ def ensure_session(
         _cleanup_legacy_plaintext()
         if not _SESSION_META:
             _SESSION_META = _load_cookie_update_state()
-        if _SESSION_META.get("cookie_update_required") and not force_refresh:
-            raise YouTubeSessionUnavailable(str(_SESSION_META.get("reason") or "Fresh YouTube cookies are required."))
-        if (
-            force_refresh and stale_generation is not None and _GENERATION > stale_generation
-            and _jar_is_authenticated(_MEMORY_JAR) and _meta_matches_preference(_SESSION_META, preferred)
-        ):
-            return _clone_jar(_MEMORY_JAR), _GENERATION
-        if (
-            not force_refresh and _jar_is_authenticated(_MEMORY_JAR)
-            and _meta_matches_preference(_SESSION_META, preferred)
-        ):
-            return _clone_jar(_MEMORY_JAR), _GENERATION
-
+        # A freshly supplied cookie file is new evidence, not the rejected
+        # saved session: try it BEFORE honouring a stale signed-out marker.
+        # Otherwise one failed probe permanently blocks every later file
+        # install and the pipeline silently falls back to anonymous search.
+        # A file that verifies installs and clears the marker; a file that
+        # fails verification falls through to the marker error below.
         explicit_env = (
             os.environ.get("VIDZEO_YT_COOKIES_FILE")
             or os.environ.get("VIDZEO_YT_COOKIES_PATH")
@@ -1150,11 +1451,26 @@ def ensure_session(
         )
         explicit = str(explicit_env or "").strip()
         candidate_paths = []
+        # The configured pool (VIDZEO_YT_COOKIE_FILES list + cookies
+        # directory) is explicit operator config: try those files first,
+        # ahead of the stale-marker check below and ahead of the
+        # cwd/browser scan, so a fresh file is never shadowed.
+        for candidate in _parse_cookie_file_setting(
+            os.environ.get("VIDZEO_YT_COOKIE_FILES") or ""
+        ):
+            if candidate.is_file():
+                candidate_paths.append(candidate)
+        for candidate in _discover_cookie_dir_paths():
+            if candidate.is_file() and candidate not in candidate_paths:
+                candidate_paths.append(candidate)
         if explicit:
             candidate_paths.append(Path(explicit).expanduser())
         elif explicit_env is None:
             vidnets_root = Path(__file__).resolve().parents[2]
             repo_root = vidnets_root.parent
+            # Try every existing candidate in order: a stale partial export
+            # (e.g. a generated cookies.txt with no auth cookies) must not
+            # shadow a good cookies.json sitting next to it.
             for candidate in [
                 Path.cwd() / "test_cookies.txt",
                 Path.cwd() / "test_cookies.json",
@@ -1175,7 +1491,6 @@ def ensure_session(
             ]:
                 if candidate.is_file():
                     candidate_paths.append(candidate)
-                    break
 
         for cookie_path in candidate_paths:
             try:
@@ -1194,6 +1509,19 @@ def ensure_session(
                         return installed, _GENERATION
             except Exception as exc:
                 print(f"   [yt-session] manual cookie file {cookie_path.name} rejected: {type(exc).__name__}")
+
+        if _SESSION_META.get("cookie_update_required") and not force_refresh:
+            raise YouTubeSessionUnavailable(str(_SESSION_META.get("reason") or "Fresh YouTube cookies are required."))
+        if (
+            force_refresh and stale_generation is not None and _GENERATION > stale_generation
+            and _jar_is_authenticated(_MEMORY_JAR) and _meta_matches_preference(_SESSION_META, preferred)
+        ):
+            return _clone_jar(_MEMORY_JAR), _GENERATION
+        if (
+            not force_refresh and _jar_is_authenticated(_MEMORY_JAR)
+            and _meta_matches_preference(_SESSION_META, preferred)
+        ):
+            return _clone_jar(_MEMORY_JAR), _GENERATION
 
         if not force_refresh:
             persisted_jar, persisted_meta = _load_persisted()
@@ -1451,6 +1779,7 @@ def reset_for_tests() -> None:
         _MEMORY_JAR = None
         _SESSION_META = {}
         _GENERATION = 0
+    reset_configured_pool()
 
 
 def inherit_from_vidnets() -> Dict[str, Any]:
