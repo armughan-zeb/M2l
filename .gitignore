@@ -6,6 +6,9 @@ node_modules/
 # Testing and cache
 .cache/
 cache/
+!scriptit/src/cache/
+scriptit/src/cache/*
+!scriptit/src/cache/cache.js
 .pytest_cache/
 __pycache__/
 *.py[cod]
@@ -19,6 +22,10 @@ artifacts/
 temp/
 logs/
 *.log
+
+# Linux Remotion render project (built artefacts; source is committed)
+remotion-linux/node_modules/
+remotion-linux/out/
 
 # Muse worker state (never commit: contains the worker bearer token)
 .muse-agent.json

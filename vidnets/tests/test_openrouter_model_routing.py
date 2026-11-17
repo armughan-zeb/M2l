@@ -133,7 +133,7 @@ def test_scene_brain_defaults_to_nemotron_free_without_premium_fallbacks(monkeyp
     monkeypatch.delenv("VIDZEO_SCENE_BRAIN_FALLBACK_MODELS", raising=False)
     monkeypatch.delenv("VIDZEO_SCENE_BRAIN_FALLBACK_CHAIN", raising=False)
     config = normalize_generation_config({})
-    assert config["scene_brain_model"] == DEFAULT_SCENE_BRAIN_MODEL
+    assert config["scene_brain_model"] == "nvidia/nemotron-3.5-super-vl:free"
     assert config["scene_brain_fallback_models"] == [
         "nvidia/nemotron-3.5-super-vl:free",
     ]
@@ -225,6 +225,11 @@ def test_scene_query_director_uses_compact_valid_schema(monkeypatch):
         "subject_evidence": "A cargo ship enters a Panama Canal lock.",
         "visible_target": "Cargo ship entering a canal lock",
         "identity_scope": "subject",
+        "domain_category": "travel",
+        "scene_subject_type": "place",
+        "retrieval_positive_terms": ["Panama Canal", "cargo ship", "canal lock", "lock transit"],
+        "retrieval_negative_terms": [],
+        "youtube_query_intents": ["raw footage", "lock transit", "ship entering"],
         "youtube": {
             "primary": "Panama Canal cargo ship entering lock raw footage",
             "supporting": "Panama Canal ship lock transit footage",

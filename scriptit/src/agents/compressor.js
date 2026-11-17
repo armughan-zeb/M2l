@@ -106,6 +106,9 @@ function buildBrief(research) {
       url: x.url || '',
       source: x.source || '',
       date: x.date || x.articleDate || '',
+      // Synthetic (model-written dossier) items carry fabricated archive
+      // URLs; the evidence gate must not count them as external sources.
+      synthetic: x.synthetic === true,
     })),
     facts: dedupe(facts).slice(0, 12),
     recentEvents: dedupe(recentEvents).slice(0, 10),

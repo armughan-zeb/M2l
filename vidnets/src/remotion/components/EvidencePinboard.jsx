@@ -113,7 +113,6 @@ export function EvidencePinboard({
             stroke="#E53E3E"
             strokeWidth="3.5"
             strokeLinecap="round"
-            filter="drop-shadow(0 8px 10px rgba(0,0,0,0.7))"
           />
         )}
         {/* String 2: Node 2 (center) to Node 3 (right) */}
@@ -124,7 +123,6 @@ export function EvidencePinboard({
             stroke="#E53E3E"
             strokeWidth="3.5"
             strokeLinecap="round"
-            filter="drop-shadow(0 8px 10px rgba(0,0,0,0.7))"
           />
         )}
       </svg>

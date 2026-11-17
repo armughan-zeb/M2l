@@ -284,16 +284,17 @@ def run_visual_intelligence_pass(
             flush=True,
         )
     image_pipeline = ImageIntelligencePipeline(client, visual_required=bool(context.visual_required))
+    # Spec: 1-2 frames per clip for vision ranking, frames only.
     try:
         final_clip_frames = max(
-            3,
+            1,
             min(
-                5,
-                int(os.environ.get("VIDZEO_VIP_FINAL_CLIP_FRAMES", "3") or 3),
+                2,
+                int(os.environ.get("VIDZEO_VIP_FINAL_CLIP_FRAMES", "2") or 2),
             ),
         )
     except Exception:
-        final_clip_frames = 3
+        final_clip_frames = 2
     clip_pipeline = ClipIntelligencePipeline(
         client,
         max_frames=final_clip_frames,

@@ -376,11 +376,12 @@ def run_startup_maintenance():
     if auto_requeue or os.environ.get('VIDZEO_AGENT_RECOVER_QUEUE') == '1':
         try:
             qm = get_queue_manager()
+            from services.queue_manager import SYSTEM_RECOVERY_PAUSED_REASONS
             # Jobs paused by a backend restart (not by the user) resume
             # automatically, so a rebooted machine picks up where it left off
             # instead of leaving jobs parked until someone clicks Resume.
             for item in list(qm.queue):
-                if item.get("status") == "paused" and item.get("paused_reason") in {"backend_restart", "cancellation_cleanup_timeout"}:
+                if item.get("status") == "paused" and item.get("paused_reason") in SYSTEM_RECOVERY_PAUSED_REASONS:
                     qm.resume_item(item.get("id"))
             has_queued = any(item.get("status") == "queued" for item in qm.queue)
             if has_queued and not qm.worker_running:
@@ -388,6 +389,22 @@ def run_startup_maintenance():
                 qm.start_worker(_queue_generation_callback)
         except Exception as e:
             print(f"[Startup] Failed to auto-start queue worker: {e}")
+    # The worker itself is NOT gated on auto-requeue. The driver (or a
+    # manual Retry) can only move a job to QUEUED, and a QUEUED job with no
+    # worker running sits stranded until the next /queue/add or /queue/start
+    # call. After a reboot the server starts with no worker — nothing sets
+    # VIDZEO_AUTO_REQUEUE_INTERRUPTED in the stock start path — so start
+    # it whenever accepted work is already waiting. An idle worker just
+    # waits on the queue condition; this changes no resume policy, it only
+    # lets already-queued work run. Without this, a driver-resumed job
+    # after a reboot would sit QUEUED forever on a quiet machine.
+    try:
+        qm = get_queue_manager()
+        if any(item.get("status") == "queued" for item in qm.queue) and not qm.worker_running:
+            print("[Startup] Starting queue worker for saved queued jobs...")
+            qm.start_worker(_queue_generation_callback)
+    except Exception as e:
+        print(f"[Startup] Failed to start queue worker for saved jobs: {e}")
 
 # NSFW startup initialization removed.
 # It was not part of the active media pipeline and only added noisy startup warnings.
@@ -2195,13 +2212,20 @@ def _sanitize_user_progress_message(fraction, raw_msg):
     return clean
 
 
-def _make_progress_reporter(raw_callback=None):
+def _make_progress_reporter(raw_callback=None, on_progress=None):
     """Normalize concurrent progress callbacks without hiding active stages.
 
     Audio, captions, media retrieval, and rendering can report in parallel.
     Their local fractions are not comparable, so a slower branch must still be
     allowed to update the stage label while the public fraction stays
     monotonic. The callback state is shared by worker threads.
+
+    ``on_progress`` is called only on a genuine advance — a higher public
+    fraction, or a further scene count in a count-bearing stage label — and
+    never on a heartbeat re-emission ("still working …") or a stale shadow
+    count. It exists so the delivery budget can be extended by real progress
+    (``DeliveryBudget.note_progress``); a stalled job must never extend its
+    own deadline by re-emitting the same state.
     """
     if raw_callback is None:
         return lambda fraction, message: None
@@ -2242,6 +2266,7 @@ def _make_progress_reporter(raw_callback=None):
         # threads, and their local fractions describe different phases.
         with state_lock:
             stage, detail = _stage_detail(clean_msg)
+            detail_advanced = False
             if stage and detail:
                 # A wave is one run of a scene-counting stage, identified
                 # by its scene total. The primary web wave and a later
@@ -2259,6 +2284,7 @@ def _make_progress_reporter(raw_callback=None):
                     # shadow branch of the finished one.
                     if previous[0] >= previous[1]:
                         last_stage_detail[key] = detail
+                        detail_advanced = True
                     else:
                         # Shadow/fallback branches report their own subset
                         # counts. Ignore stale scene counts while allowing
@@ -2266,6 +2292,7 @@ def _make_progress_reporter(raw_callback=None):
                         # remain visible.
                         return
                 elif previous:
+                    detail_advanced = detail[0] > previous[0] or detail[2] > previous[2]
                     detail = (
                         max(detail[0], previous[0]),
                         max(detail[1], previous[1]),
@@ -2274,6 +2301,7 @@ def _make_progress_reporter(raw_callback=None):
                     last_stage_detail[key] = detail
                 else:
                     last_stage_detail[key] = detail
+                    detail_advanced = True
 
             # Never discard a real phase update just because another parallel
             # branch has a larger local fraction. Preserve a monotonic public
@@ -2281,8 +2309,14 @@ def _make_progress_reporter(raw_callback=None):
             reported_fraction = max(last_fraction, clamped)
             if reported_fraction == last_fraction and clean_msg == last_message:
                 return
+            fraction_advanced = reported_fraction > last_fraction
             last_fraction = reported_fraction
             last_message = clean_msg
+            if (fraction_advanced or detail_advanced) and on_progress is not None:
+                try:
+                    on_progress()
+                except Exception:
+                    pass
             try:
                 raw_callback(reported_fraction, clean_msg)
                 return
@@ -2540,6 +2574,101 @@ def _set_video_package_status(config, status, **extra):
         marker.write_text(json.dumps(_checkpoint_safe(payload), indent=2, default=str), encoding="utf-8")
     except OSError:
         pass
+
+
+def _remotion_render_output_path(package_dir, safe_name):
+    """One stable render output path shared by the first render and its resume.
+
+    The JS runner checkpoints finished sections beside this path
+    (``.<basename>.render-sections/<hash>/``), so the original render and a
+    checkpoint resume must use the SAME path or the resume re-renders every
+    finished section from scratch. Previously the first render wrote to a
+    title-derived TEMP file while the resume rendered into
+    ``<package>/render/<name>_remotion.mp4`` — different directories, so no
+    section was ever reused across the designed resume path.
+    """
+    return Path(str(package_dir)).expanduser().resolve() / "render" / f"{sanitize_output_name(safe_name)}_remotion.mp4"
+
+
+def _classify_render_failure(error):
+    """Map a render exception to (kind, retryable, extra) for render_failure.json.
+
+    ``retryable`` means a later attempt from the saved checkpoint may succeed
+    (manual Retry or driver pause). It is True for every render failure except
+    a proven-terminal defect, because a failed render must never kill a video
+    except for no usable media / zero real media. Cancellation is retryable
+    too — the checkpoint is what a manual Resume reuses — but it is recorded
+    as kind ``cancelled`` with ``cancelled_by`` so the driver never mistakes
+    a user stop for a render bug and auto-retries it.
+    """
+    from services.cancellation import JobCancelled
+
+    message = str(error or "")
+    lowered = message.lower()
+    stage = getattr(error, "stage", None)
+    if isinstance(error, (JobCancelled, InterruptedError)):
+        reason = ""
+        args = getattr(error, "args", None)
+        if args:
+            reason = str(args[0] or "")
+        cancelled_by = "delivery_deadline" if "deadline exceeded" in lowered else "user"
+        return ("cancelled", True, {"cancelled_by": cancelled_by, "cancel_reason": (reason or message)[:500]})
+    if stage == "delivery_deadline" or "deadline exceeded" in lowered or "preparation deadline expired" in lowered:
+        return ("delivery_deadline", True, {})
+    memory_snapshot = getattr(error, "memory_snapshot", None)
+    if memory_snapshot is None:
+        memory_snapshot = getattr(getattr(error, "__cause__", None), "memory_snapshot", None)
+    if memory_snapshot:
+        return ("low_memory", True, {"memory": dict(memory_snapshot)})
+    if isinstance(error, RemotionEditPlanError):
+        return ("edit_plan_invalid", True, {})
+    if (
+        "mediacachesizeinbytes" in lowered
+        or "offthreadvideocachesizeinbytes" in lowered
+        or "minimum value for the" in lowered
+    ):
+        # Deterministic Remotion prop validation (GTA VI ef306926: 64 MB media
+        # cache vs the 240 MB minimum). A later attempt can pass once
+        # render-mode has freed memory or the cache floor is fixed, but an
+        # immediate retry with identical conditions cannot.
+        return ("render_config_invalid", True, {"immediate_retry": False})
+    return ("render_failed", True, {})
+
+
+def _write_render_failure_checkpoint(config, error, *, kind=None, retryable=None, extra=None):
+    """Write the complete render_failure.json contract for ANY render failure.
+
+    Every render failure — not just low-memory ones — must leave
+    ``kind`` / ``error`` / ``edit_plan_path`` / ``retryable`` behind, or the
+    driver and humans cannot tell a deterministic config error from a
+    transient crash, and the resume gate cannot tell a cancelled job from a
+    failed one. Returns the payload written.
+    """
+    auto_kind, auto_retryable, auto_extra = _classify_render_failure(error)
+    kind = kind or auto_kind
+    retryable = auto_retryable if retryable is None else bool(retryable)
+    merged_extra = {**(auto_extra or {}), **(extra or {})}
+    payload = {
+        "kind": kind,
+        "error": f"{type(error).__name__}: {error}",
+        "edit_plan_path": (config or {}).get("_remotion_plan_path"),
+        "retryable": bool(retryable),
+        **merged_extra,
+    }
+    stage = {
+        "low_memory": "waiting_for_memory",
+        "edit_plan_invalid": "waiting_for_plan_correction",
+        "cancelled": "cancelled",
+    }.get(kind, "waiting_for_render_retry")
+    _write_generation_checkpoint(
+        config,
+        "render_failure.json",
+        payload,
+        stage=stage,
+        status="retryable" if retryable else "failed",
+    )
+    _set_video_package_status(config, stage, retryable=bool(retryable))
+    return payload
 
 
 def _is_video_path(path):
@@ -4372,6 +4501,56 @@ def _apply_authenticated_youtube_mix(policy, config, session_verified=None):
     return resolved
 
 
+def _apply_gaming_mode_policy(config, policy, title, script, scene_texts):
+    """Wire the gaming niche policy into the config the quota math reads.
+
+    The planner computes gaming weights (YT 0.80) but the adapter's ratio
+    function only reads ``config['mixed_media_weights']`` — the GTA hole was
+    that the policy weights lived only in ``_niche_media_policy`` and never
+    reached it. This copies them for gaming jobs and records
+    ``config['_gaming_mode']`` so the adapter binds the 0.90 YouTube target
+    and YT-primary lane order. Explicit operator weights stay authoritative:
+    the copy only fills the gap when the job has none.
+    """
+    if not isinstance(config, dict) or not isinstance(policy, dict):
+        return
+    try:
+        from services.mixed_media_planner import gaming_mode_for
+        gaming = gaming_mode_for(
+            title, script, list(scene_texts or []),
+            config.get('category') or config.get('niche') or '',
+        )
+    except Exception:
+        gaming = False
+    if not gaming:
+        gaming = str(policy.get('niche') or '').strip().lower() == 'gaming'
+    config['_gaming_mode'] = bool(gaming)
+    if not gaming:
+        return
+    # Stamp the binding 0.90 YouTube target from the planner constant so
+    # the adapter's quota math reads the same number the policy sets.
+    try:
+        from services.mixed_media_planner import GAMING_YOUTUBE_TARGET_RATIO
+        config['_gaming_youtube_target'] = GAMING_YOUTUBE_TARGET_RATIO
+    except Exception:
+        config['_gaming_youtube_target'] = 0.90
+    weights = policy.get('weights')
+    if isinstance(weights, dict) and weights:
+        explicit = config.get('mixed_media_weights') or config.get('media_weights')
+        if not (isinstance(explicit, dict) and any(
+            str(key).strip() in {"Web Images", "YouTube Clips", "Stock Media", "AI Images"}
+            for key in explicit
+        )):
+            config['mixed_media_weights'] = dict(weights)
+    # GTA got 6 download candidates because setdefault kept a pre-existing
+    # value. Gaming mode enforces 10 explicitly, not via setdefault.
+    retrieval = policy.get('retrieval_policy') if isinstance(policy.get('retrieval_policy'), dict) else {}
+    try:
+        config['yt_download_candidate_limit'] = int(retrieval.get('yt_download_candidate_limit', 10))
+    except (TypeError, ValueError):
+        config['yt_download_candidate_limit'] = 10
+
+
 def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
     """Attach one auditable script-niche policy before plan/query branches."""
     if not isinstance(config, dict):
@@ -4405,6 +4584,7 @@ def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
                     config.setdefault(key, value)
             existing = _apply_authenticated_youtube_mix(existing, config)
             config['_niche_media_policy'] = existing
+            _apply_gaming_mode_policy(config, existing, title, script, scene_texts)
             return existing
         print("   [mix] refreshing stale niche policy for the current script context")
     try:
@@ -4463,6 +4643,7 @@ def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
     if isinstance(retrieval_policy, dict):
         for key, value in retrieval_policy.items():
             config.setdefault(key, value)
+    _apply_gaming_mode_policy(config, policy, title, script, scene_texts)
     weights = policy.get('weights') or {}
     print(
         f"   [mix] script niche policy: {policy.get('niche') or 'general'} "
@@ -4472,6 +4653,7 @@ def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
         f"stock={float(weights.get('Stock Media') or 0):.0%}"
         + (", verified YouTube session" if policy.get('youtube_coverage_mode') == 'verified_cookie_video_majority' else '')
         + (", GTA VI exact-title media; prior-title clips only for an explicit scene comparison" if policy.get('gta_vi') else '')
+        + (", gaming mode: 90% YouTube" if config.get('_gaming_mode') else '')
         + ")"
     )
     return policy
@@ -6524,6 +6706,16 @@ def _adapt_scene_brain_plans(plans, scene_texts, title, section_subjects=None, s
     section_subjects = list(section_subjects or [])
     sections = list(sections or [])
     try:
+        from services.vidzeo_brain import (
+            _infer_scene_subject_type,
+            _subject_type_mismatch,
+            scene_subject_game_for_scene,
+        )
+    except Exception:
+        _infer_scene_subject_type = None
+        _subject_type_mismatch = None
+        scene_subject_game_for_scene = None
+    try:
         from services.container_guard import canonical_container_subject, canonicalize_sections
         sections = canonicalize_sections(sections, scene_texts=list(scene_texts or []), topic=title or "") if sections else sections
         section_subjects = [
@@ -6637,11 +6829,38 @@ def _adapt_scene_brain_plans(plans, scene_texts, title, section_subjects=None, s
         forbidden_subjects = plan.get("forbidden_subjects")
         if not isinstance(forbidden_subjects, list):
             forbidden_subjects = _scene_brain_forbidden_subjects(idx, active_subject, section_subjects)
+        # Subject type is inferred, never defaulted to "person": the old
+        # default typed every studio, place and game title as a person
+        # (the GTA VI proof job shipped 8/8 rows "person"). Keep the
+        # plan's value only when it does not contradict the subject;
+        # otherwise infer from the visual type / subject text. The
+        # fallback when the helper is unavailable is the neutral "topic".
+        claimed_type = str(plan.get("scene_subject_type") or "").strip().lower()
+        if _infer_scene_subject_type is not None:
+            probe = {"scene_subject": scene_subject, "container_subject": section_subject,
+                     "scene_subject_type": claimed_type,
+                     "visual_subject_type": plan.get("visual_subject_type") or ""}
+            scene_subject_type = claimed_type
+            if not claimed_type or (_subject_type_mismatch is not None and _subject_type_mismatch(probe)):
+                scene_subject_type = _infer_scene_subject_type(
+                    scene_subject, plan.get("visual_subject_type") or "", scene_text)
+        else:
+            scene_subject_type = claimed_type or "topic"
+        # Scene-relative game: carry the plan's derived subject game, or
+        # derive it from this scene's own narration, so retrieval and the
+        # relevance gate see which game this scene's queries must seek.
+        scene_subject_game = str(plan.get("scene_subject_game") or "").strip().lower()
+        if not scene_subject_game and scene_subject_game_for_scene is not None:
+            try:
+                scene_subject_game = str(scene_subject_game_for_scene(scene_text, title).get("key") or "")
+            except Exception:
+                scene_subject_game = ""
         base = {
             "scene_number": idx + 1,
             "section_subject": section_subject,
             "scene_subject": scene_subject,
-            "scene_subject_type": str(plan.get("scene_subject_type") or ("person" if section_subject else "topic")).strip().lower(),
+            "scene_subject_type": scene_subject_type,
+            "scene_subject_game": scene_subject_game,
             "container_type": str(section_info.get("container_type") or plan.get("container_type") or plan.get("scene_subject_type") or ("entity" if section_subject else "topic")).strip().lower(),
             "subject_query": active_subject,
             "topic_anchor": row_topic_anchor,
@@ -6903,7 +7122,10 @@ def _shared_plan_cache_path(script, title, scene_texts) -> Path:
 # scene plan even though the live resolver has been fixed.  Version the cache
 # payload so query semantics are invalidated deliberately instead of relying
 # on filesystem age or a manual cleanup.
-_SHARED_PLAN_CACHE_SCHEMA = "scene_context_v19_grounded_local_subjects"
+# v20: scene-relative queries — contract-validated rows only (non-empty
+# retrieval fields, correct subject types, distinct scene-accurate primaries,
+# queries naming the scene's own subject game). v19 bundles are not servable.
+_SHARED_PLAN_CACHE_SCHEMA = "scene_context_v20_scene_relative_queries"
 
 
 def _shared_plan_cache_ttl(config) -> float:
@@ -6957,6 +7179,19 @@ def _load_shared_plan_cache(script, title, scene_texts, config):
             distinct_queries.discard("")
             if len(distinct_queries) <= 1:
                 return None
+        # Contract gate: a stored bundle predating the retrieval-contract
+        # validator (or written with empty fields, wrong subject types, or
+        # duplicate queries) must not be served. The GTA VI proof job was
+        # served such a bundle from cache: all 8 rows failed validation
+        # and 7 typed a studio/place/game as "person". Reject -> fresh plan.
+        try:
+            from services.vidzeo_brain import validate_cached_scene_bundle
+            cache_error = validate_cached_scene_bundle(bundle, list(scene_texts or []), str(title or ""))
+        except Exception:
+            cache_error = None
+        if cache_error:
+            print(f"   [brain] shared plan cache rejected: {cache_error}")
+            return None
         return bundle
     except Exception:
         return None
@@ -10251,34 +10486,16 @@ def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, conf
 
 
 def _mixed_youtube_download_worker_capacity(config=None):
-    """Match the Mixed Media wall calculation to safe host download parallelism."""
-    settings = config if isinstance(config, dict) else {}
+    """Match the Mixed Media wall calculation to safe host download parallelism.
+
+    Delegates to the single shared implementation in
+    ``services.youtube_pipeline_v2.mixed_youtube_download_worker_capacity``
+    so the adapter-side wall call budgets the same fitted count.
+    """
     try:
-        requested = max(1, min(6, int(
-            settings.get('yt_download_concurrency')
-            or os.environ.get('VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY', '4')
-            or 4
-        )))
-    except (TypeError, ValueError, OverflowError):
-        requested = 1
-    try:
-        import psutil
-        from services.youtube_pipeline_v2 import _ranged_download_worker_limit
-        memory = psutil.virtual_memory()
-        # Search/audio/vision may still be loading when the parent budgets
-        # this branch. On 8 GB hosts the child commonly drops from two range
-        # workers to one. Reserve serial transfer waves without forcing the
-        # actual downloader to run serially when more RAM remains available.
-        if memory.total < 12 * 1024 ** 3:
-            return 1
-        return _ranged_download_worker_limit(
-            requested,
-            int(memory.available / (1024 ** 2)),
-            memory.total,
-        )
-    except (ImportError, OSError, ValueError, TypeError, AttributeError):
-        # If memory is unknown, budget conservatively for one worker. The
-        # worker applies the same safe limit before opening any transfers.
+        from services.youtube_pipeline_v2 import mixed_youtube_download_worker_capacity
+        return mixed_youtube_download_worker_capacity(config)
+    except Exception:
         return 1
 
 
@@ -10712,9 +10929,12 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             or "12"
         )
         # Transcript ranking is opportunistic; deterministic timestamp cuts
-        # remain valid when caption endpoints are slow.
+        # remain valid when caption endpoints are slow. Gaming jobs get a
+        # 120 s transcript deadline: 18 s risks heuristic timestamps for
+        # every scene of a footage-led edit.
         yt_environment["VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS"] = str(
             config.get("yt_transcript_deadline_seconds")
+            or ("120" if config.get("_gaming_mode") else None)
             or yt_environment.get("VIDZEO_MIXED_YT_TRANSCRIPT_DEADLINE_SECONDS")
             or "18"
         )
@@ -11555,6 +11775,14 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         resolved = _count_yt_paths(yt_paths)
         if isinstance(config, dict) and hasattr(yt_paths, "audit"):
             config["_yt_attempt_audit"] = yt_paths.audit
+            # The timeout/salvage audits carry no worker counts, so the
+            # media plan recorded download_workers: 0 even though the wall
+            # was budgeted with the fitted count. Stamp it here so the
+            # receipt stays honest; a full pipeline audit keeps its own.
+            _audit_workers = _mixed_youtube_download_worker_capacity(config)
+            if isinstance(yt_paths.audit, dict):
+                yt_paths.audit.setdefault("download_workers", _audit_workers)
+                yt_paths.audit.setdefault("requested_download_workers", _audit_workers)
             attempts = yt_paths.audit.get("attempts") or {}
             failure_counts = {}
             for rows in attempts.values():
@@ -11562,6 +11790,24 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                     status = str(attempt.get("status") or "unknown")
                     failure_counts[status] = failure_counts.get(status, 0) + 1
             print(f"   [yt] attempt audit: {failure_counts}")
+        elif isinstance(yt_paths, list) and not hasattr(yt_paths, "audit"):
+            # Timeout with nothing salvaged returns a plain list with no
+            # audit at all, so the adapter receipt reads download_workers:
+            # 0. Wrap it so the fitted worker count survives into the
+            # receipt instead of a zero that never ran.
+            from services.youtube_pipeline_v2 import YouTubeClipResults
+            _audit_workers = _mixed_youtube_download_worker_capacity(config)
+            yt_paths = YouTubeClipResults(
+                list(yt_paths),
+                audit={
+                    "requested": len(yt_paths),
+                    "resolved": resolved,
+                    "download_workers": _audit_workers,
+                    "requested_download_workers": _audit_workers,
+                },
+            )
+            if isinstance(config, dict):
+                config["_yt_attempt_audit"] = yt_paths.audit
         if _youtube_only_job and allow_source_reuse_config:
             verified_available = sum(
                 1 for path in yt_paths
@@ -12245,6 +12491,38 @@ def _fill_unresolved_with_rotating_video_pool(
         reuse_counts[selected_key] += 1
         rescued += 1
     return rescued
+
+
+def _record_yt_to_web_substitution(metadata, scene_index, *, via, reason, to_path):
+    """Record a YouTube→web lane substitution in the job metadata.
+
+    The merge already falls back to web images when the YouTube lane cannot
+    deliver for a scene, but it did so silently (print statements only). These
+    records persist into ``checkpoints/media_plan.json`` alongside the other
+    media metadata, so a substitution is visible in the job output — the same
+    spirit as ``manifest["media_substitutions"]`` — instead of looking like a
+    web-assigned scene. One record per scene (a scene rescued once is no
+    longer unresolved, so it cannot be rescued again).
+    """
+    if not isinstance(metadata, dict):
+        return
+    try:
+        index = int(scene_index)
+    except (TypeError, ValueError):
+        return
+    records = metadata.setdefault('yt_to_web_substitutions', [])
+    if not isinstance(records, list):
+        return
+    for record in records:
+        if isinstance(record, dict) and int(record.get('scene_index', -1)) == index:
+            return
+    records.append({
+        'scene_index': index,
+        'from': 'YouTube Clips',
+        'to': str(to_path or ''),
+        'via': via,
+        'reason': reason,
+    })
 
 
 def _fill_unresolved_with_general_web_fallback(
@@ -16633,9 +16911,24 @@ def _resolve_media_paths(config, audio_plan, report_progress, cancellation=None)
                 except (TypeError, ValueError):
                     _mixed_yt_search = 150.0
                 from services.pipeline_v2_media_adapter import mixed_youtube_time_budget
+                # Bound the YouTube wall by the delivery-budget allowance
+                # (with a render reserve) so a long YouTube lane can use the
+                # time the job actually has, but can never eat the render
+                # reserve. Without a budget, the lane's own scaled cap
+                # (900s–3600s) binds.
+                _yt_max_wall = None
+                try:
+                    from services.delivery_budget import get_delivery_budget
+
+                    _yt_budget = get_delivery_budget(config)
+                    if _yt_budget is not None:
+                        _yt_max_wall = _yt_budget.allowance(None, reserve_after_seconds=300.0)
+                except Exception:
+                    _yt_max_wall = None
                 _mixed_yt_wall, _mixed_yt_search = mixed_youtube_time_budget(
                     len(yt_request_indices), _mixed_yt_wall, _mixed_yt_search,
                     download_workers=_mixed_youtube_download_worker_capacity(config),
+                    max_wall_seconds=_yt_max_wall,
                 )
                 # Return completed mixed-lane clips while the coordinator still
                 # has time to inspect them visually. Two observed jobs filled
@@ -17339,6 +17632,12 @@ def _resolve_media_paths(config, audio_plan, report_progress, cancellation=None)
             final_paths[scene_idx] = candidate_path
             if scene_idx < len(source_labels):
                 source_labels[scene_idx] = 'Web Images (parallel web rescue)'
+            if assigned_source_by_scene.get(scene_idx) == 'YouTube Clips':
+                _record_yt_to_web_substitution(
+                    metadata, scene_idx,
+                    via='shadow_web', reason='youtube_lane_no_clip',
+                    to_path=candidate_path,
+                )
             if candidate_key:
                 used_media_keys.add(candidate_key)
             shadow_rescued += 1
@@ -17365,6 +17664,9 @@ def _resolve_media_paths(config, audio_plan, report_progress, cancellation=None)
             f"   [media] YouTube fallback: {len(unresolved_yt_slots)} scene(s) "
             "still unresolved; using web media before any stock/video reuse"
         )
+        _yt_fallback_before = {
+            idx: final_paths[idx] for idx in unresolved_yt_slots if idx < len(final_paths)
+        }
         _fill_unresolved_with_general_web_fallback(
             final_paths=final_paths,
             source_labels=source_labels,
@@ -17376,6 +17678,17 @@ def _resolve_media_paths(config, audio_plan, report_progress, cancellation=None)
             config=config,
             force_web=True,
         )
+        for _rescued_idx in unresolved_yt_slots:
+            if (
+                _rescued_idx < len(final_paths)
+                and not _yt_fallback_before.get(_rescued_idx)
+                and final_paths[_rescued_idx]
+            ):
+                _record_yt_to_web_substitution(
+                    metadata, _rescued_idx,
+                    via='general_web_fallback', reason='youtube_lane_no_clip',
+                    to_path=final_paths[_rescued_idx],
+                )
         all_unresolved = [
             scene_idx for scene_idx in all_unresolved
             if scene_idx < len(final_paths) and not final_paths[scene_idx]
@@ -17444,6 +17757,12 @@ def _resolve_media_paths(config, audio_plan, report_progress, cancellation=None)
         for scene_idx in unresolved_video_slots:
             if scene_idx < len(final_paths) and final_paths[scene_idx]:
                 source_labels[scene_idx] = f"{assigned_source_by_scene.get(scene_idx) or 'Video'} (image fallback)"
+                if assigned_source_by_scene.get(scene_idx) == 'YouTube Clips':
+                    _record_yt_to_web_substitution(
+                        metadata, scene_idx,
+                        via='general_web_fallback', reason='youtube_lane_unresolved',
+                        to_path=final_paths[scene_idx],
+                    )
         all_unresolved = [
             scene_idx for scene_idx in all_unresolved
             if scene_idx < len(final_paths) and not final_paths[scene_idx]
@@ -20693,7 +21012,17 @@ def _render_video_with_semantic_editing(
             **(job_config.get('_render_metadata') or {}),
             'edit_plan_path': str(plan_path),
         }
-    semantic_path = TEMP_DIR / f"{safe_name}_semantic.mp4"
+    # Render into the package render dir (not a title-derived TEMP file) so a
+    # checkpoint resume reuses this exact output path — and therefore the
+    # section checkpoints beside it — instead of re-rendering finished work.
+    # The path is also recorded in pre_render.json for the resume to read back.
+    _render_package_dir = (
+        job_config.get("_output_package_dir")
+        or job_config.get("output_package_dir")
+        or output_dir
+    )
+    semantic_path = _remotion_render_output_path(_render_package_dir, safe_name)
+    semantic_path.parent.mkdir(parents=True, exist_ok=True)
     final_path = output_dir / f"{safe_name}.mp4"
 
 
@@ -20812,6 +21141,7 @@ def _render_video_with_semantic_editing(
         {
             'backend': 'remotion',
             'edit_plan_path': job_config.get('_remotion_plan_path'),
+            'render_output_path': str(semantic_path),
             'media_paths': list((media_plan or {}).get('media_paths') or []),
             'audio_path': (audio_plan or {}).get('audio_path'),
             'subtitle_path': str(subtitle_path or ''),
@@ -20868,28 +21198,12 @@ def _render_video_with_semantic_editing(
             cancellation=cancellation,
         )
     except Exception as render_error:
-        memory_snapshot = getattr(render_error, 'memory_snapshot', None)
-        if memory_snapshot is None:
-            memory_snapshot = getattr(getattr(render_error, '__cause__', None), 'memory_snapshot', None)
-        if memory_snapshot:
-            _write_generation_checkpoint(
-                job_config,
-                'render_failure.json',
-                {
-                    'kind': 'low_memory',
-                    'error': f'{type(render_error).__name__}: {render_error}',
-                    'memory': memory_snapshot,
-                    'retryable': True,
-                },
-                stage='waiting_for_memory',
-                status='retryable',
-            )
-            _set_video_package_status(
-                job_config,
-                'waiting_for_memory',
-                retryable=True,
-                memory=memory_snapshot,
-            )
+        # Every render failure leaves the complete checkpoint behind — not
+        # just low-memory ones — so the driver and humans can act on the
+        # real cause (config error, deadline, cancel, plan defect) and the
+        # resume gate can tell them apart. The outer pipeline handler writes
+        # the same contract again; the write is idempotent.
+        _write_render_failure_checkpoint(job_config, render_error)
         raise
     try:
         remotion_elapsed = round(float(result.get('render_seconds') or 0.0), 3)
@@ -21230,7 +21544,25 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
     from services.job_context import JobThreadPoolExecutor as ThreadPoolExecutor
 
     config = normalize_generation_config(config)
-    report_progress = _make_progress_reporter(progress_callback)
+    def _note_budget_progress():
+        # Genuine progress extends the delivery budget (progress-aware
+        # deadline): a job that keeps moving is never killed for being slow.
+        # Heartbeat re-emissions never reach this hook — the reporter only
+        # calls on_progress on a real advance — so a stalled job cannot
+        # keep its own deadline alive.
+        try:
+            from services.delivery_budget import get_delivery_budget
+
+            budget = get_delivery_budget(config)
+        except Exception:
+            return
+        if budget is not None:
+            try:
+                budget.note_progress()
+            except Exception:
+                pass
+
+    report_progress = _make_progress_reporter(progress_callback, on_progress=_note_budget_progress)
     whisper_warmup_handle = (
         config.pop('_whisper_warmup_handle', None)
         if isinstance(config, dict)
@@ -22614,64 +22946,21 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
             render_straight_media_ffmpeg,
         )
         budget_exhausted = isinstance(render_error, SemanticRenderBudgetExceeded)
-        memory_snapshot = getattr(render_error, "memory_snapshot", None)
-        if memory_snapshot is None:
-            cause = getattr(render_error, "__cause__", None)
-            memory_snapshot = getattr(cause, "memory_snapshot", None)
-        plan_error = isinstance(render_error, RemotionEditPlanError)
-        if plan_error:
-            _write_generation_checkpoint(
-                job_config,
-                'render_failure.json',
-                {
-                    'kind': 'edit_plan_invalid',
-                    'error': str(render_error),
-                    'edit_plan_path': job_config.get('_remotion_plan_path'),
-                    'retryable': True,
-                },
-                stage='waiting_for_plan_correction',
-                status='retryable',
-            )
-            _set_video_package_status(job_config, 'waiting_for_plan_correction', retryable=True)
-        if memory_snapshot:
-            _write_generation_checkpoint(
-                job_config,
-                "render_failure.json",
-                {
-                    "kind": "low_memory",
-                    "error": f"{type(render_error).__name__}: {render_error}",
-                    "memory": memory_snapshot,
-                    "retryable": True,
-                },
-                stage="waiting_for_memory",
-                status="retryable",
-            )
-            _set_video_package_status(
-                job_config,
-                "waiting_for_memory",
-                retryable=True,
-                memory=memory_snapshot,
-            )
-        if (
-            not plan_error
-            and not memory_snapshot
-            and str(job_config.get('render_backend') or '').strip().lower() in {'remotion', 'react'}
-        ):
-            _write_generation_checkpoint(
-                job_config,
-                'render_failure.json',
-                {
-                    'kind': 'render_failed',
-                    'error': f'{type(render_error).__name__}: {render_error}',
-                    'edit_plan_path': job_config.get('_remotion_plan_path'),
-                    'retryable': True,
-                },
-                stage='waiting_for_render_retry',
-                status='retryable',
-            )
-            _set_video_package_status(job_config, 'waiting_for_render_retry', retryable=True)
-        if not budget_exhausted:
+        # One complete checkpoint for every render failure (kind / error /
+        # edit_plan_path / retryable), classified from the real cause — a
+        # cancelled or deadline-killed render must not masquerade as a
+        # generic render failure, and a deterministic config error must not
+        # masquerade as a transient crash.
+        failure_payload = _write_render_failure_checkpoint(job_config, render_error)
+        failure_kind = str(failure_payload.get("kind") or "render_failed")
+        memory_snapshot = failure_payload.get("memory") or None
+        plan_error = failure_kind == "edit_plan_invalid"
+        if not budget_exhausted and failure_kind != "cancelled":
             traceback.print_exc()
+        if failure_kind == "cancelled":
+            # A stop stays a stop: do not wrap it as a render failure or the
+            # queue cannot tell a user/deadline cancel from a broken render.
+            raise render_error
 
         # A requested documentary edit must not be replaced by a visually
         # different renderer after a Remotion failure. Keep its plan available
@@ -22700,9 +22989,15 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                 wrapped_error.edit_plan_path = str(job_config.get('_remotion_plan_path') or '')
                 wrapped_error.checkpoint_dir = str(job_config.get('_output_package_dir') or '')
             else:
-                wrapped_error.retryable = True
+                # Honor the renderer's own retryability: a proven-terminal
+                # defect (bad bundle, invalid manifest) surfaces as
+                # non-retryable so the queue fails it visibly instead of
+                # pausing for a retry that cannot succeed; everything else
+                # pauses for retry from the saved checkpoint.
+                wrapped_error.retryable = bool(getattr(render_error, "retryable", True))
                 wrapped_error.stage = 'remotion_render'
                 wrapped_error.checkpoint_dir = str(job_config.get('_output_package_dir') or '')
+            wrapped_error.failure_kind = failure_kind
             raise wrapped_error from render_error
 
         # Legacy native-only jobs can opt into a one-pass FFmpeg recovery when
@@ -23233,7 +23528,7 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
     failure = _read_json(checkpoint_dir / 'render_failure.json')
     failure_kind = str(failure.get('kind') or '').strip().lower()
     retry_checkpoint = (
-        failure_kind in {'low_memory', 'edit_plan_invalid', 'render_failed'}
+        failure_kind in {'low_memory', 'edit_plan_invalid', 'render_failed', 'render_config_invalid', 'delivery_deadline', 'cancelled'}
         and bool(failure.get('retryable'))
         and not bool(failure.get('resolved'))
         and (checkpoint_dir / 'pre_render.json').is_file()
@@ -23285,6 +23580,7 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
     audio_plan = _read_json(checkpoint_dir / 'audio_plan.json')
     if plan_path is None or not audio_plan:
         return None
+    config['_remotion_plan_path'] = str(plan_path)
     retained_master = _retained_remotion_master(package_dir, plan_path)
     manifest = _read_json(plan_path)
     scenes = list(manifest.get('scenes') or []) if isinstance(manifest, Mapping) else []
@@ -23600,12 +23896,21 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
             from services.editorial_director.production_contract import compile_production_timeline
             compile_production_timeline(manifest)
         validation = _validate_remotion_edit_plan(manifest, len(scenes))
-    except RemotionEditPlanError:
+    except RemotionEditPlanError as plan_exc:
+        # A failed resume must not leave the previous failure checkpoint in
+        # place: the driver and humans would chase a stale cause.
+        _write_render_failure_checkpoint(config, plan_exc)
         raise
     except Exception as exc:
         print(f'   [retry] saved edit plan validation failed; rebuilding from script: {exc}')
         return None
     if not isinstance(validation, Mapping) or validation.get('status') != 'pass':
+        _write_render_failure_checkpoint(
+            config,
+            RemotionEditPlanError(
+                f"Saved Remotion edit plan still needs correction: {(validation or {}).get('errors')}"
+            ),
+        )
         raise RemotionEditPlanError(
             f"Saved Remotion edit plan still needs correction: {(validation or {}).get('errors')}"
         )
@@ -23626,7 +23931,17 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
     if str(director.get('status') or '').lower() in {'deterministic_fallback', 'local_fallback'} and not output_name.endswith('_local_director_fallback'):
         output_name = f'{output_name}_local_director_fallback'
     output_path = package_dir / f'{output_name}.mp4'
-    render_output_path = render_dir / f'{output_name}_remotion.mp4'
+    # Resume the failed render's own output path when it was recorded in
+    # pre_render.json: the JS section checkpoints live beside that path, so
+    # reusing it resumes finished sections instead of re-rendering them.
+    # Falls back to the recomputed package path when nothing was recorded.
+    render_output_path = _remotion_render_output_path(package_dir, output_name)
+    recorded_render_path = str((pre_render or {}).get('render_output_path') or '').strip()
+    if recorded_render_path:
+        recorded = Path(recorded_render_path).expanduser().resolve()
+        if recorded.is_relative_to(package_dir):
+            render_output_path = recorded
+    render_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     render_config = dict(manifest.get('config') or {}) if isinstance(manifest.get('config'), Mapping) else {}
     for key in (
@@ -23697,28 +24012,10 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
             render_config=render_config,
         )
     except Exception as render_error:
-        memory_warning = getattr(render_error, 'memory_warning', None) or getattr(render_error, 'memory_snapshot', None)
-        if memory_warning is None:
-            memory_warning = getattr(getattr(render_error, '__cause__', None), 'memory_snapshot', None)
-        if memory_warning:
-            _write_generation_checkpoint(
-                config,
-                'render_failure.json',
-                {
-                    'kind': 'low_memory',
-                    'error': f'{type(render_error).__name__}: {render_error}',
-                    'memory': memory_warning,
-                    'retryable': True,
-                },
-                stage='waiting_for_memory',
-                status='retryable',
-            )
-            _set_video_package_status(
-                config,
-                'waiting_for_memory',
-                retryable=True,
-                memory=memory_warning,
-            )
+        # Every resume failure rewrites the checkpoint with the NEW cause —
+        # a stale checkpoint from the first failure would mislead the driver
+        # and humans on the next retry.
+        _write_render_failure_checkpoint(config, render_error)
         raise
     if cancellation is not None:
         cancellation.raise_if_cancelled()
@@ -23754,8 +24051,17 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
         require_audio=True,
     )
     if rendered_path != output_path.resolve():
+        # Atomic publish: a crash mid-copy must never leave a partial master
+        # at the deliverable path. The validated master is staged beside it
+        # and renamed into place.
         import shutil
-        shutil.copy2(rendered_path, output_path)
+        import uuid
+        staged = output_path.with_name(f'.{output_path.name}.validated-{uuid.uuid4().hex}')
+        try:
+            shutil.copy2(rendered_path, staged)
+            staged.replace(output_path)
+        finally:
+            staged.unlink(missing_ok=True)
     render_metadata = {
         **dict(manifest.get('render_metadata') or {}),
         'selected_backend': 'remotion',

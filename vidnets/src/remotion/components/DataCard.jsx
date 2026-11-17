@@ -93,8 +93,6 @@ export function DataCard({ scene = {}, visualDNA = {}, props = {} }) {
         width: cardWidth,
         opacity: finalOpacity,
         background: `linear-gradient(135deg, ${rgba(background, 0.94)} 0%, ${rgba(palette.surface || '#0c1a26', 0.88)} 100%)`,
-        backdropFilter: 'blur(16px)',
-        WebkitBackdropFilter: 'blur(16px)',
         borderRadius: 14 * scale,
         border: `1px solid ${rgba(accent, 0.28)}`,
         borderLeft: `5px solid ${accent}`,

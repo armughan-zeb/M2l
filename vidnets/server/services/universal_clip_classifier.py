@@ -355,8 +355,94 @@ def score_niches(title: str, script_text: str = '') -> dict:
     return scores
 
 
-def detect_niche_conflict(expected_text: str, candidate_text: str, minimum_score: int = 3, detected_niche: str = ""):
-    """Detect strong candidate drift using the shared niche taxonomy."""
+def _gta_entry(text: str) -> str:
+    """Return which Grand Theft Auto entry a text names, or "".
+
+    A numbered entry beats a named one: "Grand Theft Auto VI returns to
+    Vice City" is VI, not Vice City — the city is the setting, the numeral
+    is the title. A bare franchise mention ("Grand Theft Auto gameplay")
+    names no entry and never conflicts.
+    """
+    lowered = (text or "").lower()
+    if not re.search(r"\b(?:grand theft auto|gta)\b", lowered):
+        return ""
+    for key, pattern in (
+        ("vi", re.compile(r"\b(?:grand theft auto\s*(?:vi|6)|grand theft auto six|gta\s*(?:vi|6)|gta six)\b")),
+        ("v", re.compile(r"\b(?:grand theft auto\s*v(?![iv])|grand theft auto\s*5|grand theft auto five|gta\s*v(?![iv])|gta\s*5|gta five)\b")),
+        ("iv", re.compile(r"\b(?:grand theft auto\s*iv|grand theft auto\s*4|gta\s*iv|gta\s*4)\b")),
+        ("iii", re.compile(r"\b(?:grand theft auto\s*iii|grand theft auto\s*3|gta\s*iii|gta\s*3)\b")),
+    ):
+        if pattern.search(lowered):
+            return key
+    for key, pattern in (
+        ("san_andreas", re.compile(r"\b(?:grand theft auto|gta)\b[^.]{0,40}?\bsan andreas\b")),
+        ("vice_city", re.compile(r"\b(?:grand theft auto|gta)\s*:?\s*vice city\b")),
+        ("liberty_city_stories", re.compile(r"\bliberty city stories\b")),
+    ):
+        if pattern.search(lowered):
+            return key
+    return ""
+
+
+def _gta_entries(text: str) -> set:
+    """Return every Grand Theft Auto entry a text names (set-valued _gta_entry).
+
+    A scene can be about two entries at once ("ten years since Grand Theft
+    Auto Five" inside a Grand Theft Auto Six story), so the single-winner
+    ``_gta_entry`` cannot answer scene-relative questions. Spelled-out
+    numerals count: "Grand Theft Auto Six" is VI, "Grand Theft Auto Five"
+    is V. A bare "Vice City" names no entry: in a GTA VI scene it is the
+    new Vice City setting, not the 2002 game — only a "GTA: Vice City"
+    style mention names the 2002 entry.
+    """
+    lowered = (text or "").lower()
+    if not re.search(r"\b(?:grand theft auto|gta)\b", lowered):
+        return set()
+    entries = set()
+    for key, pattern in (
+        ("vi", re.compile(r"\b(?:grand theft auto\s*(?:vi|6)|grand theft auto six|gta\s*(?:vi|6)|gta six)\b")),
+        ("v", re.compile(r"\b(?:grand theft auto\s*v(?![iv])|grand theft auto\s*5|grand theft auto five|gta\s*v(?![iv])|gta\s*5|gta five)\b")),
+        ("iv", re.compile(r"\b(?:grand theft auto\s*iv|grand theft auto\s*4|gta\s*iv|gta\s*4)\b")),
+        ("iii", re.compile(r"\b(?:grand theft auto\s*iii|grand theft auto\s*3|gta\s*iii|gta\s*3)\b")),
+        ("san_andreas", re.compile(r"\b(?:grand theft auto|gta)\b[^.]{0,40}?\bsan andreas\b")),
+        ("vice_city", re.compile(r"\b(?:grand theft auto|gta)\s*:?\s*vice city\b")),
+        ("liberty_city_stories", re.compile(r"\bliberty city stories\b")),
+    ):
+        if pattern.search(lowered):
+            entries.add(key)
+    return entries
+
+
+def _franchise_entry_conflict(expected_text: str, candidate_text: str) -> bool:
+    """True when two texts name different entries of the same franchise.
+
+    Same-niche, different-title is the hole the niche taxonomy cannot see:
+    "Grand Theft Auto: San Andreas" scores gaming exactly like
+    "Grand Theft Auto VI", so a San Andreas cut passes as a GTA VI cut.
+    A different explicit entry is a conflict; a bare franchise mention is
+    not (generic franchise footage may still fit).
+    """
+    expected_entry = _gta_entry(expected_text or "")
+    candidate_entry = _gta_entry(candidate_text or "")
+    return bool(expected_entry and candidate_entry and expected_entry != candidate_entry)
+
+
+def detect_niche_conflict(expected_text: str, candidate_text: str, minimum_score: int = 3, detected_niche: str = "", scene_entries=None):
+    """Detect strong candidate drift using the shared niche taxonomy.
+
+    Also detects a same-franchise different-title conflict (e.g. a
+    San Andreas video offered for a GTA VI scene): the niche scores are
+    identical there, so the taxonomy alone cannot see the drift.
+
+    ``scene_entries`` is the set of GTA entries the scene is about (see
+    ``_gta_entries``). When it is given and the candidate names one of
+    those entries, there is no conflict even when the coarse niche
+    taxonomy disagrees: a scene narrating Lucia and Jason scores
+    crime-flavoured keywords on the expected side while the correct GTA VI
+    trailer scores gaming on the candidate side, and the taxonomy alone
+    would call the right clip a conflict. A candidate naming no scene
+    entry gets no such exemption.
+    """
     def _sports_override(text: str) -> tuple[str, int]:
         lower = (text or "").lower()
         cricket_terms = ("cricket", "kohli", "babar", "batting", "bowling", "wicket", "innings", "century", "icc", "t20", "odi", "ipl")
@@ -384,7 +470,23 @@ def detect_niche_conflict(expected_text: str, candidate_text: str, minimum_score
         candidate_niche, candidate_score = override_candidate, override_candidate_score
     if expected_score <= 0 or candidate_score < minimum_score:
         return False, expected_niche, candidate_niche
-    
+
+    # Scene-relative exemption: the candidate names a game the scene is
+    # about, so neither the franchise check nor the coarse taxonomy may
+    # veto it. (A GTA V clip for a GTA V-history scene and a GTA VI
+    # trailer for a Lucia/Jason scene both pass here; a GTA V clip for a
+    # GTA VI-only scene does not, because "v" is not in its scene set.)
+    if scene_entries:
+        candidate_entry = _gta_entry(candidate_text or "")
+        if candidate_entry and candidate_entry in set(scene_entries):
+            return False, expected_niche, candidate_niche
+
+    # Same franchise, different title: the taxonomy scores both sides
+    # "gaming" and would call them a match. A San Andreas cut is never a
+    # GTA VI cut, whatever the niche scores say.
+    if _franchise_entry_conflict(expected_text or "", candidate_text or ""):
+        return True, expected_niche, candidate_niche
+
     # History is a broad meta-niche that overlaps with many subjects (e.g. history of football, space, etc.)
     if expected_niche == 'history' or candidate_niche == 'history':
         return False, expected_niche, candidate_niche

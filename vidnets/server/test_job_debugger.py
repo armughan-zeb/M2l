@@ -90,6 +90,8 @@ def debugger(tmp_path):
     )
     # Diagnosis recording would touch the real queue manager; silence it.
     dbg._record_diagnosis = lambda job_id, diagnosis, now: None
+    # Rate-limit holds are recorded the same way; silence that too.
+    dbg._record_event = lambda job_id, text: None
     return dbg, actions, queue_path
 
 
@@ -171,19 +173,30 @@ def test_dead_worker_restarts_server(debugger):
     assert dbg.state["restarts"]["f04c6b9f"] == 1
 
 
-def test_restart_cap_flags_job_and_stops(debugger):
+def test_restart_cap_flags_job_and_escalates_instead_of_restarting(debugger):
     dbg, actions, queue_path = debugger
     dbg.diagnose = lambda job_id: _fake_diagnosis(server_responsive=False)
     dbg.state["restarts"]["f04c6b9f"] = 3
     _write_queue(queue_path, [_job(text="Generating captions", seq=100)])
     assert dbg.tick(now=T0) == []
     taken = dbg.tick(now=T0 + 16 * 60)
-    assert taken == []
+    # No server restart after the ever-cap — but the job is NOT left
+    # silently parked: the driver escalates it so a human can see it.
     assert actions.calls == []
     assert "f04c6b9f" in dbg.state["flagged"]
+    assert taken == [
+        {
+            "job_id": "f04c6b9f",
+            "kind": "escalate",
+            "reason": "debugger restarted 3 times; left alone",
+        }
+    ]
 
 
-def test_action_rate_limit(debugger):
+def test_safe_actions_not_capped_by_prior_safe_actions(debugger):
+    # REGRESSION (2026-11-16): the per-hour budget used to count every
+    # recorded action, so three rewakes in an hour blocked further safe
+    # recovery. Safe actions are bounded by the tick only, never capped.
     dbg, actions, queue_path = debugger
     dbg.diagnose = lambda job_id: _fake_diagnosis(
         stale_inbox=[{"id": "abc123", "operation": "x", "kind": "vision", "age_seconds": 300.0, "threshold_seconds": 240}]
@@ -194,8 +207,74 @@ def test_action_rate_limit(debugger):
         {"action": "rewake", "reason": "x", "at": T0 - 1800},
     ]
     assert dbg.tick(now=T0) == []
-    assert dbg.tick(now=T0 + 11 * 60) == []
+    taken = dbg.tick(now=T0 + 11 * 60)
+    assert len(taken) == 1
+    assert actions.calls[0][0] == "rewake"
+
+
+def test_restart_not_blocked_by_prior_safe_actions(debugger):
+    # REGRESSION (2026-11-16, replayed live): a dead-worker job got NO
+    # restart because three prior rewakes had consumed the per-hour
+    # budget. Only prior restarts count against a restart.
+    dbg, actions, queue_path = debugger
+    dbg.diagnose = lambda job_id: _fake_diagnosis(server_responsive=False)
+    dbg.state["actions"]["f04c6b9f"] = [
+        {"action": "rewake", "reason": "x", "at": T0 - 600},
+        {"action": "advance_scene", "reason": "x", "at": T0 - 1200},
+        {"action": "kill_hung_child", "reason": "x", "at": T0 - 1800},
+    ]
+    _write_queue(queue_path, [_job(text="Generating captions", seq=100)])
+    assert dbg.tick(now=T0) == []
+    taken = dbg.tick(now=T0 + 16 * 60)
+    assert len(taken) == 1
+    assert actions.calls[0][0] == "restart_server"
+    assert dbg.state["restarts"]["f04c6b9f"] == 1
+
+
+def test_restart_rate_limit_counts_only_restarts(debugger):
+    # The per-hour restart budget still works — it just counts restarts.
+    # max_restarts is raised here so the ever-cap does not mask the
+    # hourly check (with the default 3 ever, three restarts in an hour
+    # already flags the job first).
+    dbg, actions, queue_path = debugger
+    dbg.config = DebuggerConfig(
+        env={
+            "VIDZEO_JOB_DEBUGGER_MAX_RESTARTS": "10",
+            "VIDZEO_JOB_DEBUGGER_MAX_ACTIONS_PER_HOUR": "3",
+        }
+    )
+    dbg.diagnose = lambda job_id: _fake_diagnosis(server_responsive=False)
+    dbg.state["actions"]["f04c6b9f"] = [
+        {"action": "restart_server", "reason": "x", "at": T0 - 600},
+        {"action": "restart_server", "reason": "x", "at": T0 - 1200},
+        {"action": "restart_server", "reason": "x", "at": T0 - 1800},
+    ]
+    _write_queue(queue_path, [_job(text="Generating captions", seq=100)])
+    assert dbg.tick(now=T0) == []
+    assert dbg.tick(now=T0 + 16 * 60) == []
     assert actions.calls == []
+    # Two prior restarts in the hour: the restart is allowed.
+    dbg.state["actions"]["f04c6b9f"] = dbg.state["actions"]["f04c6b9f"][:2]
+    taken = dbg.tick(now=T0 + 32 * 60)
+    assert len(taken) == 1
+    assert actions.calls[0][0] == "restart_server"
+
+
+def test_flagged_job_still_gets_safe_action(debugger):
+    # REGRESSION (2026-11-16): the tick used to skip a flagged job
+    # wholesale, so a restart-cap flag silently blocked safe recovery
+    # too. The flag blocks restarts only; a rewake still fires.
+    dbg, actions, queue_path = debugger
+    dbg.diagnose = lambda job_id: _fake_diagnosis(
+        stale_inbox=[{"id": "abc123", "operation": "x", "kind": "vision", "age_seconds": 300.0, "threshold_seconds": 240}]
+    )
+    dbg.state["restarts"]["f04c6b9f"] = 3
+    dbg.state["flagged"]["f04c6b9f"] = {"reason": "debugger restarted 3 times; left alone", "at": T0}
+    assert dbg.tick(now=T0) == []
+    taken = dbg.tick(now=T0 + 11 * 60)
+    assert actions.calls[0][0] == "rewake"
+    assert all(call[0] != "restart_server" for call in actions.calls)
+    assert len(taken) == 1 and taken[0]["job_id"] == "f04c6b9f"
 
 
 def test_hung_child_killed(debugger):

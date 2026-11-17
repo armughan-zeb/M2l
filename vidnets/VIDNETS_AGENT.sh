@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -e
+export VIDZEO_AUTH_MODE="${VIDZEO_AUTH_MODE:-local}"
+export VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH="${VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH:-1}"
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do

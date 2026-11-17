@@ -1,6 +1,59 @@
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
+// Bing soft rate-limits this egress IP: after several rapid searches it
+// keeps answering HTTP 200 but serves decoy results — for "D B Cooper"
+// it returned ten letter-"D" pages ("D - Wikipedia", "Letter D ...") with
+// zero query relevance, and real results came back after a 45s pause
+// (verified live 2026-11-09). Two defenses:
+//   1. Pace Bing calls: at least 5s between fetches, chained so parallel
+//      callers serialize instead of bursting.
+//   2. Relevance check: if none of the parsed results contains any query
+//      token, the page is a decoy — throw a retryable error (with a long
+//      Retry-After hint) instead of returning junk the researcher would
+//      silently drop as irrelevant.
+let lastBingAt = 0;
+let bingQueue = Promise.resolve();
+const MIN_BING_GAP_MS = 5000;
+function throttleBing() {
+  const run = bingQueue.then(async () => {
+    const wait = MIN_BING_GAP_MS - (Date.now() - lastBingAt);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    lastBingAt = Date.now();
+  });
+  bingQueue = run.catch(() => {});
+  return run;
+}
+
+const BING_STOPWORDS = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one',
+  'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now',
+  'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'let', 'say', 'she', 'too', 'use',
+  'with', 'this', 'that', 'from', 'have', 'had', 'said', 'will', 'they', 'their',
+  'them', 'been', 'than', 'what', 'when', 'your', 'into', 'more', 'some', 'time',
+  'over', 'just', 'also', 'after', 'year', 'years', 'first', 'last', 'long', 'great',
+  'still', 'most', 'back', 'much', 'such', 'best', 'make', 'made', 'here', 'where',
+  'about', 'would', 'could', 'should', 'these', 'those', 'every', 'being', 'because',
+  'while', 'other', 'around', 'between', 'through', 'without', 'against', 'another',
+]);
+
+function queryTokens(query) {
+  return String(query || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !BING_STOPWORDS.has(w));
+}
+
+function resultsMatchQuery(results, query) {
+  const tokens = queryTokens(query);
+  if (!tokens.length) return true;
+  return results.some((r) => {
+    const haystack = `${r.title || ''} ${r.snippet || ''} ${r.url || ''}`.toLowerCase();
+    return tokens.some((t) => haystack.includes(t));
+  });
+}
+
 function clean(value) {
   return String(value || '')
     .replace(/<[^>]+>/g, ' ')
@@ -64,8 +117,9 @@ function parseDateInSnippet(snippet) {
   return '';
 }
 
-async function bingSearch(query, { limit = 8, timeoutMs = 8000 } = {}) {
+async function bingSearch(query, { limit = 8, timeoutMs = 12000 } = {}) {
   const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${Math.min(limit + 4, 20)}&setlang=en`;
+  await throttleBing();
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -79,7 +133,25 @@ async function bingSearch(query, { limit = 8, timeoutMs = 8000 } = {}) {
     });
     if (!res.ok) throw new Error(`Bing HTTP ${res.status}`);
     const html = await res.text();
-    return parseBingResults(html, limit);
+    const results = parseBingResults(html, limit);
+    // An HTTP 200 page with zero parseable results is a markup change or a
+    // bot challenge, not a genuine "no results" — surface it so the
+    // resilience layer retries and the research log names the failure.
+    if (!results.length) {
+      const err = new Error('Bing returned no parseable results (markup changed or bot challenge)');
+      err.code = 'NO_PARSEABLE_RESULTS';
+      throw err;
+    }
+    // Decoy page: parseable, but nothing in it is about the query (Bing
+    // serves letter-"D" pages for "D B Cooper" when rate-limiting this
+    // IP). Returning junk wastes the research pass; retry after a pause.
+    if (!resultsMatchQuery(results, query)) {
+      const err = new Error('Bing returned no results about the query (decoy/rate-limited page)');
+      err.code = 'BING_LOW_RELEVANCE';
+      err.retryAfterMs = 15000;
+      throw err;
+    }
+    return results;
   } finally {
     clearTimeout(t);
   }

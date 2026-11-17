@@ -24,7 +24,10 @@ other provider, no other key — anywhere, including tests and fallback
 chains. `node muse-agent.js doctor` must pass before any job runs.
 `MUSE_INFERENCE_COMMAND` points at the shipped spool transport
 (`node scripts/muse-inference-spool.cjs`) and the resident inference
-worker answers it — see `scripts/resident-inference-worker/WORKER_BRIEF.md`.
+worker pool answers it — the supervisor brief is
+`scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md`, workers
+follow `scripts/resident-inference-worker/WORKER_BRIEF.md` and claim one
+request each by atomic rename.
 That is the ONLY transport: never set `MUSE_INFERENCE_URL` alongside it,
 never point the command at a stub, and never run a second answerer (the
 host hook is the fallback, not a parallel answerer — a double answer

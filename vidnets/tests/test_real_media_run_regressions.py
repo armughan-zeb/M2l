@@ -152,6 +152,7 @@ def test_slideshow_candidate_is_replaced_before_youtube_handoff(monkeypatch, tmp
     from services import youtube_pipeline_v2 as youtube
     from services import youtube_pool_renderer as quality
     from services import youtube_media_cache as cache
+    monkeypatch.setenv('VIDZEO_YT_RANGED_MOMENTS', '0')
     rows = [{'scene_text': 'Beer flows from a pub tap.', 'section_subject': 'British Beer',
              'candidate_subject': 'British Beer', 'domain_category': 'food'}]
     candidates = [{'id': vid, 'title': 'British beer pub footage', 'duration': 60,

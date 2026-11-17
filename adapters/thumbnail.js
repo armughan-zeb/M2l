@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { runCommand } = require('../lib/command');
 const log = require('../lib/log');
+const { registerStageProcess } = require('../lib/stageCleanup');
 const ffmpeg = require('../lib/ffmpeg');
 
 function existingThumbnail(workDir) {
@@ -87,6 +88,7 @@ async function fromCommand(command, job, scriptText, videoPath, workDir, { signa
     signal,
     timeoutMs: Number(process.env.MUSE_THUMBNAIL_TIMEOUT_MS) || 10 * 60 * 1000,
     label: 'Muse thumbnail command',
+    onSpawn: spawn => registerStageProcess(job.jobId, 'thumbnail', spawn),
     env: {
       MUSE_JOB_ID: job.jobId,
       MUSE_WORK_DIR: workDir,

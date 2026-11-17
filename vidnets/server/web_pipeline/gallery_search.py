@@ -174,7 +174,7 @@ async def _download_async(
     async def _dl(url: str) -> Tuple[str, Optional[Path], str]:
         try:
             ext = ".jpg"
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=True) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                     if resp.status != 200: return url, None, f"http {resp.status}"
                     data = await resp.read()
