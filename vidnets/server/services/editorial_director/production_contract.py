@@ -322,6 +322,116 @@ def script_requirements(narration: str) -> dict[str, Any]:
     return {"map_required": map_request}
 
 
+_MAP_TEMPLATES = {"map-route", "map-comparison", "map-card"}
+_MAP_TYPES = {"animatedmap", "satellitemap"}
+_GEOGRAPHIC_RELATION = re.compile(
+    r"\b(?:route|journey|border|distance|connects?|separates?|cross(?:es|ed)?|migrat\w*|travell?ed|sailed|flew)\b",
+    re.I,
+)
+_NAVIGATION_LOCATOR = re.compile(
+    r"\b(?:convoy|fleet|expedition|ship|vessel|flight|train)\b[^.!?]{0,75}"
+    r"\b(?:entered|reached|approached|arrived)\b",
+    re.I,
+)
+
+
+def _has_geographic_intent(narration: str, place_count: int) -> bool:
+    return bool(
+        (place_count >= 2 and _GEOGRAPHIC_RELATION.search(narration))
+        or (place_count and _NAVIGATION_LOCATOR.search(narration))
+    )
+
+
+def narration_calls_for_map(narration: str) -> bool:
+    if script_requirements(narration)["map_required"]:
+        return True
+    if not (_GEOGRAPHIC_RELATION.search(narration) or _NAVIGATION_LOCATOR.search(narration)):
+        return False
+    from .director import _narrated_local_geography
+    places, _ = _narrated_local_geography(narration)
+    return _has_geographic_intent(narration, len(places))
+
+
+def _map_explains_scene(narration: str, shot: Mapping[str, Any]) -> bool:
+    requested = script_requirements(narration)["map_required"]
+    if requested and not shot:
+        return True
+    if requested and shot.get("geographic_scope") == "Earth" and shot.get("scope_evidence") == "Earth":
+        return True
+    # Keep the director's verified geography catalog as the authority for
+    # labels. A city mentioned as backdrop is not a map explanation.
+    if not shot.get("enabled"):
+        return False
+    from .director import _fold_place_name, _narrated_local_geography
+
+    places, features = _narrated_local_geography(narration)
+    placed = {_fold_place_name(name) for name in shot.get("location_names") or []}
+    grounded = {_fold_place_name(name) for name in places}
+    feature_ids = {str(value).upper() for value in shot.get("feature_ids") or []}
+    if not placed.issubset(grounded) or not feature_ids.issubset(set(features)):
+        return False
+    if requested:
+        return bool(placed or feature_ids)
+    return bool(_has_geographic_intent(narration, len(places)) and (placed or feature_ids))
+
+
+def _remove_incidental_maps(scenes: list[Any]) -> None:
+    def mapping(value: Any) -> dict:
+        return value if isinstance(value, dict) else {}
+
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        primary = mapping(scene.get("primary_visual"))
+        graphic = mapping(scene.get("graphic"))
+        props = mapping(primary.get("props"))
+        graphic_props = mapping(graphic.get("props"))
+        shot = mapping(scene.get("map_shot") or props.get("map_shot") or graphic_props.get("map_shot"))
+        recipe = scene.get("template_recipe") or props.get("template_recipe") or graphic_props.get("template_recipe")
+        layers = recipe.get("layers") or [] if isinstance(recipe, Mapping) else []
+        cues = scene.get("motion_cues") or []
+        map_primary = str(primary.get("type") or "").casefold() in _MAP_TYPES
+        map_graphic = any(
+            str(value or "").casefold() in _MAP_TEMPLATES
+            for value in (scene.get("template_id"), graphic.get("template_id"))
+        )
+        is_map_layer = lambda item: isinstance(item, Mapping) and str(item.get("kind") or "").lower() == "map"
+        is_map_cue = lambda item: isinstance(item, Mapping) and str(item.get("element") or "").lower() == "map"
+        if not (map_primary or map_graphic or shot.get("enabled")
+                or any(map(is_map_layer, layers)) or any(map(is_map_cue, cues))):
+            continue
+        narration = str(scene.get("narration") or "")
+        if _map_explains_scene(narration, shot):
+            continue
+        scene["map_shot"] = {"enabled": False}
+        scene["motion_cues"] = [cue for cue in cues if not is_map_cue(cue)]
+        style = scene.get("text")
+        if isinstance(style, dict) and style.get("frame_mode") == "map":
+            style["frame_mode"] = "media"
+        # Filter map layers from mixed recipes while retaining other approved
+        # chart, copy, and evidence layers.
+        if isinstance(recipe, Mapping):
+            layers = [layer for layer in layers if not is_map_layer(layer)]
+            recipe = {**recipe, "layers": layers} if layers else {}
+            scene["template_recipe"] = recipe
+            if "template_recipe" in props:
+                props["template_recipe"] = recipe
+            if "template_recipe" in graphic_props:
+                graphic_props["template_recipe"] = recipe
+        props.pop("map_shot", None)
+        graphic_props.pop("map_shot", None)
+        if map_primary or map_graphic:
+            media = mapping(scene.get("media"))
+            has_media = bool(media.get("src") or media.get("path") or media.get("shots"))
+            if map_primary:
+                visual_type = ("SmartVideo" if media.get("type") == "video" else "SmartImage") if has_media else "KineticText"
+                scene["primary_visual"] = {"type": visual_type, "props": {} if has_media else {"text": narration}}
+            scene["template_id"] = "full-bleed" if has_media else "kinetic-statement"
+            scene["graphic"] = {"template_id": scene["template_id"], "props": {} if has_media else {"text": narration}}
+            scene["visual_role"] = "media_only" if has_media else "primary_explanation"
+        scene["map_decision"] = "no_grounded_geography_needed_for_scene"
+
+
 def _number(value: Any, fallback: float = 0.0) -> float:
     try:
         n = float(value)
@@ -1520,6 +1630,7 @@ def compile_production_timeline(manifest: dict[str, Any]) -> dict[str, Any]:
         reconcile_research_source_marks(manifest)
     fps = max(1, _number(manifest.get("fps"), 30))
     scenes = manifest.get("scenes") or []
+    _remove_incidental_maps(scenes)
     _repair_graphic_fallback_media(scenes, fps=fps)
     film_names = _film_person_entities([scene for scene in scenes if isinstance(scene, Mapping)])
     tracks = {name: [] for name in ("media", "graphics", "copy", "camera", "transitions", "narration", "captions", "music", "sfx")}

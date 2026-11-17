@@ -286,6 +286,7 @@ def _v2_schema_metadata(payload: dict) -> tuple[list[str], list[str]]:
 def _normalise_image_response(payload: dict) -> dict:
     schema_present, schema_errors = _v2_schema_metadata(payload)
     return {
+        **({"candidates": payload["candidates"]} if isinstance(payload.get("candidates"), list) else {}),
         **({'identity_confirmed': _coerce_bool(payload['identity_confirmed'])} if 'identity_confirmed' in payload else {}),
         "candidate_id": _coerce_str(payload.get("candidate_id")),
         "entity_conflict": _coerce_bool(payload.get("entity_conflict")),

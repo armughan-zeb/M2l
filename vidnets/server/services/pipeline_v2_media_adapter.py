@@ -3132,6 +3132,7 @@ def _source_lane_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     elif normalized in {"youtube", "youtube clip", "youtube clips"}:
         mode = "YouTube Clips"
         youtube, web, stock = True, False, False
+        allow_stock_last_resort = _as_bool(config.get("allow_stock_last_resort"), False)
     elif normalized in {"stock", "stock media", "real media"}:
         mode = "Stock Media"
         youtube, web, stock = False, False, allow_stock
@@ -3182,6 +3183,8 @@ def _source_lane_policy(config: Mapping[str, Any]) -> dict[str, Any]:
                 category=str(config.get("category") or config.get("niche") or ""),
             )
             stock = bool(allow_stock and topic != "serious")
+        if not _as_bool(config.get("allow_relevant_stock"), False):
+            allow_stock = stock = False
     if mode == 'Mixed Media' and _as_bool(config.get('stock_rescue_only'), True):
         stock = False
     if mode == 'Mixed Media':
@@ -3386,6 +3389,7 @@ def _automatic_youtube_scene_indices(
         category=config.get("category") or config.get("niche") or "",
         scene_media_mode=config.get("mixed_media_policy") or "automatic",
         strict_weights=False,
+        allow_stock=_as_bool(config.get("allow_relevant_stock"), False),
     )
     indices = sorted({int(index) for index in (plan.grouped_indices.get("YouTube Clips") or [])})
     indices = [index for index in indices if 0 <= index < count]
@@ -4807,6 +4811,9 @@ def resolve_existing_provider_branches_v2(
             # whole film. Applying 60% again budgets only part of that quota.
             lane_config["_youtube_quota_preselected"] = True
             lane_config["youtube_accepted_coverage_target"] = 1.0
+            gaming_job = bool(lane_policy.get("gaming_mode"))
+            default_candidates = 10 if gaming_job else 6
+            default_attempts = 6 if gaming_job else 3
             # Mixed Media reserves a script-specific footage quota. Keep recovery
             # waves bounded, with enough distinct sources to recover when a
             # publisher blocks downloads. The shared branch wall still wins.
@@ -4814,17 +4821,17 @@ def resolve_existing_provider_branches_v2(
                 mixed_candidate_cap = max(
                     1,
                     min(
-                        8,
+                        10 if gaming_job else 8,
                         int(
                             os.environ.get(
-                                "VIDZEO_MIXED_YT_DOWNLOAD_CANDIDATES", "6"
+                                "VIDZEO_MIXED_YT_DOWNLOAD_CANDIDATES", str(default_candidates)
                             )
-                            or 6
+                            or default_candidates
                         ),
                     ),
                 )
             except (TypeError, ValueError):
-                mixed_candidate_cap = 6
+                mixed_candidate_cap = default_candidates
             try:
                 mixed_attempt_cap = max(
                     1,
@@ -4832,15 +4839,15 @@ def resolve_existing_provider_branches_v2(
                         6,
                         int(
                             os.environ.get(
-                                "VIDZEO_MIXED_YT_DOWNLOAD_ATTEMPTS", "3"
+                                "VIDZEO_MIXED_YT_DOWNLOAD_ATTEMPTS", str(default_attempts)
                             )
-                            or 3
+                            or default_attempts
                         ),
                     ),
                 )
             except (TypeError, ValueError):
-                mixed_attempt_cap = 3
-            if len(youtube_scene_indices) <= 8:
+                mixed_attempt_cap = default_attempts
+            if len(youtube_scene_indices) <= 8 and not gaming_job:
                 # Small jobs cap at 3 attempts/scene (the pipeline pass cap
                 # enforces the same bound): 6 passes of mostly throttled
                 # ranged transfers was the download sink on GTA VI (up to 48
@@ -5955,15 +5962,11 @@ def resolve_existing_provider_branches_v2(
     # Quotas express editorial preference, not recovery eligibility. Failed
     # web/stock scenes may need footage too. The coordinator supplies only
     # failed primary scenes before the single bounded recovery batch starts.
-    fallback_youtube_scene_indices = (
-        list(range(len(scenes)))
-        if lane_policy.get("mode") == "Mixed Media" and lane_policy["youtube_enabled"]
-        else (
-            list(range(len(scenes)))
-            if _as_bool(config.get("allow_cross_source_youtube_fallback"), False)
-            else []
-        )
-    )
+    youtube_only = lane_policy["mode"] == "YouTube Clips"
+    fallback_youtube_scene_indices = list(range(len(scenes))) if (
+        lane_policy["mode"] in {"YouTube Clips", "Mixed Media"}
+        or _as_bool(config.get("allow_cross_source_youtube_fallback"), False)
+    ) else []
     primary_youtube_audit: dict[str, Any] | None = None
     # Cross-source fallback is batch-coalesced below.  Keep the per-scene
     # caches as a compatibility layer for callers that inspect retry audits.
@@ -5991,7 +5994,7 @@ def resolve_existing_provider_branches_v2(
         """Run one bounded YouTube recovery wave for all unresolved scenes."""
         nonlocal primary_youtube_audit
         primary_youtube_audit = dict(branch_audit.get("youtube") or {})
-        if primary_youtube_audit.get('provider_network_unavailable'):
+        if primary_youtube_audit.get('provider_network_unavailable') or primary_youtube_audit.get('network_diagnostic'):
             branch_audit['youtube_fallback'] = {'status': 'skipped_provider_network_unavailable'}
             print('   [v2] YouTube DNS unavailable; continuing with web/stock instead of repeating downloads', flush=True)
             return {}
@@ -6959,11 +6962,12 @@ def resolve_existing_provider_branches_v2(
     youtube_lane.get_row = saved_or_fresh_youtube_row
     youtube_fallback_lane = (
         BatchFallbackLane(load_youtube_fallback_batch, prepare_indices=prepare_youtube_recovery)
-        if lane_policy.get("cross_source_fallback", True) and fallback_youtube_scene_indices
+        if fallback_youtube_scene_indices and (youtube_only or lane_policy.get("cross_source_fallback", True))
         else None
     )
     if youtube_fallback_lane is not None:
         youtube_fallback_lane.retry_rejected_primary = True
+        youtube_fallback_lane.retry_missing_primary = youtube_only
     fresh_web_lane = LazyBatchLane(load_web) if lane_policy['web_enabled'] and web_indices_ref['indices'] else disabled_lane
     def web_lane(scene, cancel_event):
         if not lane_policy['web_enabled']:
@@ -6990,10 +6994,13 @@ def resolve_existing_provider_branches_v2(
         return getter(index, timeout=timeout) if callable(getter) else saved_web_rows.get(index)
     web_lane.get_row = saved_or_fresh_web_row
     web_lane._rows = getattr(fresh_web_lane, '_rows', {})
-    # The preferred source lane is not an exclusivity wall. Every unresolved
-    # scene gets a real opposite-source retry; a failed web scene must not be
-    # pointed back at the already-exhausted shared web batch.
-    if lane_policy.get("cross_source_fallback", True):
+    # YouTube Clips rejects web stills at delivery, so only start web recovery
+    # if the job explicitly permits it.
+    youtube_web_fallback = _as_bool(
+        config.get("allow_web_fallback_after_youtube_exhausted"),
+        _as_bool(os.environ.get("VIDZEO_YT_ALLOW_WEB_FALLBACK"), False),
+    )
+    if lane_policy.get("cross_source_fallback", True) and (not youtube_only or youtube_web_fallback):
         web_fallback_lane = SceneFallbackLane(load_web_fallback_for_scene, prepare_web_recovery)
     else:
         web_fallback_lane = None

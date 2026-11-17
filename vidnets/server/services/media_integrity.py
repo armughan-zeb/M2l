@@ -169,6 +169,7 @@ def probe_media(
     max_bytes: Optional[int] = None,
     min_duration: float = 0.05,
     timeout_seconds: float = 20.0,
+    duration_from_video: bool = False,
 ) -> MediaProbeResult:
     """Return a structured integrity verdict for one exact local file."""
     source = Path(path)
@@ -187,7 +188,7 @@ def probe_media(
         probe,
         "-v", "error",
         "-show_entries",
-        "format=duration:stream=index,codec_type,width,height,avg_frame_rate",
+        "format=duration:stream=index,codec_type,width,height,avg_frame_rate,duration",
         "-of", "json",
         str(source),
     ]
@@ -224,9 +225,10 @@ def probe_media(
             str(source), False, "missing_video_stream",
             video_streams=0, audio_streams=len(audio_rows), size_bytes=size_bytes,
         )
-    format_row = payload.get("format") if isinstance(payload, dict) else {}
+    video = video_rows[0] if video_rows else {}
+    duration_row = video if duration_from_video else payload.get("format") if isinstance(payload, dict) else {}
     try:
-        duration = max(0.0, float((format_row or {}).get("duration") or 0.0))
+        duration = max(0.0, float((duration_row or {}).get("duration") or 0.0))
     except (TypeError, ValueError):
         duration = 0.0
     if duration < max(0.0, float(min_duration)):
@@ -234,7 +236,6 @@ def probe_media(
             str(source), False, "invalid_duration", duration=duration,
             video_streams=len(video_rows), audio_streams=len(audio_rows), size_bytes=size_bytes,
         )
-    video = video_rows[0] if video_rows else {}
     return MediaProbeResult(
         path=str(source),
         valid=True,
@@ -263,6 +264,7 @@ def promote_verified_media(
     expected_height: Optional[int] = None,
     require_decode: bool = False,
     ffmpeg_path: str = "",
+    duration_from_video: bool = False,
 ) -> MediaProbeResult:
     """Validate a job-owned staged file and atomically promote it.
 
@@ -284,6 +286,7 @@ def promote_verified_media(
         min_bytes=min_bytes,
         max_bytes=max_bytes,
         min_duration=min_duration,
+        duration_from_video=duration_from_video,
     )
     if not probe.valid:
         return probe

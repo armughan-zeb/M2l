@@ -101,12 +101,13 @@ function buildRequest(job, scriptText, packageDir) {
   // auto-degrade it from CPU / available memory at render start
   // (vidnets/scripts/render-remotion-manifest.js adaptiveConcurrency).
   const concurrency = readRequestedWorkers(process.env);
-  const coverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET);
-  // Floor 0.3, not 0.4: the Nov 10, 2026 media-speedups decision set the
-  // YouTube accepted-coverage target to 0.30 (web is the main source now;
-  // 0.8 was per-job values from before). The server default is 0.30 when
-  // no explicit target is sent, so the adapter must not clamp above it.
-  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.3, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.6;
+  const explicitCoverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET || options.youtubeCoverageTarget);
+  // Respect explicit operator/job coverage target when supplied; when omitted,
+  // let Vidnets resolve the dynamic mixed-media niche policy (e.g. 80% YouTube
+  // for gaming / GTA VI, 75% for sports, 65% for entertainment, 55% for doc).
+  const coverageTarget = Number.isFinite(explicitCoverage)
+    ? Math.max(0.3, Math.min(1, explicitCoverage > 1 ? explicitCoverage / 100 : explicitCoverage))
+    : undefined;
   // FILTER-BEST (Nov 9, 2026): Vidnets' native mixed-media design ranks
   // candidates and keeps the best real media per scene — vision is ADVISORY
   // by default ("an uncertain verdict must not prevent video delivery",
@@ -130,7 +131,7 @@ function buildRequest(job, scriptText, packageDir) {
   // with a 6h floor) instead of a fixed ceiling.
   const deliveryBudget = Math.ceil(renderBudgetMs(job) / 1000);
 
-  return {
+  const request = {
     title: job.title,
     name: job.title,
     content_title: job.title,
@@ -146,23 +147,18 @@ function buildRequest(job, scriptText, packageDir) {
     vo_mode: 'Use Audiogram',
     tts_model: 'audiogram',
     edge_tts_options: { rate: 0, pitch: 0, volume: 0 },
-    image_source: 'Mixed Media',
-    media_source_priority: ['youtube', 'web', 'stock'],
-    media_mode: 'automatic',
+    image_source: options.imageSource || 'Mixed Media',
+    media_source_priority: options.mediaSourcePriority || ['youtube', 'web'],
+    media_mode: options.mediaMode || 'automatic',
     pipeline_v2_mode: 'on',
     youtube_rights_mode: 'all_public',
-    youtube_accepted_coverage_target: coverageTarget,
-    yt_stop_when_coverage_target_met: true,
-    allow_relevant_stock: true,
-    allow_stock_last_resort: true,
-    stock_last_resort_in_coordinator: true,
+    allow_relevant_stock: false,
+    allow_stock_last_resort: false,
+    stock_last_resort_in_coordinator: false,
     stock_video_only: false,
     visual_understanding: true,
     visual_required: strictMedia,
     final_visual_gate_mode: 'run',
-    media_sources: ['pexels', 'pixabay'],
-    pexels_api_key: String(process.env.PEXELS_API_KEY || '').trim(),
-    pixabay_api_key: String(process.env.PIXABAY_API_KEY || '').trim(),
     // Muse inference is compulsory: never send an OpenRouter key to
     // Vidnets. llm_provider=external_agent is the only provider, and the
     // server must never select Qwen for an external_agent job.
@@ -172,6 +168,7 @@ function buildRequest(job, scriptText, packageDir) {
     allow_emergency_media: false,
     allow_grounded_graphic_fallback: true,
     allow_grounded_graphic_fallback_strict: true,
+    global_media_guarantee: true,
     media_fallback_policy: process.env.MUSE_MEDIA_FALLBACK_POLICY || 'grounded_graphic',
     scene_mode: 'Every Beat',
     captions_enabled: options.captionsEnabled !== false,
@@ -195,6 +192,15 @@ function buildRequest(job, scriptText, packageDir) {
     delivery_budget_seconds: deliveryBudget,
     delivery_budget_max_cap_seconds: deliveryBudget
   };
+
+  if (coverageTarget !== undefined) {
+    request.youtube_accepted_coverage_target = coverageTarget;
+    request.yt_stop_when_coverage_target_met = true;
+  }
+  if (options.mixedMediaWeights || options.mediaWeights) {
+    request.mixed_media_weights = options.mixedMediaWeights || options.mediaWeights;
+  }
+  return request;
 }
 
 function requestId(value) {

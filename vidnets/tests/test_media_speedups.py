@@ -16,6 +16,7 @@
    test_media_selection_spec.py / test_web_candidate_pool.py.
 """
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -323,6 +324,12 @@ class TestSparePoolReuse(unittest.TestCase):
                  "forbidden_subjects": [],
                  "source_policy": {"visual_verification_required": True, "strict_real_media": True}},
             ]
+            for scene in scenes:
+                scene["visual_requirement"] = {
+                    "canonical_entity": "BNSF",
+                    "requirement_hash": scene["scene_id"],
+                }
+            reviewed = []
 
             def web_lane(scene, _cancel):
                 if scene["scene_index"] == 2:
@@ -332,8 +339,15 @@ class TestSparePoolReuse(unittest.TestCase):
                          "title": "BNSF locomotive snow", "score": 90,
                          "url": f"https://images.example/{os.path.basename(path)}"}]
 
-            def verify(_scene, _candidate):
-                return {"accepted": True, "status": "accepted", "score": 90}
+            def verify(scene, candidate):
+                path = candidate["path"]
+                reviewed.append((scene["scene_id"], path))
+                return {
+                    "accepted": True, "status": "accepted", "score": 90,
+                    "visual_checked": True, "visual_available": True, "semantic_verified": True,
+                    "verified_requirement_hash": scene["visual_requirement"]["requirement_hash"],
+                    "verified_asset_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                }
 
             result = resolve_storyboard_media_v2(
                 scenes,
@@ -351,6 +365,8 @@ class TestSparePoolReuse(unittest.TestCase):
             self.assertEqual(result[2].selected_path, shared)
             self.assertEqual(result[2].status, "accepted")
             self.assertEqual(result[2].fallback_reason, "spare_pool_reuse")
+            self.assertIn(("scene-2", shared), reviewed)
+            self.assertEqual(result[2].visual_decision["verified_requirement_hash"], "scene-2")
 
 
 if __name__ == "__main__":

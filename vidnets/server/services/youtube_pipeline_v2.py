@@ -44,8 +44,74 @@ from .scene_entities import comparison_pair_conflict, explicit_named_pairs
 
 def _youtube_host_dns_failure(error) -> bool:
     text = str(error or '').lower()
-    return any(host in text for host in ('youtube.com', 'youtubei.googleapis.com')) and any(
-        marker in text for marker in ('failed to resolve', 'getaddrinfo failed', 'name resolution'))
+    # yt-dlp wrappers do not always retain the hostname in the nested socket
+    # exception, so recognize DNS failures in this YouTube-only transport path
+    # even when the final error string contains only the resolver failure.
+    return any(marker in text for marker in (
+        'failed to resolve', 'getaddrinfo failed', 'name resolution',
+        'name or service not known', 'temporary failure in name resolution',
+    ))
+
+
+_YT_NETWORK_DIAGNOSTIC_LOCK = threading.Lock()
+_YT_NETWORK_DIAGNOSTIC: Dict[str, str] = {}
+
+
+def _network_disabled_by_runtime() -> bool:
+    return str(os.environ.get('CODEX_SANDBOX_NETWORK_DISABLED', '') or '').strip().lower() in {
+        '1', 'true', 'yes', 'on',
+    }
+
+
+def _record_youtube_network_failure(stage: str, error: Any = '') -> Dict[str, str]:
+    """Store a safe, actionable diagnosis and stop repeating a dead network call."""
+    detail = str(error or '').lower()
+    if _network_disabled_by_runtime():
+        code = 'network_disabled_by_sandbox'
+        message = (
+            'Outbound networking is disabled for this worker runtime '
+            '(CODEX_SANDBOX_NETWORK_DISABLED=1). Run Muse on a network-enabled '
+            'host; application code cannot override the runtime network policy.'
+        )
+    elif any(marker in detail for marker in (
+        'failed to resolve', 'getaddrinfo failed', 'name resolution',
+        'name or service not known', 'temporary failure in name resolution',
+        'provider_dns_unavailable', 'dns_resolution_failed',
+    )):
+        code = 'dns_resolution_failed'
+        message = (
+            'YouTube hostnames could not be resolved. Check the worker DNS '
+            'resolver and outbound DNS (UDP/TCP 53), then HTTPS access (TCP 443).'
+        )
+    elif any(marker in detail for marker in (
+        'network is unreachable', 'unreachable network', 'no route to host',
+        'connection refused', 'wsaenetunreach', 'winerror 10051', 'errno 101',
+    )):
+        code = 'outbound_network_unavailable'
+        message = 'The worker cannot reach the YouTube endpoint; check its route, firewall, and HTTPS egress.'
+    else:
+        code = 'youtube_transport_unavailable'
+        message = 'YouTube transport failed; inspect the stage log for the provider error.'
+    diagnostic = {'code': code, 'stage': str(stage or 'retrieval'), 'message': message}
+    if code not in {
+        'network_disabled_by_sandbox', 'dns_resolution_failed',
+        'outbound_network_unavailable',
+    }:
+        return diagnostic
+    with _YT_NETWORK_DIAGNOSTIC_LOCK:
+        if not _YT_NETWORK_DIAGNOSTIC:
+            _YT_NETWORK_DIAGNOSTIC.update(diagnostic)
+        return dict(_YT_NETWORK_DIAGNOSTIC)
+
+
+def _current_youtube_network_diagnostic() -> Dict[str, str]:
+    with _YT_NETWORK_DIAGNOSTIC_LOCK:
+        return dict(_YT_NETWORK_DIAGNOSTIC)
+
+
+def _reset_youtube_network_diagnostic() -> None:
+    with _YT_NETWORK_DIAGNOSTIC_LOCK:
+        _YT_NETWORK_DIAGNOSTIC.clear()
 
 
 def _youtube_js_runtime_options() -> Dict[str, Any]:
@@ -2107,6 +2173,20 @@ def _get_authenticated_youtube_session(
         return _adapt_youtube_cookie_jar(youtube_session)
     if not enabled:
         return None
+    cookie_files = str(os.environ.get("VIDZEO_YT_COOKIE_FILES") or "").strip()
+    if cookie_files:
+        from services.youtube_session import ConfiguredYouTubeSessions
+        pool = ConfiguredYouTubeSessions(cookie_files)
+        index, jar = pool.next_verified()
+        adapted = _adapt_youtube_cookie_jar(jar)
+        if adapted is not None:
+            adapted._vidzeo_session_pool = pool
+            adapted._vidzeo_session_index = index
+            return adapted
+        print("   [yt-v2] configured YouTube accounts unavailable; using public search", flush=True)
+        if str(os.environ.get("VIDZEO_YT_REQUIRE_SESSION") or "").lower() in {"1", "true", "yes", "on"}:
+            raise RuntimeError("Configured YouTube accounts could not be verified. Reconnect an account before retrying.")
+        return None
     try:
         from services.youtube_session import ensure_verified_session
     except Exception:
@@ -2166,6 +2246,9 @@ def _adapt_youtube_cookie_jar(session_jar: Any) -> Any:
 
 def _install_youtube_session(ydl: Any, session_jar: Any) -> None:
     """Attach the broker's in-memory cookie jar without writing plaintext cookies."""
+    if getattr(session_jar, "_vidzeo_session_pool", None) is not None:
+        from services.youtube_session import _clone_jar
+        session_jar = _clone_jar(session_jar)
     session_jar = _adapt_youtube_cookie_jar(session_jar)
     if session_jar is None:
         return
@@ -2177,6 +2260,44 @@ def _install_youtube_session(ydl: Any, session_jar: Any) -> None:
             ydl.__dict__["_opener"] = None
     except Exception as exc:
         print(f"   [yt-v2] could not attach authenticated session ({type(exc).__name__})")
+
+
+def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation, output_dir, raw_prefix):
+    """Retry a sign-in requirement with one other verified account."""
+    def download(jar):
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        attempt_opts = dict(opts, extractor_args={
+            **(opts.get("extractor_args") or {}),
+            "youtube": {
+                **((opts.get("extractor_args") or {}).get("youtube") or {}),
+                "player_client": _youtube_player_clients(jar),
+            },
+        })
+        with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            _install_youtube_session(ydl, jar)
+            ydl.download([url])
+
+    try:
+        download(session_jar)
+    except Exception as exc:
+        pool = getattr(session_jar, "_vidzeo_session_pool", None)
+        detail = str(exc).casefold()
+        sign_in = any(phrase in detail for phrase in (
+            "sign in to confirm your age", "age-restricted", "login required",
+            "sign in to view", "sign in to watch",
+        ))
+        if pool is None or not sign_in or "not a bot" in detail:
+            raise
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        index, backup = pool.next_verified(session_jar._vidzeo_session_index)
+        if backup is None:
+            raise
+        for stale in output_dir.glob(raw_prefix + "*"):
+            stale.unlink(missing_ok=True)
+        print(f"   [yt-session] retrying sign-in-required footage with verified account {index + 1}", flush=True)
+        download(backup)
 
 
 def _youtube_player_clients(session_jar: Any = None) -> List[str]:
@@ -2291,6 +2412,14 @@ def _search_youtube_uncached(
                 pass
             restored.append(row)
         return restored[:max(1, int(max_results or 12))]
+    if _network_disabled_by_runtime():
+        diagnostic = _record_youtube_network_failure('search')
+        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        return []
+    if _current_youtube_network_diagnostic():
+        # A previous uncached query already established that this worker's
+        # network cannot reach YouTube. Cached query rows above still work.
+        return []
     try:
         from services.yt_dlp_runtime import load_yt_dlp
         yt_dlp = load_yt_dlp()
@@ -2346,7 +2475,14 @@ def _search_youtube_uncached(
             _store_search_results(query, [dict(item) for item in entries])
         return [dict(item or {}, query_text=query) for item in entries]
     except Exception as exc:
-        print(f"   [yt-v2] search failed '{query[:70]}': {str(exc)[:120]}")
+        diagnostic = _record_youtube_network_failure('search', exc)
+        if diagnostic['code'] in {
+            'network_disabled_by_sandbox', 'dns_resolution_failed',
+            'outbound_network_unavailable',
+        }:
+            print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        else:
+            print(f"   [yt-v2] search failed '{query[:70]}': {str(exc)[:120]}", flush=True)
         return []
 
 
@@ -3625,6 +3761,11 @@ def _download_youtube_probe(
         or probe_host.endswith(".localhost")
     ):
         return False
+    if _network_disabled_by_runtime() or _current_youtube_network_diagnostic():
+        diagnostic = _record_youtube_network_failure('probe')
+        candidate['_transport_failure'] = diagnostic['code']
+        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        return False
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     raw_prefix = output_path.stem + ".raw."
@@ -3635,7 +3776,7 @@ def _download_youtube_probe(
             pass
     output_path.unlink(missing_ok=True)
     try:
-        probe_seconds = max(1.0, min(4.0, float(duration or 2.0)))
+        probe_seconds = max(1.0, min(32.0, float(duration or 2.0)))
         probe_start = max(0.0, float(start or 0.0))
     except (TypeError, ValueError):
         probe_seconds, probe_start = 2.0, 0.0
@@ -3649,14 +3790,14 @@ def _download_youtube_probe(
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
-            "format": '/'.join(_youtube_quality_formats() + _archival_quality_formats(candidate)),
+            "format": "18/best[height<=360][ext=mp4]/bestvideo[height<=360][ext=mp4]/best[height<=360]/best",
             "merge_output_format": "mp4",
             "outtmpl": raw_template,
             "download_ranges": download_range_func(
                 None,
                 [(probe_start, probe_start + probe_seconds + 0.4)],
             ),
-            "force_keyframes_at_cuts": False,
+            "force_keyframes_at_cuts": True,
             "extractor_args": {"youtube": {"player_client": _youtube_player_clients(session_jar)}},
             "external_downloader_args": {
                 "ffmpeg_i": ["-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
@@ -3664,16 +3805,16 @@ def _download_youtube_probe(
             "socket_timeout": int(
                 os.environ.get(
                     "VIDZEO_YT_PROBE_SOCKET_TIMEOUT",
-                    str(_youtube_transport_timeout_defaults()[0]),
+                    "5",
                 )
-                or _youtube_transport_timeout_defaults()[0]
+                or 5
             ),
             "retries": int(
                 os.environ.get(
                     "VIDZEO_YT_PROBE_RETRIES",
-                    str(_youtube_transport_timeout_defaults()[1]),
+                    "2",
                 )
-                or _youtube_transport_timeout_defaults()[1]
+                or 2
             ),
             "ffmpeg_location": _ffmpeg_bin("ffmpeg"),
         }
@@ -3681,11 +3822,11 @@ def _download_youtube_probe(
 
         if stream_downloads:
             opts["concurrent_fragment_downloads"] = 1
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            _install_youtube_session(ydl, session_jar)
-            if cancellation is not None:
-                cancellation.raise_if_cancelled()
-            ydl.download([_candidate_url(candidate)])
+        if cancellation is not None:
+            opts['progress_hooks'] = [lambda _status: cancellation.raise_if_cancelled()]
+        _download_with_youtube_session(
+            yt_dlp, opts, probe_url, session_jar, cancellation, output_path.parent, raw_prefix,
+        )
         raw_files = sorted(
             output_path.parent.glob(raw_prefix + "*"),
             key=lambda path: path.stat().st_mtime,
@@ -3703,18 +3844,25 @@ def _download_youtube_probe(
         if raw is None:
             return False
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            _ffmpeg_bin("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(raw), "-t", str(probe_seconds), "-an",
             "-c:v", "libx264", "-preset", "ultrafast", str(output_path)
         ]
-        subprocess.run(cmd, check=True, timeout=15)
+        subprocess.run(cmd, check=True, timeout=35)
         return output_path.is_file() and output_path.stat().st_size > 1024
     except Exception as exc:
-        print(
-            f"   [yt-v2] probe failed '{str(candidate.get('title') or '')[:55]}': "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
-        )
+        if cancellation is not None and cancellation.cancelled():
+            cancellation.raise_if_cancelled()
+        if _youtube_host_dns_failure(exc) or _network_disabled_by_runtime():
+            diagnostic = _record_youtube_network_failure('probe', exc)
+            candidate['_transport_failure'] = diagnostic['code']
+            print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        else:
+            print(
+                f"   [yt-v2] probe failed '{str(candidate.get('title') or '')[:55]}': "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
         output_path.unlink(missing_ok=True)
         return False
     finally:
@@ -4074,6 +4222,20 @@ def _download_clip(
     url = _candidate_url(candidate)
     if not url:
         return False
+    if _network_disabled_by_runtime() or _current_youtube_network_diagnostic():
+        diagnostic = _record_youtube_network_failure('download')
+        candidate['_transport_failure'] = diagnostic['code']
+        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        return False
+    # Round the required scene and transition handle up to an output frame.
+    # FFmpeg -t rounds differently and could produce a cut one frame shorter
+    # than the same request's duration gate.
+    _, target_fps = _youtube_quality_limits()
+    required_duration = max(1.0, float(duration) + 0.4)
+    requested_frames = math.ceil(required_duration * target_fps - 1e-8)
+    requested_duration = requested_frames / target_fps
+    range_start = max(0.0, float(start))
+    range_end = range_start + requested_duration + 1.0
     raw_template = str(output_path.with_suffix(".raw.%(ext)s"))
     raw_prefix = output_path.stem + ".raw."
     part_path = output_path.with_name(
@@ -4117,8 +4279,11 @@ def _download_clip(
             "format": format_candidates[0],
             "logger": runtime_log,
             "merge_output_format": "mp4",
-            "download_ranges": download_range_func(None, [(max(0.0, start), max(1.0, start + duration + 1.0))]),
-            "force_keyframes_at_cuts": False,
+            "download_ranges": download_range_func(None, [(range_start, range_end)]),
+            # Perform a precise seek for a pre-reviewed contact-sheet moment.
+            # Normal ranges retain the source and the final verifier reviews
+            # the actual downloaded frames.
+            "force_keyframes_at_cuts": bool(candidate.get('_contact_window_selected')),
             "extractor_args": {"youtube": {"player_client": _youtube_player_clients(session_jar)}},
             "external_downloader_args": {
                 "ffmpeg_i": [
@@ -4158,11 +4323,9 @@ def _download_clip(
                         pass
                 opts["format"] = format_spec
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    _install_youtube_session(ydl, session_jar)
-                    if cancellation is not None:
-                        cancellation.raise_if_cancelled()
-                    ydl.download([url])
+                _download_with_youtube_session(
+                    yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
+                )
                 download_error = None
                 break
             except Exception as exc:
@@ -4179,8 +4342,6 @@ def _download_clip(
                 # move to the next ranked candidate immediately; the error is
                 # still retained in the branch audit.
                 error_text = str(exc or "").lower()
-                if _youtube_host_dns_failure(error_text):
-                    candidate['_transport_failure'] = 'provider_dns_unavailable'
                 # A transport timeout says the current transfer is unhealthy;
                 # changing format cannot make that network request faster and
                 # used to spend the remaining scene wall on a duplicate retry.
@@ -4190,11 +4351,23 @@ def _download_clip(
                 # still be clean). Without the stamp every failure looked
                 # the same and the scene re-queued the same throttled video
                 # at another timestamp for up to 6 passes.
+                if _youtube_host_dns_failure(error_text):
+                    diagnostic = _record_youtube_network_failure('download', exc)
+                    candidate['_transport_failure'] = diagnostic['code']
+                    print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+                    raise
+                if any(marker in error_text for marker in (
+                    'network is unreachable', 'unreachable network',
+                    'no route to host', 'connection refused',
+                    'wsaenetunreach', 'winerror 10051', 'errno 101',
+                )):
+                    diagnostic = _record_youtube_network_failure('download', exc)
+                    candidate['_transport_failure'] = diagnostic['code']
+                    print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+                    raise
                 if any(marker in error_text for marker in (
                     "timeout", "timed out", "temporarily unavailable",
                     "connection reset", "connection aborted",
-                    "failed to resolve", "getaddrinfo failed", "name resolution",
-                    "network is unreachable", "no route to host",
                 )):
                     candidate['_transport_failure'] = 'transport_timeout'
                     print(
@@ -4206,6 +4379,7 @@ def _download_clip(
                     marker in error_text
                     for marker in (
                         "please sign in",
+                        "sign in to confirm",
                         "use --cookies",
                         "confirm you're not a bot",
                         "video unavailable",
@@ -4215,6 +4389,11 @@ def _download_clip(
                     )
                 )
                 if non_selector_failure:
+                    candidate['_transport_failure'] = (
+                        'youtube_access_required' if any(marker in error_text for marker in (
+                            'sign in', 'use --cookies', 'age-restricted', "confirm you're not a bot",
+                        )) else 'youtube_source_unavailable'
+                    )
                     print(
                         "   [yt-v2] non-selector download failure; "
                         "skipping format retries for this candidate",
@@ -4230,6 +4409,8 @@ def _download_clip(
                     continue
                 # Both extractions already tried the complete bounded format
                 # set. Switch source instead of repeating an unbounded rescue.
+                if 'requested format is not available' in error_text:
+                    candidate['_transport_failure'] = 'youtube_format_unavailable'
                 raise
         if download_error is not None:
             raise download_error
@@ -4290,8 +4471,6 @@ def _download_clip(
     _record_source_resolution(candidate, source_height)
     if candidate['reduced_resolution_source']:
         print(f"   [yt-v2] accepted {source_height}p {candidate['source_resolution_policy']} for final scene verification", flush=True)
-    requested_duration = max(1.0, float(duration))
-
     # yt-dlp has already produced the requested time range at the best source
     # quality (bounded to 1080p). Do not immediately scale/crop/recompress that
     # range only to make the semantic renderer encode it again. Atomic source
@@ -4300,6 +4479,11 @@ def _download_clip(
     preserve_source = str(
         os.environ.get("VIDZEO_YT_RETRIEVAL_PRESERVE_SOURCE", "1") or "1"
     ).strip().lower() not in {"0", "false", "no", "off"}
+    try:
+        contact_crop = max(0.0, min(15.0, float(candidate.get('contact_crop_pct') or 0)))
+    except (TypeError, ValueError):
+        contact_crop = 0.0
+    preserve_source = preserve_source and contact_crop == 0
     if preserve_source and raw.suffix.lower() == ".mp4":
         try:
             os.replace(raw, part_path)
@@ -4310,24 +4494,23 @@ def _download_clip(
                 ffprobe_path=_ffmpeg_bin("ffprobe"),
                 require_video=True,
                 min_bytes=4096,
-                min_duration=max(0.5, requested_duration * 0.70),
+                min_duration=required_duration - 1e-6,
+                duration_from_video=True,
                 require_decode=True,
                 ffmpeg_path=_ffmpeg_bin('ffmpeg'),
             )
             if promoted.valid:
                 for stale in output_path.parent.glob(raw_prefix + "*"):
-                    stale.unlink(missing_ok=True)
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 print(
                     f"   [yt-v2] source-quality range ready: {output_path.name} "
                     f"({source_height or 'unknown'}p, no retrieval re-encode)",
                     flush=True,
                 )
-                return True
-            # Unit-test process doubles cannot return a real ffprobe payload;
-            # retain their established compatibility without relaxing the
-            # production integrity contract.
-            if promoted.reason == "ffprobe_invalid_result" and _source_has_video_stream(part_path):
-                os.replace(part_path, output_path)
+                candidate['_download_mode'] = 'preserved_source'
                 return True
             print(
                 f"   [yt-v2] source-preserve probe rejected ({promoted.reason}); "
@@ -4345,18 +4528,20 @@ def _download_clip(
                     os.replace(part_path, raw)
                 except OSError:
                     pass
-    _source_height, target_fps = _youtube_quality_limits()
     try:
         target_width = int(os.environ.get("VIDZEO_PROJECT_WIDTH", "1920") or 1920)
         target_height = int(os.environ.get("VIDZEO_PROJECT_HEIGHT", "1080") or 1080)
     except (TypeError, ValueError):
         target_width, target_height = 1920, 1080
+    zoom_crop = (f"crop=trunc(iw*{1 - contact_crop / 100:.4f}/2)*2:"
+                 f"trunc(ih*{1 - contact_crop / 100:.4f}/2)*2,"
+                 if contact_crop else "")
     cmd = [
         _ffmpeg_bin("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(raw), "-t", str(requested_duration), "-an",
-        "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_width}:{target_height},fps={target_fps}",
+        "-i", str(raw), "-frames:v", str(requested_frames), "-an",
+        "-vf", f"{zoom_crop}scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_width}:{target_height},fps={target_fps}",
         "-c:v", "libx264", "-preset", "fast", "-crf", "17",
-        "-pix_fmt", "yuv420p", "-r", str(target_fps), str(part_path),
+        "-pix_fmt", "yuv420p", "-r", str(target_fps), "-g", "30", str(part_path),
     ]
     try:
         if cancellation is not None:
@@ -4387,7 +4572,7 @@ def _download_clip(
             ffprobe_path=_ffmpeg_bin("ffprobe"),
             require_video=True,
             min_bytes=4096,
-            min_duration=max(0.05, requested_duration - (1.0 / target_fps)),
+            min_duration=required_duration - 1e-6,
             expected_duration=requested_duration,
             duration_tolerance=(1.0 / target_fps) + 0.005,
             expected_width=target_width,
@@ -4396,14 +4581,15 @@ def _download_clip(
             ffmpeg_path=_ffmpeg_bin('ffmpeg'),
         )
         if promoted.valid:
+            candidate['_download_mode'] = 'normalized_range'
             return True
-        # A few legacy unit tests use a subprocess double that writes the
-        # requested output but returns ``None``. Real subprocess.run cannot do
-        # that, so retain compatibility without weakening production probes.
-        if promoted.reason == "ffprobe_invalid_result" and _source_has_video_stream(part_path):
-            os.replace(part_path, output_path)
-            return True
-        print(f"   [yt-v2] clip integrity rejection ({promoted.reason}): {output_path.name}")
+        if promoted.reason in {'invalid_duration', 'duration_mismatch'}:
+            candidate['_transport_failure'] = 'youtube_range_duration_invalid'
+        print(
+            f"   [yt-v2] clip integrity rejection ({promoted.reason}): {output_path.name} "
+            f"(observed={promoted.duration:.3f}s, required={required_duration:.3f}s)",
+            flush=True,
+        )
         for _partial in output_path.parent.glob(raw_prefix + "*"):
             try:
                 _partial.unlink()
@@ -4802,11 +4988,9 @@ def _download_source_once(
                     flush=True,
                 )
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    _install_youtube_session(ydl, session_jar)
-                    if cancellation is not None:
-                        cancellation.raise_if_cancelled()
-                    ydl.download([url])
+                _download_with_youtube_session(
+                    yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
+                )
                 download_error = None
                 break
             except Exception as exc:
@@ -5867,6 +6051,7 @@ def get_youtube_clips(
     )
     if cancellation is not None:
         cancellation.raise_if_cancelled()
+    _reset_youtube_network_diagnostic()
     if visual_context is None:
         effective_openrouter_key = str(
             openrouter_api_key
@@ -6058,6 +6243,18 @@ def get_youtube_clips(
     total_candidates = sum(len(v) for v in pools.values())
     search_elapsed_seconds = time.monotonic() - batch_started_monotonic
     print(f"   [yt-v2] search complete: {total_candidates} unique candidate(s)")
+    network_diagnostic = _current_youtube_network_diagnostic()
+    if not total_candidates and network_diagnostic:
+        print(f"   [yt-v2] retrieval stopped: {network_diagnostic['message']}", flush=True)
+        return _restore_scene_slots([None] * requested_scene_count, {
+            'resolved': 0,
+            'requested': requested_scene_count,
+            'metadata_selected': 0,
+            'stop_reason': network_diagnostic['code'],
+            'network_diagnostic': network_diagnostic,
+            'search_elapsed_seconds': round(search_elapsed_seconds, 2),
+            'runtime': runtime_receipt(),
+        })
     if progress_callback:
         progress_callback(0.35, f"YouTube V2: ranked {total_candidates} candidates")
     if allow_same_source_reuse is None:
@@ -6271,7 +6468,6 @@ def get_youtube_clips(
     download_used_timestamps: Dict[str, List[float]] = defaultdict(list)
     download_timestamp_owners = defaultdict(set)
     failed_download_counts: Counter = Counter()
-    network_failed_sources = set()
     provider_network_unavailable = threading.Event()
     attempt_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     chapter_cache = {}
@@ -6495,6 +6691,50 @@ def get_youtube_clips(
             attempt_audit[idx].append(audit)
             attempt_started = time.monotonic()
             try:
+                # Inspect a padded low-resolution range before committing to a
+                # high-quality cut. A model-selected range is only evidence
+                # for these exact pixels; the final clip still goes through the
+                # normal transport and scene-level visual checks below.
+                if visual_context is not None and getattr(visual_context, 'enabled', False):
+                    from services.youtube_contact_probe import inspect_candidate
+                    try:
+                        probe_client = visual_context.get_client()
+                    except Exception:
+                        probe_client = None
+                    status, window, probe_audit = inspect_candidate(
+                        option, start, duration, rows[idx].get('scene_text', ''),
+                        output_root / 'contact_probes' / uuid.uuid4().hex,
+                        probe_client, _download_youtube_probe,
+                        _ffmpeg_bin('ffmpeg'), _ffmpeg_bin('ffprobe'),
+                        session_jar=authenticated_session,
+                        stream_downloads=bool(stream_downloads), cancellation=download_cancellation,
+                    )
+                    audit['contact_probe'] = dict(probe_audit, status=status)
+                    if status == 'rejected':
+                        audit.update(status='contact_vision_rejected', failure_kind='content_reject')
+                        return None
+                    if status == 'accepted':
+                        selected_start = float(window['start'])
+                        with download_timestamp_lock:
+                            keys = _timestamp_reuse_keys(option)
+                            gap = max(duration + 1.5, 8.0)
+                            collision = any(
+                                abs(selected_start - old) < gap
+                                and download_timestamp_owners[(k, old)] != {idx}
+                                for k in keys for old in download_used_timestamps[k]
+                            )
+                            if not collision:
+                                for k in keys:
+                                    download_used_timestamps[k].append(selected_start)
+                                    download_timestamp_owners[(k, selected_start)].add(idx)
+                        if collision:
+                            audit.update(status='contact_window_reused', failure_kind='content_reject')
+                            return None
+                        start = selected_start
+                        option['contact_crop_pct'] = window['crop_pct']
+                        option['_contact_window_selected'] = True
+                        audit['timestamp'] = round(start, 2)
+                        audit['timestamp_evidence'] = 'contact_sheet_vision'
                 downloaded = False
                 # A transport cache hit still goes through the overlay and
                 # scene-specific visual gates below. It only removes the
@@ -6502,7 +6742,8 @@ def get_youtube_clips(
                 # that a cut is relevant to a different scene.
                 try:
                     from services.youtube_media_cache import get_verified_cut
-                    cached = get_verified_cut(vid, start, duration)
+                    cached = (get_verified_cut(vid, start, duration)
+                              if not option.get('contact_crop_pct') else None)
                 except Exception:
                     cached = None
                 if cached and cached.get("path"):
@@ -6548,6 +6789,8 @@ def get_youtube_clips(
                 })
                 downloaded = False
             audit['runtime_warning_categories'] = list(option.get('_runtime_warning_categories') or [])
+            if option.get('_download_mode'):
+                audit['download_mode'] = option['_download_mode']
             audit["elapsed_seconds"] = round(time.monotonic() - attempt_started, 2)
             if downloaded:
                 audit["status"] = "downloaded"
@@ -6614,7 +6857,7 @@ def get_youtube_clips(
                 try:
                     from services.youtube_media_cache import put_verified_cut
                     cache_source = str(cleaned_path or out.resolve())
-                    cached_path = put_verified_cut(
+                    cached_path = not option.get('contact_crop_pct') and put_verified_cut(
                         vid, start, duration, cache_source,
                         metadata={
                             "source_url": str(_candidate_url(option) or ""),
@@ -6635,22 +6878,32 @@ def get_youtube_clips(
                 "status": "download_failed",
                 "reason": failure or "yt_dlp_or_ffmpeg",
                 "failure_kind": (
-                    "transport_timeout"
-                    if failure in {"transport_timeout", "provider_dns_unavailable"}
+                    "network_unavailable"
+                    if failure in {
+                        "provider_dns_unavailable", "dns_resolution_failed",
+                        "network_disabled_by_sandbox", "outbound_network_unavailable",
+                    }
+                    else "transport_timeout"
+                    if failure == "transport_timeout"
                     else "download_error"
                 ),
             })
-            if failure == 'provider_dns_unavailable':
+            if failure in {
+                'provider_dns_unavailable', 'dns_resolution_failed',
+                'network_disabled_by_sandbox', 'outbound_network_unavailable',
+            }:
+                _record_youtube_network_failure('download', failure)
                 with download_timestamp_lock:
-                    network_failed_sources.add(vid)
-                    if len(network_failed_sources) >= 2:
-                        provider_network_unavailable.set()
+                    provider_network_unavailable.set()
             try:
                 out.unlink(missing_ok=True)
             except Exception:
                 pass
             with download_timestamp_lock:
-                failed_download_counts[vid] += 1
+                if failure in {'youtube_access_required', 'youtube_source_unavailable', 'youtube_format_unavailable'}:
+                    failed_download_counts[vid] = max(2, failed_download_counts[vid])
+                else:
+                    failed_download_counts[vid] += 1
             return None
 
         def _finalize_progressive(win_path: str) -> Tuple[int, Optional[str]]:
@@ -6679,8 +6932,13 @@ def get_youtube_clips(
                         str(Path(win_path).resolve()) if attempt.get("overlay_blurred") else ""
                     )
                     attempt["selected"] = True
-                    attempt["semantic_verified"] = True
-                    attempt["visual_checked"] = True
+                    # A transport-only handoff has not been inspected by the
+                    # scene-specific vision gate. Never certify it as such.
+                    attempt["visual_checked"] = bool(attempt.get("visual_available"))
+                    attempt["semantic_verified"] = bool(
+                        attempt.get("visual_available")
+                        and attempt.get("visual_outcome") == "pass"
+                    )
                     try:
                         from services.youtube_clip_provenance import write_clip_provenance
                         write_clip_provenance(win_path, idx, attempt)
@@ -6697,7 +6955,8 @@ def get_youtube_clips(
         visual_required = bool(getattr(visual_context, "visual_required", False)) if visual_context is not None else False
         transport_only = bool(
             visual_context is not None
-            and not bool(getattr(visual_context, "enabled", False))
+            and (not bool(getattr(visual_context, "enabled", False))
+                 or bool(getattr(visual_context, 'youtube_contact_only', False)))
         )
         advisory_fallback: Optional[str] = None
         downloaded_alternates: List[str] = []
@@ -6716,6 +6975,7 @@ def get_youtube_clips(
                 vid_duration = float(option.get("duration") or 0.0)
                 retryable_cut = bool(attempt_audit[idx] and attempt_audit[idx][-1].get('status') in {
                     'motion_or_quality_rejected', 'overlay_or_talking_head_rejected',
+                    'contact_vision_rejected',
                 })
                 if (retryable_cut and len(options) > 1
                         and attempt_audit[idx][-1].get('rejection_reason') in {
@@ -6947,17 +7207,9 @@ def get_youtube_clips(
     stopped_reason = ""
 
     def _download_pass_cap() -> int:
-        # Total download passes per scene. Small jobs (<=8 scenes) get at
-        # most 3: one primary + two alternates. Six passes of mostly
-        # throttled ranged transfers was the download sink on GTA VI (up to
-        # 48 transfers); with transport timeouts parked (see
-        # _download_scene) the remaining passes are distinct candidates,
-        # and anything still missing falls through to the parallel web
-        # lane instead of a fourth re-queue.
-        cap = min(max_attempts, candidate_limit)
-        if requested_scene_count <= 8:
-            cap = min(cap, 3)
-        return max(1, cap)
+        # Honor the caller's bounded pass budget even for short jobs. The
+        # mixed-media adapter can still supply a smaller quota budget.
+        return max(1, min(max_attempts, candidate_limit))
 
 
     def _submit_available() -> None:
@@ -7008,8 +7260,20 @@ def get_youtube_clips(
     try:
         while pending:
             if provider_network_unavailable.is_set():
-                stopped_reason = 'provider_network_unavailable'
-                print('   [yt-v2] YouTube DNS failed for two sources; preserving completed clips and handing gaps to other providers', flush=True)
+                diagnostic = _current_youtube_network_diagnostic()
+                stopped_reason = diagnostic.get('code') or 'provider_network_unavailable'
+                if diagnostic:
+                    print(
+                        f"   [yt-v2] stopping YouTube retrieval: {diagnostic['code']}: "
+                        f"{diagnostic['message']} Completed clips are preserved; "
+                        "unresolved scenes are left for the caller's fallback providers.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        '   [yt-v2] YouTube transport is unavailable; preserving completed clips and handing gaps to other providers',
+                        flush=True,
+                    )
                 break
             ready_count = sum(1 for path in results[:requested_scene_count] if path)
             if ready_count >= requested_scene_count:
@@ -7214,6 +7478,7 @@ def get_youtube_clips(
             "requested": requested_scene_count,
             "stop_reason": stopped_reason,
             "provider_network_unavailable": provider_network_unavailable.is_set(),
+            "network_diagnostic": _current_youtube_network_diagnostic(),
             "strategy": "coverage_first_round_robin_downloads",
             "search_elapsed_seconds": round(search_elapsed_seconds, 2),
             "download_passes": dict(scene_passes),

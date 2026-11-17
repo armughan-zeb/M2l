@@ -4377,7 +4377,7 @@ function toggleImageSource() {
     const source = $('imageSource')?.value;
     const isCustom = (source === 'Custom Images');
     const isMixedMedia = (source === 'Mixed Media');
-    const isStockMedia = (source === 'Stock Media' || source === 'Real Media' || isMixedMedia);
+    const isStockMedia = (source === 'Stock Media' || source === 'Real Media');
     const isWebImages = (source === 'Web Images');
 
     // Show Custom Upload only for Custom
@@ -4396,7 +4396,7 @@ function toggleBulkLongImageSource() {
     const source = $('bulkLongImageSource')?.value;
     const isWebImages = (source === 'Web Images');
     const isMixedMedia = (source === 'Mixed Media');
-    const isStockMedia = (source === 'Stock Media' || source === 'Real Media' || isMixedMedia);
+    const isStockMedia = (source === 'Stock Media' || source === 'Real Media');
     setElementVisibility('bulkLongWebImagesNotice', isWebImages);
     setElementVisibility('bulkLongMixedMediaNotice', isMixedMedia);
     const stockSources = $('bulkLongStockMediaSources');
@@ -5301,9 +5301,8 @@ const VideoGenerationController = {
             request.documentary_density = selectedDensity;
 
             if (imageSource === 'Mixed Media') {
-                request.media_sources = mediaSources;
-                request.pexels_api_key = AppState.apiKeys.pexels || '';
-                request.pixabay_api_key = AppState.apiKeys.pixabay || '';
+                request.allow_relevant_stock = false;
+                request.allow_stock_last_resort = false;
             } else if (imageSource === 'Stock Media') {
                 request.media_sources = mediaSources;
                 request.pexels_api_key = AppState.apiKeys.pexels || '';
@@ -5855,9 +5854,8 @@ const QueueController = {
         config.pipeline_v2_mode = 'on';
 
         if (imageSource === 'Mixed Media') {
-            config.media_sources = mediaSources;
-            config.pexels_api_key = AppState.apiKeys.pexels || '';
-            config.pixabay_api_key = AppState.apiKeys.pixabay || '';
+            config.allow_relevant_stock = false;
+            config.allow_stock_last_resort = false;
         } else if (imageSource === 'Stock Media') {
             config.media_sources = mediaSources;
             config.pexels_api_key = AppState.apiKeys.pexels || '';

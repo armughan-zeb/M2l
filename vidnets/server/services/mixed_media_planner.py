@@ -1216,6 +1216,7 @@ def build_adaptive_mixed_media_plan(
     category: str = "",
     scene_media_mode: str = "",
     media_policy: Dict[str, object] | None = None,
+    allow_stock: bool = True,
 ) -> AdaptiveMixedMediaPlan:
     automatic_mode = str(scene_media_mode or "").strip().lower() in {
         "auto", "automatic", "smart", "topic_aware", "topic-aware",
@@ -1259,6 +1260,11 @@ def build_adaptive_mixed_media_plan(
                 scene_texts=scene_texts,
                 category=category,
             )
+    if not allow_stock:
+        # Keep the intended motion share and give the unavailable stock
+        # slots to web stills before assigning scenes and planning queries.
+        weights["Web Images"] += weights["Stock Media"]
+        weights["Stock Media"] = 0.0
     num_scenes = len(scene_texts)
 
     yt_first = (

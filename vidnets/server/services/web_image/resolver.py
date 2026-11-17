@@ -505,16 +505,11 @@ try:
 except (TypeError, ValueError):
     _universal_workers = 6
 try:
-    # Search engines answer slowly through the egress proxy. The engine
-    # timeout is generous by operator override (Nov 16: no time limit for
-    # web — a bit late beats a graphic fallback): each engine gets a full
-    # 300s latency budget (they run in parallel, and the wave waits for
-    # them under liveness gating instead of abandoning the batch at 15s).
-    # The runtime .env already sets 300; the code default now matches it
-    # so the behavior survives without the .env.
-    _universal_timeout = float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "300") or 300)
+    # Direct callers use the fast-pass budget. Completion passes specify
+    # their own budget when calling the manager.
+    _universal_timeout = float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS") or 8)
 except (TypeError, ValueError):
-    _universal_timeout = 300.0
+    _universal_timeout = 8.0
 _UNIVERSAL_SCRAPER = UniversalScraperManager(
     max_workers=_universal_workers,
     engine_timeout_seconds=_universal_timeout,
@@ -1632,17 +1627,16 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
 def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> List[Dict]:
     """Run the copied four-engine scraper and map rows into resolver records."""
     global _UNIVERSAL_LAST_AUDIT
+    default_engine_timeout = 30.0 if wait_until_complete else 8.0
     try:
         enabled = str(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_ENGINES", "") or "").strip()
         engine_ids = [part.strip() for part in enabled.split(",") if part.strip()] or None
         limit = max(6, min(30, int(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_LIMIT", "20") or 20)))
-        # Generous by operator override (Nov 16): the 300s engine timeout
-        # is a latency budget, not a wave wall — the resolver wave waits
-        # for the batch under liveness gating. The runtime .env already
-        # sets 300; the code default now matches it.
-        timeout = max(2.0, min(300.0, float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "300") or 300)))
+        timeout = max(2.0, min(300.0, float(
+            os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS") or default_engine_timeout
+        )))
     except (TypeError, ValueError):
-        engine_ids, limit, timeout = None, 20, 300.0
+        engine_ids, limit, timeout = None, 20, default_engine_timeout
     response = _UNIVERSAL_SCRAPER.search(
         query,
         engine_ids=engine_ids,
@@ -1661,6 +1655,7 @@ def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> L
         for stat in response.stats
     )
     if response.total == 0 or timed_out:
+        default_late_wait = 120.0 if wait_until_complete else 5.0
         try:
             # Late wait raised 5s → 120s (GTA fix, Nov 16): the old 5s was
             # far short of the ~22s gap between the wave abandoning a batch
@@ -1672,15 +1667,16 @@ def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> L
                 min(
                     300.0,
                     float(
-                        os.environ.get(
-                            "VIDZEO_UNIVERSAL_LATE_WAIT_SECONDS", "120"
-                        )
-                        or 120
+                        os.environ.get("VIDZEO_UNIVERSAL_LATE_WAIT_SECONDS") or default_late_wait
                     ),
                 ),
             )
         except (TypeError, ValueError):
-            late_wait = 120.0
+            late_wait = default_late_wait
+        if response.total and not wait_until_complete:
+            # Healthy engines already supplied usable leads. Harvest
+            # available late rows now and let recovery query again for gaps.
+            late_wait = 0.0
         late_rows = _UNIVERSAL_SCRAPER.collect_late_results(
             query, wait_seconds=late_wait
         )
@@ -2342,6 +2338,22 @@ def _topic_candidate_mismatch(title: str, url: str, query: str, scene_text: str,
     if not terms:
         return False
     return not any(re.search(r"\b" + re.escape(term.rstrip("s")) + r"s?\b", metadata_text) for term in terms)
+
+
+def _publisher_screenshot_query(subject: str, scene_text: str) -> str:
+    """Use an official still first for GTA, with the scene's installment intact."""
+    match = re.search(r"\b(?:grand theft auto|gta)\s*(vi|v|6|5)\b", subject, re.I)
+    if not match:
+        return ""
+    edition = "VI" if match.group(1).lower() in {"vi", "6"} else "V"
+    alternate = _narrated_installment_anchor(scene_text, f"Grand Theft Auto {edition}") or {}
+    if alternate.get("version") in {"5", "6"}:
+        edition = "VI" if alternate["version"] == "6" else "V"
+    terms = re.findall(r"\b(?:Lucia|Jason|Vice City|Leonida|beaches|swamps|trailer|gameplay)\b", scene_text, re.I)
+    focus = " ".join(dict.fromkeys(term.lower() for term in terms))[:48] if edition == "VI" else ""
+    return " ".join(part for part in (
+        f"Grand Theft Auto {edition}", focus, "official screenshot site:rockstargames.com",
+    ) if part)
 
 
 def _royal_identity_requirement(main_subject: str, scene_text: str = "") -> str:
@@ -3509,7 +3521,14 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
     # warm-up already supplies breadth; four scene-level waves are enough for
     # identity, action, archival, and one recovery variant without turning a
     # slow image host into a per-scene latency multiplier.
-    queries = list(dict.fromkeys(str(q).strip() for q in (queries or []) if str(q).strip()))[:4]
+    queries = list(dict.fromkeys(str(q).strip() for q in (queries or []) if str(q).strip()))
+    canonical = (visual_requirement or {}).get("canonical_entity") if isinstance(visual_requirement, Mapping) else ""
+    publisher_query = _publisher_screenshot_query(str(canonical or main_subject or ""), scene_text)
+    if publisher_query:
+        # Preserve the scene director's most specific search and reserve
+        # the next attempt for a genuine publisher still.
+        queries = list(dict.fromkeys(queries[:1] + [publisher_query] + queries[1:]))
+    queries = queries[:4]
     # Rank a bounded shortlist first, retaining a second host/query wave for
     # failures. The shared scene budget covers every query and replacement.
     if fast_mode:

@@ -174,6 +174,9 @@ test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key
   assert.equal(request.strict_retrieval_accuracy, false);
   assert.equal(request.visual_understanding, true);
   assert.equal(request.stock_video_only, false);
+  assert.equal(request.allow_relevant_stock, false);
+  assert.equal(request.allow_stock_last_resort, false);
+  assert.deepEqual(request.media_source_priority, ['youtube', 'web']);
   assert.equal(request.allow_emergency_media, false);
   assert.equal(request.allow_grounded_graphic_fallback, true);
   assert.equal(request.media_fallback_policy, 'grounded_graphic');

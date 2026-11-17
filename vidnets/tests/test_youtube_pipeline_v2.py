@@ -186,7 +186,8 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                     Path(command[-1]).write_bytes(b"clip" * 2048),
                     None,
                 )[1],
-            ), mock.patch.object(ytv2, "_source_video_height", return_value=1080):
+            ), mock.patch.object(ytv2, "_source_video_height", return_value=1080), \
+                 mock.patch("services.media_integrity.promote_verified_media", return_value=SimpleNamespace(valid=True, reason="ok")):
                 downloaded = ytv2._download_clip(
                     {"id": "video-1", "webpage_url": "https://youtube.com/watch?v=video-1"},
                     Path(temp_dir) / "clip.mp4",

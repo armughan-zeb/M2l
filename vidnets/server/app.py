@@ -4376,6 +4376,8 @@ def _stock_rescue_allowed(config, title='', script='', scene_texts=None):
         return True
     if source not in {'Mixed Media', 'Mixed'}:
         return False
+    if not _enabled((config or {}).get('allow_relevant_stock'), default=False):
+        return False
     # Explicit mixed-media weights are an opt-in contract: when the caller
     # deliberately excludes Stock Media (weight 0 or absent), no rescue pass
     # may resurrect it and burn branch budget on an unrequested source.
@@ -4527,6 +4529,9 @@ def _apply_gaming_mode_policy(config, policy, title, script, scene_texts):
     config['_gaming_mode'] = bool(gaming)
     if not gaming:
         return
+    config.setdefault('media_source_priority', ['youtube', 'web'])
+    config['allow_relevant_stock'] = False
+    config['allow_stock_last_resort'] = False
     # Stamp the binding 0.90 YouTube target from the planner constant so
     # the adapter's quota math reads the same number the policy sets.
     try:
@@ -10417,18 +10422,19 @@ def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, conf
     image_source = str(config.get('image_source') or '').strip()
     try:
         candidate_limit = int(config.get('yt_download_candidate_limit') or (
-            6 if image_source == 'Mixed Media' else
-            (4 if image_source == 'YouTube Clips' else os.environ.get('VIDZEO_YT_DOWNLOAD_CANDIDATES', '3'))
+            6 if image_source in {'YouTube Clips', 'Mixed Media'} else
+            os.environ.get('VIDZEO_YT_DOWNLOAD_CANDIDATES', '3')
         ) or 2)
     except (TypeError, ValueError):
         candidate_limit = 2
     try:
         attempts = int(config.get('yt_max_download_attempts_per_scene') or (
-            6 if image_source == 'Mixed Media' else (4 if image_source == 'YouTube Clips' else 0)
+            6 if image_source in {'YouTube Clips', 'Mixed Media'} else 0
         ))
     except (TypeError, ValueError):
         attempts = 0
     from services.media_query_strategy import supported_specific_topic
+    from services.job_context import current_job
     query_rows = _json_safe_youtube_value(scene_query_overrides or [])
     for row in query_rows:
         if not isinstance(row, dict):
@@ -10452,6 +10458,17 @@ def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, conf
         'scene_texts': list(scene_texts or []),
         'scene_durations': list(scene_durations or []),
         'openrouter_api_key': openrouter_key or '',
+        'youtube_contact_vision': image_source == 'YouTube Clips' and _enabled(config.get('yt_contact_vision')),
+        'visual_config': {
+            'llm_provider': config.get('llm_provider', ''),
+            'agent_owner_id': config.get('agent_owner_id', ''),
+            'openrouter_api_key': openrouter_key or '',
+            'visual_understanding': config.get('visual_understanding', True),
+            'visual_max_calls': config.get('visual_max_calls'),
+            'pipeline_v2_mode': bool(_pipeline_v2_visible(config)),
+        },
+        'job_context': {key: value for key, value in current_job().items()
+                        if key in ('job_id', 'llm_provider', 'agent_owner_id', 'chatgpt_account_id', 'cost_profile')},
         'pipeline_v2_mode': bool(_pipeline_v2_visible(config)),
         'scene_query_overrides': query_rows,
         'scene_timing_windows': _json_safe_youtube_value(config.get('_scene_timing_windows') or []),
@@ -10477,7 +10494,7 @@ def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, conf
         'hard_timeout_seconds': config.get('yt_hard_timeout_seconds'),
         'session_jar': _json_safe_youtube_value(config.get('_yt_session_jar')),
         'youtube_session': _json_safe_youtube_value(config.get('_yt_session')),
-        'use_authenticated_session': bool(config.get('yt_use_authenticated_session', True)),
+        'use_authenticated_session': _enabled(config.get('yt_use_authenticated_session'), default=True),
         'excluded_video_ids': list(config.get('youtube_excluded_video_ids') or []),
         'excluded_channel_ids': list(config.get('youtube_excluded_channel_ids') or []),
         'prefer_whisper_timing': bool(config.get('youtube_prefer_whisper_timing', True)),
@@ -10599,14 +10616,12 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
     # already returned 0/scene results. Keep the lane bounded; do not make it
     # an unbounded long-form wait.
     _medium_youtube_job = _youtube_only_job and scene_count >= 8
-    # Use the shared source pool for YouTube-only app jobs as well as Mixed
-    # Media. The pool pays the authenticated download cost once and cuts
-    # several verified moments from the same source, which is substantially
-    # more reliable than letting every ranged worker race the hard deadline.
-    # Large jobs can still opt out explicitly with yt_pool_first=False.
-    if _youtube_only_job and isinstance(config, dict) and 'yt_pool_first' not in config:
-        config['yt_pool_first'] = True
     if _youtube_only_job:
+        # Short jobs use authenticated ranges. The shared source pool pays
+        # off when many scenes can cut distinct moments from one master.
+        config.setdefault('yt_pool_first', scene_count >= 24)
+        config.setdefault('yt_download_candidate_limit', 6)
+        config.setdefault('yt_max_download_attempts_per_scene', 6)
         # The provider also consults VIDZEO_YT_POOL_FIRST.  Leaving the
         # process-wide .env value at 1 silently re-enabled full-source pool
         # downloads even when the job explicitly requested ranged clips.
@@ -11238,7 +11253,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                  hard_timeout_seconds=config.get('yt_hard_timeout_seconds'),
                  session_jar=config.get('_yt_session_jar'),
                  youtube_session=config.get('_yt_session'),
-                use_authenticated_session=bool(config.get('yt_use_authenticated_session', True)),
+                use_authenticated_session=_enabled(config.get('yt_use_authenticated_session'), default=True),
                 visual_context=visual_context,
                 prefer_whisper_timing=bool(config.get('youtube_prefer_whisper_timing', True)),
                 # YouTube-only app jobs use the shared source pool so the
@@ -11783,6 +11798,14 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             if isinstance(yt_paths.audit, dict):
                 yt_paths.audit.setdefault("download_workers", _audit_workers)
                 yt_paths.audit.setdefault("requested_download_workers", _audit_workers)
+                _yt_network_diagnostic = yt_paths.audit.get("network_diagnostic") or {}
+                if isinstance(_yt_network_diagnostic, dict) and _yt_network_diagnostic.get("code"):
+                    print(
+                        f"   [yt] retrieval network diagnostic: "
+                        f"{_yt_network_diagnostic.get('code')}: "
+                        f"{_yt_network_diagnostic.get('message')}",
+                        flush=True,
+                    )
             attempts = yt_paths.audit.get("attempts") or {}
             failure_counts = {}
             for rows in attempts.values():
@@ -16754,6 +16777,7 @@ def _resolve_media_paths(config, audio_plan, report_progress, cancellation=None)
             scene_media_mode=config.get('mixed_media_policy') or 'automatic',
             strict_weights=False,
             media_policy=config.get('_niche_media_policy'),
+            allow_stock=_enabled(config.get('allow_relevant_stock'), default=False),
         )
     weights = dict(plan.requested_weights)
     web_enabled = (weights.get('Web Images') or 0) > 0
@@ -21569,6 +21593,9 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
         else None
     ) or _start_whisper_warmup(config)
     job_config = _coerce_media_source_from_weights(_ensure_script_for_queue(config))
+    if str(job_config.get("image_source") or "").strip().casefold() in {"mixed", "mixed media"}:
+        job_config.setdefault("allow_relevant_stock", False)
+        job_config.setdefault("allow_stock_last_resort", False)
     job_config = _enforce_generation_plan_limits(job_config)
     creative_seed = _ensure_generation_variation_seed(
         job_config,
@@ -21896,7 +21923,7 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
             if _effective_source == 'YouTube Clips':
                 job_config.setdefault('yt_stream_downloads', False)
                 job_config.setdefault('yt_stop_on_soft_timeout', True)
-                job_config.setdefault('yt_download_candidate_limit', 5)
+                job_config.setdefault('yt_download_candidate_limit', 6)
                 job_config.setdefault('yt_lenient_acceptance', True)
                 if _is_disaster_script_context(
                     job_config.get('title') or title,
@@ -22132,6 +22159,7 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                         scene_media_mode=job_config.get('mixed_media_policy') or 'automatic',
                         strict_weights=False,
                         media_policy=job_config.get('_niche_media_policy'),
+                        allow_stock=_enabled(job_config.get('allow_relevant_stock'), default=False),
                     )
                     job_config['_prebuilt_mixed_plan'] = {
                         '_scene_count': len(aligned_scene_texts),

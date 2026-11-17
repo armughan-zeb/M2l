@@ -529,6 +529,44 @@ def detect_browser_profiles() -> List[BrowserProfile]:
     return candidates
 
 
+def _cookie_from_browser_json(item: Dict[str, Any]) -> Optional[http.cookiejar.Cookie]:
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return None
+    value = str(item.get("value") or "")
+    domain = str(item.get("domain") or ".youtube.com")
+    path = str(item.get("path") or "/")
+    secure = bool(item.get("secure", False))
+    exp = item.get("expirationDate") or item.get("expires")
+    try:
+        exp = int(float(exp)) if exp is not None else None
+    except (ValueError, TypeError):
+        exp = None
+    http_only = bool(item.get("httpOnly", False))
+    rest = {"HttpOnly": None} if http_only else {}
+    if item.get("sameSite"):
+        rest["SameSite"] = str(item.get("sameSite"))
+    return http.cookiejar.Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=True,
+        domain_initial_dot=domain.startswith("."),
+        path=path,
+        path_specified=True,
+        secure=secure,
+        expires=exp,
+        discard=bool(item.get("discard", exp is None or item.get("session", False))),
+        comment=None,
+        comment_url=None,
+        rest=rest,
+        rfc2109=False,
+    )
+
+
 def _load_explicit_cookie_file(path: Path) -> http.cookiejar.CookieJar:
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -537,11 +575,34 @@ def _load_explicit_cookie_file(path: Path) -> http.cookiejar.CookieJar:
     # Browser exports occasionally include a UTF-8 BOM. Treat it as encoding
     # metadata, not part of the Netscape header, so packaged imports behave the
     # same as developer imports.
-    header = path.read_bytes()[:256].decode("utf-8-sig", errors="replace")
-    if not header.startswith(("# Netscape HTTP Cookie File", "# HTTP Cookie File")):
-        raise ValueError("cookie export is not Netscape/Mozilla format")
+    raw_bytes = path.read_bytes()
+    text = raw_bytes.decode("utf-8-sig", errors="replace").strip()
+
+    # Support JSON exports (Cookie-Editor extension, browser JSON format)
+    if text.startswith(("[", "{")):
+        try:
+            payload = json.loads(text)
+            cookie_items = payload if isinstance(payload, list) else payload.get("cookies", [])
+            jar = http.cookiejar.CookieJar()
+            for item in cookie_items:
+                if isinstance(item, dict):
+                    cookie = _cookie_from_browser_json(item)
+                    if cookie:
+                        jar.set_cookie(cookie)
+            return _filtered_jar(jar)
+        except Exception as exc:
+            raise ValueError(f"cookie export JSON could not be parsed: {exc}")
+
+    if not text.startswith(("# Netscape HTTP Cookie File", "# HTTP Cookie File", "#")):
+        raise ValueError("cookie export is not Netscape/Mozilla format or JSON format")
     jar = http.cookiejar.MozillaCookieJar(str(path))
     jar.load(ignore_discard=True, ignore_expires=True)
+    # Netscape exports commonly write zero for cookies that live only
+    # for the browser session. Verify the resulting jar with YouTube.
+    for cookie in jar:
+        if cookie.expires == 0:
+            cookie.expires = None
+            cookie.discard = True
     return _filtered_jar(jar)
 
 
@@ -579,7 +640,9 @@ def _extract_profile(profile: BrowserProfile) -> http.cookiejar.CookieJar:
         return _filtered_jar(ydl.cookiejar)
 
 
-def _verify_youtube_session(jar: http.cookiejar.CookieJar) -> Tuple[Optional[bool], str]:
+def _verify_youtube_session(
+    jar: http.cookiejar.CookieJar, *, explicit_sign_in_only: bool = False,
+) -> Tuple[Optional[bool], str]:
     """Verify that YouTube itself recognizes the jar as signed in.
 
     ``None`` means the network response was unavailable or inconclusive. Cookie
@@ -622,10 +685,13 @@ def _verify_youtube_session(jar: http.cookiejar.CookieJar) -> Tuple[Optional[boo
             return False, "youtube-reported-signed-out"
         elif "accounts.google.com/ServiceLogin" in page or "Sign in to YouTube" in page:
             return False, "youtube-sign-in-page"
-        elif _auth_cookie_count(jar) >= 2 and not ("ServiceLogin" in str(getattr(response, "url", ""))):
+        elif (not explicit_sign_in_only and _auth_cookie_count(jar) >= 2
+              and "ServiceLogin" not in str(getattr(response, "url", ""))):
             confirmed = True
 
         if confirmed:
+            if explicit_sign_in_only:
+                return True, "youtube-confirmed"
             global _CURRENT_CHANNEL_TITLE
             m_modern_title = re.search(
                 r'"pageHeaderViewModel"\s*:\s*\{.*?"title"\s*:\s*\{\s*"dynamicTextViewModel"\s*:\s*\{\s*"text"\s*:\s*\{\s*"content"\s*:\s*"([^"]+)"',
@@ -650,6 +716,40 @@ def _verify_youtube_session(jar: http.cookiejar.CookieJar) -> Tuple[Optional[boo
         return None, "youtube-response-inconclusive"
     except Exception as exc:
         return None, f"youtube-probe-{type(exc).__name__}"
+
+
+class ConfiguredYouTubeSessions:
+    """Verify operator-supplied accounts on demand, separately from browser login."""
+
+    def __init__(self, setting: str):
+        paths = (part.strip().strip('"') for part in setting.split(os.pathsep))
+        self.paths = tuple(dict.fromkeys(Path(path).expanduser() for path in paths if path))[:8]
+        self._lock = RLock()
+        self._checked: Dict[int, Optional[http.cookiejar.CookieJar]] = {}
+
+    def next_verified(self, after: int = -1) -> Tuple[int, Optional[http.cookiejar.CookieJar]]:
+        with self._lock:
+            for index in range(after + 1, len(self.paths)):
+                if index not in self._checked:
+                    self._checked[index] = None
+                    try:
+                        jar = _filtered_jar(
+                            cookie for cookie in _load_explicit_cookie_file(self.paths[index])
+                            if cookie.domain.lstrip(".").lower() == "youtube.com"
+                            or cookie.domain.lower().endswith(".youtube.com")
+                        )
+                        if _jar_is_authenticated(jar):
+                            verified, _reason = _verify_youtube_session(jar, explicit_sign_in_only=True)
+                            if verified is True:
+                                self._checked[index] = jar
+                    except (OSError, ValueError, http.cookiejar.LoadError):
+                        pass
+                    status = "verified" if self._checked[index] is not None else "unavailable"
+                    print(f"   [yt-session] configured account {index + 1}: {status}", flush=True)
+                jar = self._checked[index]
+                if jar is not None:
+                    return index, _clone_jar(jar)
+        return -1, None
 
 
 def _classify_extraction_error(profile: BrowserProfile, exc: Exception) -> str:
@@ -941,16 +1041,18 @@ def _write_netscape_cookies(jar: http.cookiejar.CookieJar) -> List[Path]:
         targets.append(Path(explicit).expanduser().resolve())
 
     vidnets_root = Path(__file__).resolve().parents[2]
+    repo_root = vidnets_root.parent
     targets.append(vidnets_root / "cookies.txt")
+    if (repo_root / "cookies.txt") not in targets:
+        targets.append(repo_root / "cookies.txt")
     clean_folder = vidnets_root.parent / "Vidnets Clean Working Folder"
     if clean_folder.is_dir():
         targets.append(clean_folder / "cookies.txt")
     cms_root = vidnets_root.parent.parent / "Management" / "YT CMS"
     if cms_root.is_dir():
         targets.append(cms_root / "cookies.txt")
-    repo_root = vidnets_root.parent.parent
-    if (repo_root / "cookies.txt") not in targets:
-        targets.append(repo_root / "cookies.txt")
+    if (vidnets_root.parent.parent / "cookies.txt") not in targets:
+        targets.append(vidnets_root.parent.parent / "cookies.txt")
     cwd_cookie = Path.cwd() / "cookies.txt"
     if cwd_cookie not in targets:
         targets.append(cwd_cookie)
@@ -1039,20 +1141,37 @@ def ensure_session(
         ):
             return _clone_jar(_MEMORY_JAR), _GENERATION
 
-        explicit_env = os.environ.get("VIDZEO_YT_COOKIES_FILE")
+        explicit_env = (
+            os.environ.get("VIDZEO_YT_COOKIES_FILE")
+            or os.environ.get("VIDZEO_YT_COOKIES_PATH")
+            or os.environ.get("VIDZEO_YT_COOKIE_FILE")
+            or os.environ.get("MUSE_YOUTUBE_COOKIES_PATH")
+            or os.environ.get("MUSE_COOKIES_PATH")
+        )
         explicit = str(explicit_env or "").strip()
         candidate_paths = []
         if explicit:
             candidate_paths.append(Path(explicit).expanduser())
         elif explicit_env is None:
             vidnets_root = Path(__file__).resolve().parents[2]
+            repo_root = vidnets_root.parent
             for candidate in [
                 Path.cwd() / "test_cookies.txt",
+                Path.cwd() / "test_cookies.json",
                 Path.cwd() / "cookies.txt",
+                Path.cwd() / "cookies.json",
                 vidnets_root / "test_cookies.txt",
+                vidnets_root / "test_cookies.json",
                 vidnets_root / "cookies.txt",
-                vidnets_root.parent.parent / "cookies.txt",
-                vidnets_root.parent.parent / "Management" / "YT CMS" / "cookies.txt",
+                vidnets_root / "cookies.json",
+                repo_root / "test_cookies.txt",
+                repo_root / "test_cookies.json",
+                repo_root / "cookies.txt",
+                repo_root / "cookies.json",
+                repo_root.parent / "cookies.txt",
+                repo_root.parent / "cookies.json",
+                repo_root.parent / "Management" / "YT CMS" / "cookies.txt",
+                repo_root.parent / "Management" / "YT CMS" / "cookies.json",
             ]:
                 if candidate.is_file():
                     candidate_paths.append(candidate)

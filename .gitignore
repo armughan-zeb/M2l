@@ -39,6 +39,10 @@ run/
 .env.local
 .env.*.local
 cookies.txt
+cookies.json
+test_cookies.txt
+test_cookies.json
+!cookies.example.json
 youtube-session-meta.json
 .vidzeo_*
 *.pem

@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 from unittest import mock
+import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../server")))
 
@@ -114,7 +115,8 @@ def test_bad_recovery_does_not_replace_verified_image():
     assert resolved.provider == "web"
 
 
-def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, tmp_path):
+@pytest.mark.parametrize("source_mode", ["Mixed Media", "YouTube Clips"])
+def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, tmp_path, source_mode):
     from services import pipeline_v2_media_adapter as adapter
     calls = []
     def runner(texts, durations, config, *args, **kwargs):
@@ -129,13 +131,17 @@ def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, 
         kwargs["youtube_lane"](rows[0], cancel)
         recovery = kwargs["youtube_fallback_lane"]
         assert recovery.retry_rejected_primary
+        if source_mode == "YouTube Clips":
+            assert recovery.retry_missing_primary
+            assert kwargs["web_fallback_lane"] is None
+            assert kwargs["stock_lane"] is None
         recovery.prepare_recovery([0])
         recovery(rows[0], cancel)
         recovery(rows[0], cancel)  # One coalesced wave, never per-scene loops.
         return {"media_paths": [], "source_labels": [], "metadata": {}}, {}
     monkeypatch.setattr(adapter, "resolve_and_build_media_plan", coordinator)
     adapter.resolve_existing_provider_branches_v2(
-        {"image_source": "Mixed Media", "visual_understanding": False,
+        {"image_source": source_mode, "visual_understanding": False,
          "global_media_guarantee": False, "_run_temp_dir": str(tmp_path),
          "youtube_accepted_coverage_target": 1},
         {"scene_contracts": [{"scene_id": "car", "order": 0, "duration": 4,
@@ -147,3 +153,29 @@ def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, 
     assert len(calls) == 2
     assert calls[1]["youtube_excluded_video_ids"] == ["rejected-master"]
     assert calls[1]["_run_temp_dir"].endswith("youtube_content_recovery")
+
+
+def test_youtube_only_retries_missing_primary_and_keeps_ready_clip():
+    scenes = [
+        {"scene_index": index, "text": "Toyota Corolla driving footage",
+         "source_policy": {"footage_only": True, "youtube_quota": True}}
+        for index in range(2)
+    ]
+
+    def clip(path):
+        return {"path": path, "source": "youtube", "media_type": "video", "score": 90}
+
+    def primary(scene, _cancel):
+        return [clip("primary.mp4")] if scene["scene_index"] == 0 else []
+
+    primary.primary_attempted_indices = {0, 1}
+    prepared = []
+    fallback = BatchFallbackLane(lambda: {1: [clip("recovery.mp4")]}, prepared.extend)
+    fallback.retry_missing_primary = True
+    resolutions = resolve_storyboard_media_v2(
+        scenes, youtube_lane=primary, web_lane=lambda *_: [],
+        youtube_fallback_lane=fallback, visual_verifier=lambda *_: True,
+        deadline_seconds=5,
+    )
+    assert prepared == [1]
+    assert [resolutions[i].selected_path for i in range(2)] == ["primary.mp4", "recovery.mp4"]

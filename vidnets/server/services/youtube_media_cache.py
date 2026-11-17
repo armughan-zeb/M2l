@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-SCHEMA_VERSION = "youtube-cut-v2-sharp-source"
+# Older cuts were admitted at 70% of the requested duration. Do not reuse
+# those entries under the full-duration contract.
+SCHEMA_VERSION = "youtube-cut-v4-duration-handles"
 _INIT_LOCK = threading.Lock()
 _INITIALIZED: set[str] = set()
 

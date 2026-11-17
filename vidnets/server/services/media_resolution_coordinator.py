@@ -4639,10 +4639,13 @@ def resolve_storyboard_media_v2(
                 )
             )
         )
-        yt_fallback = (
-            None if yt_primary_attempted and idx not in rejected_youtube_indices
-            else youtube_fallback_lane
+        needs_youtube_retry = (
+            getattr(youtube_fallback_lane, "retry_missing_primary", False)
+            and "youtube" not in sources
         )
+        yt_fallback = youtube_fallback_lane
+        if yt_primary_attempted and idx not in rejected_youtube_indices and not needs_youtube_retry:
+            yt_fallback = None
         if idx in web_transport_failed:
             # Web transport failed for this scene: skip the web recovery lane
             # (same proxy/hosts, same failure) and fall through to YouTube.
@@ -5492,13 +5495,41 @@ def resolve_storyboard_media_v2(
                 index, scene, rows, discovered, gated_outcomes, reuse_counts
             )
             if spare is not None:
-                accepted.append(spare)
+                rank, source_tie, candidate, decision = spare
+                source = _normalize_candidate_source(candidate)
+                path = str(candidate.get("cleaned_path") or candidate.get("path") or "")
+                requirement = scene.get("visual_requirement") or {}
+                requirement_hash = requirement.get("requirement_hash") if isinstance(requirement, Mapping) else None
+                review = SceneResolution(scene_index=index, selected_path=path, visual_decision=decision)
+                approved = not requirement_hash or _review_bound_to_scene(scene, review)
+                status = "accepted" if approved else "target_scene_review_required"
+                if not approved and (
+                    scene_budget_open(index)
+                    and vision_start_allowed(index)
+                    and visual_budget_open("spare_pool_target_review", source)
+                ):
+                    check_candidate = dict(candidate, path=path, semantic_context_pending=True,
+                                           visual_verification_required=True,
+                                           verification_status="pending_visual_verification")
+                    check_candidate.pop("visual_decision", None)
+                    check_candidate.pop("qwen_result", None)
+                    note_vision_start(index)
+                    verified, reason, _score, target_decision = _verification_result(
+                        scene, check_candidate, visual_verifier,
+                    )
+                    review.visual_decision = target_decision
+                    approved = verified and _review_bound_to_scene(scene, review)
+                    status = "accepted" if approved else ("target_scene_review_unbound" if verified else reason)
+                    if approved:
+                        decision = dict(target_decision or {})
+                if approved:
+                    accepted.append((rank, source_tie, dict(candidate, path=path), decision))
                 attempts[index].append({
-                    "source": _normalize_candidate_source(spare[2]),
+                    "source": source,
                     "stage": "spare_pool_reuse",
-                    "status": "accepted",
-                    "candidate_id": str(spare[2].get("candidate_id") or spare[2].get("id") or ""),
-                    "path": str(spare[2].get("path") or ""),
+                    "status": status,
+                    "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or ""),
+                    "path": path,
                 })
 
         # Same-video timestamp recovery. A downloaded YouTube clip can be
