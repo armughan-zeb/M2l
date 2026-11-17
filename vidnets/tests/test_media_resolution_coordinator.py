@@ -17,6 +17,35 @@ from services.media_resolution_coordinator import (
 import app as server_app
 
 
+def test_adaptive_review_starts_while_other_provider_is_searching():
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    checked = threading.Event()
+    overlap = []
+
+    def slow_youtube(_scene, _cancel):
+        overlap.append(checked.wait(2))
+        return []
+
+    def verify(_scene, _candidate):
+        checked.set()
+        return {"accepted": True, "status": "visual_pass", "score": 95,
+                "visual_checked": True, "visual_available": True}
+
+    result = resolve_storyboard_media_v2(
+        [{"scene_index": 0, "scene_id": "car", "text": "Jaguar E-Type automobile"}],
+        youtube_lane=slow_youtube,
+        web_lane=lambda *_args: {"path": "car.jpg", "source": "web",
+                                 "title": "Jaguar E-Type automobile", "score": 95},
+        visual_verifier=verify,
+        neutral_factory=lambda _scene: None,
+        deadline_seconds=5,
+        adaptive_media_review=True,
+    )
+    assert overlap == [True]
+    assert result[0].selected_path == "car.jpg"
+
+
 def test_external_job_cancellation_interrupts_media_discovery_promptly():
     from services.media_resolution_coordinator import resolve_storyboard_media_v2
 
@@ -1033,6 +1062,271 @@ class CrossContainerReuseContractTests(unittest.TestCase):
         self.assertEqual(after_bounded_attempt[0].provider, "web")
         self.assertEqual(repeat_calls, [])
 
+    def test_web_transport_failure_falls_through_to_youtube_only(self):
+        from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        accepted = lambda _scene, _candidate: {"accepted": True, "status": "accepted", "score": 95}
+        youtube_fallback = lambda _scene, _cancel: {
+            "path": "yt-jaguar.mp4", "source": "youtube", "provider": "youtube", "media_type": "video", "score": 95,
+        }
+        web_fallback = lambda _scene, _cancel: {
+            "path": "web-jaguar.jpg", "source": "web", "provider": "web", "score": 95,
+        }
+
+        # Web lane raises (transport failure) with zero candidates: the web
+        # recovery lane must not be retried — it would hit the same
+        # proxy/hosts — and the scene falls through to YouTube only.
+        web_fallback_calls = []
+        youtube_fallback_calls = []
+        result = resolve_storyboard_media_v2(
+            [scene(0)],
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: (_ for _ in ()).throw(RuntimeError("boom")),
+            youtube_fallback_lane=lambda *_args: youtube_fallback_calls.append(True) or youtube_fallback(*_args),
+            web_fallback_lane=lambda *_args: web_fallback_calls.append(True) or web_fallback(*_args),
+            visual_verifier=accepted,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=2,
+        )
+        self.assertEqual(result[0].provider, "youtube")
+        self.assertEqual(result[0].resolution_kind, "cross_lane_youtube_fallback")
+        self.assertEqual(youtube_fallback_calls, [True])
+        self.assertEqual(web_fallback_calls, [])
+
+        # Web lane hangs past the env-tunable web cap: same fast fall-through.
+        web_fallback_calls.clear()
+        youtube_fallback_calls.clear()
+
+        def hanging_web_lane(_scene, _cancel):
+            time.sleep(5)
+            return []
+
+        with mock.patch.dict(os.environ, {"VIDZEO_WEB_LANE_TIMEOUT_SECONDS": "0.3"}):
+            result = resolve_storyboard_media_v2(
+                [scene(0)],
+                youtube_lane=lambda _scene, _cancel: [],
+                web_lane=hanging_web_lane,
+                youtube_fallback_lane=lambda *_args: youtube_fallback_calls.append(True) or youtube_fallback(*_args),
+                web_fallback_lane=lambda *_args: web_fallback_calls.append(True) or web_fallback(*_args),
+                visual_verifier=accepted,
+                neutral_factory=lambda _scene: None,
+                deadline_seconds=5,
+            )
+        self.assertEqual(result[0].provider, "youtube")
+        self.assertEqual(result[0].resolution_kind, "cross_lane_youtube_fallback")
+        self.assertEqual(youtube_fallback_calls, [True])
+        self.assertEqual(web_fallback_calls, [])
+
+    def test_vision_verdict_cache_reuses_candidate_across_rounds(self):
+        from services.media_resolution_coordinator import (
+            _vision_verdict_cache_key,
+            resolve_storyboard_media_v2,
+        )
+
+        # Cache key: same clip+timestamp, same URL, same file — and empty
+        # when there is nothing to identify the candidate with.
+        self.assertEqual(
+            _vision_verdict_cache_key({
+                "fallback_source_path": "/tmp/clip.mp4", "fallback_frame_index": 2,
+            }),
+            "yt-frame:/tmp/clip.mp4#2",
+        )
+        self.assertEqual(
+            _vision_verdict_cache_key({"source": "web", "source_url": "https://example.test/a.jpg"}),
+            "url:https://example.test/a.jpg",
+        )
+        self.assertEqual(_vision_verdict_cache_key({}), "")
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        def web_candidate(url, path):
+            return {
+                "path": path, "source": "web", "provider": "web",
+                "source_url": url, "score": 90,
+            }
+
+        calls = []
+
+        def verifier(_scene, candidate):
+            calls.append(candidate.get("source_url"))
+            return {
+                "accepted": False, "status": "rejected", "final_score": 30,
+                "visual_checked": True, "visual_available": True,
+                "reason": "not the subject",
+            }
+
+        candidate_a = web_candidate("https://example.test/a.jpg", "/tmp/a.jpg")
+        candidate_b = web_candidate("https://example.test/b.jpg", "/tmp/b.jpg")
+        candidate_c = web_candidate("https://example.test/c.jpg", "/tmp/c.jpg")
+        # The recovery round returns candidate A again (same URL) plus a new
+        # candidate C. A must reuse its primary-round verdict without a
+        # second live vision read; C is verified once. adaptive_media_review
+        # is on so the recovery round actually vision-checks (the default
+        # fast path accepts recovery candidates on metadata alone).
+        result = resolve_storyboard_media_v2(
+            [scene(0)],
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: [candidate_a, candidate_b],
+            youtube_fallback_lane=None,
+            web_fallback_lane=lambda _scene, _cancel: [candidate_a, candidate_c],
+            visual_verifier=verifier,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=5,
+            adaptive_media_review=True,
+        )
+        self.assertEqual(sorted(calls), [
+            "https://example.test/a.jpg",
+            "https://example.test/b.jpg",
+            "https://example.test/c.jpg",
+        ])
+        self.assertEqual(len(calls), 3)
+
+    def test_timed_out_vision_is_not_reissued_within_ttl(self):
+        # A verifier timeout is a transient outage, not a verdict. The
+        # recovery round must not spend a second live vision read on the
+        # same candidate while the outage TTL holds; after the TTL it may
+        # try again. Genuine verdicts still go through the verdict cache.
+        from services.media_resolution_coordinator import (
+            resolve_storyboard_media_v2,
+        )
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        def web_candidate(url, path):
+            return {
+                "path": path, "source": "web", "provider": "web",
+                "source_url": url, "score": 90,
+            }
+
+        calls = []
+
+        def verifier(_scene, candidate):
+            calls.append(candidate.get("source_url"))
+            if candidate.get("source_url") == "https://example.test/a.jpg":
+                raise TimeoutError("visual_verifier timed out")
+            return {
+                "accepted": False, "status": "rejected", "final_score": 30,
+                "visual_checked": True, "visual_available": True,
+                "reason": "not the subject",
+            }
+
+        candidate_a = web_candidate("https://example.test/a.jpg", "/tmp/a.jpg")
+        candidate_b = web_candidate("https://example.test/b.jpg", "/tmp/b.jpg")
+        candidate_c = web_candidate("https://example.test/c.jpg", "/tmp/c.jpg")
+        kwargs = dict(
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: [candidate_a, candidate_b],
+            youtube_fallback_lane=None,
+            web_fallback_lane=lambda _scene, _cancel: [candidate_a, candidate_c],
+            visual_verifier=verifier,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=5,
+            adaptive_media_review=True,
+        )
+        with mock.patch.dict(os.environ, {"VIDZEO_VISION_UNAVAILABLE_TTL_SECONDS": "60"}):
+            resolve_storyboard_media_v2([scene(0)], **kwargs)
+        # A timed out once (primary round); the recovery round reuses the
+        # stored outage verdict instead of calling the verifier again.
+        self.assertEqual(sorted(calls), [
+            "https://example.test/a.jpg",
+            "https://example.test/b.jpg",
+            "https://example.test/c.jpg",
+        ])
+        calls.clear()
+        with mock.patch.dict(os.environ, {"VIDZEO_VISION_UNAVAILABLE_TTL_SECONDS": "0"}):
+            resolve_storyboard_media_v2([scene(0)], **kwargs)
+        # With a zero TTL the outage is not suppressed: A is re-issued in
+        # the recovery round.
+        self.assertEqual(calls.count("https://example.test/a.jpg"), 2)
+
+    def test_scene_budget_resolves_best_so_far_without_new_vision_calls(self):
+        # F2: when the per-scene budget expires, the scene resolves with the
+        # best hard-gate-passing candidate found so far instead of burning
+        # minutes on further vision rounds and then failing bare. A candidate
+        # genuinely rejected by vision is never resurrected.
+        from services.media_resolution_coordinator import (
+            resolve_storyboard_media_v2,
+        )
+
+        def scene(index):
+            return {
+                "scene_id": f"scene-{index}", "scene_index": index,
+                "container_id": "jaguar", "text": "Jaguar E-Type archival detail",
+                "positive_subjects": ["Jaguar E-Type"], "forbidden_subjects": [],
+                "source_policy": {"visual_verification_required": False},
+            }
+
+        def web_candidate(url, path, score):
+            return {
+                "path": path, "source": "web", "provider": "web",
+                "source_url": url, "score": score,
+            }
+
+        calls = []
+
+        def verifier(_scene, candidate):
+            calls.append(candidate.get("source_url"))
+            # One live vision read takes 0.6s, so the first primary read
+            # alone exhausts the 0.5s test budget; no second read may start.
+            time.sleep(0.6)
+            return {
+                "accepted": False, "status": "rejected", "final_score": 30,
+                "visual_checked": True, "visual_available": True,
+                "reason": "not the subject",
+            }
+
+        candidate_a = web_candidate("https://example.test/a.jpg", "/tmp/a.jpg", 90)
+        candidate_b = web_candidate("https://example.test/b.jpg", "/tmp/b.jpg", 80)
+        candidate_c = web_candidate("https://example.test/c.jpg", "/tmp/c.jpg", 95)
+        result = resolve_storyboard_media_v2(
+            [scene(0)],
+            youtube_lane=lambda _scene, _cancel: [],
+            web_lane=lambda _scene, _cancel: [candidate_a, candidate_b],
+            youtube_fallback_lane=None,
+            web_fallback_lane=lambda _scene, _cancel: [candidate_a, candidate_c],
+            visual_verifier=verifier,
+            neutral_factory=lambda _scene: None,
+            deadline_seconds=30,
+            adaptive_media_review=True,
+            scene_budget_seconds=1.0,
+        )
+        # Only the primary gate's two vision reads happened (1.2s total,
+        # past the 1.0s budget); the recovery round spent no further vision
+        # call.
+        self.assertEqual(
+            sorted(calls),
+            ["https://example.test/a.jpg", "https://example.test/b.jpg"],
+        )
+        # The scene still resolved with real media: candidate C, the best
+        # hard-gate-passing candidate not rejected by vision.
+        self.assertEqual(result[0].selected_path, "/tmp/c.jpg")
+        self.assertTrue(
+            any(
+                attempt.get("status") == "scene_budget_exhausted"
+                for attempt in result[0].attempts
+            )
+        )
+
     def test_serial_fallbacks_stop_after_coordinator_deadline(self):
         from services.media_resolution_coordinator import resolve_storyboard_media_v2
 
@@ -1387,3 +1681,913 @@ def test_quota_retention_upgrades_fallback_stills_to_ready_youtube_cuts(tmp_path
     assert result[1].provider == "youtube"
     assert result[1].media_type == "video"
     assert result[1].selected_path == str(clip_1)
+
+
+def _quota_retention_strict_scene(tmp_path, clip_path, still_path, pool_decision_extra=None):
+    """One strict quota scene whose YouTube cut arrives late (lazy lane).
+
+    Mirrors ff377408: the clip is downloaded and on disk, its pool decision
+    is still ``visual_verification_pending`` (no live vision verdict yet),
+    and the scene falls back to a web still in the primary gate.
+    """
+    clip_path.write_bytes(b"verified rail crew cut bytes")
+    still_path.write_bytes(b"web still bytes")
+    scene = {
+        "scene_id": "quota-strict-scene",
+        "scene_index": 0,
+        "container_id": "rail-crew",
+        "text": "Test rail crew operations documentary scene",
+        "visual_requirement": {
+            "strict_identity": True,
+            "domain": "rail_transport",
+            "subject_type": "rail_crew",
+            "canonical_entity": "Test Rail Crew",
+            "requirement_hash": "quota-strict-requirement-hash",
+        },
+        "source_policy": {
+            "mixed_media": True,
+            "youtube_quota": True,
+        },
+    }
+
+    class FakeLazyYoutubeLane:
+        def __init__(self):
+            self._calls = 0
+            # Deliberately NOT named ``_rows``: the batch promoter falls
+            # back to ``lane._rows`` when get_row returns None, which would
+            # leak the cut into the primary gate.
+            self._late_rows = {
+                0: {
+                    "path": str(clip_path),
+                    "source": "youtube",
+                    "provider": "youtube",
+                    "media_type": "video",
+                    "status": "downloaded",
+                    "verification_status": "visual_verification_pending",
+                    "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    "asset_fingerprint": "quota-strict-clip",
+                    "overlay_clean": True,
+                    "title": "Test rail crew operations footage",
+                    "visual_decision": {
+                        "accepted": False,
+                        "status": "visual_verification_pending",
+                        "source": "youtube_pool_moment",
+                        "recovery_kind": "disk_verified_pool_cut",
+                        "visual_checked": False,
+                        "semantic_verified": False,
+                        "visual_available": False,
+                        "deterministic_only": True,
+                        "requirement_hash": "quota-strict-requirement-hash",
+                        **(pool_decision_extra or {}),
+                    },
+                },
+            }
+
+        def __call__(self, scene, cancel_event):
+            return None
+
+        def get_row(self, index, timeout=0.0):
+            # The cut finishes downloading after the pre-gate batch
+            # promotions (two get_row calls) but before quota retention:
+            # the production case the quota lane exists for. Returning it
+            # earlier would let the primary gate select it directly and
+            # the test would not exercise the upgrade construction.
+            self._calls += 1
+            if self._calls <= 2:
+                return None
+            return self._late_rows.get(index)
+
+    def fake_web_lane(scene, _cancel_event):
+        return {
+            "path": str(still_path),
+            "source": "web",
+            "provider": "web",
+            "media_type": "image",
+            "status": "accepted",
+            "verification_status": "verified",
+            "title": "Test rail crew operations photo",
+            "visual_decision": {"accepted": True},
+        }
+
+    return scene, FakeLazyYoutubeLane(), fake_web_lane
+
+
+def test_quota_upgrade_stores_gate_approved_vision_verdict(tmp_path):
+    """A vision-accepted quota clip survives to the final plan (ff377408).
+
+    The late quota lane gives the downloaded clip its bounded vision pass;
+    the upgrade must store that live verdict — accepted + visual_checked +
+    bound requirement hash + bound asset sha — so the downstream contract
+    gate (_visual_requirement_issue) accepts the row instead of rejecting
+    it as 'visual_verdict_rejected'. Before the fix the construction block
+    re-read the candidate's raw pending decision, so the row claimed
+    accepted while its decision said pending, and 3 of 4 retained clips
+    were dropped to graphics.
+    """
+    import hashlib
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+    from services.pipeline_v2_media_adapter import _visual_requirement_issue
+
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _quota_retention_strict_scene(tmp_path, clip, still)
+    clip_sha = hashlib.sha256(clip.read_bytes()).hexdigest()
+
+    def live_verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            return {
+                "accepted": True,
+                "status": "accepted",
+                "visual_checked": True,
+                "semantic_verified": True,
+                "visual_available": True,
+                "identity_score": 90.0,
+                "final_score": 90.0,
+                "reason": "Authentic rail crew footage",
+            }
+        return {"accepted": True, "status": "accepted", "visual_checked": True}
+
+    result = resolve_storyboard_media_v2(
+        [scene],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        visual_verifier=live_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+    )
+
+    assert result[0].provider == "youtube"
+    assert result[0].selected_path == str(clip)
+    decision = dict(result[0].visual_decision or {})
+    assert decision.get("accepted") is True
+    assert decision.get("visual_checked") is True
+    assert decision.get("verified_requirement_hash") == "quota-strict-requirement-hash"
+    assert decision.get("verified_asset_sha256") == clip_sha
+    assert any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+    # The downstream gate that dropped ff377408 scenes 1, 2, 6 must accept
+    # this row: a live, bound vision verdict is present.
+    assert (
+        _visual_requirement_issue(scene, result[0].to_dict(), result[0], "YouTube Clips")
+        == ""
+    )
+
+
+def test_quota_upgrade_never_mints_acceptance_from_download_alone(tmp_path):
+    """A downloaded clip with no live vision accept is not upgraded.
+
+    Fail-closed: the pool already looked at this cut (visual_checked) and
+    did not accept it, and the coordinator has no live gated verdict for
+    it — the late lane skips already-checked candidates. The only remaining
+    evidence is "the file exists and is clean" (the ff377408 shape: the
+    clip downloaded, vision never accepted it). Quota retention must leave
+    the scene on its web still instead of minting accepted/visual_checked
+    from the download and promoting a clip the downstream gate then
+    rejects as unverified.
+    """
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _quota_retention_strict_scene(
+        tmp_path, clip, still, pool_decision_extra={"visual_checked": True}
+    )
+
+    def unavailable_verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            return {"accepted": False, "status": "vision_unavailable", "visual_available": False}
+        return {"accepted": True, "status": "accepted", "visual_checked": True}
+
+    result = resolve_storyboard_media_v2(
+        [scene],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        visual_verifier=unavailable_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+    )
+
+    assert result[0].provider == "web"
+    assert result[0].selected_path == str(still)
+    assert not any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+
+
+def test_late_verification_deadline_floors_when_delivery_wall_spent():
+    """The late quota vision lane still runs when the delivery wall is spent.
+
+    ff377408: YouTube discovery took 954s of a 1033s media deadline, so the
+    delivery deadline was already past when quota retention ran and the old
+    min() clamp made the late lane dead on arrival. The floor keeps a
+    bounded window (at most the configured late seconds, capped at 60s past
+    the wall) for already-downloaded clips only; it never reopens discovery.
+    """
+    import time
+
+    from services.media_resolution_coordinator import _late_local_verification_deadline
+
+    now = time.monotonic()
+    spent = _late_local_verification_deadline(2, delivery_deadline=now - 10.0)
+    # +1s tolerance: ``now`` was captured just before the call.
+    assert now < spent <= now + 61.0
+    future = _late_local_verification_deadline(2, delivery_deadline=now + 30.0)
+    assert now < future <= now + 31.0
+    assert _late_local_verification_deadline(0, delivery_deadline=now - 10.0) <= now + 1.0
+
+
+# ---------------------------------------------------------------------------
+# Vision + budget (worker D): validator-only vision, game-engine veto fix,
+# split discovery/verification clocks with vision reserve, liveness-aware
+# discovery clock, reserved frame-fallback allowance.
+# ---------------------------------------------------------------------------
+import base64 as _b64
+
+_PNG_1X1 = _b64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def _gta_scene(index=0):
+    return {
+        "scene_id": f"gta-{index}",
+        "scene_index": index,
+        "container_id": "gta",
+        "text": "Grand Theft Auto VI gameplay in Vice City",
+        "domain_category": "gaming",
+        "positive_subjects": ["Grand Theft Auto VI"],
+        "forbidden_subjects": [],
+        "source_policy": {"youtube_quota": True, "visual_verification_required": False},
+    }
+
+
+def _png_file(tmp_path, name):
+    path = tmp_path / name
+    path.write_bytes(_PNG_1X1)
+    return str(path)
+
+
+def _yt_clip(path, score=80, clip_id="yt:trailer2"):
+    return {
+        "path": path,
+        "source": "youtube",
+        "provider": "youtube",
+        "candidate_id": clip_id,
+        "title": "Grand Theft Auto VI Trailer 2",
+        "description": "Official GTA VI trailer footage",
+        "score": score,
+        "final_score": score,
+        "media_type": "video",
+    }
+
+
+def _reject_verdict(reason="not the subject"):
+    return {
+        "accepted": False, "status": "rejected", "final_score": 20,
+        "identity_score": 20, "action_score": 20, "context_score": 20,
+        "visual_checked": True, "visual_available": True, "reason": reason,
+    }
+
+
+def _accept_verdict(reason="frame shows GTA VI gameplay in Vice City"):
+    return {
+        "accepted": True, "status": "accepted", "final_score": 90,
+        "identity_score": 90, "action_score": 85, "context_score": 88,
+        "visual_checked": True, "visual_available": True, "reason": reason,
+    }
+
+
+class _CountingVerifier:
+    """Fake verifier: __call__ is the single-candidate path, verify_batch
+    is the batched compare path. Both count their invocations."""
+
+    def __init__(self, verdict_by_path=None, single=None, single_fn=None):
+        self.verdict_by_path = dict(verdict_by_path or {})
+        self.single = single if single is not None else _reject_verdict()
+        self.single_fn = single_fn
+        self.single_calls = []
+        self.batch_calls = []
+
+    def __call__(self, scene, candidate):
+        self.single_calls.append(str(candidate.get("path") or ""))
+        if self.single_fn is not None:
+            return self.single_fn(scene, candidate)
+        return dict(self.single)
+
+    def verify_batch(self, scene, candidates):
+        self.batch_calls.append([str(c.get("path") or "") for c in candidates])
+        out = {}
+        for candidate in candidates:
+            path = str(candidate.get("path") or "")
+            out[path] = dict(self.verdict_by_path.get(path, self.single))
+        return out
+
+
+def _patch_frame_extraction(monkeypatch, frames_by_clip):
+    from services.visual_intelligence import frame_extractor
+
+    def fake_extract(path, out_dir=None, **kwargs):
+        return list(frames_by_clip.get(str(path), [])), 7.0
+
+    monkeypatch.setattr(frame_extractor, "extract_clip_frames", fake_extract)
+
+
+def test_frame_fallbacks_get_reserved_batched_vision_after_scene_budget(tmp_path, monkeypatch):
+    """(a) A slow primary verifier eats the whole scene budget; the
+    same-video frame fallbacks still receive exactly 1 batched vision call
+    and a recorded verdict — never skipped_after_scene_budget."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip_path = _png_file(tmp_path, "trailer2.mp4")
+    frame1 = _png_file(tmp_path, "frame1.png")
+    frame2 = _png_file(tmp_path, "frame2.png")
+    _patch_frame_extraction(monkeypatch, {clip_path: [frame1, frame2]})
+    winner = _accept_verdict()
+    loser = {"accepted": False, "status": "compare_not_selected", "final_score": 5,
+             "identity_score": 5, "visual_checked": False, "visual_available": False,
+             "reason": "compare_not_selected"}
+    def slow_single(scene, candidate):
+        time.sleep(1.5)
+        return _reject_verdict()
+
+    verifier = _CountingVerifier(
+        verdict_by_path={frame1: winner, frame2: loser},
+        single_fn=slow_single,
+    )
+
+    result = resolve_storyboard_media_v2(
+        [_gta_scene(0)],
+        youtube_lane=lambda _s, _c: [_yt_clip(clip_path)],
+        web_lane=lambda _s, _c: [],
+        visual_verifier=verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+        scene_budget_seconds=1,
+        vision_reserve_seconds=1,
+    )
+    assert len(verifier.batch_calls) == 1
+    assert sorted(verifier.batch_calls[0]) == sorted([frame1, frame2])
+    assert result[0].selected_path == frame1
+    # A recorded verdict for the frame (the extracted-frame recovery lane
+    # re-labels the reason with its own stamp; the verdict itself — a live
+    # vision accept — is what must be present, not a skip).
+    decision = result[0].visual_decision or {}
+    assert decision.get("accepted") is True
+    assert decision.get("visual_checked") is True
+    assert str(decision.get("reason") or "").strip()
+    assert not any(
+        a.get("stage") == "visual_gate" and a.get("status") == "skipped_after_scene_budget"
+        for a in result[0].attempts
+    )
+
+
+def test_slow_primary_verifier_resolves_best_so_far_not_unverified_pool(tmp_path, monkeypatch):
+    """(b) Fake slow primary verifier consumes the whole scene budget and
+    there is no batched path: the scene resolves via scene_budget_best_so_far
+    — never via an unverified pool pick."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip_path = _png_file(tmp_path, "trailer2.mp4")
+    frame1 = _png_file(tmp_path, "frame1.png")
+    frame2 = _png_file(tmp_path, "frame2.png")
+    _patch_frame_extraction(monkeypatch, {clip_path: [frame1, frame2]})
+
+    def slow_verify(scene, candidate):
+        time.sleep(1.5)
+        return _reject_verdict()
+
+    result = resolve_storyboard_media_v2(
+        [_gta_scene(0)],
+        youtube_lane=lambda _s, _c: [_yt_clip(clip_path)],
+        web_lane=lambda _s, _c: [],
+        visual_verifier=slow_verify,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+        scene_budget_seconds=1,
+        vision_reserve_seconds=1,
+    )
+    assert result[0].selected_path == frame1
+    assert any(
+        a.get("stage") == "visual_gate" and a.get("status") == "scene_budget_best_so_far"
+        for a in result[0].attempts
+    )
+    # The selected frame resolved via best-so-far, not via a skip: its own
+    # visual-gate attempt carries the best-so-far status. (The unselected
+    # frame may legitimately record a budget skip — it was never verified.)
+
+
+def test_full_chain_costs_at_most_two_batched_calls(tmp_path, monkeypatch):
+    """(c) Primary 3 + frame fallbacks 4 cost <=2 batched vision calls:
+    one compare for the primaries, one for the frames."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    web_paths = [_png_file(tmp_path, f"web{i}.png") for i in range(3)]
+    clip1 = _png_file(tmp_path, "clip1.mp4")
+    clip2 = _png_file(tmp_path, "clip2.mp4")
+    frames1 = [_png_file(tmp_path, "f1a.png"), _png_file(tmp_path, "f1b.png")]
+    frames2 = [_png_file(tmp_path, "f2a.png"), _png_file(tmp_path, "f2b.png")]
+    _patch_frame_extraction(monkeypatch, {clip1: frames1, clip2: frames2})
+    winner = _accept_verdict()
+    loser = {"accepted": False, "status": "compare_not_selected", "final_score": 5,
+             "identity_score": 5, "visual_checked": False, "visual_available": False,
+             "reason": "compare_not_selected"}
+    verdicts = {frames1[0]: winner}
+    for path in frames1[1:] + frames2:
+        verdicts[path] = loser
+    verifier = _CountingVerifier(verdict_by_path=verdicts)
+
+    def web_lane(_s, _c):
+        # Web stills score BELOW the clips here on purpose in the original
+        # variant; the realistic case (web outranking the clips) is covered
+        # by test_frame_fallback_filters_to_youtube_before_top_slice below —
+        # since the Nov 16 fix the builder filters to YouTube sources
+        # BEFORE slicing to the top-2, so a web-dominated pool still yields
+        # frames from the downloaded clips.
+        return [{
+            "path": path, "source": "web", "provider": "web",
+            "source_url": f"https://example.test/{i}.jpg",
+            "title": "Grand Theft Auto VI key art", "score": 30, "final_score": 30,
+        } for i, path in enumerate(web_paths)]
+
+    result = resolve_storyboard_media_v2(
+        [_gta_scene(0)],
+        youtube_lane=lambda _s, _c: [_yt_clip(clip1, 50, "yt:clip1"), _yt_clip(clip2, 40, "yt:clip2")],
+        web_lane=web_lane,
+        visual_verifier=verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+    )
+    assert len(verifier.batch_calls) == 2
+    assert sorted(len(call) for call in verifier.batch_calls) == [3, 4]
+    assert result[0].selected_path == frames1[0]
+
+
+def test_frame_fallback_filters_to_youtube_before_top_slice(tmp_path, monkeypatch):
+    """Fix 3 (Nov 16): a web-dominated pool used to fill both top-2 slots
+    with stills, the builder then skipped them, yielded [], and the reserved
+    frame vision never fired. The builder must filter to YouTube sources
+    BEFORE slicing — web stills outranking the clips is the normal case."""
+    from services.media_resolution_coordinator import _youtube_frame_fallback_candidates
+
+    clip1 = _png_file(tmp_path, "clip1.mp4")
+    clip2 = _png_file(tmp_path, "clip2.mp4")
+    frames1 = [_png_file(tmp_path, "f1a.png"), _png_file(tmp_path, "f1b.png")]
+    frames2 = [_png_file(tmp_path, "f2a.png"), _png_file(tmp_path, "f2b.png")]
+    _patch_frame_extraction(monkeypatch, {clip1: frames1, clip2: frames2})
+    web_paths = [_png_file(tmp_path, f"web{i}.png") for i in range(3)]
+    candidates = [
+        {"path": path, "source": "web", "provider": "web",
+         "title": "Grand Theft Auto VI key art", "score": 95 - i, "final_score": 95 - i}
+        for i, path in enumerate(web_paths)
+    ] + [_yt_clip(clip1, 50, "yt:clip1"), _yt_clip(clip2, 40, "yt:clip2")]
+    frames = _youtube_frame_fallback_candidates(_gta_scene(0), candidates, 0)
+    assert len(frames) == 4
+    assert sorted(f.get("fallback_source_path") for f in frames) == sorted(
+        [clip1, clip1, clip2, clip2])
+    assert all(f.get("fallback_layer") == "same_video_timestamp_frame" for f in frames)
+
+
+def test_full_chain_frame_fallback_fires_when_web_outranks_clips(tmp_path, monkeypatch):
+    """Same fix at full-chain level: web stills score 90+ while the clips
+    score 50/40, yet the frame fallback still builds from the clips and the
+    reserved frame vision fires (2 batched calls total, frame selected)."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    web_paths = [_png_file(tmp_path, f"web{i}.png") for i in range(3)]
+    clip1 = _png_file(tmp_path, "clip1.mp4")
+    clip2 = _png_file(tmp_path, "clip2.mp4")
+    frames1 = [_png_file(tmp_path, "f1a.png"), _png_file(tmp_path, "f1b.png")]
+    frames2 = [_png_file(tmp_path, "f2a.png"), _png_file(tmp_path, "f2b.png")]
+    _patch_frame_extraction(monkeypatch, {clip1: frames1, clip2: frames2})
+    winner = _accept_verdict()
+    loser = {"accepted": False, "status": "compare_not_selected", "final_score": 5,
+             "identity_score": 5, "visual_checked": False, "visual_available": False,
+             "reason": "compare_not_selected"}
+    verdicts = {frames1[0]: winner}
+    for path in frames1[1:] + frames2:
+        verdicts[path] = loser
+    verifier = _CountingVerifier(verdict_by_path=verdicts)
+
+    def web_lane(_s, _c):
+        return [{
+            "path": path, "source": "web", "provider": "web",
+            "source_url": f"https://example.test/{i}.jpg",
+            "title": "Grand Theft Auto VI key art", "score": 95 - i, "final_score": 95 - i,
+        } for i, path in enumerate(web_paths)]
+
+    result = resolve_storyboard_media_v2(
+        [_gta_scene(0)],
+        youtube_lane=lambda _s, _c: [_yt_clip(clip1, 50, "yt:clip1"), _yt_clip(clip2, 40, "yt:clip2")],
+        web_lane=web_lane,
+        visual_verifier=verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+    )
+    assert len(verifier.batch_calls) == 2
+    assert sorted(len(call) for call in verifier.batch_calls) == [3, 4]
+    assert result[0].selected_path == frames1[0]
+
+
+def test_skip_records_visual_checked_false_and_reason(tmp_path, monkeypatch):
+    """(e) A skip records visual_checked: False + a reason in the ledger,
+    never a bare deadline_exceeded."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    paths = [_png_file(tmp_path, f"exp{i}.png") for i in range(8)]
+    monkeypatch.setenv("VIDZEO_VISUAL_PRIMARY_EXPANSION_LIMIT", "6")
+    monkeypatch.setenv("VIDZEO_VISUAL_FALLBACK_FINALIST_LIMIT", "6")
+
+    def web_lane(_s, _c):
+        return [{
+            "path": path, "source": "web", "provider": "web",
+            "source_url": f"https://example.test/{i}.jpg",
+            "title": "Grand Theft Auto VI key art", "score": 95 - i, "final_score": 95 - i,
+        } for i, path in enumerate(paths)]
+
+    def verify(_s, _c):
+        return _reject_verdict()
+
+    result = resolve_storyboard_media_v2(
+        [_gta_scene(0)],
+        youtube_lane=lambda _s, _c: [],
+        web_lane=web_lane,
+        visual_verifier=verify,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+    )
+    skipped = [
+        a for a in result[0].attempts
+        if a.get("stage") == "visual_gate"
+        and a.get("status") == "skipped_after_vision_start_budget"
+    ]
+    assert skipped, "expected a vision-start-budget skip in the ledger"
+    ledger = {row.get("path"): row for row in result[0].candidate_ledger}
+    recorded = [
+        row for row in ledger.values()
+        if (row.get("visual_decision") or {}).get("reason") == "skipped_after_vision_start_budget"
+    ]
+    assert recorded, "expected the skip verdict in the candidate ledger"
+    for row in recorded:
+        assert row["visual_decision"].get("visual_checked") is False
+        assert row["visual_decision"].get("reason")
+
+
+def test_gaming_scene_game_engine_marker_is_not_a_veto():
+    """(f) A verdict whose reason is 'video-game simulation footage' does
+    NOT veto a gaming scene — but a wrong-game verdict still does."""
+    from services.media_resolution_coordinator import _verification_result
+    from services.visual_intelligence.semantic_guard import explicit_scene_conflict
+
+    gaming = {"domain_category": "gaming", "text": "Grand Theft Auto VI gameplay"}
+    plain = {"text": "A documentary about the 1969 moon landing"}
+    verdict = {
+        "accepted": False, "status": "rejected", "fatal_mismatch": True,
+        "identity_score": 80, "final_score": 80,
+        "visual_checked": True, "visual_available": True,
+        "reason": "video-game simulation footage of the game world",
+    }
+    assert explicit_scene_conflict(verdict, relaxed=True, scene=gaming) is False
+    assert explicit_scene_conflict(verdict, relaxed=True, scene=plain) is True
+    assert explicit_scene_conflict(verdict, relaxed=False, scene=gaming) is False
+    accepted, reason, _score, _verdict = _verification_result(
+        gaming, {"path": "/tmp/x.mp4", "source": "youtube", "score": 80},
+        lambda _s, _c: dict(verdict),
+    )
+    assert reason != "explicit_scene_conflict"
+    accepted, reason, _score, _verdict = _verification_result(
+        plain, {"path": "/tmp/x.mp4", "source": "youtube", "score": 80},
+        lambda _s, _c: dict(verdict),
+    )
+    assert reason == "explicit_scene_conflict"
+    # Wrong game still vetoes: in the strict lane the game-engine exemption
+    # does not apply (the reason names the wrong game), and a live verdict
+    # carrying entity_conflict is still a hard rejection.
+    wrong_game = dict(verdict, entity_conflict=True,
+                      reason="wrong game: shows GTA V footage, wrong entity")
+    assert explicit_scene_conflict(wrong_game, relaxed=False, scene=gaming) is True
+    accepted, reason, _score, _verdict = _verification_result(
+        gaming, {"path": "/tmp/x.mp4", "source": "youtube", "score": 80},
+        lambda _s, _c: dict(wrong_game),
+    )
+    assert accepted is False
+    low_game = dict(verdict, fatal_mismatch=False, identity_score=20, final_score=20,
+                    reason="video-game simulation footage, low identity match")
+    accepted, reason, _score, _verdict = _verification_result(
+        gaming, {"path": "/tmp/x.mp4", "source": "youtube", "score": 80},
+        lambda _s, _c: dict(low_game),
+    )
+    assert reason != "insufficient_visible_subject_match"
+
+
+def test_discovery_clock_is_liveness_aware(tmp_path, monkeypatch):
+    """(g) The discovery clock does not advance while a lane reports
+    progress, and does advance during a zero-progress window."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    monkeypatch.setenv("VIDZEO_DISCOVERY_STALL_SECONDS", "10")
+    clip0 = _png_file(tmp_path, "w0.mp4")
+    clip1 = _png_file(tmp_path, "w1.mp4")
+
+    def accept(_s, _c):
+        return _accept_verdict("matches")
+
+    def lanes(first_sleep, second_sleep):
+        def youtube(_s, _c):
+            time.sleep(first_sleep if _s.get("scene_index") == 0 else second_sleep)
+            path = clip0 if _s.get("scene_index") == 0 else clip1
+            return [_yt_clip(path)]
+        return youtube, lambda _s, _c: []
+
+    # Progress case: wave 1 finishes at ~0.8s (progress extends the wall
+    # to the 2s absolute cap), wave 2's 1.0s lane still fits.
+    yt, web = lanes(0.8, 1.0)
+    result = resolve_storyboard_media_v2(
+        [_gta_scene(0), _gta_scene(1)],
+        youtube_lane=yt, web_lane=web,
+        visual_verifier=accept,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=2,
+        scene_budget_seconds=30,
+        vision_reserve_seconds=0.5,
+    )
+    assert result[1].selected_path == clip1
+
+    # Zero-progress case: wave 1 never completes inside the wall, so wave 2
+    # never starts and both scenes stay unresolved.
+    yt, web = lanes(3.0, 3.0)
+    result = resolve_storyboard_media_v2(
+        [_gta_scene(0), _gta_scene(1)],
+        youtube_lane=yt, web_lane=web,
+        visual_verifier=accept,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=2,
+        scene_budget_seconds=30,
+        vision_reserve_seconds=0.5,
+    )
+    assert result[0].selected_path == ""
+    assert result[1].selected_path == ""
+
+
+def test_vision_reserve_sizes_verification_clock_and_shrinks_discovery(monkeypatch):
+    """Budget split: an external-agent job gets a >=300s verification clock
+    and a discovery wall of total minus reserve."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    scene = _gta_scene(0)
+    seen = {}
+
+    def web_lane(s, _c):
+        seen["deadline"] = True
+        return []
+
+    result = resolve_storyboard_media_v2(
+        [scene],
+        youtube_lane=lambda _s, _c: [],
+        web_lane=web_lane,
+        visual_verifier=lambda _s, _c: _reject_verdict(),
+        neutral_factory=lambda _s: None,
+        deadline_seconds=600,
+        vision_reserve_seconds=300,
+    )
+    assert result[0].selected_path == ""
+
+
+# ---------------------------------------------------------------------------
+# Worker E (gaming mode + fallback chain) regression tests
+# ---------------------------------------------------------------------------
+
+
+def _padded_clip_file(tmp_path, name, size=2048):
+    """A fake clip file big enough for the spare-pool size gate (>1024 B)."""
+    path = tmp_path / name
+    blob = _PNG_1X1 + b"\x00" * (size - len(_PNG_1X1))
+    path.write_bytes(blob)
+    return str(path)
+
+
+def _gaming_scene(index=0, container_id=None, requirement_hash=None):
+    scene = _gta_scene(index)
+    if container_id is not None:
+        scene["container_id"] = container_id
+    if requirement_hash is not None:
+        scene["requirement_hash"] = requirement_hash
+    return scene
+
+
+def _semantic_accept_verdict(reason="frame shows GTA VI gameplay in Vice City"):
+    verdict = _accept_verdict(reason)
+    verdict["semantic_verified"] = True
+    return verdict
+
+
+def test_gaming_quota_multi_container_reuse_requires_distinct_verified_sources(tmp_path):
+    """(b-part 2) 8 scenes in 8 distinct containers, one verified YouTube
+    clip for scene 0 only: the clip stays in its own container. One verified
+    source cannot cover 8 containers, so full 90% coverage needs >=7 more
+    distinct verified sources (the quota math alone does not create them)."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip = _padded_clip_file(tmp_path, "trailer2.mp4")
+    scenes = [
+        _gaming_scene(i, container_id=f"container-{i}", requirement_hash=f"req-{i}")
+        for i in range(8)
+    ]
+    for scene in scenes:
+        scene["source_policy"] = {"youtube_quota": True}
+
+    def yt_lane(scene, _cancel):
+        if scene["scene_index"] == 0:
+            return [_yt_clip(clip, score=90)]
+        return []
+
+    calls = []
+
+    def verify(scene, candidate):
+        calls.append((scene["scene_index"], str(candidate.get("path") or "")))
+        return _semantic_accept_verdict()
+
+    result = resolve_storyboard_media_v2(
+        scenes,
+        youtube_lane=yt_lane,
+        web_lane=lambda _s, _c: [],
+        visual_verifier=verify,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+        scene_budget_seconds=30,
+        vision_reserve_seconds=0.5,
+    )
+    assert result[0].selected_path == clip
+    assert result[0].provider == "youtube"
+    # No other scene replays the single verified source.
+    for i in range(1, 8):
+        assert result[i].selected_path == "", f"scene {i} replayed the one verified clip"
+        assert result[i].provider in {"neutral", "graphic"}
+
+
+def test_pool_recovery_reverifies_recovered_clip_for_this_scene(tmp_path):
+    """(c) Scene 1 has no lanes of its own; scene 0's unselected clipB is
+    pool-recovered into it. The result must carry a live vision verdict for
+    scene 1 (verified_reuse), never a bare deterministic_degraded stamp
+    borrowed from another scene's stored verdict."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip_a = _padded_clip_file(tmp_path, "clipA.mp4")
+    clip_b = _padded_clip_file(tmp_path, "clipB.mp4")
+    scenes = [
+        _gaming_scene(0, requirement_hash="req-0"),
+        _gaming_scene(1, requirement_hash="req-1"),
+    ]
+
+    def yt_lane(scene, _cancel):
+        if scene["scene_index"] == 0:
+            return [_yt_clip(clip_a, score=95, clip_id="yt:clipA"),
+                    _yt_clip(clip_b, score=90, clip_id="yt:clipB")]
+        return []
+
+    live_calls = []
+
+    def verify(scene, candidate):
+        live_calls.append((scene["scene_index"], str(candidate.get("path") or "")))
+        return _semantic_accept_verdict()
+
+    result = resolve_storyboard_media_v2(
+        scenes,
+        youtube_lane=yt_lane,
+        web_lane=lambda _s, _c: [],
+        visual_verifier=verify,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+        scene_budget_seconds=30,
+        vision_reserve_seconds=0.5,
+    )
+    assert result[0].selected_path == clip_a
+    assert result[1].selected_path == clip_b
+    # The recovered clip was vision-checked FOR scene 1, not inherited.
+    assert (1, clip_b) in live_calls
+    assert result[1].verification_status == "verified_reuse"
+    decision = result[1].visual_decision or {}
+    assert decision.get("visual_checked") is True
+    assert decision.get("accepted") is True
+    assert str(decision.get("reason") or "").strip()
+    assert any(
+        a.get("status") == "verified_reuse" for a in result[1].attempts
+    )
+
+
+def test_pool_recovery_vision_unavailable_keeps_explicit_reason(tmp_path):
+    """(c, variant) With no verifier at all, pool recovery keeps the
+    degraded stamp but must say WHY: an explicit vision_unavailable reason,
+    never a bare deterministic_degraded with no reason."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip_a = _padded_clip_file(tmp_path, "clipA.mp4")
+    clip_b = _padded_clip_file(tmp_path, "clipB.mp4")
+    scenes = [
+        _gaming_scene(0, requirement_hash="req-0"),
+        _gaming_scene(1, requirement_hash="req-1"),
+    ]
+
+    def yt_lane(scene, _cancel):
+        if scene["scene_index"] == 0:
+            return [_yt_clip(clip_a, score=95, clip_id="yt:clipA"),
+                    _yt_clip(clip_b, score=90, clip_id="yt:clipB")]
+        return []
+
+    result = resolve_storyboard_media_v2(
+        scenes,
+        youtube_lane=yt_lane,
+        web_lane=lambda _s, _c: [],
+        visual_verifier=None,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+        scene_budget_seconds=30,
+        vision_reserve_seconds=0.5,
+    )
+    assert result[1].selected_path == clip_b
+    assert result[1].verification_status == "deterministic_degraded"
+    decision = result[1].visual_decision or {}
+    assert decision.get("reason") == "vision_unavailable"
+    assert any(
+        a.get("status") == "vision_unavailable" for a in result[1].attempts
+    )
+
+
+def test_gaming_scene_skips_stock_window_entirely(tmp_path):
+    """(d-part 2) A GTA-typed degraded scene never opens the stock window:
+    the stock lane is not called for it and the ledger records
+    stock_skipped_gaming_topic (policy, not failure). A non-gaming degraded
+    scene in the same job still reaches the stock lane."""
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    gta = _gaming_scene(0, requirement_hash="req-gta")
+    gta["source_policy"] = {"youtube_quota": True, "stock_last_resort_allowed": True}
+    doc = {
+        "scene_id": "doc-1",
+        "scene_index": 1,
+        "container_id": "doc",
+        "text": "The Titanic sank in the Atlantic in 1912",
+        "domain_category": "documentary",
+        "positive_subjects": ["Titanic"],
+        "forbidden_subjects": [],
+        "requirement_hash": "req-doc",
+        "source_policy": {"stock_last_resort_allowed": True},
+    }
+    stock_calls = []
+
+    def stock_lane(scene, _cancel):
+        stock_calls.append(scene["scene_index"])
+        return []
+
+    result = resolve_storyboard_media_v2(
+        [gta, doc],
+        youtube_lane=lambda _s, _c: [],
+        web_lane=lambda _s, _c: [],
+        stock_lane=stock_lane,
+        visual_verifier=lambda _s, _c: _reject_verdict(),
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+        scene_budget_seconds=30,
+        vision_reserve_seconds=0.5,
+    )
+    assert 0 not in stock_calls, "stock lane must never be called for the gaming scene"
+    assert 1 in stock_calls, "non-gaming scene must still reach the stock lane"
+    assert any(
+        a.get("status") == "stock_skipped_gaming_topic" for a in result[0].attempts
+    ), "gaming skip must be logged in the ledger"
+    assert not any(
+        a.get("status") == "stock_skipped_gaming_topic" for a in result[1].attempts
+    )
+
+
+def test_spare_pool_tier_a_runs_once_per_unresolved_scene(monkeypatch):
+    """(e) The spare-pool tier (a) block was duplicated (two identical
+    blocks); after dedupe it runs exactly once per unresolved scene."""
+    import services.media_resolution_coordinator as coordinator
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    real_pick = coordinator._pick_spare_candidate
+    calls = []
+
+    def counting_pick(*args, **kwargs):
+        calls.append(args[1] if len(args) > 1 else None)
+        return real_pick(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "_pick_spare_candidate", counting_pick)
+    result = resolve_storyboard_media_v2(
+        [_gaming_scene(0, requirement_hash="req-0")],
+        youtube_lane=lambda _s, _c: [],
+        web_lane=lambda _s, _c: [],
+        visual_verifier=lambda _s, _c: _reject_verdict(),
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30,
+        scene_budget_seconds=30,
+        vision_reserve_seconds=0.5,
+    )
+    assert result[0].selected_path == ""
+    assert len(calls) == 1, f"spare tier ran {len(calls)} times, expected exactly 1"

@@ -4554,6 +4554,7 @@ def build_semantic_edit_manifest(
             },
             "media": {
                 "src": media_src, "type": media_type,
+                "verified": bool(media_item.get('verified')),
                 "graphic_fallback": dict(media_item.get('graphic_fallback') or {}),
                 "visual_decision": dict(visual_decision),
                 # Multiple real-media beats may belong to one narration

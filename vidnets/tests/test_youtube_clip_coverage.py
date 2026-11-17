@@ -236,3 +236,15 @@ def test_unavailable_hd_source_does_not_repeat_every_format(monkeypatch, tmp_pat
     assert len(calls) == 2
     assert 'height<=2160' in calls[1]
     assert calls[1].endswith('bestvideo[height>=720][height<=2160]')
+
+
+def test_vision_reserve_shrinks_youtube_hard_wall():
+    """Vision reserve: the YT hard wall shrinks by the reserve instead of
+    reserving only transfer time; with no reserve the plan is unchanged."""
+    plan = youtube_stage_budget(900, {}, scene_count=8, download_workers=3,
+                                vision_reserve_seconds=300)
+    assert plan["vision_reserve_seconds"] == 300
+    assert plan["yt_hard_timeout_seconds"] == pytest.approx(582.0)
+    plain = youtube_stage_budget(900, {}, scene_count=8, download_workers=3)
+    assert "vision_reserve_seconds" not in plain
+    assert plain["yt_hard_timeout_seconds"] == pytest.approx(882.0)

@@ -264,6 +264,27 @@ class MixedMediaPlannerTests(unittest.TestCase):
         self.assertTrue(policy["llm_supported"])
         self.assertEqual(policy["weights"]["YouTube Clips"], 0.80)
 
+    def test_gaming_mode_for_detects_gta_vi_and_other_games(self):
+        # GTA VI via the story regex, even without the word "gaming".
+        self.assertTrue(planner.gaming_mode_for(
+            title="GTA VI: Vice City",
+            script="Leonida revealed in the record-breaking first trailer.",
+        ))
+        # Another game via the topic classifier.
+        self.assertTrue(planner.gaming_mode_for(
+            title="Elden Ring boss guide",
+            script="Elden Ring gameplay walkthrough and boss fight strategy.",
+        ))
+        # Explicit gaming category is authoritative.
+        self.assertTrue(planner.gaming_mode_for(
+            title="Untitled", script="A documentary.", category="gaming",
+        ))
+        # A non-gaming documentary is not gaming mode.
+        self.assertFalse(planner.gaming_mode_for(
+            title="The History of Jaguar Cars",
+            script="A factual history of the 1961 Jaguar E-Type classic automobile.",
+        ))
+
     def test_crime_and_history_have_distinct_evidence_led_profiles(self):
         crime = planner.resolve_media_policy(
             title="Crime investigation",

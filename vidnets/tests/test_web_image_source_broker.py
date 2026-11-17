@@ -10,6 +10,27 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 
 
 class SourceBrokerTests(unittest.TestCase):
+    def test_yandex_is_first_in_the_provider_catalog(self):
+        from services.web_image.source_broker import (
+            WEB_ENGINE_PRIORITY,
+            web_image_source_catalog,
+        )
+
+        self.assertEqual(
+            WEB_ENGINE_PRIORITY, ("yandex", "bing", "flickr", "duckduckgo")
+        )
+        tier_zero = [
+            row["name"] for row in web_image_source_catalog() if int(row["tier"]) == 0
+        ]
+        # Yandex first; Bing, Flickr and DuckDuckGo are fallbacks in that
+        # order (lane names differ from engine names, hence the mapping).
+        for earlier, later in (
+            ("yandex", "bing_hybrid"),
+            ("bing_hybrid", "flickr_api"),
+            ("flickr_api", "ddg_hybrid"),
+        ):
+            self.assertLess(tier_zero.index(earlier), tier_zero.index(later))
+
     def test_repairs_cross_job_sports_leak_and_duplicate_terms(self):
         from services.web_image.source_broker import sanitize_source_query
 
@@ -137,28 +158,62 @@ class SourceBrokerTests(unittest.TestCase):
         self.assertEqual(snapshot["totals"]["relevance_rejected"], 15)
         self.assertEqual(snapshot["query_repairs"][0]["scene_number"], 4)
 
-    def test_legacy_search_lanes_are_opt_in(self):
+    def test_public_fast_search_lanes_are_enabled_by_default(self):
         from services.web_image import resolver
 
         with mock.patch.dict(
             os.environ,
             {"VIDZEO_ENABLE_LEGACY_WEB_SEARCH": "0"},
-            clear=False,
+            clear=True,
         ):
             default_names = [name for name, _kind in resolver._enabled_fast_sources()]
         with mock.patch.dict(
             os.environ,
             {"VIDZEO_ENABLE_LEGACY_WEB_SEARCH": "1"},
-            clear=False,
+            clear=True,
         ):
-            legacy_names = [name for name, _kind in resolver._enabled_fast_sources()]
+            enabled_names = [name for name, _kind in resolver._enabled_fast_sources()]
 
-        # Direct Bing is now a bounded default fast lane. Only the old hybrid
-        # DDG lane remains behind the legacy switch.
-        self.assertIn("bing_hybrid", default_names)
-        self.assertNotIn("ddg_hybrid", default_names)
-        self.assertIn("bing_hybrid", legacy_names)
-        self.assertIn("ddg_hybrid", legacy_names)
+        expected = {
+            "universal_scraper", "yandex", "bing_hybrid", "flickr_api",
+            "ddg_hybrid", "openverse", "wikimedia", "library_of_congress",
+            "google_images", "getty_bing", "getty_ddg",
+        }
+        self.assertTrue(expected.issubset(default_names))
+        self.assertTrue(expected.issubset(enabled_names))
+        # Credentialed/instance-hosted sources only run when configured.
+        self.assertNotIn("brave_images", default_names)
+        self.assertNotIn("searxng_images", default_names)
+
+    def test_definitive_provider_403_opens_the_job_circuit(self):
+        from services.web_image import resolver
+        from services.web_image.source_broker import SourceHealth
+
+        health = SourceHealth(failure_threshold=4, cooldown_seconds=30.0)
+        old_health = resolver._ACTIVE_PROVIDER_HEALTH
+        resolver._ACTIVE_PROVIDER_HEALTH = health
+        try:
+            resolver._report_provider_failure(
+                "flickr_api", RuntimeError("Flickr returned HTTP status 403")
+            )
+        finally:
+            resolver._ACTIVE_PROVIDER_HEALTH = old_health
+        self.assertFalse(health.healthy("flickr_api"))
+
+    def test_configured_searx_lane_is_enabled_without_a_network_probe(self):
+        from services.web_image import resolver
+
+        with mock.patch.dict(
+            os.environ,
+            {"VIDZEO_SEARXNG_URL": "https://search.example"},
+            clear=True,
+        ), mock.patch.object(
+            resolver._SEARXNG_SOURCE, "is_available", return_value=False
+        ) as is_available:
+            names = [name for name, _kind in resolver._enabled_fast_sources()]
+
+        self.assertIn("searxng_images", names)
+        is_available.assert_not_called()
 
     def test_bing_thumbnail_is_preserved_for_blocked_original_retry(self):
         from services.web_image import resolver
@@ -196,6 +251,61 @@ class SourceBrokerTests(unittest.TestCase):
         assert rows[0]["image_url"] == "https://images.example/titanic.jpg"
         assert rows[0]["thumbnail_url"] == "https://bing.example/titanic-thumb.jpg"
         assert rows[0]["width"] == 1200
+
+    def test_flickr_html_parser_reads_server_rendered_search_page(self):
+        """S7: Flickr's search page (no API key) yields full-text results.
+        Fixture mirrors the real page shape: modelExport photo objects
+        with escaped slashes, ownerNsid/title/sizes, _b as the large size."""
+        from services.web_image.flickr_api_source import _parse_flickr_html
+
+        def photo(photo_id, owner, alias, title):
+            sizes = "".join(
+                f'"{key}":{{"data":{{"displayUrl":"\\/\\/live.staticflickr.com\\/8660\\/'
+                f'{photo_id}_382a71b7a1_{key}.jpg","url":"\\/\\/live.staticflickr.com\\/8660\\/'
+                f'{photo_id}_382a71b7a1_{key}.jpg"}}}},'
+                for key in ("s", "m", "z", "c", "b")
+            )
+            return (
+                f'{{"data":{{"pathAlias":"{alias}","username":"{alias}",'
+                f'"ownerNsid":"{owner}","faveCount":17,"commentCount":6,'
+                f'"title":"{title}","description":"Iceland aurora.",'
+                f'"license":0,"sizes":{{"data":{{{sizes.rstrip(",")}}}}}}}}}'
+            )
+
+        html = (
+            '<html><body>'
+            + photo("16492450850", "61827574@N03", "snow_cheetah", "Northern lights")
+            + photo("55622475618", "12345678@N00", "hdr-nutter", "Northern Lights - Eagle")
+            + "</body></html>"
+        )
+        rows = _parse_flickr_html(html, 5)
+
+        assert len(rows) == 2
+        assert rows[0]["image_url"] == (
+            "https://live.staticflickr.com/8660/16492450850_382a71b7a1_b.jpg"
+        )
+        assert rows[0]["title"] == "Northern lights"
+        assert rows[0]["source_url"] == (
+            "https://www.flickr.com/photos/snow_cheetah/16492450850/"
+        )
+        assert rows[0]["resolver_lane"] == "flickr-html"
+        assert rows[1]["image_url"].endswith("_b.jpg")
+        assert rows[1]["source_url"].startswith(
+            "https://www.flickr.com/photos/hdr-nutter/"
+        )
+
+    def test_flickr_html_parser_prefers_largest_size_and_dedupes(self):
+        from services.web_image.flickr_api_source import _parse_flickr_html
+
+        # Same photo at _m and _b: only the _b row survives, once.
+        html = (
+            '"ownerNsid":"1@N01","title":"Aurora",'
+            '"sizes":{"data":{"m":{"data":{"url":"\\/\\/live.staticflickr.com\\/1\\/9_a_m.jpg"}},'
+            '"b":{"data":{"url":"\\/\\/live.staticflickr.com\\/1\\/9_a_b.jpg"}}}}'
+        )
+        rows = _parse_flickr_html(html, 5)
+        assert len(rows) == 1
+        assert rows[0]["image_url"] == "https://live.staticflickr.com/1/9_a_b.jpg"
 
     def test_provider_download_headers_use_publisher_for_originals(self):
         from services.web_image.resolver import _provider_download_headers

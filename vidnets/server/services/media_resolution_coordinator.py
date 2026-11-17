@@ -157,6 +157,32 @@ def _review_bound_to_scene(scene: Mapping[str, Any], resolution: SceneResolution
         return False
 
 
+def _verdict_has_vision_evidence(decision: Any) -> bool:
+    """True when a verdict carries actual pixel evidence from vision.
+
+    The unbound strict-identity fall-through must catch only verdicts with
+    NO vision at all (proof job a57cb5c7 scene 6, ff8f checkpoint: an
+    accepted ``deterministic_degraded`` frame verdict for a Rockstar-logo
+    frame — status ``deterministic_degraded``, no ``visual_checked``, no
+    ``semantic_verified``, no identity/action/context scores, no hashes).
+    A verdict that vision actually passed — ``visual_checked`` /
+    ``semantic_verified``, or the identity/action/context scores the vision
+    scorer returns — is evidence for the pixels even when the verdict was
+    never stamped with this scene's requirement/asset hashes, so it commits
+    exactly as it did before the fall-through existed. Hash binding remains
+    the ideal; a vision pass is the requirement.
+    """
+    if not isinstance(decision, Mapping):
+        return False
+    if decision.get("visual_checked") or decision.get("semantic_verified"):
+        return True
+    for key in ("identity_score", "action_score", "context_score"):
+        value = decision.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return True
+    return False
+
+
 def _semantic_reuse_compatible(scene: Mapping[str, Any], resolution: SceneResolution) -> bool:
     """Reuse only an asset verified for the same immutable identity contract.
 
@@ -590,6 +616,47 @@ def _youtube_frame_fallback_candidates(
         key=lambda item: float(item.get("final_score") or item.get("score") or item.get("metadata_score") or 0.0),
         reverse=True,
     )
+    # Filter to YouTube sources BEFORE slicing to the top-N: a web-dominated
+    # pool used to fill both slots with stills, the loop then skipped them,
+    # and the builder yielded [] — so the reserved frame vision never fired
+    # even though downloaded clips sat in the pool. Web stills outranking
+    # clips is the normal case, not an edge case.
+    ranked = [
+        item for item in ranked
+        if "youtube" in str(item.get("source") or item.get("provider") or "").strip().lower()
+        or str(item.get("source") or item.get("provider") or "").strip().lower() in {"yt", "youtube clips"}
+    ]
+    # Scene-relative wrong-game filter: a downloaded GTA V clip must not
+    # yield frames for a trailer/Leonida/Lucia scene, however high its
+    # final_score — in the proof job one wrong download became 5 scenes x
+    # 4 vision calls this way. It MAY yield frames for a scene narrating
+    # GTA V. The scene's game comes from its narration first, then its
+    # content title (the job topic). If the scene names no game, or the
+    # helper is unavailable, everything passes through: this filter must
+    # never strand a scene on an import error.
+    try:
+        from .youtube_pipeline_v2 import _gta_entries as _yt_gta_entries
+        from .youtube_pipeline_v2 import _scene_subject_games as _yt_scene_games
+        _scene_games = _yt_scene_games(
+            " ".join([
+                str(scene.get("text") or ""),
+                str(scene.get("visual_intent") or ""),
+                " ".join(str(item) for item in (scene.get("positive_subjects") or [])),
+            ]),
+            "",
+            {"domain_anchor": str(scene.get("content_title") or "")},
+        )
+        if _scene_games:
+            def _frame_source_game_allowed(item):
+                games = _yt_gta_entries(" ".join([
+                    str(item.get("title") or ""),
+                    str(item.get("description") or ""),
+                ]))
+                return not games or bool(games & _scene_games)
+
+            ranked = [item for item in ranked if _frame_source_game_allowed(item)]
+    except Exception:
+        pass
     try:
         from .visual_intelligence.frame_extractor import extract_clip_frames
     except Exception:
@@ -710,10 +777,10 @@ def _youtube_relaxed_visual_gate(scene: Mapping[str, Any]) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _quota_gate_is_hard_rejection(reason: Any, verdict: Any) -> bool:
+def _quota_gate_is_hard_rejection(reason: Any, verdict: Any, *, scene: Any = None) -> bool:
     """A late quota upgrade may soften uncertainty, never an explicit veto."""
-    from .visual_intelligence.semantic_guard import explicit_low_visual_match
-    if explicit_low_visual_match(verdict) or str(reason or '') == 'insufficient_visible_subject_match':
+    from .visual_intelligence.semantic_guard import explicit_low_visual_match, is_gaming_scene
+    if explicit_low_visual_match(verdict, scene=scene if isinstance(scene, Mapping) else None) or str(reason or '') == 'insufficient_visible_subject_match':
         return True
     if isinstance(verdict, Mapping) and (verdict.get("unsafe_content") or verdict.get("suggestive_content")):
         return True
@@ -730,11 +797,16 @@ def _quota_gate_is_hard_rejection(reason: Any, verdict: Any) -> bool:
             "wrong entity", "different entity", "wrong subject", "different subject",
             "required entity is absent", "required subject is absent",
         )
+        # Gaming scene: "game-engine" is required footage, not a hard marker.
+        _hard_markers = (
+            "wrong domain", "different_sport", "simulation_for_real_world",
+            "wrong era", "different era", "anachronistic", "anachronism",
+        ) if (isinstance(scene, Mapping) and is_gaming_scene(scene)) else (
+            "wrong domain", "different_sport", "simulation_for_real_world", "game-engine",
+            "wrong era", "different era", "anachronistic", "anachronism",
+        )
         if any(token in reason_text for token in spurious_tokens) and not any(
-            marker in reason_text for marker in (
-                "wrong domain", "different_sport", "simulation_for_real_world", "game-engine",
-                "wrong era", "different era", "anachronistic", "anachronism",
-            )
+            marker in reason_text for marker in _hard_markers
         ):
             return False
     hard_reasons = {
@@ -748,7 +820,7 @@ def _quota_gate_is_hard_rejection(reason: Any, verdict: Any) -> bool:
         return False
     try:
         from .visual_intelligence.semantic_guard import explicit_scene_conflict
-        return explicit_scene_conflict(verdict)
+        return explicit_scene_conflict(verdict, scene=scene if isinstance(scene, Mapping) else None)
     except Exception:
         return False
 
@@ -1405,6 +1477,85 @@ def _choose_diverse_verified_media(accepted, prior_resolutions, alignment):
     return min(comparable, key=rank) if comparable else best
 
 
+def _web_candidate_is_ownership_marked(candidate: Mapping[str, Any], path: str) -> bool:
+    """True when a web still carries a visible ownership/watermark mark.
+
+    Vision can pass a stock-agency photo whose credit line only the
+    ownership OCR sees.  Every tier that re-admits a raw pool candidate
+    must run this check — the early gate alone cannot help, because the
+    rescue tiers read the raw discovered pool, not the gated finalists.
+    Fails open when OCR is unavailable.
+    """
+    if not _is_web_source(candidate):
+        return False
+    media_type = str(
+        candidate.get("media_type") or candidate.get("type") or ""
+    ).strip().lower()
+    if media_type not in {"", "image", "still", "photo"}:
+        return False
+    if str(path or "").strip().lower().endswith(
+        (".mp4", ".mov", ".mkv", ".webm", ".avi")
+    ):
+        return False
+    try:
+        from .web_image.ownership_mark import inspect_ownership_mark
+
+        return bool(inspect_ownership_mark(str(path or "")).get("watermark"))
+    except Exception:
+        return False
+
+
+def _drop_watermarked_web_finalists(accepted, prior_resolutions, alignment, attempts):
+    """Ownership-watermark early gate for the chosen web still.
+
+    Berlin Wall scene 2: the top web photo passed vision, then the final
+    handoff's ownership-OCR gate rejected it for an AFP-via-Getty credit
+    line — by which point the ranked alternates were already gone, so the
+    scene fell straight to a graphic.  Catch the watermark HERE, while
+    the ranked alternates are still alive: screen the chosen candidate,
+    drop it when ownership-marked, and re-pick the next ranked finalist.
+    Only web stills are screened (YouTube cuts have their own overlay
+    policy, which tolerates small publisher marks); the OCR check fails
+    open when unavailable, so it can never block a clean candidate.  The
+    returned pool is what the alternates are built from, so a dropped
+    watermarked candidate can never resurface as a late-gate alternate.
+    """
+    pool = list(accepted or [])
+    while pool:
+        _rank, _tie, candidate, _qwen = _choose_diverse_verified_media(
+            pool, prior_resolutions, alignment
+        )
+        if not isinstance(candidate, Mapping):
+            return pool
+        if not _is_web_source(candidate):
+            return pool
+        media_type = str(
+            candidate.get("media_type") or candidate.get("type") or ""
+        ).strip().lower()
+        if media_type not in {"", "image", "still", "photo"}:
+            return pool
+        path = str(candidate.get("path") or "")
+        try:
+            from .web_image.ownership_mark import inspect_ownership_mark
+
+            watermarked = bool(inspect_ownership_mark(path).get("watermark"))
+        except Exception:
+            watermarked = False
+        if not watermarked:
+            return pool
+        attempts.append({
+            "source": str(candidate.get("source") or candidate.get("provider") or "web"),
+            "stage": "ownership_watermark_early_gate",
+            "status": "ownership_watermark_detected",
+            "path": path,
+        })
+        pool = [
+            item for item in pool
+            if not (item[2] is candidate or str(item[2].get("path") or "") == path)
+        ]
+    return pool
+
+
 def _topic_reuse_limit(
     scene: Mapping[str, Any],
     resolution: SceneResolution,
@@ -1478,6 +1629,69 @@ def _adjacent_selected_paths(
         if path:
             paths.add(path)
     return paths
+
+
+def _sha256_file_hexdigest(path: str) -> str:
+    """Byte digest of a local file, or "" when it cannot be read.
+
+    The final render gate dedupes by file bytes, not by provider identity:
+    the same pixels copied under a different filename are still a repeat.
+    Rescue-side guards must use the same measure or they approve a repeat
+    the gate then rejects (GTA VI proof job a57cb5c7: the key-art poster
+    lived under three different paths with one digest).
+    """
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _adjacent_asset_keys(
+    resolutions: Mapping[int, SceneResolution],
+    index: int,
+) -> tuple[set[str], set[str]]:
+    """Provider identities and byte digests of the adjacent scenes' assets.
+
+    Both keys are needed: identity catches the same candidate reused under
+    its own id, bytes catch the same pixels re-downloaded under a new path.
+    """
+    identities: set[str] = set()
+    digests: set[str] = set()
+    for neighbor in (index - 1, index + 1):
+        resolution = resolutions.get(neighbor)
+        if resolution is None:
+            continue
+        identity = _resolution_asset_identity(resolution)
+        if identity:
+            identities.add(identity)
+        path = str(getattr(resolution, "selected_path", "") or "")
+        if path:
+            digest = _sha256_file_hexdigest(path)
+            if digest:
+                digests.add(digest)
+    return identities, digests
+
+
+def _normalize_rescue_score(value: Any) -> float:
+    """Rescue ranking on one 0-1 scale.
+
+    Provider scores arrive on two scales: metadata scores are 0-100
+    (a rescued still scores 55.0) while alternate-pool scores are 0-1
+    (a ranked alternate scores 0.42). Ranking the raw numbers always
+    prefers an already-selected 55.0 file over an unused 0.89 alternate,
+    so unused verified alternates could never win the rescue.
+    """
+    try:
+        score = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if score > 1.0:
+        score /= 100.0
+    return max(0.0, min(1.0, score))
 
 
 _PENDING_VISUAL_METADATA_SOURCES = frozenset({
@@ -1882,6 +2096,150 @@ def _candidate_hard_gate(scene: Mapping[str, Any], candidate: Mapping[str, Any])
     return True, "passed"
 
 
+# Hard-gate reasons the pre-stock rescue's general-media tier may never
+# bypass: explicit identity rejections, container/path problems, and
+# deterministic gate failures. Any other failure (notably
+# ``canonical_entity_mismatch``: the metadata does not prove this scene's
+# named entity) is a soft metadata verdict, not proof of a wrong asset.
+_RESCUE_HARD_GATE_REASONS = frozenset({
+    "forbidden_confusable_entity",
+    "person_confusable_entity",
+    "conflicting_person_ordinal",
+    "wrong_subject_type_animal",
+    "wrong_subject_type_automobile",
+    "forbidden_subject",
+    "container_mismatch",
+    "missing_path",
+    "deterministic_gate_failed",
+    "facecam_or_inset_contamination",
+    "talking_head_contamination",
+    "web_presenter_package",
+})
+
+
+def _rescue_general_media_eligible(
+    scene: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    gate_reason: str,
+    gated_outcomes: Mapping[Any, Any],
+) -> bool:
+    """General same-job fallback for an exhausted scene in the rescue.
+
+    A scene whose own media is exhausted may reuse an asset vision already
+    accepted for another scene of the SAME job even when the asset's metadata
+    does not prove this scene's named entity (``canonical_entity_mismatch``):
+    the pixels were checked, the container matches, and nothing evidences a
+    conflicting identity. This is the rescue's "general scene from the same
+    job's approved media" tier (proof job a57cb5c7 scene 6: the Vice City
+    alternates are GTA VI world imagery, not a conflicting identity, and
+    beat a graphic for a launch-platforms scene).
+
+    Never admits an asset vision never accepted anywhere in the job, and
+    never overrides a hard rejection. The rescue still re-verifies (or
+    re-stamps) the choice for the target scene before committing it, and the
+    reuse-cap / adjacency guards still apply downstream.
+    """
+    reason = str(gate_reason or "").strip().lower()
+    if (
+        reason in _RESCUE_HARD_GATE_REASONS
+        or "domain_conflict" in reason
+        or "forbidden" in reason
+        or "confusable" in reason
+    ):
+        return False
+    scene_container = str(scene.get("container_id") or "")
+    candidate_container = str(candidate.get("container_id") or "")
+    if not scene_container or candidate_container != scene_container:
+        return False
+    path = str(candidate.get("path") or candidate.get("cleaned_path") or "").strip()
+    if not path:
+        return False
+    norm_path = os.path.normcase(os.path.normpath(path))
+    verdict: Any = None
+    verified_in_job = False
+    for (_g_idx, g_path), outcome in (gated_outcomes or {}).items():
+        if os.path.normcase(os.path.normpath(str(g_path or ""))) != norm_path:
+            continue
+        try:
+            _ok, _reason, g_verified, _g_reason, _score, g_qwen = outcome
+        except (TypeError, ValueError):
+            continue
+        if g_verified:
+            verified_in_job = True
+            if isinstance(g_qwen, Mapping):
+                verdict = g_qwen
+            break
+    if not verified_in_job:
+        own = candidate.get("visual_decision") or candidate.get("qwen_result")
+        if isinstance(own, Mapping) and (
+            own.get("accepted") is True
+            or str(own.get("status") or "").lower()
+            in {"accepted", "pass", "keep", "soft_visual_pass", "deterministic_degraded"}
+        ):
+            verified_in_job = True
+            verdict = own
+    if not verified_in_job:
+        return False
+    if isinstance(verdict, Mapping):
+        if verdict.get("unsafe_content") or verdict.get("suggestive_content"):
+            return False
+        if verdict.get("entity_conflict") or verdict.get("fatal_mismatch"):
+            return False
+        from .visual_intelligence.semantic_guard import explicit_scene_conflict
+        if explicit_scene_conflict(verdict, relaxed=True, scene=scene):
+            return False
+    return True
+
+
+def _rescue_donor_identity_compatible(
+    scene: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    resolutions: Mapping[int, Any],
+) -> bool:
+    """Whether a last-resort adjacent donor may serve this scene's identity.
+
+    The general rescue tier admits a donor whose metadata does not prove
+    the scene's entity (``canonical_entity_mismatch``) — right for topic
+    beats (a Vice City still for a GTA VI launch-platforms scene). It is
+    wrong for a strict-identity PERSON scene: a verified photo of Malcolm
+    Butler is not verified media for Jermaine Kearse merely because both
+    beats belong to the same game. The main loop's nearest-neighbour path
+    already enforces this via ``_strict_reuse_identity_compatible``; the
+    pre-stock rescue's last-resort promotion must enforce the same
+    boundary, or the promotion re-admits exactly the cross-person reuse
+    the main loop refused.
+
+    Only person scenes are gated here: for topic/place/event beats the
+    general tier's judgement stands. The donor's identity comes from the
+    scene that selected it (its resolution's requirement); a donor no
+    scene vouches for cannot prove it shows this person, so it is refused
+    for a person scene as well.
+    """
+    requirement = scene.get("visual_requirement") or {}
+    if not isinstance(requirement, Mapping) or not requirement.get("strict_identity"):
+        return True
+    subject_type = str(requirement.get("subject_type") or "").strip().lower()
+    domain = str(requirement.get("domain") or "").strip().lower()
+    if subject_type != "person" and domain != "person":
+        return True
+    wanted = " ".join(str(requirement.get("canonical_entity") or "").strip().casefold().split())
+    if not wanted:
+        return True
+    c_path = str(candidate.get("path") or candidate.get("cleaned_path") or "").strip()
+    for res in (resolutions or {}).values():
+        if res is None or not c_path or str(getattr(res, "selected_path", "") or "") != c_path:
+            continue
+        context = getattr(res, "final_scene_context", None) or {}
+        req = context.get("visual_requirement") if isinstance(context, Mapping) else {}
+        existing = (
+            " ".join(str((req or {}).get("canonical_entity") or "").strip().casefold().split())
+            if isinstance(req, Mapping)
+            else ""
+        )
+        return bool(existing and existing == wanted)
+    return False
+
+
 # The terminal stock lane intentionally skips pixel vision, but it must not
 # become an unbounded "anything downloadable" lane.  Provider tags/captions
 # are cheap and sufficient to block the common conceptual substitutions that
@@ -2140,7 +2498,7 @@ def _verification_result(
             bound_hash = str(previous.get("verified_asset_sha256") or "")
             requirement_hash = str(requirement.get("requirement_hash") or "")
             live = all(previous.get(flag) is True for flag in ("accepted", "visual_checked", "visual_available"))
-            safe = not (explicit_scene_conflict(previous) or previous.get("unsafe_content")
+            safe = not (explicit_scene_conflict(previous, scene=scene) or previous.get("unsafe_content")
                         or previous.get("suggestive_content")
                         or (_is_web_source(candidate) and previous.get("watermark")))
             if (live and safe and bound_hash and requirement_hash
@@ -2386,7 +2744,11 @@ def _verification_result(
             "reason": detail or "visual_verifier_exception",
         }
     if isinstance(raw, bool):
-        return raw, "visual_pass" if raw else "visual_rejected", 100.0 if raw else 0.0, {"accepted": raw}
+        return raw, "visual_pass" if raw else "visual_rejected", 100.0 if raw else 0.0, {
+            "accepted": raw,
+            "reason": "visual_pass" if raw else "visual_rejected",
+            "visual_checked": True,
+        }
     result = dict(raw or {}) if isinstance(raw, dict) else {}
     source = str(candidate.get("source") or candidate.get("provider") or "").strip().lower()
     is_youtube_candidate = source in {"youtube", "youtube clips", "yt"}
@@ -2394,7 +2756,7 @@ def _verification_result(
     score = float(result.get("final_score") or result.get("relevance") or result.get("score") or 0.0)
     identity_val = float(result.get("identity_score") or 0.0)
     from .visual_intelligence.semantic_guard import explicit_low_visual_match
-    if explicit_low_visual_match(result):
+    if explicit_low_visual_match(result, scene=scene):
         result.update(accepted=False, status='rejected', fatal_mismatch=True,
                       rejection_reason='insufficient_visible_subject_match')
         return False, 'insufficient_visible_subject_match', score, result
@@ -2421,11 +2783,20 @@ def _verification_result(
             "different event", "distinct events", "wrong event", "competing event",
             "wrong matchup", "different matchup", "different location", "wrong venue",
         )
+        # Gaming scene: "game-engine" is required footage, not a hard
+        # marker — it must not block clearing a spurious fatal_mismatch.
+        from .visual_intelligence.semantic_guard import is_gaming_scene
+
+        _gaming_scene = is_gaming_scene(scene)
+        _hard_markers = (
+            "wrong domain", "different_sport", "simulation_for_real_world",
+            "wrong era", "different era", "anachronistic", "anachronism",
+        ) if _gaming_scene else (
+            "wrong domain", "different_sport", "simulation_for_real_world", "game-engine",
+            "wrong era", "different era", "anachronistic", "anachronism",
+        )
         if any(token in reason_text for token in spurious_tokens) and not any(
-            marker in reason_text for marker in (
-                "wrong domain", "different_sport", "simulation_for_real_world", "game-engine",
-                "wrong era", "different era", "anachronistic", "anachronism",
-            )
+            marker in reason_text for marker in _hard_markers
         ):
             result["spurious_mismatch"] = True
             model_fatal_mismatch = False
@@ -2433,7 +2804,7 @@ def _verification_result(
 
     # High scores cannot erase a positive factual-conflict flag.
     from .visual_intelligence.semantic_guard import explicit_scene_conflict
-    is_conflict = explicit_scene_conflict(result, relaxed=youtube_relaxed)
+    is_conflict = explicit_scene_conflict(result, relaxed=youtube_relaxed, scene=scene)
     # Explicit pixel-level contradictions are factual vetoes, including for
     # relaxed YouTube scenes.  The relaxed lane may soften an ambiguous
     # relevance score, but it must never turn a different matchup/event,
@@ -3089,6 +3460,11 @@ def _verification_result(
             "verification_status": "soft_visual_pass",
             "promotion_reason": "high_identity_no_hard_visual_rejection",
         })
+    # Verdict contract: every return carries a mandatory non-empty reason —
+    # the model's reason text preserved, never just the code — so a skip is
+    # distinguishable from a rejection in the ledger.
+    if not str(result.get("reason") or "").strip():
+        result["reason"] = "visual_pass" if final_accepted else "visual_rejected"
     return final_accepted, "visual_pass" if final_accepted else "visual_rejected", score, result
 
 
@@ -3301,6 +3677,12 @@ def _pick_spare_candidate(
         passed, _reason = _candidate_hard_gate(scene, candidate)
         if not passed:
             continue
+        # A vision-passed still can still carry a stock-agency credit
+        # line.  The early gate drops it from its own scene's finalists,
+        # but the spare pool reads the raw discovered rows — screen here
+        # too, or the watermarked still is spared into another scene.
+        if _web_candidate_is_ownership_marked(candidate, local_path):
+            continue
         # Reuse cap: a web still may serve a second non-adjacent scene, a
         # YouTube file may not be replayed. Probe a resolution so the cap
         # uses the same identity the final ledger records.
@@ -3363,6 +3745,7 @@ def resolve_storyboard_media_v2(
     external_cancel_event: Optional[threading.Event] = None,
     adaptive_media_review: bool = False,
     scene_budget_seconds: Optional[float] = None,
+    vision_reserve_seconds: Optional[float] = None,
 ) -> Dict[int, SceneResolution]:
     """Resolve immutable storyboard scenes through the V2 fallback machine.
 
@@ -3381,6 +3764,54 @@ def resolve_storyboard_media_v2(
     if not rows:
         return {}
     started_at = time.monotonic()
+    # Vision reserve (seconds of the total wall kept for verification).
+    # Threaded from the caller / VIDZEO_VISION_RESERVE_SECONDS; an
+    # external-agent job needs >=1 inbox round trip (>=300s), a direct
+    # provider job needs far less. The discovery wall below is total minus
+    # this reserve, so discovery can never spend verification's share.
+    try:
+        from .job_context import current_job as _current_job
+
+        _job_provider = str(_current_job().get("llm_provider") or "").strip().lower()
+    except Exception:
+        _job_provider = ""
+    try:
+        vision_reserve = float(
+            vision_reserve_seconds
+            if vision_reserve_seconds is not None
+            else os.environ.get("VIDZEO_VISION_RESERVE_SECONDS")
+            or (300.0 if _job_provider == "external_agent" else 120.0)
+        )
+    except (TypeError, ValueError):
+        vision_reserve = 300.0 if _job_provider == "external_agent" else 120.0
+    vision_reserve = max(0.0, vision_reserve)
+    # Liveness-aware discovery clock (reconciliation of "no time limit for
+    # web" with "never stuck forever"): the discovery budget bounds only
+    # STALLED time, never working time. Time consumes the budget only while
+    # no lane reports progress; any engine completion, row arrival, or lane
+    # progress event extends/resets the window. Absolute cap: the total wall
+    # (discovery may extend into the reserve only by progressing, never
+    # past the total wall); the verification clock below still gets its
+    # reserve on top of the discovery wall.
+    try:
+        discovery_stall_seconds = max(
+            5.0,
+            float(os.environ.get("VIDZEO_DISCOVERY_STALL_SECONDS", "120") or 120),
+        )
+    except (TypeError, ValueError):
+        discovery_stall_seconds = 120.0
+    discovery_progress_state = {"last_at": started_at}
+
+    def note_discovery_progress(kind: str = "lane_complete") -> None:
+        """Record lane progress and extend the discovery wall by one stall
+        window from now (capped at the total wall). Called on engine
+        completion, row arrival, and lane last-progress advances."""
+        nonlocal deadline_at
+        now = time.monotonic()
+        discovery_progress_state["last_at"] = now
+        extended = min(now + discovery_stall_seconds, discovery_absolute_deadline_at)
+        if extended > deadline_at:
+            deadline_at = extended
     # The flag allows the shared web batch to publish its completed rows, but
     # the coordinator's media wall and delivery budget still bound this wait.
     web_wait_until_complete = bool(web_wait_until_complete)
@@ -3390,7 +3821,15 @@ def resolve_storyboard_media_v2(
             effective_wall = 600.0
     except (TypeError, ValueError):
         effective_wall = 600.0
-    deadline_at = started_at + max(1.0, effective_wall)
+    # Discovery wall = total wall minus the vision reserve: discovery
+    # cannot spend verification's share. Liveness may extend it back up to
+    # the total wall (discovery_absolute_deadline_at) while lanes progress,
+    # never beyond it. The reserve is capped at half the total wall: on a
+    # short wall (tests, the 210s default) an uncapped 300s agent reserve
+    # would collapse discovery to ~1s and strand every lane.
+    capped_reserve = min(vision_reserve, 0.5 * effective_wall)
+    discovery_absolute_deadline_at = started_at + max(1.0, effective_wall)
+    deadline_at = started_at + max(1.0, effective_wall - capped_reserve)
     try:
         web_fallback_grace = max(0.0, min(300.0, float(web_fallback_grace_seconds or 0.0)))
     except (TypeError, ValueError):
@@ -3421,21 +3860,56 @@ def resolve_storyboard_media_v2(
     # _cached_verification_result). Genuine rejections are never recorded
     # here; they stay in the verdict cache above.
     vision_unavailable: Dict[tuple, tuple] = {}
-    # Per-scene total verification budget (F2). The clock starts when a
-    # scene's verification phase starts (queue_review) and bounds review +
+    # Per-scene verification budget (F2). The clock starts when a scene's
+    # verification phase starts (queue_review) and bounds review +
     # finalists + recovery. When it expires the scene resolves with the best
     # candidate found so far instead of burning minutes on further vision
     # rounds and then failing bare. Env VIDZEO_SCENE_BUDGET_SECONDS,
-    # default 120s.
+    # default 120s — but sized per provider when the caller leaves it to
+    # the default: an external-agent job needs >=1 inbox round trip
+    # (>=300s), so the reserve above is the floor for the default
+    # verification clock, never 120s for an agent job. An explicit
+    # scene_budget_seconds always wins as-is (callers/tests that set it
+    # are sizing it deliberately).
+    if scene_budget_seconds is not None:
+        try:
+            scene_budget_value = max(1.0, float(scene_budget_seconds))
+        except (TypeError, ValueError):
+            scene_budget_value = 120.0
+    else:
+        try:
+            scene_budget_value = float(
+                os.environ.get("VIDZEO_SCENE_BUDGET_SECONDS", "120") or 120
+            )
+        except (TypeError, ValueError):
+            scene_budget_value = 120.0
+        scene_budget_value = max(1.0, scene_budget_value, vision_reserve)
+    # Vision call-count budget (bounds the validator by starts as well as
+    # time, so one slow inbox cannot eat the reserve): at most 6 vision
+    # starts per scene; the last 2 are reserved for frame fallbacks, so
+    # ordinary recovery may start at most 4. Batched calls count once.
     try:
-        scene_budget_value = float(
-            scene_budget_seconds
-            if scene_budget_seconds is not None
-            else os.environ.get("VIDZEO_SCENE_BUDGET_SECONDS", "120") or 120
+        vision_max_starts_per_scene = max(
+            1, int(os.environ.get("VIDZEO_VISION_MAX_STARTS_PER_SCENE", "6") or 6)
         )
     except (TypeError, ValueError):
-        scene_budget_value = 120.0
-    scene_budget_value = max(1.0, scene_budget_value)
+        vision_max_starts_per_scene = 6
+    vision_frame_reserve_starts = max(
+        0, min(2, vision_max_starts_per_scene - 1)
+    )
+    vision_starts: Dict[int, int] = {}
+
+    def vision_start_allowed(index: int, *, frame_reserved: bool = False) -> bool:
+        """Call-count gate: frame fallbacks may spend the last reserved
+        starts; ordinary verification may not."""
+        used = vision_starts.get(index, 0)
+        cap = vision_max_starts_per_scene if frame_reserved else max(
+            0, vision_max_starts_per_scene - vision_frame_reserve_starts
+        )
+        return used < cap
+
+    def note_vision_start(index: int) -> None:
+        vision_starts[index] = vision_starts.get(index, 0) + 1
     scene_verify_started_at: Dict[int, float] = {}
 
     def scene_budget_open(index: int) -> bool:
@@ -3944,6 +4418,13 @@ def resolve_storyboard_media_v2(
             index, source, candidates, status = future.result()
         except Exception:
             return
+        # Liveness: a finished lane is progress (engine completion; row
+        # arrival when candidates landed). It extends/resets the discovery
+        # window, so working time never consumes the discovery budget. A
+        # timeout/error handoff is a stall, not progress: it must not extend
+        # the window.
+        if status in {"ok", "empty"}:
+            note_discovery_progress("row_arrival" if candidates else "lane_complete")
         attempts[index].append({
             "source": source, "stage": "discovery_result",
             "wave": wave_number, "status": status, "candidate_count": len(candidates),
@@ -4001,6 +4482,37 @@ def resolve_storyboard_media_v2(
                     for source, lane in (("youtube", youtube_lane), ("web", web_lane))
                 }
                 pending = set(futures)
+                # Lane progress interface (worker A web lane): a lane exposes
+                # its wave's last-progress timestamp as ``last_progress_at``
+                # (monotonic seconds) or ``get_last_progress_monotonic()``.
+                # Any advance counts as progress (engine completion / row
+                # arrival) and extends the discovery window; the poll below
+                # is a no-op for lanes that do not expose it, and lane
+                # completion via consume_discovery still notes progress.
+                lane_progress_seen: Dict[int, float] = {}
+
+                def _poll_lane_progress() -> None:
+                    for _lane in (youtube_lane, web_lane):
+                        _stamp = None
+                        _getter = getattr(_lane, "get_last_progress_monotonic", None)
+                        if callable(_getter):
+                            try:
+                                _stamp = float(_getter())
+                            except Exception:
+                                _stamp = None
+                        if _stamp is None:
+                            _stamp = getattr(_lane, "last_progress_at", None)
+                        try:
+                            _stamp = float(_stamp) if _stamp is not None else None
+                        except (TypeError, ValueError):
+                            _stamp = None
+                        if _stamp is None:
+                            continue
+                        _key = id(_lane)
+                        if _stamp > lane_progress_seen.get(_key, 0.0):
+                            lane_progress_seen[_key] = _stamp
+                            note_discovery_progress("lane_progress")
+
                 while pending and not cancel_event.is_set() and (web_wait_until_complete or time.monotonic() < deadline_at):
                     done, pending = wait(
                         pending,
@@ -4009,6 +4521,7 @@ def resolve_storyboard_media_v2(
                     )
                     for future in done:
                         consume_discovery(future, wave_number)
+                    _poll_lane_progress()
                 if pending and shared_batch_mode and not cancel_event.is_set():
                     # If a shared batch provider (e.g. web image lane or youtube lane)
                     # is still completing its network/transcode work, give the scene waiters
@@ -4029,6 +4542,26 @@ def resolve_storyboard_media_v2(
             executor.shutdown(wait=False, cancel_futures=True)
 
         _promote_completed_batch_lanes("pre_gate_batch_promotion", timeout=0.0)
+        # Discovery may have run to (or been extended to) its wall while
+        # lanes progressed. Verification starts now, with its own clock:
+        # refresh the visual-gate deadline from the (possibly extended)
+        # discovery wall plus the grace, so the gate is not already expired
+        # when the first scene is queued. The delivery budget still caps it.
+        visual_gate_deadline_at = max(
+            visual_gate_deadline_at, time.monotonic() + visual_gate_grace
+        )
+        if verification_delivery_deadline is not None:
+            visual_gate_deadline_at = min(
+                visual_gate_deadline_at, verification_delivery_deadline
+            )
+        web_recovery_visual_deadline_at = max(
+            visual_gate_deadline_at,
+            web_fallback_deadline_at + visual_gate_grace,
+        )
+        if verification_delivery_deadline is not None:
+            web_recovery_visual_deadline_at = min(
+                web_recovery_visual_deadline_at, verification_delivery_deadline
+            )
         for index in range(len(rows)):
             queue_review(index)
         last_count = -1
@@ -4330,8 +4863,60 @@ def resolve_storyboard_media_v2(
                     "stage": "scene_budget",
                     "status": "scene_budget_exhausted",
                 })
+            # Reserved frame-fallback allowance — checked BEFORE the general
+            # scene budget. Same-video timestamp frames / verified-topic
+            # frame-pool candidates are always vision-checked through the
+            # existing batched path (_run_scene_batch: one compare_images
+            # call for up to 4 frames), spending one of the last 2 reserved
+            # vision starts for the scene. A slow primary verifier that
+            # consumed the whole scene budget must never silently skip them.
+            _frame_layers = {"youtube_extracted_frame", "same_video_timestamp_frame"}
+            frame_rows = bool(rows_to_verify) and all(
+                str(c.get("resolution_kind") or c.get("fallback_layer") or "").strip().lower()
+                in _frame_layers
+                for c, _s in rows_to_verify
+            )
+            frame_batched_verdicts: dict[int, tuple] | None = None
+            if (
+                frame_rows
+                and visual_verifier is not None
+                and not fast_metadata_accept
+                and vision_start_allowed(index, frame_reserved=True)
+                and time.monotonic() < visual_gate_deadline_at
+            ):
+                _frame_items = [
+                    (
+                        index,
+                        -preference_rank.get(source, 9),
+                        candidate,
+                        source,
+                        float(
+                            candidate.get("final_score")
+                            or candidate.get("score")
+                            or candidate.get("metadata_score")
+                            or 0.0
+                        ),
+                    )
+                    for candidate, source in rows_to_verify
+                ]
+                _run_scene_batch(index, _frame_items)
+                _batched: dict[int, tuple] = {}
+                for _ci, (_cand, _src) in enumerate(rows_to_verify):
+                    _verdict = batched_gate_verdicts.get(
+                        (index, str(_cand.get("path") or ""))
+                    )
+                    if isinstance(_verdict, dict):
+                        _batched[_ci] = _cached_verification_result(
+                            index, scene, _cand, _BatchedVerifier(_verdict),
+                            vision_verdict_cache, vision_unavailable,
+                        )
+                if _batched:
+                    note_vision_start(index)
+                    frame_batched_verdicts = _batched
             parallel_verdicts: dict[int, tuple] = {}
-            if fast_metadata_accept:
+            if frame_batched_verdicts is not None:
+                parallel_verdicts.update(frame_batched_verdicts)
+            elif fast_metadata_accept:
                 for candidate_index, (candidate, source) in enumerate(rows_to_verify):
                     passed, _reason = _candidate_hard_gate(scene, candidate)
                     if passed:
@@ -4394,6 +4979,7 @@ def resolve_storyboard_media_v2(
                                 "accepted": True,
                                 "status": "scene_budget_best_so_far",
                                 "visual_verification_skipped": True,
+                                "visual_checked": False,
                                 "reason": "per-scene budget exhausted: best hard-gate-passing candidate",
                             },
                         )
@@ -4421,9 +5007,21 @@ def resolve_storyboard_media_v2(
                                 False,
                                 "skipped_after_scene_budget",
                                 0.0,
-                                {"accepted": False, "status": "deadline_exceeded"},
+                                {"accepted": False, "status": "deadline_exceeded",
+                                 "reason": "skipped_after_scene_budget",
+                                 "visual_checked": False},
+                            )
+                        if not vision_start_allowed(index):
+                            return candidate_index, (
+                                False,
+                                "skipped_after_vision_start_budget",
+                                0.0,
+                                {"accepted": False, "status": "deadline_exceeded",
+                                 "reason": "skipped_after_vision_start_budget",
+                                 "visual_checked": False},
                             )
                         if visual_budget_open("visual_gate_fallback_parallel", source):
+                            note_vision_start(index)
                             result = _cached_verification_result(
                                 index, scene, candidate, visual_verifier, vision_verdict_cache,
                                 vision_unavailable)
@@ -4432,7 +5030,9 @@ def resolve_storyboard_media_v2(
                                 False,
                                 "skipped_after_media_deadline",
                                 0.0,
-                                {"accepted": False, "status": "deadline_exceeded"},
+                                {"accepted": False, "status": "deadline_exceeded",
+                                 "reason": "skipped_after_media_deadline",
+                                 "visual_checked": False},
                             )
                         return candidate_index, result
 
@@ -4635,16 +5235,28 @@ def resolve_storyboard_media_v2(
                     elif not scene_budget_open(index):
                         verified, verify_reason, visual_score, qwen = (
                             False, "skipped_after_scene_budget", 0.0,
-                            {"accepted": False, "status": "deadline_exceeded"},
+                            {"accepted": False, "status": "deadline_exceeded",
+                             "reason": "skipped_after_scene_budget",
+                             "visual_checked": False},
+                        )
+                    elif not vision_start_allowed(index):
+                        verified, verify_reason, visual_score, qwen = (
+                            False, "skipped_after_vision_start_budget", 0.0,
+                            {"accepted": False, "status": "deadline_exceeded",
+                             "reason": "skipped_after_vision_start_budget",
+                             "visual_checked": False},
                         )
                     elif visual_budget_open("visual_gate_fallback", source):
+                        note_vision_start(index)
                         verified, verify_reason, visual_score, qwen = _verification_result(
                             scene, candidate, visual_verifier,
                         )
                     else:
                         verified, verify_reason, visual_score, qwen = (
                             False, "skipped_after_media_deadline", 0.0,
-                            {"accepted": False, "status": "deadline_exceeded"},
+                            {"accepted": False, "status": "deadline_exceeded",
+                             "reason": "skipped_after_media_deadline",
+                             "visual_checked": False},
                         )
                     attempts[index].append({
                         "source": source,
@@ -4889,26 +5501,6 @@ def resolve_storyboard_media_v2(
                     "path": str(spare[2].get("path") or ""),
                 })
 
-        # Spare-pool reuse (Nov 10, 2026): fallback tier (a). When a scene's
-        # own lanes found nothing usable, reuse an already-downloaded,
-        # vision-checked asset from another scene's top-12 pool before
-        # fetching anything new (tier (b) YT clip frames below) or falling
-        # back to a graphic (tier (c), last). The scene's own exact search
-        # already outranks another scene's spare — cross-lane ran first.
-        if not accepted:
-            spare = _pick_spare_candidate(
-                index, scene, rows, discovered, gated_outcomes, reuse_counts
-            )
-            if spare is not None:
-                accepted.append(spare)
-                attempts[index].append({
-                    "source": _normalize_candidate_source(spare[2]),
-                    "stage": "spare_pool_reuse",
-                    "status": "accepted",
-                    "candidate_id": str(spare[2].get("candidate_id") or spare[2].get("id") or ""),
-                    "path": str(spare[2].get("path") or ""),
-                })
-
         # Same-video timestamp recovery. A downloaded YouTube clip can be
         # semantically valid even when the selected cut opens on a transition,
         # title card, or weak frame. Extract a few distinct local timestamps
@@ -5009,6 +5601,20 @@ def resolve_storyboard_media_v2(
             except Exception:
                 pass
 
+        # Ownership-watermark early gate (Berlin Wall scene 2): a
+        # vision-passed web still can still carry a stock-agency credit
+        # line that only the ownership OCR sees.  Screen the chosen
+        # finalist now, while ranked alternates are alive to replace it;
+        # an all-watermarked pool falls through to the reuse/rescue tiers
+        # below instead of shipping a watermarked still.
+        if accepted:
+            accepted = _drop_watermarked_web_finalists(
+                accepted,
+                list(resolutions.values()),
+                event_alignment,
+                attempts[index],
+            )
+
         if accepted:
             explicit_order = _source_policy_value(scene, 'media_source_priority', None)
             if isinstance(explicit_order, (list, tuple)) and accepted:
@@ -5100,10 +5706,51 @@ def resolve_storyboard_media_v2(
                     or ""
                 ),
             )
-            resolutions[index] = resolution
-            verified_by_container.setdefault(resolution.container_id, []).append((index, resolution))
-            reuse_counts.setdefault(_resolution_asset_identity(resolution), 1)
-            continue
+            # A YouTube acceptance whose verdict is not bound to this scene
+            # and these bytes is not an acceptance the final gate will keep:
+            # strict-identity scenes require a bound pixel review, and the
+            # adapter rejects the frame with 'visual_verification_pending'
+            # (GTA VI proof job a57cb5c7 scene 6: a deterministic frame
+            # verdict for a Rockstar-logo frame, no vision, no hashes).
+            # Committing it here would short-circuit every recovery tier
+            # below (the YouTube frame pool only runs `if not accepted`)
+            # and end in a graphic even though verified web media for the
+            # same job sits unused. Fall through to the recovery chain
+            # instead; the frame is not registered anywhere, so no later
+            # scene can borrow it as verified either. A bound vision
+            # verdict (verified_requirement_hash + verified_asset_sha256
+            # matching this scene and file) commits exactly as before, and
+            # so does any verdict vision actually passed: hash binding is
+            # the ideal, a vision pass is the requirement, and a verdict
+            # with no vision evidence at all is the only thing that falls
+            # through. Without that boundary the fall-through discards
+            # every vision-verified strict-identity clip whose verdict was
+            # never hash-stamped (the 63-scene listicle and the royal
+            # quota tests both regressed on exactly that).
+            unbound_youtube_acceptance = (
+                _is_youtube_source(resolution)
+                and bool(
+                    (scene.get("visual_requirement") or {}).get("strict_identity")
+                    if isinstance(scene.get("visual_requirement"), Mapping)
+                    else False
+                )
+                and not _review_bound_to_scene(scene, resolution)
+                and not _verdict_has_vision_evidence(qwen)
+            )
+            if unbound_youtube_acceptance:
+                attempts[index].append({
+                    "source": str(resolution.provider or ""),
+                    "stage": "bound_pixel_review",
+                    "status": "accepted_without_bound_pixel_review",
+                    "candidate_id": str(resolution.candidate_id or ""),
+                    "candidate_path": str(resolution.selected_path or ""),
+                })
+                accepted = []
+            else:
+                resolutions[index] = resolution
+                verified_by_container.setdefault(resolution.container_id, []).append((index, resolution))
+                reuse_counts.setdefault(_resolution_asset_identity(resolution), 1)
+                continue
 
         # Same-container reuse is bounded and never adjacent. When the top-1
         # lane candidates were all rejected (or the lane came back empty) but
@@ -5779,6 +6426,28 @@ def resolve_storyboard_media_v2(
             or bool(_source_policy_value(scene, "stock_last_resort_allowed", False))
         ):
             return None
+        # Gaming guard, hoisted from the adapter (guarded_stock_lane): real
+        # stock cannot depict a named game's world, so a gaming scene skips
+        # the stock window entirely instead of opening it and getting None
+        # back. The ledger entry makes "0 candidates" read as policy, not
+        # failure. The stock window filters these scenes out before any
+        # worker starts; this is the defense-in-depth check for direct calls.
+        try:
+            from .visual_intelligence.semantic_guard import is_gaming_scene
+            gaming_scene = bool(is_gaming_scene(scene))
+        except Exception:
+            gaming_scene = False
+        if gaming_scene:
+            _skip_entry = {
+                "source": "stock",
+                "stage": "stock_last_resort",
+                "status": "stock_skipped_gaming_topic",
+            }
+            attempts[index].append(_skip_entry)
+            _current = resolutions.get(index)
+            if _current is not None and _current.attempts is not attempts[index]:
+                _current.attempts.append(dict(_skip_entry))
+            return None
         # Reserve a small bounded grace window for the terminal stock request.
         # The primary web/YouTube workers may legitimately consume the normal
         # media deadline; without this reserve, the final fallback could never
@@ -6277,7 +6946,7 @@ def resolve_storyboard_media_v2(
                 prior = gated_outcomes.get((index, path))
                 # A transport/deadline miss is not a visual rejection. Retry
                 # only unavailable checks, never an actual negative verdict.
-                if prior and (prior[2] or _quota_gate_is_hard_rejection(prior[3], prior[5])
+                if prior and (prior[2] or _quota_gate_is_hard_rejection(prior[3], prior[5], scene=rows[index] if index < len(rows) else None)
                               or not any(token in str(prior[3]).lower() for token in ('unavailable', 'deadline', 'budget', 'timeout', 'missing_verdict'))):
                     continue
                 if not path:
@@ -6348,6 +7017,20 @@ def resolve_storyboard_media_v2(
             yt_cand = _quota_youtube_candidate(index)
             if yt_cand is not None:
                 qwen = dict(yt_cand.get("visual_decision") or yt_cand.get("qwen_result") or {})
+                # A bound pixel review is a live vision verdict (or live
+                # semantic verification) for this scene's bytes. The
+                # fail-open / soft-pass mints below manufacture
+                # accepted/visual_checked from "vision unavailable" or
+                # "the file exists"; they must not also manufacture the
+                # binding hashes, or the rescue pass and the final gate
+                # would mistake an unbound deterministic verdict for a
+                # vision-verified cut (proof job a57cb5c7 scene 6:
+                # Rockstar-logo frame, no vision, no hashes). Capture the
+                # live-bound state before any mint touches the verdict.
+                qwen_live_bound = bool(
+                    (qwen.get("visual_checked") and qwen.get("accepted"))
+                    or qwen.get("semantic_verified")
+                )
                 # Check authoritative visual gate outcome: never promote a candidate
                 # that was explicitly rejected by the live vision verifier.
                 gated = gated_outcomes.get((index, str(yt_cand.get("path") or "")))
@@ -6364,7 +7047,7 @@ def resolve_storyboard_media_v2(
                     is_unsafe = bool(isinstance(gated_qwen, Mapping) and (gated_qwen.get("unsafe_content") or gated_qwen.get("suggestive_content")))
                     # This quota lane runs after normal allocation, so its
                     # relaxed score must not undo an explicit visual veto.
-                    fatal_rejection = is_unsafe or _quota_gate_is_hard_rejection(gated_reason, gated_qwen)
+                    fatal_rejection = is_unsafe or _quota_gate_is_hard_rejection(gated_reason, gated_qwen, scene=rows[index] if index < len(rows) else None)
                     vision_transport_fail = str(gated_reason or "").lower() in {
                         "vision_unavailable", "visual_verifier_unavailable", "deadline_exceeded",
                         "timeout", "missing_verdict", "strict_identity_requires_live_semantic_verification"
@@ -6398,6 +7081,10 @@ def resolve_storyboard_media_v2(
                         successful_visual_gate = True
                         if gated_qwen and isinstance(gated_qwen, Mapping):
                             qwen.update(gated_qwen)
+                            qwen_live_bound = qwen_live_bound or bool(
+                                (gated_qwen.get("visual_checked") and gated_qwen.get("accepted"))
+                                or gated_qwen.get("semantic_verified")
+                            )
                             if soft_pass:
                                 qwen["accepted"] = True
                 else:
@@ -6584,11 +7271,16 @@ def resolve_storyboard_media_v2(
                 qwen["reason"] = qwen.get("reason") or "youtube_quota_upgrade"
                 scene_req = scene.get("visual_requirement") if isinstance(scene.get("visual_requirement"), Mapping) else {}
                 expected_req_hash = str(scene_req.get("requirement_hash") or "").strip()
-                if expected_req_hash and not qwen.get("verified_requirement_hash"):
+                # Stamp the binding hashes only for a live-bound verdict.
+                # A fail-open / soft-pass mint has no vision behind it, so
+                # its hashes stay absent: the rescue pass reopens the scene
+                # for real media and the final gate still sees the verdict
+                # as unbound instead of taking a stamped hash as proof.
+                if expected_req_hash and not qwen.get("verified_requirement_hash") and qwen_live_bound:
                     qwen["verified_requirement_hash"] = expected_req_hash
                 from services.visual_intelligence.decision import asset_fingerprint
                 cut_sha = asset_fingerprint(selected_path) if selected_path else ""
-                if cut_sha and not qwen.get("verified_asset_sha256"):
+                if cut_sha and not qwen.get("verified_asset_sha256") and qwen_live_bound:
                     qwen["verified_asset_sha256"] = cut_sha
                 qwen["visual_review_policy_version"] = 17
                 attempts_for_scene = list((current.attempts if current else attempts.get(index, [])) or [])
@@ -6648,6 +7340,14 @@ def resolve_storyboard_media_v2(
             and str(resolution.status or "").strip().lower() == "accepted"
             and str(resolution.verification_status or "").strip().lower()
             in {"verified", "verified_reuse", "soft_visual_pass", "deterministic_degraded", "youtube_quota_upgrade"}
+            # Quota scenes are the footage promise of the mix: only a
+            # semantically verified clip may be reused into another quota
+            # scene. A deterministic_degraded accept (no live vision) or a
+            # verdict without the semantic flag never seeds quota retention.
+            and (
+                isinstance(resolution.visual_decision, Mapping)
+                and bool(resolution.visual_decision.get("semantic_verified"))
+            )
             and (
                 not isinstance(resolution.visual_decision, Mapping)
                 or (
@@ -6963,13 +7663,83 @@ def resolve_storyboard_media_v2(
     unresolved_before_stock = [
         idx for idx in range(len(rows))
         if resolutions.get(idx) is not None
-        and resolutions[idx].provider in {"neutral", "graphic"}
+        and (
+            resolutions[idx].provider in {"neutral", "graphic"}
+            # A strict-identity YouTube selection whose verdict is not bound
+            # to this scene and these bytes will be rejected by the final
+            # gate ('visual_verification_pending') exactly like an unresolved
+            # scene, so it gets the same rescue attempt while the job pool
+            # is still available. The main loop already falls through for
+            # primary-lane acceptances; this covers selections that arrived
+            # through later recovery tiers (e.g. verified global recovery
+            # reusing a clip verified for a different scene). Same boundary
+            # as the main loop: a verdict vision actually passed commits
+            # even without hash binding — only a no-vision verdict is
+            # reopened here.
+            or (
+                _is_youtube_source(resolutions[idx])
+                and bool(
+                    (rows[idx].get("visual_requirement") or {}).get("strict_identity")
+                    if isinstance(rows[idx].get("visual_requirement"), Mapping)
+                    else False
+                )
+                and not _review_bound_to_scene(rows[idx], resolutions[idx])
+                and not _verdict_has_vision_evidence(resolutions[idx].visual_decision)
+            )
+        )
     ]
     if unresolved_before_stock:
         print(f"   [v2] pre-stock web image rescue checking {len(unresolved_before_stock)} unresolved scene(s)...", flush=True)
+        # Byte-level use counts mirror the final render gate, which dedupes
+        # by file bytes: the same pixels under a new path still count as a
+        # repeat. Provider identities alone miss re-downloaded copies.
+        rescue_sha_cache: dict[str, str] = {}
+
+        def _rescue_sha(path: str) -> str:
+            if path not in rescue_sha_cache:
+                rescue_sha_cache[path] = _sha256_file_hexdigest(path)
+            return rescue_sha_cache[path]
+
+        final_sha_uses: dict[str, int] = {}
+        for _resolution in resolutions.values():
+            _path = str(_resolution.selected_path or "")
+            _digest = _rescue_sha(_path) if _path else ""
+            if _digest:
+                final_sha_uses[_digest] = final_sha_uses.get(_digest, 0) + 1
+
         for idx in unresolved_before_stock:
             scene = rows[idx]
+            # Guards the final gate enforces, applied before choosing: the
+            # gate rejects any asset whose bytes repeat an adjacent scene
+            # (`excess_media_reuse_indices`) and any asset already used
+            # twice. The rescue used to check only the provider-identity
+            # count, so it picked the adjacent scene's own file (GTA VI
+            # proof job scene 2 rescued scene 1's still) and the gate then
+            # threw it away for a graphic.
+            adjacent_identities, adjacent_digests = _adjacent_asset_keys(resolutions, idx)
+
+            def _note_rescue_skip(status: str, path: str) -> None:
+                entry = {
+                    "source": "web",
+                    "stage": "pre_stock_web_rescue",
+                    "status": status,
+                    "path": path,
+                }
+                attempts[idx].append(dict(entry))
+                current = resolutions.get(idx)
+                if current is not None and current.attempts is not attempts[idx]:
+                    current.attempts.append(dict(entry))
+
+            # A strict YouTube selection reopened here had no bound pixel
+            # review; say so in the ledger instead of silently re-resolving.
+            _previous = resolutions.get(idx)
+            if _previous is not None and _is_youtube_source(_previous):
+                _note_rescue_skip(
+                    "reopened_unbound_acceptance",
+                    str(_previous.selected_path or ""),
+                )
             web_candidates: List[Dict[str, Any]] = []
+            deferred_adjacent: list = []
             seen_cands = set()
 
             def _add_cand(c: Any) -> None:
@@ -7016,12 +7786,38 @@ def resolve_storyboard_media_v2(
                 if not (c_path and Path(c_path).is_file() and Path(c_path).stat().st_size > 0):
                     continue
                 passed, reason = _candidate_hard_gate(scene, c)
-                if not passed:
+                if not passed and not _rescue_general_media_eligible(scene, c, reason, gated_outcomes):
                     continue
+                if not passed:
+                    # Soft identity failure only (see the helper): vision
+                    # already accepted these pixels for another scene of
+                    # this job and nothing evidences a conflicting identity,
+                    # so the asset may serve as general same-job media.
+                    # Cap, adjacency, conflict and re-verification checks
+                    # below still apply; the ledger records the tier.
+                    _note_rescue_skip("general_same_job_media", c_path)
                 c_identity = _web_asset_identity(c)
                 cap = _reuse_limit_for_resolution(scene, c, non_mixed_limit=2) if hasattr(c, "provider") else 2
                 if c_identity and final_uses.get(c_identity, 0) >= cap:
+                    _note_rescue_skip("rejected_reuse_cap", c_path)
                     continue
+                candidate_sha = _rescue_sha(c_path)
+                if candidate_sha and final_sha_uses.get(candidate_sha, 0) >= cap:
+                    _note_rescue_skip("rejected_reuse_cap", c_path)
+                    continue
+                # # Adjacent reuse is a last resort, not a rejection. The
+                # downstream gate does reject an adjacent repeat
+                # (`excess_media_reuse_indices`), so a non-adjacent verified
+                # donor always wins — but refusing the only verified media
+                # in the job would return a neutral card while usable pixels
+                # sit on disk, which is exactly the stall policy's tier 1
+                # (reuse the closest already-downloaded media). Defer the
+                # adjacent candidate; it is used only when no non-adjacent
+                # valid candidate exists at all.
+                is_adjacent_reuse = bool(
+                    (c_identity and c_identity in adjacent_identities)
+                    or (candidate_sha and candidate_sha in adjacent_digests)
+                )
 
                 outcome = gated_outcomes.get((idx, c_path))
                 v_verified = False
@@ -7039,10 +7835,19 @@ def resolve_storyboard_media_v2(
                     if v_qwen.get("unsafe_content") or v_qwen.get("suggestive_content"):
                         continue
                     from .visual_intelligence.semantic_guard import explicit_scene_conflict
-                    if explicit_scene_conflict(v_qwen, relaxed=True):
+                    if explicit_scene_conflict(v_qwen, relaxed=True, scene=scene):
                         continue
 
-                valid_web_candidates.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
+                if is_adjacent_reuse:
+                    # First-pass refusal, not a final rejection: the
+                    # candidate is deferred (see the promotion below) and
+                    # the ledger keeps the "rejected_adjacent_reuse" entry
+                    # the leonida test pins, so a later reader can tell the
+                    # adjacent donor lost the first pass on purpose.
+                    _note_rescue_skip("rejected_adjacent_reuse", c_path)
+                    deferred_adjacent.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
+                else:
+                    valid_web_candidates.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
 
             if not valid_web_candidates:
                 # Cross-scene rescue: check other storyboard scenes' discovered or web_lane candidates
@@ -7064,12 +7869,35 @@ def resolve_storyboard_media_v2(
                     if not (c_path and Path(c_path).is_file() and Path(c_path).stat().st_size > 0):
                         continue
                     passed, reason = _candidate_hard_gate(scene, c)
-                    if not passed:
+                    if not passed and not _rescue_general_media_eligible(scene, c, reason, gated_outcomes):
                         continue
+                    if not passed:
+                        # Soft identity failure only (see the helper):
+                        # general same-job media, as in the own-candidate
+                        # loop above.
+                        _note_rescue_skip("general_same_job_media", c_path)
                     c_identity = _web_asset_identity(c)
                     cap = _reuse_limit_for_resolution(scene, c, non_mixed_limit=2) if hasattr(c, "provider") else 2
                     if c_identity and final_uses.get(c_identity, 0) >= cap:
+                        _note_rescue_skip("rejected_reuse_cap", c_path)
                         continue
+                    candidate_sha = _rescue_sha(c_path)
+                    if candidate_sha and final_sha_uses.get(candidate_sha, 0) >= cap:
+                        _note_rescue_skip("rejected_reuse_cap", c_path)
+                        continue
+                    # # Adjacent reuse is a last resort, not a rejection. The
+                    # downstream gate does reject an adjacent repeat
+                    # (`excess_media_reuse_indices`), so a non-adjacent verified
+                    # donor always wins — but refusing the only verified media
+                    # in the job would return a neutral card while usable pixels
+                    # sit on disk, which is exactly the stall policy's tier 1
+                    # (reuse the closest already-downloaded media). Defer the
+                    # adjacent candidate; it is used only when no non-adjacent
+                    # valid candidate exists at all.
+                    is_adjacent_reuse = bool(
+                        (c_identity and c_identity in adjacent_identities)
+                        or (candidate_sha and candidate_sha in adjacent_digests)
+                    )
                     outcome = gated_outcomes.get((idx, c_path))
                     v_verified = False
                     v_qwen = None
@@ -7085,20 +7913,94 @@ def resolve_storyboard_media_v2(
                         if v_qwen.get("unsafe_content") or v_qwen.get("suggestive_content"):
                             continue
                         from .visual_intelligence.semantic_guard import explicit_scene_conflict
-                        if explicit_scene_conflict(v_qwen, relaxed=True):
+                        if explicit_scene_conflict(v_qwen, relaxed=True, scene=scene):
                             continue
-                    valid_web_candidates.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
+                    if is_adjacent_reuse:
+                        # First-pass refusal, not a final rejection: the
+                        # candidate is deferred (see the promotion below) and
+                        # the ledger keeps the "rejected_adjacent_reuse" entry
+                        # the leonida test pins, so a later reader can tell the
+                        # adjacent donor lost the first pass on purpose.
+                        _note_rescue_skip("rejected_adjacent_reuse", c_path)
+                        deferred_adjacent.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
+                    else:
+                        valid_web_candidates.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
 
+            if not valid_web_candidates and deferred_adjacent:
+                # Last resort only: no non-adjacent verified donor exists,
+                # so reuse the adjacent scene's verified media rather than
+                # a neutral card or graphic. The promotion is logged under
+                # its own status so the earlier "rejected_adjacent_reuse"
+                # entry reads as the first-pass refusal it was. A deferred
+                # donor that would show the wrong named person stays
+                # refused: the promotion must not override the identity
+                # boundary the main loop's nearest-neighbour path enforces
+                # (a Butler photo is never Kearse media).
+                promotable = []
+                for _deferred in deferred_adjacent:
+                    if _rescue_donor_identity_compatible(scene, _deferred[0], resolutions):
+                        _note_rescue_skip("adjacent_reuse_last_resort", str(_deferred[1] or ""))
+                        promotable.append(_deferred)
+                    else:
+                        _note_rescue_skip("rejected_adjacent_identity_mismatch", str(_deferred[1] or ""))
+                valid_web_candidates.extend(promotable)
             if valid_web_candidates:
+                # Closest verified media first: an asset no scene uses yet
+                # outranks an already-selected one, whatever the raw score
+                # scales say (provider scores are 0-100 while alternate
+                # scores are 0-1; see _normalize_rescue_score). A graphic
+                # must never be chosen while an unused verified alternate
+                # sits in the same job's pool.
                 valid_web_candidates.sort(
                     key=lambda item: (
+                        1 if final_uses.get(item[2], 0) == 0 else 0,
                         1 if item[3] else 0,
-                        item[4],
-                        float(item[0].get("final_score") or item[0].get("score") or item[0].get("metadata_score") or 0.0),
+                        _normalize_rescue_score(item[4]),
+                        _normalize_rescue_score(
+                            item[0].get("final_score")
+                            or item[0].get("score")
+                            or item[0].get("metadata_score")
+                            or 0.0
+                        ),
                     ),
                     reverse=True,
                 )
-                chosen_cand, chosen_path, chosen_identity, chosen_verified, chosen_score, chosen_qwen = valid_web_candidates[0]
+                # Ownership-watermark filter: the best-ranked candidate may
+                # carry a stock-agency credit line in the pixels (the
+                # Berlin Wall scene 2 photo did), which the late handoff
+                # gate rejects after this rescue has already accepted it.
+                # Walk the ranked list and take the first ownership-clean
+                # candidate instead of blindly taking [0].
+                chosen = None
+                for candidate_tuple in valid_web_candidates:
+                    candidate_path = str(candidate_tuple[1] or "")
+                    try:
+                        from .web_image.ownership_mark import inspect_ownership_mark
+                        watermarked = bool(inspect_ownership_mark(candidate_path).get("watermark"))
+                    except Exception:
+                        # Ownership OCR is best-effort and fails open.
+                        watermarked = False
+                    if watermarked:
+                        # Record on the resolution's own ledger: the
+                        # graphic-fallback resolution was built from a copy
+                        # of the module-level attempts, so appending there
+                        # alone would never reach the returned resolution.
+                        watermark_attempt = {
+                            "source": "web",
+                            "stage": "pre_stock_web_rescue",
+                            "status": "ownership_watermark_detected",
+                            "path": candidate_path,
+                        }
+                        if resolutions.get(idx) is not None:
+                            resolutions[idx].attempts.append(watermark_attempt)
+                        else:
+                            attempts[idx].append(watermark_attempt)
+                        continue
+                    chosen = candidate_tuple
+                    break
+                if chosen is None:
+                    continue
+                chosen_cand, chosen_path, chosen_identity, chosen_verified, chosen_score, chosen_qwen = chosen
 
                 # If candidate not yet verified, try verifying with visual_verifier if available
                 if not chosen_verified and visual_verifier is not None:
@@ -7185,6 +8087,19 @@ def resolve_storyboard_media_v2(
                 )
                 if chosen_identity:
                     final_uses[chosen_identity] = final_uses.get(chosen_identity, 0) + 1
+                chosen_sha = _rescue_sha(chosen_path)
+                if chosen_sha:
+                    final_sha_uses[chosen_sha] = final_sha_uses.get(chosen_sha, 0) + 1
+                # A replaced unbound YouTube selection no longer occupies
+                # its slot: release its counts so a later scene's rescue is
+                # not blocked by an asset this job no longer shows.
+                if _previous is not None and _is_youtube_source(_previous):
+                    old_identity = _resolution_asset_identity(_previous)
+                    if old_identity and final_uses.get(old_identity, 0) > 0:
+                        final_uses[old_identity] -= 1
+                    old_sha = _rescue_sha(str(_previous.selected_path or ""))
+                    if old_sha and final_sha_uses.get(old_sha, 0) > 0:
+                        final_sha_uses[old_sha] -= 1
                 print(f"   [v2] pre-stock web image rescue succeeded for scene {idx + 1} with {chosen_path}", flush=True)
 
     # Absolute last-resort real-media recovery. By this point the scene has
@@ -7197,6 +8112,36 @@ def resolve_storyboard_media_v2(
         if (resolutions.get(index) is not None
             and resolutions[index].provider in {"neutral", "graphic"})
     ]
+    # Gaming scenes skip the stock window entirely: real stock cannot depict
+    # a named game's world, and the adapter guard would return None for every
+    # one of them. Log the skip in the ledger so "0 candidates" reads as
+    # policy, not failure. (_final_stock_resolution repeats the guard for
+    # direct calls.)
+    if degraded_stock_scenes:
+        try:
+            from .visual_intelligence.semantic_guard import is_gaming_scene
+            _gaming_stock_scenes = [
+                (index, scene) for index, scene in degraded_stock_scenes
+                if bool(is_gaming_scene(scene))
+            ]
+        except Exception:
+            _gaming_stock_scenes = []
+        for _gaming_index, _gaming_scene in _gaming_stock_scenes:
+            _skip_entry = {
+                "source": "stock",
+                "stage": "stock_last_resort",
+                "status": "stock_skipped_gaming_topic",
+            }
+            attempts[_gaming_index].append(_skip_entry)
+            _current = resolutions.get(_gaming_index)
+            if _current is not None and _current.attempts is not attempts[_gaming_index]:
+                _current.attempts.append(dict(_skip_entry))
+        if _gaming_stock_scenes:
+            _gaming_stock_indices = {index for index, _scene in _gaming_stock_scenes}
+            degraded_stock_scenes = [
+                (index, scene) for index, scene in degraded_stock_scenes
+                if index not in _gaming_stock_indices
+            ]
     if degraded_stock_scenes:
         stock_started = time.monotonic()
         # Web recovery has its own later deadline. Start one shared, bounded
@@ -7333,6 +8278,36 @@ def resolve_storyboard_media_v2(
     # Note AGENTS.md runbook rule: "Mixed Media still-image reuse is an emergency allowance
     # of two non-adjacent appearances; exact YouTube clips remain single-use."
     pool_media_candidates = []
+    # Content identity per pool path, fixed at build time. A discovered row
+    # carries its provider fingerprint; a selected resolution carries its
+    # asset fingerprint. The recovery loop below used to derive the
+    # identity from a fresh, fingerprint-less SceneResolution, so it fell
+    # back to the local path — which never matches the fingerprint-keyed
+    # final_uses counts. The reuse cap then silently passed for assets
+    # already used twice (the GTA VI key art could have taken a third
+    # scene). Recording the real identity here makes the cap hold.
+    # The identity must use the SAME branch final_uses uses
+    # (_resolution_asset_identity): YouTube rows are youtube:fingerprint:
+    # (or youtube:path:/youtube:url:), web rows web:fingerprint: (or
+    # web:url:/web:path:). A web: identity for a YouTube clip never
+    # matches its youtube: count, so the clip would look unused and the
+    # single-use rule would break.
+    def _pool_candidate_identity(cand: Mapping[str, Any], path: str) -> str:
+        if isinstance(cand, Mapping) and _is_youtube_source(cand):
+            fingerprint = str(
+                cand.get("asset_fingerprint") or cand.get("fingerprint") or ""
+            ).strip().casefold()
+            if fingerprint:
+                return f"youtube:fingerprint:{fingerprint}"
+            if path:
+                return f"youtube:path:{os.path.normcase(os.path.normpath(path))}"
+            source_url = str(cand.get("source_url") or "").strip().casefold()
+            if source_url:
+                return f"youtube:url:{source_url}"
+            return ""
+        return _web_asset_identity(cand)
+
+    pool_entry_identities: Dict[str, str] = {}
     for s_idx in range(len(rows)):
         s_row = rows[s_idx] if s_idx < len(rows) else {}
         for cand in discovered.get(s_idx, []):
@@ -7343,10 +8318,27 @@ def resolve_storyboard_media_v2(
                     continue
                 c_prov = str(cand.get("provider") or cand.get("source") or "").strip().lower()
                 pool_media_candidates.append((c_p, cand, s_row, c_prov))
+                pool_entry_identities.setdefault(c_p, _pool_candidate_identity(cand, c_p))
         res_s = resolutions.get(s_idx)
         if res_s and res_s.selected_path and res_s.provider not in {"neutral", "graphic"}:
             if Path(res_s.selected_path).is_file():
                 pool_media_candidates.append((res_s.selected_path, res_s.final_scene_context, s_row, res_s.provider))
+                pool_entry_identities.setdefault(
+                    res_s.selected_path, _resolution_asset_identity(res_s)
+                )
+
+    # Distinctness first (GTA VI proof job): the pool holds both
+    # never-used discovered rows and already-selected stills. An unused
+    # verified asset must be tried before any reuse, however the rows
+    # happen to be ordered; reuse stays available under its cap as the
+    # last resort, and the loop's cap check below remains the hard guard
+    # (the static order is best-effort: counts grow as scenes recover).
+    pool_media_candidates.sort(
+        key=lambda entry: (
+            1 if final_uses.get(pool_entry_identities.get(entry[0], ""), 0) > 0 else 0,
+            entry[0],
+        )
+    )
 
     for index, scene in enumerate(rows):
         res = resolutions.get(index)
@@ -7365,6 +8357,17 @@ def resolve_storyboard_media_v2(
                 p_ctx = dict(p_origin_scene)
                 p_dec = p_cand.get("visual_decision") or p_cand.get("qwen_result") if isinstance(p_cand, Mapping) else {}
                 is_video = str(p_path).lower().endswith((".mp4", ".mov", ".mkv", ".webm"))
+                # The pool holds raw discovered rows, not gated finalists:
+                # a vision-passed web still dropped by the ownership early
+                # gate would otherwise be re-admitted here as "clean".
+                if not is_video and isinstance(p_cand, Mapping) and _web_candidate_is_ownership_marked(p_cand, p_path):
+                    res.attempts.append({
+                        "source": "pool_media_recovery",
+                        "stage": "terminal_recovery",
+                        "status": "ownership_watermark_detected",
+                        "path": p_path,
+                    })
+                    continue
                 p_res = SceneResolution(
                     scene_index=index,
                     provider="youtube" if is_video else (p_prov or "web"),
@@ -7374,7 +8377,16 @@ def resolve_storyboard_media_v2(
                 )
                 if not _strict_reuse_identity_compatible(scene, p_res):
                     continue
-                p_ident = _resolution_asset_identity(p_res) or p_path
+                # Identity from the candidate row (or the donor resolution),
+                # not from the fresh fingerprint-less p_res: a path-only
+                # identity never matches the fingerprint-keyed final_uses
+                # counts, so the reuse cap below would pass a third use of
+                # an already-twice-used still.
+                p_ident = (
+                    pool_entry_identities.get(p_path)
+                    or _resolution_asset_identity(p_res)
+                    or p_path
+                )
                 # Exact YouTube clips remain single-use; still images allow up to 2 non-adjacent appearances
                 max_uses = 1 if is_video else 2
                 current_uses = final_uses.get(p_ident, 0)
@@ -7400,6 +8412,135 @@ def resolve_storyboard_media_v2(
                 })
                 print(f"   [v2] recovered scene {index + 1} using job media pool: {Path(p_path).name} (provider={res.provider})", flush=True)
                 break
+
+    # Re-verify pool-recovered media for THIS scene. The GTA hole was that
+    # recovered media was never vision-checked for its scene: it was stamped
+    # deterministic_degraded and rendered under a graphic template. Each
+    # recovered selection gets one live check through the same cached
+    # verification entry point the primary gate uses.
+    # NOTE on batching: _run_scene_batch only judges >=2 same-scene image
+    # finalists and refuses video, so it cannot judge one recovered clip per
+    # scene; this step calls _cached_verification_result once per recovered
+    # selection instead, which still reuses a live verdict when the same
+    # scene+asset was already checked. The stored pool verdict is stripped
+    # from the candidate so a verdict bound to another scene can never be
+    # reused as this scene's. The step is deliberately not gated on the
+    # visual-gate deadline (pool recovery runs after it); the verifier's own
+    # timeout bounds the call, and a timeout keeps the degraded stamp.
+    #   - live pass (accepted + visual_checked) -> re-stamped verified_reuse
+    #   - live rejection -> the asset stays out; the graphic factory below
+    #     fills the slot honestly
+    #   - vision unavailable / timeout / no verifier -> keeps the degraded
+    #     stamp with an explicit vision_unavailable reason in the ledger
+    _recovered = [
+        (index, resolutions[index])
+        for index in range(len(rows))
+        if resolutions.get(index) is not None
+        and resolutions[index].resolution_kind == "pool_media_recovery"
+        and resolutions[index].selected_path
+    ]
+    for _rec_index, _rec_res in _recovered:
+        _rec_candidate = {
+            "path": _rec_res.selected_path,
+            "selected_path": _rec_res.selected_path,
+            "source": _rec_res.provider,
+            "provider": _rec_res.provider,
+            "media_type": _rec_res.media_type,
+            "resolution_kind": "pool_media_recovery",
+        }
+        if visual_verifier is None:
+            _rec_verdict = dict(_rec_res.visual_decision or {})
+            _rec_verdict.update({
+                "reason": "vision_unavailable",
+                "status": "vision_unavailable",
+                "visual_checked": False,
+                "visual_available": False,
+            })
+            _rec_res.visual_decision = _rec_verdict
+            _rec_res.attempts.append({
+                "source": "pool_media_recovery",
+                "stage": "terminal_recovery_reverification",
+                "status": "vision_unavailable",
+                "path": _rec_res.selected_path,
+                "reason": "vision_unavailable",
+            })
+            continue
+        try:
+            _rec_accepted, _rec_reason, _rec_score, _rec_verdict = _cached_verification_result(
+                _rec_index, rows[_rec_index], _rec_candidate, visual_verifier,
+                vision_verdict_cache, vision_unavailable,
+            )
+        except Exception as exc:
+            _rec_accepted, _rec_reason, _rec_score, _rec_verdict = (
+                False, f"visual_verifier_error:{type(exc).__name__}", 0.0, None,
+            )
+        _rec_verdict = dict(_rec_verdict) if isinstance(_rec_verdict, Mapping) else {}
+        if (
+            _rec_accepted
+            and _rec_verdict.get("visual_checked") is True
+            and not _is_verifier_unavailable_result(_rec_reason, _rec_verdict)
+        ):
+            # Live vision confirmed this asset for THIS scene. The terminal
+            # status stays degraded (it was still a rescue, not a primary
+            # accept) but the verification is re-stamped so downstream audit
+            # can tell a verified reuse from an unchecked one.
+            _rec_res.verification_status = "verified_reuse"
+            _rec_verdict.setdefault("reason", _rec_reason)
+            _rec_res.visual_decision = _rec_verdict
+            _rec_res.attempts.append({
+                "source": "pool_media_recovery",
+                "stage": "terminal_recovery_reverification",
+                "status": "verified_reuse",
+                "path": _rec_res.selected_path,
+                "reason": _rec_reason,
+            })
+        elif _is_verifier_unavailable_result(_rec_reason, _rec_verdict):
+            _rec_verdict.update({
+                "reason": _rec_reason or "vision_unavailable",
+                "status": "vision_unavailable",
+                "visual_checked": False,
+                "visual_available": False,
+            })
+            _rec_res.visual_decision = _rec_verdict
+            _rec_res.attempts.append({
+                "source": "pool_media_recovery",
+                "stage": "terminal_recovery_reverification",
+                "status": "vision_unavailable",
+                "path": _rec_res.selected_path,
+                "reason": _rec_reason or "vision_unavailable",
+            })
+        elif _rec_accepted:
+            # Retained by a soft/deterministic rule, not a live pass: keep
+            # the degraded stamp and record why it is not verified reuse.
+            _rec_verdict.setdefault("reason", _rec_reason)
+            _rec_res.visual_decision = _rec_verdict
+            _rec_res.attempts.append({
+                "source": "pool_media_recovery",
+                "stage": "terminal_recovery_reverification",
+                "status": "deterministic_retained_not_verified",
+                "path": _rec_res.selected_path,
+                "reason": _rec_reason,
+            })
+        else:
+            # Live vision rejected this asset for this scene (explicit
+            # conflict or insufficient match): it stays out so the graphic
+            # factory below can fill the slot honestly.
+            _rec_path = _rec_res.selected_path
+            _rec_res.selected_path = ""
+            _rec_res.provider = "neutral"
+            _rec_res.media_type = ""
+            _rec_res.resolution_kind = "neutral_no_claim"
+            _rec_res.verification_status = "not_applicable"
+            _rec_res.status = "degraded"
+            _rec_res.fallback_reason = f"pool_recovery_rejected:{_rec_reason}"
+            _rec_res.visual_decision = _rec_verdict
+            _rec_res.attempts.append({
+                "source": "pool_media_recovery",
+                "stage": "terminal_recovery_reverification",
+                "status": f"rejected:{_rec_reason}",
+                "path": _rec_path,
+                "reason": _rec_reason,
+            })
 
     # Produce emergency visuals only after every unresolved slot has had its
     # stock chance. A placeholder must never win the race against real media.

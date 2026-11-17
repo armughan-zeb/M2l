@@ -120,6 +120,11 @@ _NICHE_MEDIA_PROFILES.update({
     "entertainment": _media_share(.30, .65, .05), "music": _media_share(.30, .65, .05),
 })
 _GAMING_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["gaming"])
+# The gaming YouTube target: 90% of scenes served by YouTube. Single source
+# of truth for app._apply_gaming_mode_policy (which stamps it onto the job
+# config) and the adapter's quota math. The planner weights alone only
+# reach 0.80, so the target must not be derived from them.
+GAMING_YOUTUBE_TARGET_RATIO = 0.90
 _ACTION_SPORTS_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["sports"])
 _DOCUMENTARY_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["documentary"])
 _GENERAL_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["general"])
@@ -225,7 +230,7 @@ _NICHE_ALIASES = {
     "economy": "economics", "books": "literature", "poetry": "literature",
 }
 _GTA_VI_POLICY_RE = re.compile(
-    r"\b(?:gta\s*(?:vi|6)|gta\s+six|grand\s+theft\s+auto\s*(?:vi|6))\b",
+    r"\b(?:gta\s*(?:vi|6)|gta\s+six|grand\s+theft\s+auto\s*(?:vi|6)|grand\s+theft\s+auto\s+six)\b",
     re.IGNORECASE,
 )
 
@@ -631,6 +636,25 @@ def classify_mixed_media_topic(
     if _contains_topic_term(context, _SIMPLE_TOPIC_TERMS):
         return "simple"
     return "general"
+
+
+def gaming_mode_for(
+    title: str = "",
+    script: str = "",
+    scene_texts: List[str] | None = None,
+    category: str = "",
+) -> bool:
+    """True when a job is a gaming title (GTA VI or any other game).
+
+    Reuses the two existing detectors — the GTA VI story regex and the
+    topic classifier — instead of adding a third. Gaming mode drives the
+    0.90 YouTube target, YT-primary lane order, and the gaming retrieval
+    policy; it is wired into the job config by
+    ``app._resolve_mixed_media_niche_policy`` as ``config['_gaming_mode']``.
+    """
+    if _gta_vi_story(title, script, scene_texts):
+        return True
+    return classify_mixed_media_topic(title, script, scene_texts, category) == "gaming"
 
 
 def automatic_mixed_media_weights(

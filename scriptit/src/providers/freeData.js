@@ -19,6 +19,13 @@ async function getJson(url, timeoutMs = 12000) {
     if (!response.ok) {
       const error = new Error(`HTTP ${response.status} from ${new URL(url).hostname}`);
       error.status = response.status;
+      // GDELT rate-limits (429) with a Retry-After header. Surface it so
+      // the resilience layer backs off for the asked duration instead of
+      // hammering the endpoint again 400ms later.
+      if (response.status === 429) {
+        const retryAfter = Number(response.headers.get('retry-after'));
+        if (Number.isFinite(retryAfter) && retryAfter > 0) error.retryAfterMs = retryAfter * 1000;
+      }
       throw error;
     }
     return await response.json();
@@ -33,9 +40,14 @@ function dateFromGdelt(value) {
   return match ? `${match[1]}-${match[2]}-${match[3]}` : '';
 }
 
-async function gdeltSearch(query, { limit = 8 } = {}) {
+async function gdeltSearch(query, { limit = 8, timeoutMs = 12000 } = {}) {
   const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=${Math.min(25, Math.max(1, limit))}&format=json`;
-  const json = await getJson(url);
+  // Was: getJson was called with no timeout, so the 12s default applied and
+  // the caller could not tune it. The GDELT abort seen on this VM (undici +
+  // egress proxy closing sockets) already threw and was retried by the
+  // resilience layer; threading the timeout through keeps that retry window
+  // honest instead of silently fixed.
+  const json = await getJson(url, timeoutMs);
   return (json.articles || []).map((item) => ({
     title: item.title || item.seendate || 'GDELT result',
     url: item.url || '',
@@ -47,9 +59,9 @@ async function gdeltSearch(query, { limit = 8 } = {}) {
   })).filter((item) => item.url);
 }
 
-async function openAlexSearch(query, { limit = 6 } = {}) {
+async function openAlexSearch(query, { limit = 6, timeoutMs = 12000 } = {}) {
   const url = `https://api.openalex.org/works?search=${encodeURIComponent(query)}&per-page=${Math.min(25, Math.max(1, limit))}&select=id,doi,title,publication_date,primary_location,authorships,cited_by_count,open_access`;
-  const json = await getJson(url);
+  const json = await getJson(url, timeoutMs);
   return (json.results || []).map((item) => ({
     title: item.title || 'OpenAlex work',
     url: item.primary_location?.landing_page_url || item.doi || item.id || '',
@@ -61,9 +73,9 @@ async function openAlexSearch(query, { limit = 6 } = {}) {
   })).filter((item) => item.url);
 }
 
-async function crossrefSearch(query, { limit = 6 } = {}) {
+async function crossrefSearch(query, { limit = 6, timeoutMs = 12000 } = {}) {
   const url = `https://api.crossref.org/works?query.bibliographic=${encodeURIComponent(query)}&rows=${Math.min(25, Math.max(1, limit))}&select=DOI,title,URL,published,container-title,license,author`; 
-  const json = await getJson(url);
+  const json = await getJson(url, timeoutMs);
   return (json.message?.items || []).map((item) => ({
     title: item.title?.[0] || 'Crossref work',
     url: item.URL || (item.DOI ? `https://doi.org/${item.DOI}` : ''),
@@ -75,10 +87,10 @@ async function crossrefSearch(query, { limit = 6 } = {}) {
   })).filter((item) => item.url);
 }
 
-async function usgsSearch(query, { limit = 6 } = {}) {
+async function usgsSearch(query, { limit = 6, timeoutMs = 12000 } = {}) {
   if (!/earthquake|earthquakes|seismic|magnitude|aftershock/i.test(query)) return [];
   const url = `https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&orderby=time&limit=${Math.min(25, Math.max(1, limit))}&starttime=${encodeURIComponent(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())}`;
-  const json = await getJson(url);
+  const json = await getJson(url, timeoutMs);
   return (json.features || []).map((item) => ({
     title: item.properties?.title || 'USGS earthquake event',
     url: item.properties?.url || `https://earthquake.usgs.gov/earthquakes/eventpage/${item.id}`,

@@ -53,14 +53,17 @@ deliver — without asking for go-ahead. Report what you did, with numbers.
 8. **CMS down (502/530/1033) = his PC tunnel is down.** Do nothing — the
    daemon retries in-process, work is never lost. Delivery waits for the
    tunnel to come back. Never restart the container for a CMS outage.
-9. **Inference is fast when the resident worker runs — and that is the
+9. **Inference is fast when the resident worker pool runs — and that is the
     default.** The daemon's resident inbox polls every second and the
-    resident inference worker answers each request in seconds (spawn it
-    from `scripts/resident-inference-worker/WORKER_BRIEF.md` before the
-    first job; `start-daemon.sh` warns if its heartbeat is stale). The
-    host hook is only the fallback — if the worker is down, round trips
-    fall back to ~4.5 min hook wakes and requests can expire. Never run
-    without the worker and call it normal; fix the worker first.
+    resident inference worker pool answers requests in parallel (a
+    supervisor spawns 2–8 workers from
+    `scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md`, scaling
+    with the backlog; each worker follows
+    `scripts/resident-inference-worker/WORKER_BRIEF.md`). Spawn the pool
+    before the first job; `start-daemon.sh` warns if no worker heartbeat
+    is fresh. The host hook is only the fallback — if the pool is down,
+    round trips fall back to ~4.5 min hook wakes and requests can expire.
+    Never run without the pool and call it normal; fix the pool first.
 10. **Scoped instructions are literal.** A validation-only run stops before
     rendering. A bare Stop/Wait halts first, questions later. A named stop
     covers exactly what was named.
@@ -77,9 +80,11 @@ deliver — without asking for go-ahead. Report what you did, with numbers.
 | YT vision frames per clip | 2, at transcript moment | `VIDZEO_YT_VISUAL_GATE_FRAMES` |
 | YT download workers | 4 | `VIDZEO_YT_DOWNLOAD_CONCURRENCY` |
 | Agent min wall | 3600s | `VIDZEO_AGENT_MIN_WALL_SECONDS` |
-| Inference transport | spool (resident worker) | `MUSE_INFERENCE_COMMAND=node scripts/muse-inference-spool.cjs` |
+| Inference transport | spool (resident worker pool) | `MUSE_INFERENCE_COMMAND=node scripts/muse-inference-spool.cjs` |
 | Resident inbox | on (1s poll, 8 parallel) | daemon default when a transport is set |
-| Query chunk | 12 scenes/request | `VIDZEO_BRAIN_SCENE_CHUNK_SIZE` |
+| Resident pool | supervisor + 2–8 workers, claim protocol | `POOL_SUPERVISOR_BRIEF.md`; target = clamp(ceil(pending/3), 2, 8); per-worker heartbeat `worker-alive-<workerId>.json` |
+| Request wall (inbox transport wait) | 15 min | `MUSE_INBOX_REQUEST_WALL_MS` (default 900000); probes still cap at 2 min |
+| Query chunk | 32 scenes/request (bulk) | `VIDZEO_BRAIN_SCENE_CHUNK_SIZE` (clamp 3–32; a whole short job in one request) |
 | Direction batch | 8 scenes, 4 workers | external-agent override |
 | Vision batch | 4 candidates/request | `compare_images` in the vision gate |
 | Vision concurrency (external-agent) | 4 | `VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY` |
@@ -132,9 +137,10 @@ Verify both daemon and server come back healthy after any restart.
 
 Docker setup: `docker/SETUP.md`. One image, one container — the daemon
 spawns Vidnets itself. `setup.sh` is the only supported first-run path.
-Before the first job, spawn the resident inference worker from
-`scripts/resident-inference-worker/WORKER_BRIEF.md` — it is the inbox
-answerer; without it every round trip falls back to slow hook wakes. The
+Before the first job, spawn the resident inference worker pool from
+`scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md` — the
+supervisor spawns 2–8 worker agents that answer the inbox in parallel;
+without the pool every round trip falls back to slow hook wakes. The
 host Muse hook (`vidnets-inbox-watch`, template in `docker/hooks/`) must
 also be installed on the host Muse VM as the fallback, or the start gate
 fails closed when no resident transport is configured.

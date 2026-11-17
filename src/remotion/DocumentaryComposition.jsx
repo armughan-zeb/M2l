@@ -117,7 +117,7 @@ function MediaLayer({ media, theme, scene, visualDNA = {}, isBlurred = false }) 
     || String(rawSrc || '').includes('graphic_fallback')
     || media?.provider === 'neutral'
     || isRecoveryMedia(media, rawSrc);
-  if (!src || mediaFailed) return <MissingSceneMotionGraphic scene={scene} visualDNA={visualDNA} theme={theme} backgroundOnly={recoveryIsBackdrop(scene)} copyOwnedElsewhere={true} />;
+  if (!src || mediaFailed || isEmergencyPlate) return <MissingSceneMotionGraphic scene={scene} visualDNA={visualDNA} theme={theme} backgroundOnly={recoveryIsBackdrop(scene)} copyOwnedElsewhere={true} />;
   const motion = scene?.camera?.disabled ? 'hold' : String(scene?.camera?.motion || '').toLowerCase();
   const sourceStartSeconds = Math.max(0, Number(media?.source_start ?? media?.in_point ?? 0) || 0);
   const sourceStartFrames = Math.round(sourceStartSeconds * fps);

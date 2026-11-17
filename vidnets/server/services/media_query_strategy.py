@@ -10,11 +10,22 @@ _STOP.update('few fewer fewest several many can may might must anyone anything s
 _STOP.update('over under four five six seven eight nine ten hundred thousand million billion'.split())
 _STOP.update('some companies company firms firm brands brand british royal warrants warrant monarch business businesses'.split())
 _VISIBLE = ('touchscreen', 'dashboard', 'charger', 'battery', 'batteries', 'storage', 'screen', 'interface',
-    'engine', 'suspension', 'cabin', 'interior', 'exterior', 'wheels', 'factory',
+    'engine', 'suspension', 'cabin', 'cab', 'interior', 'exterior', 'wheels', 'factory',
     'driving', 'sprint', 'sprinting', 'running', 'charging', 'recharging', 'solar', 'panels',
     'race', 'stadium', 'field', 'courtroom', 'police', 'rubble', 'rescue', 'street',
     'bridge', 'harbor', 'ship', 'airport', 'aircraft', 'laboratory', 'rocket', 'portrait', 'document',
-    'carriage', 'carriages', 'cars', 'chapel', 'insignia', 'procession', 'throne', 'banquet', 'dining', 'regalia')
+    'carriage', 'carriages', 'cars', 'chapel', 'insignia', 'procession', 'throne', 'banquet', 'dining', 'regalia',
+    'whiteout', 'blizzard', 'snowstorm',
+    # Generic shot/scene words (GTA VI fix): aerial, neon streets, prison
+    # gates, police chase, open world, mission — visible nouns and shot
+    # phrases a camera can show, grounded in the narration/visual intent.
+    'aerial', 'neon', 'prison', 'gates', 'chase', 'mission', 'missions',
+    'streets', 'street', 'night', 'city', 'island', 'keys', 'beach',
+    'skyline', 'downtown', 'highway', 'ocean', 'swamp', 'swamps',
+    'trailer', 'gameplay', 'console', 'controller', 'crowd', 'stadium',
+    'concert', 'overhead', 'close-up', 'establishing', 'tracking', 'wide',
+    'ground-level', 'street-level', 'neon streets', 'police chase',
+    'open world', 'prison gates')
 
 
 def supported_specific_topic(title, narration, broad_subject):
@@ -66,17 +77,77 @@ def grounded_institutional_focus(planned, narration):
     return ''
 
 
-def query_planning_budget(chunk_count, worker_count):
+def query_planning_budget(chunk_count, worker_count, per_wave_seconds=None):
     """Scale planning time with parallel waves, without imposing a film limit."""
     try:
-        per_wave = float(os.environ.get('VIDZEO_QUERY_PLAN_WAVE_SECONDS', '120') or 120)
+        per_wave = float(per_wave_seconds if per_wave_seconds is not None else os.environ.get('VIDZEO_QUERY_PLAN_WAVE_SECONDS', '120') or 120)
         if not math.isfinite(per_wave):
             per_wave = 120.0
     except (TypeError, ValueError):
         per_wave = 120.0
-    per_wave = max(45.0, min(300.0, per_wave))
+    per_wave = max(45.0, per_wave)
     waves = max(1, math.ceil(max(1, chunk_count) / max(1, worker_count)))
     return waves * per_wave
+
+
+_VIEWPOINT_PATTERNS = (
+    re.compile(r"\b(?:from|inside|within|in)\s+(?:the\s+)?(?:driver'?s\s+)?cab\b", re.I),
+    re.compile(r"\b(?:driver'?s\s+)?cab\s+(?:interior|view)\b", re.I),
+    # Generic shot phrases (GTA VI fix): viewpoints live in visual_intent
+    # ("Aerial and street-level shots of neon-lit Vice City streets") as
+    # well as in narration, not just "from the cab".
+    re.compile(r"\baerial(?:\s+(?:shots?|view|footage|photography))?\b", re.I),
+    re.compile(r"\bstreet-level(?:\s+(?:shots?|view))?\b", re.I),
+    re.compile(r"\bstreet level(?:\s+(?:shots?|view))?\b", re.I),
+    re.compile(r"\bclose-ups?\b", re.I),
+    re.compile(r"\bprison gates?\b", re.I),
+    re.compile(r"\bneon(?:-lit)?\s+streets?\b", re.I),
+    re.compile(r"\bpolice chase\b", re.I),
+    re.compile(r"\bopen world\b", re.I),
+    re.compile(r"\bmission(?:\s+(?:gameplay|footage))?\b", re.I),
+    re.compile(r"\bdriving(?:\s+(?:shots?|footage))?\b", re.I),
+    re.compile(r"\bestablishing shots?\b", re.I),
+    re.compile(r"\bwide shots?\b", re.I),
+    re.compile(r"\boverhead(?:\s+(?:shots?|view))?\b", re.I),
+    re.compile(r"\bground-level(?:\s+(?:shots?|view))?\b", re.I),
+    re.compile(r"\btracking shots?\b", re.I),
+)
+_NEGATED_WORD_RE = re.compile(
+    r"\bnot\s+(?:from\s+|inside\s+|in\s+|at\s+|on\s+|near\s+)?(?:the\s+|a\s+|an\s+)?([A-Za-z][A-Za-z'\-]{2,})",
+    re.I,
+)
+
+
+def _viewpoint_phrases(text: str) -> list[str]:
+    """Camera-viewpoint phrases stated in the narration or visual intent.
+
+    A viewpoint is a search term, not narration glue: it names the shot the
+    scene needs. Every word of a returned phrase occurs in the scene text
+    or in the scene's own visual intent ("Aerial and street-level shots
+    of neon-lit Vice City streets", "prison gates").
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for pattern in _VIEWPOINT_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            phrase = re.sub(r"\s+", " ", match.group(0)).strip().lower()
+            if phrase and phrase not in seen:
+                seen.add(phrase)
+                found.append(phrase)
+    return found
+
+
+def _negated_words(text: str) -> set[str]:
+    """Words the narration explicitly excludes ("not from the lineside").
+
+    A negated viewpoint must never become a positive search facet: a query
+    carrying "lineside" retrieves lineside shots, exactly what the scene
+    forbids. "not" itself is a negation marker, never a facet.
+    """
+    words = {"not"}
+    for match in _NEGATED_WORD_RE.finditer(text or ""):
+        words.add(match.group(1).casefold())
+    return words
 
 
 def enrich_scene_queries(planned, requirement, narration, *, provider, focus_terms=(), preserve_planned_order=False):
@@ -85,29 +156,53 @@ def enrich_scene_queries(planned, requirement, narration, *, provider, focus_ter
     if not anchor:
         return list(dict.fromkeys(str(value or '').strip() for value in planned if str(value or '').strip()))
     text = re.sub(r'\s+', ' ', str(narration or '')).strip()
+    # The shot lives in visual_intent as well as narration ("Aerial and
+    # street-level shots of neon-lit Vice City streets", "prison gates"):
+    # mine viewpoints and visible words from both. Negations stay
+    # narration-only — a visual intent never negates a viewpoint.
+    intent_text = re.sub(r'\s+', ' ', str(req.get('visual_intent') or '')).strip()
+    grounded_text = f"{text} {intent_text}".strip()
     anchor_tokens = set(re.findall(r'[\w]+', anchor.casefold()))
     facets = []
+    # A camera viewpoint stated in the narration ("from the cab", "inside
+    # the cab") is a search term, not narration glue: it must survive into
+    # the query, ahead of generic facets. A negated viewpoint ("not from
+    # the lineside") must never become a positive facet.
+    negated = _negated_words(text)
+    facets.extend(_viewpoint_phrases(grounded_text))
     # Model-selected facets are permitted only when backed by this scene.
     if isinstance(focus_terms, str):
         focus_terms = [focus_terms]
     for value in focus_terms or ():
         phrase = str(value or '').strip()
-        if phrase and phrase.casefold() in text.casefold() and phrase.casefold() not in anchor.casefold():
+        if phrase and phrase.casefold() in text.casefold() and phrase.casefold() not in anchor.casefold() and phrase.casefold() not in negated:
             facets.append(phrase)
     # Prefer objects/actions a camera can show over abstract narration glue.
-    # Every added word must occur in this scene; the LLM's specific queries
-    # remain ahead of this grounded mechanical recall supplement.
+    # Every added word must occur in this scene (narration or its visual
+    # intent); the LLM's specific queries remain ahead of this grounded
+    # mechanical recall supplement.
     for word in _VISIBLE:
-        if (re.search(r'\b' + re.escape(word) + r'\b', text, re.I)
-                and word not in anchor_tokens and word not in {x.casefold() for x in facets}):
+        if (re.search(r'\b' + re.escape(word) + r'\b', grounded_text, re.I)
+                and word not in anchor_tokens and word not in {x.casefold() for x in facets}
+                and word not in negated):
             facets.append(word)
     named_facets = [word for word in re.findall(r'\b[A-Z][A-Za-z0-9-]{2,}\b', text)
-                    if word.casefold() not in anchor_tokens | _STOP
+                    if word.casefold() not in anchor_tokens | _STOP | negated
                     and word not in {'Inside', 'Outside', 'Larger', 'Smaller', 'However', 'Meanwhile'}]
     for word in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", text):
-        if word.casefold() not in _STOP | _ABSTRACT | anchor_tokens and word.casefold() not in {x.casefold() for x in facets}:
+        if word.casefold() not in _STOP | _ABSTRACT | anchor_tokens | negated and word.casefold() not in {x.casefold() for x in facets}:
             facets.append(word)
-    local = ' '.join(facets[:3])
+    # Build the grounded local phrase from the first facets, skipping a bare
+    # word already carried by an earlier viewpoint phrase ("from the cab"
+    # already says "cab"). The bare word stays in facets so planned queries
+    # containing it still rank as concrete/useful.
+    local_parts = []
+    for facet in facets[:3]:
+        words = facet.casefold().split()
+        if len(words) == 1 and any(words[0] in earlier.casefold().split() for earlier in local_parts):
+            continue
+        local_parts.append(facet)
+    local = ' '.join(local_parts)
     attributes = req.get('required_attributes') or {}
     year = str(attributes.get('year') or '') if isinstance(attributes, Mapping) else ''
     suffix = 'footage' if provider == 'youtube' else 'photo'
@@ -119,6 +214,21 @@ def enrich_scene_queries(planned, requirement, narration, *, provider, focus_ter
     useful = [value for value in candidates if any(facet.casefold() in value.casefold() for facet in facets[:5])]
     ordered = (concrete + ([specific] if local else []) + useful if visible_facets
                else useful + ([specific] if local else []))
+    # Scene-relative game (GTA VI fix): the requirement carries the game
+    # THIS scene narrates. If no planned query names it, lead with a
+    # game-anchored specific query — a GTA V-history scene must seek GTA V
+    # footage, not the title game's. Token-boundary game detection only,
+    # so the garbled "GTA VI V" never counts as naming GTA V.
+    try:
+        from .vidzeo_brain import game_canonical_title, game_keys_named_in_text
+        scene_game_key = str(req.get('scene_subject_game') or '').strip().lower()
+        scene_game_title = game_canonical_title(scene_game_key)
+    except Exception:
+        scene_game_key = scene_game_title = ''
+    if scene_game_title and scene_game_key and not any(
+            scene_game_key in game_keys_named_in_text(value) for value in candidates):
+        ordered = [f'{scene_game_title} {local} {suffix}'.strip() if local
+                   else f'{scene_game_title} {suffix}'] + ordered
     ordered += candidates + [f'{anchor} {year} {suffix}'.replace('  ', ' ')]
     if preserve_planned_order:
         # An explicit director query already names a visible shot. Narrative

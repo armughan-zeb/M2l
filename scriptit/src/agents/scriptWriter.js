@@ -72,6 +72,36 @@ const crypto = require('crypto');
 // still missing the newer first-party evidence lane.
 const RESEARCH_CACHE_VERSION = 'evidence-v14';
 
+function researchItemCount(research) {
+  return Object.entries(research || {})
+    .filter(([key, value]) => key !== 'errors' && Array.isArray(value))
+    .reduce((total, [, items]) => total + items.length, 0);
+}
+
+// Reload the pipeline's durable checkpoint for this topic: the pipeline
+// checkpoints its fast-pass evidence to the research store before the deep
+// pass, so a writer deadline that fires mid-pipeline must reuse that
+// partial evidence instead of discarding it and starting from empty.
+// Only a FRESH checkpoint counts (written within the last hour — i.e. by
+// this run, not a stale job from an earlier day); sufficiency is NOT
+// required here, because partial evidence is exactly what this recovers
+// and the writer's own flow (synthesis -> ungrounded) handles thin
+// evidence downstream. Never throws: a store failure degrades to null.
+async function loadCheckpointedResearch(topic, storeOverride) {
+  try {
+    const store = storeOverride || await getResearchStore();
+    const savedJob = await store.latestJob(topic);
+    const savedResearch = savedJob?.result?.research;
+    if (!savedResearch || researchItemCount(savedResearch) === 0) return null;
+    const savedAt = Date.parse(savedJob.updated_at || savedJob.updatedAt || '');
+    if (savedAt && Date.now() - savedAt > 60 * 60 * 1000) return null;
+    return savedResearch;
+  } catch (err) {
+    console.warn('[ScriptIT] Could not load checkpointed research:', err.message);
+    return null;
+  }
+}
+
 function isReusableResearchJob(job) {
   if (!job || !job.result || !job.result.research || !job.result.brief) return false;
   // A partial result is intentionally persisted so it can be inspected and
@@ -412,7 +442,7 @@ async function safeWriteDraft(options) {
   }
 }
 
-function evaluateDraft(content, { topic = '', wordTarget, previousScripts, evidence, contentType }) {
+function evaluateDraft(content, { topic = '', wordTarget, previousScripts, evidence, contentType, duration = '' }) {
   const raw = normalizeNarration(content);
   const validIds = new Set((evidence && evidence.claims ? evidence.claims : []).map((claim) => claim.id));
   const markers = [...raw.matchAll(/<evidence:\s*([^>]+)>/gi)]
@@ -427,7 +457,7 @@ function evaluateDraft(content, { topic = '', wordTarget, previousScripts, evide
     .replace(/([.!?])[ \t]+(["”])(?=\s|$)/g, '$1$2')
     .replace(/^#+\s+.*$/gm, '')
     .trim();
-  const quality = assessScript({ script, topic, wordTarget, previousScripts, contentType });
+  const quality = assessScript({ script, topic, wordTarget, previousScripts, contentType, duration });
   quality.editorialIssues = [...quality.issues];
   const supportIssues = unsupportedSentenceIssues(script, evidence || {});
   const markerIssues = markerSupportIssues(raw, evidence || {});
@@ -439,6 +469,22 @@ function evaluateDraft(content, { topic = '', wordTarget, previousScripts, evide
   // Never force-pass a long draft. A verbose script can still be generic,
   // unsupported, or full of process commentary.
   quality.passes = quality.issues.length === 0 && invalidMarkers.length === 0;
+  // Ungrounded carve-out (Nov 15, 2026): when there is NO non-synthetic
+  // evidence at all, specificity (concrete dates / numbers / people) cannot
+  // be satisfied without inventing facts — and the ungrounded draft prompt
+  // explicitly forbids inventing them. Waive the specificity issue only in
+  // that case, so the draft is judged on structure alone. A grounded draft
+  // that stays generic still fails specificity as before. The waiver is
+  // visible in the metadata (specificity.passes stays false); only the
+  // verdict accounts for the ungrounded context.
+  const hasRealEvidence = (evidence && (evidence.claims || []).some((claim) => !claim.synthetic));
+  if (!hasRealEvidence) {
+    const specificityIssue = 'The draft names almost no concrete';
+    quality.issues = quality.issues.filter((issue) => !String(issue).startsWith(specificityIssue));
+    quality.editorialIssues = quality.editorialIssues.filter((issue) => !String(issue).startsWith(specificityIssue));
+    quality.passes = quality.issues.length === 0 && invalidMarkers.length === 0;
+    quality.structuralPasses = quality.editorialIssues.length === 0 && invalidMarkers.length === 0;
+  }
   quality.evidenceMarkers = markers.filter((id) => validIds.has(id));
   quality.invalidEvidenceMarkers = invalidMarkers;
   quality.supportIssues = supportIssues;
@@ -578,6 +624,9 @@ async function runScriptGeneration({
   forceFreshResearch = false,
   research,
   researchJobFn = runResearchJob,
+  researchRecoveryFn = gatherResearch,
+  synthesizeDossierFn = null,
+  totalDeadlineMs = 600000,
   chatCompletionFn,
   onProgress,
   onDraft,
@@ -741,27 +790,49 @@ async function runScriptGeneration({
       signal?.throwIfAborted();
       console.warn('[ScriptIT] Research pipeline failed; falling back to direct research:', err.message);
       // The recovery shares the one research deadline — it gets only the
-      // time left in it, never a fresh 90s. Past the deadline there is no
-      // second pass: the writer proceeds with whatever evidence exists.
+      // time left in it, never a fresh 90s. The pipeline passes are 60s
+      // each inside the 180s deadline, so the recovery normally has ~60s
+      // left. It runs in quick mode on purpose: quick is reliable-first
+      // (Bing / Wikipedia / RSS) with 8.5s per-provider budgets, so a
+      // rescue pass fits in the remaining time instead of repeating the
+      // full slow-provider sweep that just timed out. Past the deadline
+      // there is no second pass: the writer proceeds with whatever
+      // evidence exists.
       const recoveryMs = Math.max(0, researchDeadlineAt - Date.now());
+      let recovered = null;
       try {
         if (recoveryMs <= 0) throw new Error('Research deadline reached; no direct-research recovery pass');
         // A timed-out pipeline may still have left useful per-provider or
         // first-party results in its durable checkpoint. One bounded direct
         // pass gives the writer a chance to finish from those sources; the
         // outer job deadline and caller cancellation still own this recovery.
-        rawResearch = await boundedCall(ownedSignal => gatherResearch(researchTopic, {
+        recovered = await boundedCall(ownedSignal => researchRecoveryFn(researchTopic, {
           includeReddit: true,
-          fetchLimit: quickMode ? 5 : 12,
-          quick: quickMode,
+          fetchLimit: 5,
+          quick: true,
           signal: ownedSignal,
         }), { signal, timeoutMs: recoveryMs, label: 'Direct research recovery' });
-        rawResearch.errors = [...(rawResearch.errors || []), `Durable pipeline: ${err.message}`];
+        recovered.errors = [...(recovered.errors || []), `Durable pipeline: ${err.message}`];
       } catch (fallbackErr) {
         signal?.throwIfAborted();
-        if (fallbackErr.code === 'SCRIPTIT_TIMEOUT') throw fallbackErr;
+        // A recovery timeout must DEGRADE, never kill generation: the
+        // old code rethrew SCRIPTIT_TIMEOUT here, so a slow recovery
+        // killed the whole run with no script at all. Fall through to
+        // the checkpoint / empty-research path below; the ungrounded
+        // fallback still produces a labelled script. Only a real caller
+        // cancellation (throwIfAborted above) propagates.
         console.warn('[ScriptIT] Direct research fallback failed; using safe empty result:', fallbackErr.message);
-        rawResearch = { query: researchTopic, gatheredAt: new Date().toISOString(), duckduckgo: [], duckduckgoNews: [], rss: [], bing: [], yandex: [], x: [], wikipedia: [], hackernews: [], reddit: [], official: [], errors: [err.message, fallbackErr.message] };
+      }
+      if (recovered && researchItemCount(recovered) > 0) {
+        rawResearch = recovered;
+      } else {
+        // The timed-out pipeline checkpointed its fast-pass evidence to
+        // the durable store before the deadline fired (status fast_ready,
+        // progress 35). Reuse that partial evidence instead of discarding
+        // it and starting from empty — the exact Apollo snag behind
+        // 7ad07e1, where sufficient checkpointed evidence was thrown away.
+        const checkpointed = await loadCheckpointedResearch(researchTopic);
+        rawResearch = checkpointed || { query: researchTopic, gatheredAt: new Date().toISOString(), duckduckgo: [], duckduckgoNews: [], rss: [], bing: [], yandex: [], x: [], wikipedia: [], hackernews: [], reddit: [], official: [], errors: [err.message] };
       }
       brief = buildBrief(rawResearch);
     }
@@ -800,14 +871,26 @@ async function runScriptGeneration({
   if (researchIncomplete && apiKey && !callerSuppliedResearch) {
     try {
       notify(20, 'Augmenting research with grounded encyclopedic documentary synthesis…');
-      const { synthesizeEncyclopedicDossier } = require('../research/encyclopedicSynthesizer');
-      const dossier = await synthesizeEncyclopedicDossier({
+      // Synthesis is best-effort augmentation, never a gate: it used to run
+      // with NO deadline of its own (up to 3600s on the agent bridge) and
+      // could eat the whole job budget, so the total deadline fired and the
+      // run died with no script. Bound it to a slice of the REMAINING total
+      // budget (default cap 300s, override MUSE_SYNTHESIS_TIMEOUT_MS); on
+      // timeout the catch below degrades to the ungrounded fallback and a
+      // script is still produced.
+      const remainingTotalMs = Math.max(0, (Number(totalDeadlineMs) || 600000) - (Date.now() - generationStartedAt));
+      const synthesisBudgetMs = Math.min(
+        Math.max(1000, Number(process.env.MUSE_SYNTHESIS_TIMEOUT_MS) || 300000),
+        Math.max(1000, Math.floor(remainingTotalMs * 0.25)),
+      );
+      const dossierFn = synthesizeDossierFn || require('../research/encyclopedicSynthesizer').synthesizeEncyclopedicDossier;
+      const dossier = await boundedCall(ownedSignal => dossierFn({
         topic: researchTopic,
         niche: researchForLedger.niche || 'general',
         apiKey,
         model,
-        signal
-      });
+        signal: ownedSignal,
+      }), { signal, timeoutMs: synthesisBudgetMs, label: 'Encyclopedic research synthesis' });
       if (dossier && dossier.claims?.length) {
         researchForLedger.official = [...(researchForLedger.official || []), ...dossier.claims];
         evidence = buildEvidenceLedger(researchForLedger);
@@ -833,37 +916,34 @@ async function runScriptGeneration({
     }
   }
 
-  // Graceful claim sufficiency handling:
-  // In caller-supplied research test suites, respect the caller's explicit empty set.
-  // In live production, ensure we never halt automation. If claims exist, proceed.
-  // If zero EXTERNAL claims exist (e.g. offline or search outage), fail loudly.
+  // FINAL FALLBACK (Nov 15, 2026 — user order): research must never block
+  // generation again. If every research lane failed and the encyclopedic
+  // synthesis could not ground the script either, generation CONTINUES
+  // WITHOUT RESEARCH and produces the script anyway — labelled ungrounded
+  // (P4) in the metadata so it is identifiable, never silently presented
+  // as verified. The evidence ledger still reports insufficient honestly;
+  // only the blocking behaviour is gone. No facts are invented to fill
+  // the gap: the draft prompt is told explicitly that no verified
+  // research exists, so it must stay general (and the specificity check
+  // is waived for the same reason — see evaluateDraft).
   // Model-written "anchor" claims used to be invented here to keep production
   // moving; they carried fabricated archive URLs and zero factual content, so
-  // they are gone. A script with no attributable external evidence is not a
-  // script — it is a retryable research failure.
+  // they are gone.
+  let ungrounded = false;
   if (researchIncomplete && !quickMode) {
-    if (callerSuppliedResearch) {
-      const error = new Error(`ScriptIT research is insufficient for publishable narration: ${researchGapReasons}`);
-      error.code = 'RESEARCH_INSUFFICIENT';
-      error.retryable = true;
-      throw error;
-    }
     const externalClaimCount = (evidence.claims || []).filter((claim) => !claim.synthetic).length;
     // Synthetic dossier claims are appended to research.official, so they
     // also appear in brief.sources with fabricated archive URLs. They are
-    // context only (P4) and must never open this gate on their own — a
-    // script with no attributable external evidence is a retryable research
-    // failure, even after Muse has answered the synthesis request.
+    // context only (P4) and must never open this gate on their own.
     const externalSourceCount = (brief?.sources || []).filter((source) => !source.synthetic).length;
     if (externalClaimCount > 0 || externalSourceCount > 0) {
       console.warn(`[ScriptIT] Research has gap warnings (${researchGapReasons}), but proceeding with ${externalClaimCount} grounded external claims to keep automation continuous.`);
       notify(25, `Proceeding with ${externalClaimCount} grounded claims…`);
       researchIncomplete = false;
     } else {
-      const error = new Error(`ScriptIT research is insufficient for publishable narration: ${researchGapReasons}`);
-      error.code = 'RESEARCH_INSUFFICIENT';
-      error.retryable = true;
-      throw error;
+      ungrounded = true;
+      console.warn(`[ScriptIT] UNGROUNDED fallback: all research failed (${researchGapReasons}). Continuing without research; script will be labelled P4/ungrounded.`);
+      notify(25, 'No verified research — continuing ungrounded (labelled P4)…');
     }
   }
   // Do not cache an incomplete bundle as a successful legacy cache entry.
@@ -881,7 +961,22 @@ async function runScriptGeneration({
     recentStrategyIds: history.map((entry) => entry.strategyId).filter(Boolean),
   });
   const briefText = briefToPromptText(brief);
-  const evidenceText = ledgerToPromptText(evidence);
+  let evidenceText = ledgerToPromptText(evidence);
+  if (ungrounded) {
+    // No verified research exists at all: the draft must stay general.
+    // Specific dates, figures, names and quotations would be invented,
+    // so the prompt forbids them outright (and evaluateDraft waives the
+    // specificity check for the same reason). The script is labelled
+    // ungrounded (P4) in the metadata; the narration itself carries no
+    // label — it is read aloud.
+    evidenceText += '\n\nNO VERIFIED RESEARCH AVAILABLE — UNGROUNDED SCRIPT (P4):\n' +
+      'No attributable external evidence could be retrieved for this topic. ' +
+      'Write a general narration only: do not state specific dates, numbers, ' +
+      'names of people or places beyond the topic itself, quotations, or ' +
+      'causal claims. Keep every sentence generic enough to be true without ' +
+      'a source. This script is labelled ungrounded and requires ' +
+      'fact-checking before production.';
+  }
   notify(30, 'Research gathered: ' + evidence.sourceCount + ' sources; ' + evidence.claims.length + ' claims');
   const planText = planToPromptText(plan);
   const researchMs = Date.now() - researchStartedAt;
@@ -979,7 +1074,7 @@ async function runScriptGeneration({
   // footers so the editorial checks judge the narration viewers will hear.
   if (result?.content) result.content = cleanVoiceRules(result.content);
   if (result?.content) result.content = repairEvidenceMarkers(result.content, evidence);
-  let quality = evaluateDraft(result && result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
+  let quality = evaluateDraft(result && result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType, duration });
   console.error('[ScriptIT DEBUG] initial quality:', { words: quality.words, passes: quality.passes, issues: quality.issues });
 
   // Give a failed draft focused editorial feedback. Long drafts are not
@@ -1000,7 +1095,7 @@ async function runScriptGeneration({
       });
       if (revised?.content?.trim()) {
         result = revised;
-        quality = evaluateDraft(result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
+        quality = evaluateDraft(result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType, duration });
       }
     } catch (revErr) {
       console.warn('[ScriptIT] Revision attempt failed:', revErr.message);
@@ -1017,7 +1112,7 @@ async function runScriptGeneration({
   // narration, remove bad factual lines, then run the same checks again.
   if ((quickMode || chatCompletionFn || !quality.structuralPasses) && (quality.supportIssues?.length || quality.markerIssues?.length)) {
     const sanitized = sanitizeUnsupportedSentences(result && result.content ? result.content : quality.script, evidence);
-    const sanitizedQuality = evaluateDraft(sanitized, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType });
+    const sanitizedQuality = evaluateDraft(sanitized, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType, duration });
     if (sanitizedQuality.script && sanitizedQuality.supportIssues.length === 0 && sanitizedQuality.markerIssues.length === 0) {
       quality = sanitizedQuality;
       result = { ...(result || {}), content: sanitized };
@@ -1040,9 +1135,9 @@ async function runScriptGeneration({
     // first-party rewrite merely because the verified facts are necessarily
     // the same.
     const sameTopicHistory = history.filter((entry) => String(entry.topic || '').trim().toLowerCase() === trimmedTopic.toLowerCase());
-    const fallbackQuality = evaluateDraft(fallbackScript, { topic: trimmedTopic, wordTarget, previousScripts: sameTopicHistory, evidence, contentType: plan.contentType });
+    const fallbackQuality = evaluateDraft(fallbackScript, { topic: trimmedTopic, wordTarget, previousScripts: sameTopicHistory, evidence, contentType: plan.contentType, duration });
     const mergedScript = mergeSafeDrafts(quality.script, fallbackScript, wordTarget);
-    const mergedQuality = evaluateDraft(mergedScript, { topic: trimmedTopic, wordTarget, previousScripts: sameTopicHistory, evidence, contentType: plan.contentType });
+    const mergedQuality = evaluateDraft(mergedScript, { topic: trimmedTopic, wordTarget, previousScripts: sameTopicHistory, evidence, contentType: plan.contentType, duration });
     const rescueQuality = mergedQuality.words > fallbackQuality.words ? mergedQuality : fallbackQuality;
     if (mergedQuality.script
       && mergedQuality.supportIssues.length === 0
@@ -1080,7 +1175,11 @@ async function runScriptGeneration({
   // word count to override the quality verdict is what let bad scripts reach
   // the renderer. Only a passing draft or a verified deterministic rescue is
   // publishable. Publishability also requires real external evidence:
-  // synthetic (model-written dossier) claims never count.
+  // synthetic (model-written dossier) claims never count. The ungrounded
+  // carve-out (Nov 15, 2026): when all research failed, the evidence
+  // requirement is waived — the draft still has to pass the editorial
+  // quality gate, and the script is labelled ungrounded (P4) in the
+  // metadata instead of being blocked.
   // Evidence assembly remains a review draft: local word overlap cannot
   // certify coherent narration or overturn the factual reviewer's rejection.
   if (safeFallback) {
@@ -1089,7 +1188,7 @@ async function runScriptGeneration({
   }
   const externalClaimCount = (evidence.claims || []).filter((claim) => !claim.synthetic).length;
   const syntheticClaimCount = (evidence.claims || []).length - externalClaimCount;
-  const gateOk = Boolean(cleanFinalScript && !researchIncomplete && quality.passes && !safeFallback && externalClaimCount > 0);
+  const gateOk = Boolean(cleanFinalScript && quality.passes && !safeFallback && (externalClaimCount > 0 || ungrounded));
   // Quick mode is a preview by design and is never publishable; standard
   // and thorough production publish only a gated draft with real external
   // evidence.
@@ -1109,7 +1208,7 @@ async function runScriptGeneration({
     const cleanedPartial = partial
       .replace(/<evidence:\s*[^>]+>/gi, '')
       .trim();
-    const partialQuality = evaluateDraft(cleanedPartial, { topic: trimmedTopic, wordTarget, previousScripts: [], evidence, contentType: plan.contentType });
+    const partialQuality = evaluateDraft(cleanedPartial, { topic: trimmedTopic, wordTarget, previousScripts: [], evidence, contentType: plan.contentType, duration });
     const finalDetails = researchIncomplete
       ? `research remains incomplete: ${researchGapReasons}`
       : (partialQuality.issues || []).slice(0, 5).join(' ') || 'the draft remains an editorial draft';
@@ -1128,6 +1227,8 @@ async function runScriptGeneration({
         jobId,
         status: 'draft_ready',
         publishable: false,
+        ungrounded: Boolean(ungrounded),
+        grounded: !ungrounded,
         generationCheckpoint,
         productionPolicy: 'prompt-led-v1',
         researchMode: normalizedResearchMode,
@@ -1184,7 +1285,7 @@ async function runScriptGeneration({
   // Deterministic rescue drafts are evidence-safe emergency output, not a
   // style exemplar for future similarity checks. Recording them would make a
   // later corrected draft look like a duplicate of an abandoned canary.
-  if (!safeFallback && recordHistory) recordGeneration({ topic: trimmedTopic, script: cleanFinalScript, strategyId: plan.strategy.id });
+  if (!safeFallback && recordHistory) recordGeneration({ topic: trimmedTopic, script: cleanFinalScript, strategyId: plan.strategy.id, duration, wordTarget });
   return {
     script: cleanFinalScript,
     meta: {
@@ -1200,9 +1301,15 @@ async function runScriptGeneration({
       jobId,
       status: 'ready_to_publish',
       publishable: true,
+      // Ungrounded scripts come out publishable by design (user order, Nov
+      // 15 2026: research must never block generation) — but the label
+      // travels in the metadata so no consumer can mistake one for a
+      // verified script. researchComplete stays false for them.
+      ungrounded: Boolean(ungrounded),
+      grounded: !ungrounded,
       productionPolicy: 'prompt-led-v1',
       researchMode: normalizedResearchMode,
-      researchComplete: true,
+      researchComplete: !researchIncomplete,
       hookVariants: hookInfo.variants,
       selectedHook: hookInfo.selectedHook,
       evidence: {
@@ -1229,7 +1336,7 @@ async function runScriptGeneration({
         voice: { score: voiceCheck.score, passes: voiceCheck.passes, issues: voiceCheck.issues },
         topicFit: quality.topicQuality,
         issues: quality.issues,
-        warnings: quality.warnings || [],
+        warnings: [...(quality.warnings || []), ...(ungrounded ? ['Ungrounded script (P4): no verified research — verify facts before production.'] : [])],
         factualAudit: factualAudit ? factualAudit.passes : null,
         factualAuditReport: factualAudit,
       },
@@ -1263,6 +1370,8 @@ module.exports = {
   sanitizeUnsupportedSentences,
   mergeSafeDrafts,
   isReusableResearchJob,
+  loadCheckpointedResearch,
+  researchItemCount,
   scopeResearch,
   repairEvidenceMarkers,
   auditDraft,

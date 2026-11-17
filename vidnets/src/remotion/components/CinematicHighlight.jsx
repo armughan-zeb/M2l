@@ -74,8 +74,6 @@ export function CinematicHighlight({ scene = {}, visualDNA = {}, props = {} }) {
         maxWidth: cardMaxWidth,
         opacity: enter * exitFade,
         background: `linear-gradient(135deg, ${rgba(background, 0.92)} 0%, ${rgba(palette.surface || '#0c1a26', 0.82)} 100%)`,
-        backdropFilter: 'blur(14px)',
-        WebkitBackdropFilter: 'blur(14px)',
         borderRadius: 12 * scale,
         border: `1px solid ${rgba(accent, 0.25)}`,
         borderLeft: `5px solid ${accent}`,

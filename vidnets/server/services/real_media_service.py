@@ -554,9 +554,24 @@ class MultiSourceSearchEngine:
                     height=r.height or 0,
                     score=55,
                 )
+                # Keep the provider's own provenance on the candidate: the
+                # scraper result already carries license/source/attribution.
+                # Dropping it made a stock image indistinguishable from a
+                # retrieved web image in the manifest/ledger.
+                meta = dict(getattr(r, 'metadata', None) or {})
                 item.score_breakdown = {
                     'matched_query': query,
                     'provider_relevance': 5.0,
+                    'provider_asset_id': str(r.id or ''),
+                    'source_url': meta.get('source_url', '') or meta.get('page_url', ''),
+                    'page_url': meta.get('page_url', '') or meta.get('source_url', ''),
+                    'license': meta.get('license', '') or r.license or 'Pexels License',
+                    'license_url': meta.get('license_url', '') or 'https://www.pexels.com/license/',
+                    'rights_status': meta.get('rights_status', 'provider_license_check_required'),
+                    'license_verification_required': True,
+                    'attribution': meta.get('attribution', '') or 'Pexels',
+                    'creator': meta.get('creator', ''),
+                    'retrieval_method': 'bounded_public_html_last_resort',
                 }
                 items.append(item)
             if items:
@@ -786,9 +801,20 @@ class MultiSourceSearchEngine:
                     height=r.height or 0,
                     score=50,
                 )
+                meta = dict(getattr(r, 'metadata', None) or {})
                 item.score_breakdown = {
                     'matched_query': query,
                     'provider_relevance': 4.0,
+                    'provider_asset_id': str(r.id or ''),
+                    'source_url': meta.get('source_url', '') or meta.get('foreign_url', ''),
+                    'page_url': meta.get('page_url', '') or meta.get('foreign_url', ''),
+                    'license': meta.get('license', '') or r.license or 'Pixabay Content License (provider page; verify current terms)',
+                    'license_url': meta.get('license_url', '') or 'https://pixabay.com/service/license-summary/',
+                    'rights_status': meta.get('rights_status', 'provider_license_check_required'),
+                    'license_verification_required': True,
+                    'attribution': meta.get('attribution', '') or 'Pixabay',
+                    'creator': meta.get('user', ''),
+                    'retrieval_method': 'bounded_public_html_last_resort',
                 }
                 items.append(item)
             if items:
@@ -1566,57 +1592,47 @@ class FallbackManager:
         scene_context: Dict,
         scorer: MediaScorer
     ) -> Tuple[Optional[MediaItem], str]:
-        """Level 2: Try generic stock footage"""
-        scene_type = scene_context.get('scene_type', 'generic')
-        
-        # Generic B-roll queries based on scene type
-        broll_queries = {
-            'interview': ['business meeting', 'conversation', 'office discussion'],
-            'news': ['news studio', 'city street', 'crowd'],
-            'historical': ['old photograph', 'vintage', 'archive'],
-            'nature': ['landscape', 'wildlife', 'scenery'],
-            'technology': ['computer', 'technology', 'digital'],
-            'generic': ['abstract', 'motion background', 'cinematic'],
-        }
-        
-        queries = broll_queries.get(scene_type, broll_queries['generic'])
-        
-        for query in queries:
-            results = self.search_engine.search_all_sources(
-                query, 'video', None, scene_context
-            )
-            
-            if results:
-                scored = scorer.score_all(results, query.split(), scene_context)
-                
-                if scored and scored[0].score >= 20:  # Low threshold for B-roll
-                    return scored[0], f"Stock B-roll: {query}"
-        
-        return None, "No suitable B-roll found"
-    
+        """Level 2: Try generic stock footage.
+
+        Stock is a last resort, never a silent substitute: it is searched
+        with the scene's OWN keywords (never a generic scene-type B-roll
+        query such as "abstract" or "cinematic"), and a candidate must meet
+        the same minimum relevance threshold as any other lane. A generic
+        clip that merely exists must not be presented as the scene.
+        """
+        query = ' '.join([kw for kw in (keywords or []) if str(kw).strip()][:5])
+        if not query:
+            return None, "No scene keywords to search stock with"
+        results = self.search_engine.search_all_sources(
+            query, 'both', scene_context.get('source_priorities'), scene_context
+        )
+        if not results:
+            return None, "No stock results for the scene keywords"
+        scored = scorer.score_all(results, query.split(), scene_context)
+        for item in scored:
+            if item.score >= self.config.min_score_threshold:
+                return item, f"Stock: {query}"
+        return None, (
+            f"No stock candidate met the minimum threshold "
+            f"({self.config.min_score_threshold}) for '{query}'"
+        )
+
     def _try_hybrid(
-        self, 
+        self,
         keywords: List[str],
         scene_context: Dict,
         scorer: MediaScorer
     ) -> Tuple[Optional[MediaItem], str]:
-        """Level 3: Use AI-generated media if real media unavailable"""
-        # This would integrate with AI image generation
-        # For now, try to find any usable media
-        
-        generic_queries = ['abstract background', 'motion graphics', 'cinematic']
-        
-        for query in generic_queries:
-            results = self.search_engine.search_all_sources(
-                query, 'both', None, scene_context
-            )
-            
-            if results:
-                # Accept any result at this level
-                return results[0], f"Hybrid fallback: {query}"
-        
-        # If AI generator is available, use it
-        return None, "Hybrid approach failed"
+        """Level 3: no hybrid fallback exists.
+
+        The old implementation returned the first result for a generic
+        query ("abstract background", "motion graphics") regardless of
+        relevance, and the level's name invited AI-generated media. Both
+        are banned: no AI footage, and no unrelated generic clip silently
+        standing in for the scene. Return a terminal miss so the caller
+        degrades to the next fallback (grounded graphic) instead.
+        """
+        return None, "Hybrid/AI fallback disabled: no generic or generated media"
 
 
 # =============================================================================
@@ -2966,6 +2982,15 @@ def get_real_media_for_video(
                             'page_url': str(image.get('page_url') or image.get('source_url') or ''),
                             'matched_query': str(query),
                             'media_type': 'image',
+                            # Label the retrieval method and licence explicitly:
+                            # this row comes from a bounded public-HTML scrape,
+                            # not the provider API, and its licence is unverified.
+                            'retrieval_method': 'bounded_public_html_last_resort',
+                            'license': str(image.get('license') or ''),
+                            'license_url': str(image.get('license_url') or ''),
+                            'rights_status': 'provider_license_check_required',
+                            'license_verification_required': True,
+                            'provider_asset_id': str(image.get('id') or ''),
                         }
                         print(f"   [stock] scene {i + 1}: fallback stock image from {image.get('source', 'unknown')}")
             except Exception as exc:
@@ -4720,12 +4745,23 @@ def _scrape_stock_image(query: str, fallback_providers: bool = True) -> Optional
 
 
 def _download_stock_fallback(image: Dict, query: str) -> Optional[str]:
-    """Download a scraper-found stock image to temp cache."""
+    """Download a scraper-found stock image to temp cache.
+
+    Bounded: streams with the stock size cap (default 64 MB) and rejects a
+    non-image payload. The old version buffered ``r.content`` unbounded and
+    saved whatever bytes a 200 returned — an error page or a huge file
+    could land in the cache as a scene image. A failure here returns None
+    so the scene degrades to the next fallback instead of failing the job.
+    """
     url = image.get('download_url', '')
     source = image.get('source', 'stock')
     img_id = image.get('id', 'unknown')
     if not url:
         return None
+    try:
+        max_bytes = max(1, int(_STOCK_MAX_DOWNLOAD_MB)) * 1024 * 1024
+    except (TypeError, ValueError):
+        max_bytes = 64 * 1024 * 1024
     try:
         ext = os.path.splitext(url.split('?')[0])[1] or '.jpg'
         cache_dir = Path(TEMP_DIR) / "stock_fallback"
@@ -4734,16 +4770,39 @@ def _download_stock_fallback(image: Dict, query: str) -> Optional[str]:
         if os.path.exists(local_path):
             return local_path
         import requests as req
-        r = req.get(url, timeout=15, headers={
+        r = req.get(url, timeout=15, stream=True, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         })
-        if r.status_code == 200:
+        if r.status_code != 200:
+            return None
+        content_type = str((r.headers or {}).get('Content-Type', '') or '').split(';')[0].strip().lower()
+        if content_type and not content_type.startswith('image/'):
+            return None
+        written = 0
+        try:
             with open(local_path, 'wb') as f:
-                f.write(r.content)
-            return local_path
+                for chunk in r.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise ValueError('stock fallback image exceeds size cap')
+                    f.write(chunk)
+        except Exception:
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+            return None
+        if written == 0:
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+            return None
+        return local_path
     except Exception:
-        pass
-    return None
+        return None
 
 
 # =============================================================================

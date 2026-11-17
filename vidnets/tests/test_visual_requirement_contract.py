@@ -808,3 +808,53 @@ def test_gaming_subject_type_and_clean_queries():
     assert any("gameplay" in q for q in web_queries)
     assert any("trailer" in q for q in yt_queries)
     assert not any("documentary documentary" in q for q in web_queries)
+
+
+def test_rail_operator_footage_is_not_accepted_for_another_operator():
+    """A CSX freight frame must not illustrate an Amtrak scene, and a real
+    Amtrak frame must carry identity proof for finalist ranking."""
+    req = build_visual_requirement(
+        title="Amtrak's Long Run Through the Crew's Day",
+        script="The Amtrak crew works a long day on the rails.",
+        scene_text="Passengers board the Amtrak passenger train as the crew prepares for departure.",
+    )
+    assert "csx" in req["forbidden_subjects"]
+    assert "bnsf" in req["forbidden_subjects"]
+    matched, reason, _evidence = candidate_requirement_match(req, {
+        "title": "CSX freight locomotive 6232 hauling coal",
+        "description": "CSX Transportation freight train",
+        "provider": "youtube",
+    })
+    assert not matched
+    assert reason == "forbidden_confusable_entity"
+    _matched, _reason, evidence = candidate_requirement_match(req, {
+        "title": "Amtrak passenger train boarding at the station",
+        "description": "Amtrak Northeast Regional departs",
+        "provider": "youtube",
+    })
+    assert evidence.get("identity_proof")
+    bnsf_req = build_visual_requirement(
+        title="BNSF Whiteout Crossing",
+        script="A BNSF train crosses in a whiteout.",
+        scene_text="The BNSF locomotive pushes through snow.",
+    )
+    assert "amtrak" in bnsf_req["forbidden_subjects"]
+    assert "csx" in bnsf_req["forbidden_subjects"]
+
+
+def test_gta_scene_one_action_terms_are_verbs_not_title_words():
+    """GTA VI scene 1 (real narration): action_terms must be verbs/visible
+    nouns (kept, waiting, sold, fans), never the title, a superlative, a
+    participle adjective, or a format word."""
+    scene_text = (
+        "Grand Theft Auto Six is the most anticipated video game of the decade, "
+        "and Rockstar Games has kept fans waiting for more than ten years since "
+        "Grand Theft Auto Five, a game that has sold more than two hundred million copies."
+    )
+    req = build_visual_requirement(
+        title="Grand Theft Auto VI", script=scene_text, scene_text=scene_text,
+    )
+    terms = list(req["action_terms"])
+    assert terms, "a GTA scene must yield action terms"
+    assert not {"grand", "theft", "auto", "most", "anticipated", "video"} & set(terms)
+    assert {"kept", "waiting", "sold"} & set(terms)

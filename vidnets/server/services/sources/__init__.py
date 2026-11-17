@@ -7,6 +7,7 @@ from .pixabay_source import PixabaySource
 from .wikimedia_source import WikimediaSource
 from .brave_source import BraveSource
 from .searxng_source import SearXNGSource
+from .loc_source import LibraryOfCongressSource
 
 __all__ = [
     'BaseSource',
@@ -19,4 +20,5 @@ __all__ = [
     'WikimediaSource',
     'BraveSource',
     'SearXNGSource',
+    'LibraryOfCongressSource',
 ]

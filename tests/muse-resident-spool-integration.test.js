@@ -31,11 +31,13 @@ test('resident inbox + spool transport answers the daemon probe in seconds', asy
   fs.mkdirSync(spool, { recursive: true });
 
   // The test plays the resident worker: heartbeat + a probe-echo loop.
-  // Only the daemon's own liveness probe is ever answered here.
+  // Only the daemon's own liveness probe is ever answered here. The
+  // heartbeat uses the per-worker pool file (worker-alive-worker-1.json),
+  // so this also proves the spool's pool-liveness check end to end.
   let answered = 0;
   const done = new Set();
-  const writeHeartbeat = () => fs.writeFileSync(path.join(spool, 'worker-alive.json'), JSON.stringify({
-    updatedAt: Date.now(), worker: 'test-worker', pending: 0, answered
+  const writeHeartbeat = () => fs.writeFileSync(path.join(spool, 'worker-alive-worker-1.json'), JSON.stringify({
+    updatedAt: Date.now(), worker: 'test-worker', workerId: 'worker-1', pending: 0, answered
   }));
   writeHeartbeat();
   const heartbeatTimer = setInterval(writeHeartbeat, 100);
