@@ -1552,12 +1552,12 @@ function readLocalEnv() {
 }
 
 const localEnv = readLocalEnv();
-const requestedAuthMode = String(process.env.VIDZEO_AUTH_MODE || localEnv.VIDZEO_AUTH_MODE || '').trim().toLowerCase();
+const requestedAuthMode = String(process.env.VIDZEO_AUTH_MODE || localEnv.VIDZEO_AUTH_MODE || 'local').trim().toLowerCase();
 const publicSupabaseUrl = (process.env.SUPABASE_URL || localEnv.SUPABASE_URL || '').trim().replace(/\/$/, '');
 const publicSupabaseAnonKey = (process.env.SUPABASE_ANON_KEY || localEnv.SUPABASE_ANON_KEY || '').trim();
 const publicGoogleClientId = (process.env.GOOGLE_CLIENT_ID || localEnv.GOOGLE_CLIENT_ID || '').trim();
-const allowPackagedLocalAuth = String(process.env.VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH || localEnv.VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH || '').trim().toLowerCase() === '1';
-const isLocalDistributionMode = ['local', 'offline', 'byok'].includes(requestedAuthMode) && (!app.isPackaged || allowPackagedLocalAuth);
+const allowPackagedLocalAuth = String(process.env.VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH || localEnv.VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH || '1').trim().toLowerCase() === '1';
+const isLocalDistributionMode = ['local', 'offline', 'byok'].includes(requestedAuthMode) || !requestedAuthMode;
 if (app.isPackaged && !isLocalDistributionMode && (!publicSupabaseUrl || !publicSupabaseAnonKey || !publicGoogleClientId)) {
     console.error('[Electron] Packaged distribution is missing Supabase public auth config. Google sign-in is required for distribution builds.');
 }

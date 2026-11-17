@@ -18,29 +18,100 @@ RESOURCES_MUSIC_DIR = VIDNETS_ROOT / "resources" / "audio" / "music"
 
 # ─── CHANNEL PERSONA MAPPINGS ───
 CHANNEL_PERSONA_MAP = {
-    # Channel ID or name / slug -> track slug
+    # 1. Classic Wheels
     "classic wheels": "classic-wheels",
     "classic-wheels": "classic-wheels",
+    "classic_wheels": "classic-wheels",
     "ix_1": "classic-wheels",
+    "ix-1": "classic-wheels",
+    "ix 1": "classic-wheels",
+    "ix1": "classic-wheels",
+    "profile 1": "classic-wheels",
+    "profile-1": "classic-wheels",
+    "profile_1": "classic-wheels",
+    "1": "classic-wheels",
+
+    # 2. Nostalgic Brit
     "nostalgic brit": "nostalgic-brit",
     "nostalgic-brit": "nostalgic-brit",
+    "nostalgic_brit": "nostalgic-brit",
     "nostalgic britian": "nostalgic-brit",
+    "nostalgic-britian": "nostalgic-brit",
     "ix_2": "nostalgic-brit",
+    "ix-2": "nostalgic-brit",
+    "ix 2": "nostalgic-brit",
+    "ix2": "nostalgic-brit",
+    "profile 2": "nostalgic-brit",
+    "profile-2": "nostalgic-brit",
+    "profile_2": "nostalgic-brit",
+    "2": "nostalgic-brit",
+
+    # 3. Royal Celeb
     "royal celeb": "royal-celeb",
     "royal-celeb": "royal-celeb",
+    "royal_celeb": "royal-celeb",
+    "royal celebrity": "royal-celeb",
+    "royal-celebrity": "royal-celeb",
     "ix_3": "royal-celeb",
+    "ix-3": "royal-celeb",
+    "ix 3": "royal-celeb",
+    "ix3": "royal-celeb",
+    "profile 3": "royal-celeb",
+    "profile-3": "royal-celeb",
+    "profile_3": "royal-celeb",
+    "3": "royal-celeb",
+
+    # 4. Crown Royal
     "crown royal": "crown-royal",
     "crown-royal": "crown-royal",
+    "crown_royal": "crown-royal",
     "ix_4": "crown-royal",
+    "ix-4": "crown-royal",
+    "ix 4": "crown-royal",
+    "ix4": "crown-royal",
+    "profile 4": "crown-royal",
+    "profile-4": "crown-royal",
+    "profile_4": "crown-royal",
+    "4": "crown-royal",
+
+    # 5. Crown Zone
     "crown zone": "crown-zone",
     "crown-zone": "crown-zone",
+    "crown_zone": "crown-zone",
     "ix_5": "crown-zone",
+    "ix-5": "crown-zone",
+    "ix 5": "crown-zone",
+    "ix5": "crown-zone",
+    "profile 5": "crown-zone",
+    "profile-5": "crown-zone",
+    "profile_5": "crown-zone",
+    "5": "crown-zone",
+
+    # 6. After Death
     "after death": "after-death",
     "after-death": "after-death",
+    "after_death": "after-death",
     "ix_6": "after-death",
+    "ix-6": "after-death",
+    "ix 6": "after-death",
+    "ix6": "after-death",
+    "profile 6": "after-death",
+    "profile-6": "after-death",
+    "profile_6": "after-death",
+    "6": "after-death",
+
+    # 7. Train Crew
     "train crew": "train-crew",
     "train-crew": "train-crew",
+    "train_crew": "train-crew",
     "ix_7": "train-crew",
+    "ix-7": "train-crew",
+    "ix 7": "train-crew",
+    "ix7": "train-crew",
+    "profile 7": "train-crew",
+    "profile-7": "train-crew",
+    "profile_7": "train-crew",
+    "7": "train-crew",
 }
 
 # ─── NICHE / KEYWORD MAPPINGS ───
@@ -78,20 +149,30 @@ GENRE_TRACK_MAP = {
     "retro_groove": "classic-wheels",
     "retro": "classic-wheels",
     "automotive": "classic-wheels",
+    "archival_dossier": "classic-wheels",
+    "archival-dossier": "classic-wheels",
     "british_orchestral": "nostalgic-brit",
     "heritage": "nostalgic-brit",
+    "broadsheet_heritage": "nostalgic-brit",
+    "broadsheet-heritage": "nostalgic-brit",
     "investigative_tension": "royal-celeb",
     "investigative": "royal-celeb",
     "suspense": "after-death",
     "royal_orchestral": "crown-royal",
     "regal": "crown-royal",
+    "royal_prestige": "crown-royal",
+    "royal-prestige": "crown-royal",
     "modern_cinematic": "crown-zone",
     "cinematic": "royal-celeb",
     "ambient_dark": "after-death",
     "dark": "after-death",
     "ambient": "after-death",
+    "forensic_noir": "after-death",
+    "forensic-noir": "after-death",
     "industrial_acoustic": "train-crew",
     "industrial": "train-crew",
+    "engineering_blueprint": "train-crew",
+    "engineering-blueprint": "train-crew",
     "documentary": "crown-zone",
 }
 
@@ -274,26 +355,56 @@ def calculate_ducked_volume(
 ) -> float:
     """
     Calculate instantaneous ducked music volume at current_time_sec.
-    - During narration, volume drops to base_volume * ducked_ratio.
+    - During narration, volume drops smoothly to base_volume * ducked_ratio.
     - Outside narration, volume returns smoothly to base_volume.
+    - Robust against unsorted, overlapping, or closely-spaced narration intervals.
     """
     base_volume = max(0.0, min(1.0, float(base_volume)))
+    ducked_ratio = max(0.0, min(1.0, float(ducked_ratio)))
     ducked_vol = base_volume * ducked_ratio
-    
-    # Check distance to active speech
-    is_speaking = False
-    for start, end in narration_intervals:
-        if start <= current_time_sec <= end:
-            is_speaking = True
-            break
-        # Check transition windows
-        if (start - attack_sec) <= current_time_sec < start:
-            # Ramping down into speech
-            progress = (current_time_sec - (start - attack_sec)) / max(0.01, attack_sec)
-            return base_volume - progress * (base_volume - ducked_vol)
-        if end < current_time_sec <= (end + release_sec):
-            # Ramping up after speech
-            progress = (current_time_sec - end) / max(0.01, release_sec)
-            return ducked_vol + progress * (base_volume - ducked_vol)
 
-    return ducked_vol if is_speaking else base_volume
+    if not narration_intervals:
+        return base_volume
+
+    # Clean, sort, and merge overlapping or closely-spaced speech intervals
+    valid_intervals = [
+        (float(s), float(e)) for s, e in narration_intervals
+        if float(e) >= float(s)
+    ]
+    if not valid_intervals:
+        return base_volume
+
+    valid_intervals.sort(key=lambda x: x[0])
+    # Merge intervals if gap is less than attack_sec + release_sec to prevent flutter
+    merge_threshold = max(0.1, attack_sec + release_sec)
+    merged = [valid_intervals[0]]
+    for s, e in valid_intervals[1:]:
+        prev_s, prev_e = merged[-1]
+        if s <= prev_e + merge_threshold:
+            merged[-1] = (prev_s, max(prev_e, e))
+        else:
+            merged.append((s, e))
+
+    # 1. Check if actively inside any speech interval
+    for start, end in merged:
+        if start <= current_time_sec <= end:
+            return ducked_vol
+
+    # 2. Check transition windows
+    factors = []
+    for start, end in merged:
+        # Attack window: ramping down into speech
+        if (start - attack_sec) <= current_time_sec < start:
+            prog = (current_time_sec - (start - attack_sec)) / max(0.01, attack_sec)
+            factors.append(base_volume - prog * (base_volume - ducked_vol))
+        # Release window: ramping up after speech
+        elif end < current_time_sec <= (end + release_sec):
+            prog = (current_time_sec - end) / max(0.01, release_sec)
+            factors.append(ducked_vol + prog * (base_volume - ducked_vol))
+
+    if factors:
+        # If near transitions, pick the most ducked (safest) volume
+        return max(ducked_vol, min(base_volume, min(factors)))
+
+    return base_volume
+

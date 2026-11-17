@@ -12,12 +12,13 @@ async function writeSections({ topic, wordTarget, evidenceText, editorialContext
   const generations=[];
   complete = async payload => {
     let lastError;
-    // An external-agent timeout means the connected manager did not answer
+    // An agent timeout means the connected manager did not answer
     // within its bounded inbox contract. Reissuing the same beat creates
     // duplicate request IDs and can multiply a single 8-minute wait into
     // hours. The saved section checkpoint is the retry mechanism: reconnect
-    // the same session and resume that beat once.
-    const externalAgent = String(model || '').trim().toLowerCase() === 'external-agent';
+    // the same session and resume that beat once. Both agent transports
+    // ('external-agent' HTTP and 'agent-bridge' inbox) share this rule.
+    const externalAgent = ['external-agent', 'agent-bridge'].includes(String(model || '').trim().toLowerCase());
     const maxAttempts = 1; // The owning stage retries saved beats; never multiply provider retries here.
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       signal?.throwIfAborted();

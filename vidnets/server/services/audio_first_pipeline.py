@@ -60,7 +60,12 @@ def run_audio_first_pipeline(config: dict, progress_callback=None) -> dict:
         trigger_whisper_worker_prewarm,
         align_whisper_words_to_script,
     )
-    whisper_handle = None if str(tts_model or 'audiogram').lower() in {'audiogram', 'edge', 'edge-tts', 'edge_tts'} else start_whisper_job_warmup(preload_workers=True)
+    # The offline Linux TTS command supplies no provider word timings, so
+    # captions still need Whisper: warm it even for edge/audiogram jobs when
+    # that command is configured (see _start_whisper_warmup in app.py).
+    _linux_tts = bool(str(os.environ.get('VIDZEO_LINUX_TTS_COMMAND', '') or '').strip())
+    _provider_supplies_clock = str(tts_model or 'audiogram').lower() in {'audiogram', 'edge', 'edge-tts', 'edge_tts'} and not _linux_tts
+    whisper_handle = None if _provider_supplies_clock else start_whisper_job_warmup(preload_workers=True)
 
     # ─── TTS ───
     if progress_callback:
@@ -125,6 +130,14 @@ def run_audio_first_pipeline(config: dict, progress_callback=None) -> dict:
     # script; it is explicitly marked so it cannot be mistaken for a Whisper
     # transcription, and it preserves every word and punctuation boundary.
     timing_source = "tts_word_boundary" if provider_words else "whisper"
+    # S8: the Linux TTS chunk path writes a script-derived timing sidecar
+    # (per-chunk measured durations, no speech recognition). When the
+    # provider words came from that sidecar, Whisper never ran — report
+    # it as script timing, not as measured provider boundaries.
+    if provider_words and all(
+        row.get("timing_source") == "tts_script_timing" for row in provider_words
+    ):
+        timing_source = "tts_script_timing"
     alignment = provider_alignment if provider_words else None
     if not words:
         words = _build_script_timing_fallback(script, dur)
@@ -165,31 +178,8 @@ def run_audio_first_pipeline(config: dict, progress_callback=None) -> dict:
 
 def _build_script_timing_fallback(script: str, duration: float) -> list:
     """Create monotonic word timings from the source script as a last resort."""
-    import re
-    tokens = re.findall(r"\S+", str(script or "").strip())
-    if not tokens:
-        return []
-    total = max(0.1, float(duration or 0.1))
-    weights = []
-    for token in tokens:
-        clean = re.sub(r"[^A-Za-z0-9']", "", token)
-        weight = max(1.0, min(2.8, 0.55 + len(clean) * 0.075))
-        if re.search(r"[.!?]$", token):
-            weight += 0.22
-        elif re.search(r"[,;:]$", token):
-            weight += 0.08
-        weights.append(weight)
-    step = total / max(1.0, sum(weights))
-    cursor = 0.0
-    rows = []
-    for index, token in enumerate(tokens):
-        start = cursor
-        end = min(total, start + step * weights[index])
-        rows.append({"word": token, "start": round(start, 3), "end": round(max(start + 0.02, end), 3), "index": index, "timing_source": "tts_script_timing_fallback"})
-        cursor = end
-    if rows:
-        rows[-1]["end"] = total
-    return rows
+    from .speech_timing import script_words_for_audio
+    return script_words_for_audio(script, duration, timing_source="tts_script_timing_fallback")
 
 # =============================================================================
 # INTERNAL HELPERS

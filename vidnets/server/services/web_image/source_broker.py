@@ -7,10 +7,20 @@ contamination, and records a source-by-source retrieval funnel.
 from __future__ import annotations
 
 import re
+import math
 import threading
 import time
 from collections import Counter, defaultdict, deque
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+
+def long_form_web_budget(scene_count: int, workers: int) -> float:
+    """Allow each queued scene wave time to run, with a bounded stage wall."""
+    count = max(1, int(scene_count))
+    if count < 32:
+        return 180.0
+    waves = math.ceil(count / max(1, int(workers)))
+    return min(1800.0, max(180.0, 30.0 + waves * 75.0))
 
 
 # Canonical web-image provider map.  Keep this in the broker (the shared
@@ -21,12 +31,12 @@ WEB_IMAGE_SOURCE_CATALOG: Tuple[Dict[str, object], ...] = (
     {"name": "universal_scraper", "tier": 0, "kind": "universal", "role": "parallel_multiengine_scraper", "default": True},
     {"name": "yandex", "tier": 0, "kind": "api", "role": "fast_scraper", "default": True},
     {"name": "bing_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": True},
-    {"name": "ddg_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": False},
     {"name": "flickr_api", "tier": 0, "kind": "flickr_api", "role": "fast_api", "default": True},
+    {"name": "ddg_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": True},
     {"name": "openverse", "tier": 1, "kind": "api", "role": "rights_friendly_api", "default": True},
     {"name": "wikimedia", "tier": 1, "kind": "api", "role": "rights_friendly_api", "default": True},
     {"name": "google_images", "tier": 1, "kind": "api", "role": "html_scraper", "default": True},
-    {"name": "duckduckgo", "tier": 1, "kind": "api", "role": "html_scraper", "default": False},
+    {"name": "duckduckgo", "tier": 1, "kind": "api", "role": "html_scraper", "default": True},
     {"name": "brave_images", "tier": 1, "kind": "api", "role": "optional_api", "default": False},
     {"name": "searxng_images", "tier": 1, "kind": "api", "role": "metasearch", "default": False},
     {"name": "getty_bing", "tier": 2, "kind": "hybrid", "role": "editorial_site_filter", "default": True},
@@ -35,6 +45,13 @@ WEB_IMAGE_SOURCE_CATALOG: Tuple[Dict[str, object], ...] = (
     {"name": "reddit", "tier": 3, "kind": "api", "role": "community_api", "default": False},
     {"name": "flickr", "tier": 3, "kind": "gdl", "role": "gallery_dl", "default": False},
 )
+
+
+# Canonical search-engine priority for web-image retrieval. Yandex
+# bot-walls least on this deployment, so it is always tried first; Bing,
+# Flickr and DuckDuckGo are fallbacks in that order. The universal scraper
+# and the resolver's fast lanes must keep this relative order.
+WEB_ENGINE_PRIORITY = ("yandex", "bing", "flickr", "duckduckgo")
 
 
 def web_image_source_catalog() -> List[Dict[str, object]]:
@@ -291,10 +308,11 @@ class SourceHealth:
             if self._down_until.get(source, 0.0) > now:
                 return
             self._failures.pop(source, None)
-            self._down_until[source] = now + self.cooldown_seconds
+            cooldown = max(20.0, min(45.0, self.cooldown_seconds))
+            self._down_until[source] = now + cooldown
             print(
                 f"   [web] provider '{source}' temporarily disabled "
-                f"(definitive response, reason: {reason or 'unknown'})",
+                f"(definitive response, reason: {reason or 'unknown'}, {cooldown:.0f}s cooldown)",
                 flush=True,
             )
 

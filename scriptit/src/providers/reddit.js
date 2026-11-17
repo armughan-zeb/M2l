@@ -1,7 +1,4 @@
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const Parser = require('rss-parser');
-
-const parser = new Parser({ timeout: 8000 });
 
 function mapRssItem(it) {
   const title = it.title || '';
@@ -18,9 +15,15 @@ function mapRssItem(it) {
   };
 }
 
-async function redditRssSearch(query, { limit = 8, sort = 'new' }) {
+async function redditRssSearch(query, { limit = 8, sort = 'new', timeoutMs = 8000 } = {}) {
+  const Parser = require('rss-parser');
   const url = `https://old.reddit.com/search.rss?q=${encodeURIComponent(query)}&sort=${sort}&limit=${Math.min(limit, 25)}`;
-  const feed = await parser.parseURL(url);
+  // Per-call parser so the caller's budget is real (the module-level
+  // parser's fixed 8000ms ignored it). old.reddit is also gated from
+  // this egress IP (socket hang-up, 2026-11-09), so this usually fails
+  // fast; it must never eat the JSON attempt's remaining budget.
+  const feedParser = new Parser({ timeout: Math.max(1000, timeoutMs) });
+  const feed = await feedParser.parseURL(url);
   return (feed.items || []).slice(0, limit).map(mapRssItem);
 }
 
@@ -74,13 +77,24 @@ async function redditJsonSearch(query, { limit = 8, sort = 'relevance', timeoutM
   }
 }
 
-async function redditSearch(query, { limit = 8, sort = 'relevance', timeoutMs = 8000 } = {}) {
+async function redditSearch(query, { limit = 8, sort = 'relevance', timeoutMs = 8000, rssSearchFn = redditRssSearch } = {}) {
+  // Reddit needs auth from this egress IP: the JSON API answers 403 and
+  // the old.reddit RSS fallback hangs up. That is a fail-soft lane, not
+  // a fatal error — return the block, never throw, and never trip a
+  // circuit for the other providers. The RSS fallback only runs while
+  // budget remains: the old code let it consume a second full timeout
+  // after a slow JSON attempt, so the researcher's outer timeout killed
+  // the whole provider call as PROVIDER_TIMEOUT instead of the honest
+  // "Reddit blocked" record.
+  const started = Date.now();
   const json = await redditJsonSearch(query, { limit, sort, timeoutMs });
   if (json.results && json.results.length) return json;
 
+  const elapsed = Date.now() - started;
+  if (elapsed > timeoutMs * 0.6) return json;
   // JSON API blocked / empty → fall back to old.reddit RSS, which is public and works.
   try {
-    const rssResults = await redditRssSearch(query, { limit, sort: 'new' });
+    const rssResults = await rssSearchFn(query, { limit, sort: 'new', timeoutMs: Math.max(1000, timeoutMs - elapsed) });
     if (rssResults.length) {
       return {
         rateLimited: json.rateLimited,

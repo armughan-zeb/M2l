@@ -79,14 +79,29 @@ cleanup_stale_scratch() {
 }
 cleanup_stale_scratch || echo "[start-daemon] stale scratch cleanup failed (non-fatal)" >&2
 
-# Resident inference worker check (non-fatal): the spool transport only
-# answers while the worker agent is alive. If its heartbeat is missing or
-# stale, requests fall back to the host hook (slower) until the worker
-# starts — see scripts/resident-inference-worker/WORKER_BRIEF.md.
+# Resident inference pool check (non-fatal): the spool transport only
+# answers while at least one pool worker agent is alive. If no worker
+# heartbeat is fresh, requests fall back to the host hook (slower) until
+# the pool starts — see scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md.
 SPOOL_DIR="${MUSE_INFERENCE_SPOOL_DIR:-${VIDZEO_TEMP_DIR:-$HOME/workspace/vidnets-runtime/temp}/inference-spool}"
 if [ -n "${MUSE_INFERENCE_COMMAND:-}" ]; then
-  if python3 -c "import json,os,sys,time; p=os.path.join(sys.argv[1],'worker-alive.json'); print('ok' if os.path.exists(p) and time.time()-json.load(open(p)).get('updatedAt',0)/1000 < 90 else 'stale')" "$SPOOL_DIR" 2>/dev/null | grep -qx stale; then
-    echo "[start-daemon] WARNING: resident inference worker heartbeat is stale or missing at $SPOOL_DIR/worker-alive.json — inbox requests will wait for the host hook until the worker starts (scripts/resident-inference-worker/WORKER_BRIEF.md)." >&2
+  if python3 -c "
+import glob, json, os, sys, time
+files = glob.glob(os.path.join(sys.argv[1], 'worker-alive-*.json'))
+files.append(os.path.join(sys.argv[1], 'worker-alive.json'))
+ok = False
+for p in files:
+    try:
+        with open(p) as f:
+            updated = json.load(f).get('updatedAt', 0)
+        if time.time() - updated / 1000 < 90:
+            ok = True
+            break
+    except Exception:
+        continue
+print('ok' if ok else 'stale')
+" "$SPOOL_DIR" 2>/dev/null | grep -qx stale; then
+    echo "[start-daemon] WARNING: no resident inference worker pool heartbeat is fresh at $SPOOL_DIR/worker-alive-*.json — inbox requests will wait for the host hook until the pool starts (scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md)." >&2
   fi
 fi
 

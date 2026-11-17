@@ -26,6 +26,15 @@ import uuid
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from ..job_context import JobThreadPoolExecutor as ThreadPoolExecutor
+from ..media_distinctness import (
+    alternate_anchor_allows,
+    content_identity as _distinct_content_identity,
+    is_legacy_installment_image as _is_legacy_installment_image,
+    narrated_installment_anchor as _narrated_installment_anchor,
+    promote_deferred as _promote_deferred,
+    source_host as _distinct_source_host,
+)
+from ..pipeline_activity import record_activity
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
 
@@ -42,6 +51,404 @@ def _bounded_worker_drain_seconds(stage_seconds: float) -> float:
         requested = 0.5
     return min(max(0.0, requested), 0.5, max(0.0, stage_seconds) * .1)
 
+
+def _web_recovery_budget_floor_seconds(
+    stage_deadline_seconds: float, remaining_seconds: float
+) -> float:
+    """Floor an exhaustive-recovery stage wall at one useful engine wave.
+
+    Wright (Nov 16): the recovery run got only a ~22s wall and died
+    before any engine could answer.  A recovery stage below one engine
+    round-trip can never return a candidate.  The floor is bounded by
+    the job's remaining wall time — never past the absolute deadline —
+    and may dip into the render reserve by at most the floor itself.
+    """
+    try:
+        floor = max(
+            30.0,
+            min(
+                180.0,
+                float(
+                    os.environ.get("VIDZEO_WEB_RECOVERY_MIN_SECONDS", "60")
+                    or 60
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        floor = 60.0
+    try:
+        remaining = float(remaining_seconds)
+    except (TypeError, ValueError):
+        return float(stage_deadline_seconds)
+    if remaining <= 0.0:
+        return float(stage_deadline_seconds)
+    return max(float(stage_deadline_seconds), min(floor, remaining))
+
+
+def _default_web_stage_deadline_seconds(scene_count: int) -> float:
+    """Completion-scaled default stage wall: 12s per scene, floored at 45s.
+
+    A 121-scene job gets 1452s instead of being cut off at the old fixed
+    180s ceiling after ~35 scenes; a 2-scene job keeps its 45s floor.
+    """
+    return max(
+        45.0,
+        min(_web_stage_hard_cap_seconds(), max(1, int(scene_count)) * 12.0),
+    )
+
+
+def _web_stage_hard_cap_seconds() -> float:
+    """Completion-oriented ceiling for one web retrieval stage.
+
+    The old 180s ceiling cut a 121-scene job off after ~35 scenes: the
+    stage wall must scale with the scenes left to resolve, not end at a
+    fixed time. The default 1800s still bounds a wedged stage, and the
+    delivery budget (render reserve) and the coordinator's outer wall clamp
+    it further downstream.
+    """
+    try:
+        return max(
+            180.0,
+            float(os.environ.get("VIDZEO_WEB_STAGE_HARD_CAP_SECONDS", "1800") or 1800),
+        )
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+_WEB_STAGE_HARD_CAP_SECONDS = 1800.0
+# NOTE (Nov 16): the per-scene 90s wall-clock cap
+# (_WEB_SCENE_HARD_CAP_SECONDS) is REMOVED, not raised. User override:
+# web has NO time limit — a working wave must never be cut off by a
+# scene clock. The trip for a dead wave is the liveness watchdog
+# (_web_liveness_window_seconds(), 600s of zero progress ->
+# web_retrieval_stalled), and the enclosing stage deadline remains the
+# outer wall. _scene_deadline() below is the only place the scene wall
+# lived; an operator may still set VIDZEO_WEB_SCENE_DEADLINE_SECONDS
+# to impose an explicit per-scene wall.
+
+
+# ── Web-wave liveness (GTA fix, Nov 16) ──────────────────────────────────
+# User override: web retrieval has NO time limit — being a bit late beats
+# falling back to graphics. The per-query wave deadline therefore never
+# cancels a live universal future. The counterweight is liveness, not a
+# wall: a wave that shows ZERO progress (no engine completion, no rows)
+# for a full window is provably dead and is flagged
+# ``web_retrieval_stalled`` so the driver can resolve it instead of the
+# stage sitting wedged forever. Any progress resets the window, so the
+# wait is unbounded while engines are working, and only a provably-dead
+# wave ever gives up.
+#
+# Interface for the driver / budget worker (worker D): each wave is a
+# record in _WEB_WAVE_PROGRESS, readable via get_web_wave_progress(wave_id),
+# last_web_wave_progress(), web_wave_progress_snapshot(), and
+# web_wave_stalled_for_scene(scene_number). The universal manager's own
+# progress clock is UniversalScraperManager.last_progress_at (monotonic)
+# / progress_snapshot(). A wave's effective last-progress instant is
+# max(wave record, manager clock).
+
+def _web_liveness_window_seconds() -> float:
+    """Bounded no-progress window before a web wave is declared stalled.
+
+    Default 600s (10 min). That is >> the ~37s worst engine latency seen
+    on GTA VI, >> the 53–200s stacked-timeout wall of a single engine
+    call, and longer than the worst-case universal batch wall (~315s at a
+    300s engine timeout + stagger; ~470s with the single all-empty
+    retry), so a working batch can never trip it. Only a wave with no
+    engine completing anything for ten full minutes is flagged.
+    """
+    try:
+        return max(
+            120.0,
+            min(
+                3600.0,
+                float(
+                    os.environ.get("VIDZEO_WEB_LIVENESS_WINDOW_SECONDS", "600")
+                    or 600
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 600.0
+
+
+_WEB_WAVE_PROGRESS: Dict[str, Dict[str, object]] = {}
+_WEB_WAVE_PROGRESS_LOCK = threading.Lock()
+
+
+def _web_wave_progress_new(
+    wave_id: str, *, scene_number: int, query: str
+) -> Dict[str, object]:
+    now = time.monotonic()
+    record = {
+        "wave_id": wave_id,
+        "scene_number": int(scene_number),
+        "query": str(query or "")[:120],
+        "started_at_monotonic": now,
+        "started_at_wall": time.time(),
+        "last_progress_at": now,
+        "engines_completed": 0,
+        "rows_arrived": 0,
+        "stalled": False,
+        "stall_reason": "",
+        "stall_detected_at_monotonic": None,
+        "last_event": "wave_started",
+        "universal_detached": False,
+    }
+    with _WEB_WAVE_PROGRESS_LOCK:
+        _WEB_WAVE_PROGRESS[wave_id] = record
+        if len(_WEB_WAVE_PROGRESS) > 512:
+            oldest = sorted(
+                _WEB_WAVE_PROGRESS.values(),
+                key=lambda rec: float(rec.get("started_at_monotonic") or 0.0),
+            )[: len(_WEB_WAVE_PROGRESS) - 512]
+            for rec in oldest:
+                _WEB_WAVE_PROGRESS.pop(str(rec.get("wave_id") or ""), None)
+    return record
+
+
+def _web_wave_progress_touch(
+    wave_id: str, *, engines_completed: int = 0, rows_arrived: int = 0, event: str = ""
+) -> None:
+    with _WEB_WAVE_PROGRESS_LOCK:
+        record = _WEB_WAVE_PROGRESS.get(wave_id)
+        if record is None:
+            return
+        record["last_progress_at"] = time.monotonic()
+        record["engines_completed"] = int(record.get("engines_completed") or 0) + int(engines_completed or 0)
+        record["rows_arrived"] = int(record.get("rows_arrived") or 0) + int(rows_arrived or 0)
+        if event:
+            record["last_event"] = str(event)[:160]
+        if "detached" in str(event or ""):
+            record["universal_detached"] = True
+
+
+def _web_wave_progress_mark_stalled(
+    wave_id: str, *, reason: str = "web_retrieval_stalled"
+) -> Dict[str, object]:
+    with _WEB_WAVE_PROGRESS_LOCK:
+        record = _WEB_WAVE_PROGRESS.get(wave_id)
+        if record is None:
+            return {}
+        record["stalled"] = True
+        record["stall_reason"] = str(reason)
+        record["stall_detected_at_monotonic"] = time.monotonic()
+        record["last_event"] = f"stalled:{reason}"
+        return dict(record)
+
+
+def get_web_wave_progress(wave_id: str) -> Dict[str, object]:
+    """Return one wave's progress record (copy) for the driver/coordinator."""
+    with _WEB_WAVE_PROGRESS_LOCK:
+        record = _WEB_WAVE_PROGRESS.get(str(wave_id or ""))
+        return dict(record) if record else {}
+
+
+def last_web_wave_progress() -> Dict[str, object]:
+    """Return the most recently started wave's progress record (copy)."""
+    with _WEB_WAVE_PROGRESS_LOCK:
+        if not _WEB_WAVE_PROGRESS:
+            return {}
+        record = max(
+            _WEB_WAVE_PROGRESS.values(),
+            key=lambda rec: float(rec.get("started_at_monotonic") or 0.0),
+        )
+        return dict(record)
+
+
+def web_wave_progress_snapshot() -> Dict[str, Dict[str, object]]:
+    """Return copies of all known wave progress records, keyed by wave_id."""
+    with _WEB_WAVE_PROGRESS_LOCK:
+        return {key: dict(value) for key, value in _WEB_WAVE_PROGRESS.items()}
+
+
+def web_wave_stalled_for_scene(scene_number: int) -> bool:
+    """True when any wave for this 1-based scene was flagged stalled."""
+    with _WEB_WAVE_PROGRESS_LOCK:
+        return any(
+            bool(rec.get("stalled"))
+            and int(rec.get("scene_number") or 0) == int(scene_number)
+            for rec in _WEB_WAVE_PROGRESS.values()
+        )
+
+
+def _universal_last_progress_at() -> float:
+    """Monotonic clock of the universal manager's last engine completion."""
+    try:
+        return float(_UNIVERSAL_SCRAPER.last_progress_at or 0.0)
+    except Exception:
+        return 0.0
+
+
+# Per-scene universal engine audits, keyed by one resolve_web_images_for_video_fast
+# call's audit_token and 0-based scene index. _resolve_scene records every
+# universal batch (engine, count, duration, error) here so the per-scene
+# audit entry carries it even when the scene resolves to nothing — the
+# module-global _UNIVERSAL_LAST_AUDIT alone is overwritten by the next
+# scene and cannot do that. Entries are consumed (and dropped) when the
+# audit manifest is built.
+_SCENE_UNIVERSAL_AUDITS: Dict[str, Dict[int, Dict[str, object]]] = {}
+_SCENE_UNIVERSAL_AUDITS_LOCK = threading.Lock()
+
+
+def _record_universal_audit_entry(
+    audits: List[Dict[str, object]],
+    q_str: str,
+    *,
+    audit_token: Optional[str] = None,
+    scene_index: Optional[int] = None,
+) -> None:
+    """Append the latest universal audit (if it belongs to ``q_str``).
+
+    The snapshot carries per-engine {engine, count, duration_ms, success,
+    error}; it is recorded once per query so the scene's audit entry shows
+    every engine's failure instead of only a log grep. ``audits`` is the
+    scene-local list; the token registry additionally covers scenes that
+    return None (unresolved) and therefore have no candidate dict to
+    attach the trail to.
+    """
+    snapshot = _universal_audit_snapshot()
+    engines = snapshot.get("engines") if isinstance(snapshot, dict) else None
+    if not isinstance(engines, list):
+        return
+    query = re.sub(r"\s+", " ", str(snapshot.get("query") or "")).strip().casefold()
+    wanted = re.sub(r"\s+", " ", str(q_str or "")).strip().casefold()
+    if not query or query != wanted:
+        return
+    if any(
+        re.sub(r"\s+", " ", str(entry.get("query") or "")).strip().casefold() == query
+        for entry in audits
+    ):
+        return
+    entry = {
+        "query": snapshot.get("query"),
+        "total": snapshot.get("total"),
+        "engines": [
+            {
+                "engine": engine.get("engine"),
+                "count": engine.get("count"),
+                "duration_ms": engine.get("duration_ms"),
+                "success": engine.get("success"),
+                "error": engine.get("error"),
+            }
+            for engine in engines
+            if isinstance(engine, dict)
+        ],
+    }
+    audits.append(entry)
+    if audit_token is not None and scene_index is not None:
+        with _SCENE_UNIVERSAL_AUDITS_LOCK:
+            bucket = _SCENE_UNIVERSAL_AUDITS.setdefault(str(audit_token), {}).setdefault(
+                int(scene_index),
+                {"universal_engine_audits": []},
+            )
+            seen = {
+                re.sub(r"\s+", " ", str(item.get("query") or "")).strip().casefold()
+                for item in bucket["universal_engine_audits"]
+            }
+            if query not in seen:
+                bucket["universal_engine_audits"].append(dict(entry))
+
+
+def _scene_web_audit_extras(
+    audit_token: Optional[str], scene_index: int
+) -> Dict[str, object]:
+    """Per-scene universal audit trail recorded under ``audit_token``."""
+    if not audit_token:
+        return {"universal_engine_audits": []}
+    with _SCENE_UNIVERSAL_AUDITS_LOCK:
+        bucket = _SCENE_UNIVERSAL_AUDITS.get(str(audit_token), {}).get(int(scene_index))
+        if not bucket:
+            return {"universal_engine_audits": []}
+        return {
+            "universal_engine_audits": [
+                dict(entry) for entry in bucket.get("universal_engine_audits") or []
+            ]
+        }
+
+
+def _merged_scene_universal_audits(
+    audit_token: Optional[str], scene_index: int, row: Mapping[str, object]
+) -> List[Dict[str, object]]:
+    """Merge the token registry trail with the winner row's own trail.
+
+    The registry covers unresolved scenes (no winner dict); the row covers
+    direct _resolve_scene callers without a token. Deduped by query so a
+    batch recorded through both channels appears once.
+    """
+    merged: List[Dict[str, object]] = []
+    seen: Set[str] = set()
+
+    def _add(entries: object) -> None:
+        if not isinstance(entries, (list, tuple)):
+            return
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            key = re.sub(
+                r"\s+", " ", str(entry.get("query") or "")
+            ).strip().casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(dict(entry))
+
+    _add(_scene_web_audit_extras(audit_token, scene_index).get("universal_engine_audits"))
+    _add(row.get("universal_engine_audits"))
+    return merged
+
+
+def _bounded_web_seconds(value, default: float, hard_cap: float, floor: float = 1.0) -> float:
+    """Parse an operator budget without allowing an unbounded provider wait."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if not math.isfinite(parsed):
+        parsed = float(default)
+    return min(float(hard_cap), max(float(floor), parsed))
+
+
+def _scene_deadline(stage_deadline_at: Optional[float], now: Optional[float] = None) -> Optional[float]:
+    """Scene deadline: the enclosing stage wall, nothing else.
+
+    User override (Nov 16): web has NO time limit. The old per-scene
+    90s wall-clock cap cut working waves off mid-retrieval, so it is
+    removed — a scene's deadline is now just the stage deadline (the
+    coordinator's total wall), and None when the stage itself has none.
+    A working wave is therefore never cut off by a scene clock: the wave
+    loop's liveness watchdog (zero progress for the full
+    _web_liveness_window_seconds()) is the only trip for a dead wave,
+    flagged web_retrieval_stalled for the driver. An operator may still
+    set VIDZEO_WEB_SCENE_DEADLINE_SECONDS to impose an explicit
+    per-scene wall; that explicit value is honoured as-is (no hard cap).
+    """
+    started = time.monotonic() if now is None else float(now)
+    deadline: Optional[float] = None
+    explicit = os.environ.get("VIDZEO_WEB_SCENE_DEADLINE_SECONDS")
+    if explicit is not None and str(explicit).strip():
+        try:
+            scene_seconds = float(explicit)
+        except (TypeError, ValueError):
+            scene_seconds = None
+        if (
+            scene_seconds is not None
+            and math.isfinite(scene_seconds)
+            and scene_seconds > 0
+        ):
+            deadline = started + scene_seconds
+    if stage_deadline_at is not None:
+        try:
+            stage_deadline = float(stage_deadline_at)
+            if math.isfinite(stage_deadline):
+                deadline = (
+                    stage_deadline
+                    if deadline is None
+                    else min(deadline, stage_deadline)
+                )
+        except (TypeError, ValueError):
+            pass
+    return deadline
+
 try:
     from config import TEMP_DIR
 except ImportError:
@@ -56,6 +463,7 @@ from .constants import (
 from .runtime import _web_log, resolve_gallery_dl
 from .hybrid_search import download_bulk, search_bing, search_ddg
 from .flickr_api_source import flickr_last_search_network_failure, search_flickr_api
+from .host_allowlist import is_seen_host, load_seen_hosts, record_hosts
 from .safety import candidate_is_safe, image_is_safe
 from ..visual_requirement import (
     candidate_asset_metadata,
@@ -64,11 +472,11 @@ from ..visual_requirement import (
     candidate_requirement_match,
     provider_query_variants,
 )
-from services.sources import OpenverseSource, DuckDuckGoSource, RedditSource, WikimediaSource, BraveSource, SearXNGSource
+from services.sources import OpenverseSource, DuckDuckGoSource, RedditSource, WikimediaSource, BraveSource, SearXNGSource, LibraryOfCongressSource
 from services.sources.google_images_source import GoogleImagesSource
 from services.sources.yandex_source import YandexSource
 from .source_broker import web_image_source_catalog, web_image_fallback_layers
-from .universal_scraper import UniversalScraperManager, universal_result_to_candidate
+from .universal_scraper import UniversalScraperManager, UniversalSearchResponse, universal_result_to_candidate
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 # PIL exposes this as a process-global switch and the vision client enables it
@@ -88,14 +496,25 @@ _DUCKDUCKGO_SOURCE = DuckDuckGoSource()
 _REDDIT_SOURCE = RedditSource()
 _GOOGLE_IMAGES_SOURCE = GoogleImagesSource()
 _YANDEX_SOURCE = YandexSource()
+# Library of Congress: public JSON API, no key, rights-documented photos.
+# Wired into the defaults Nov 10, 2026 (web-first audit) — it was defined
+# in services/sources/loc_source.py but never dispatched.
+_LOC_SOURCE = LibraryOfCongressSource()
 try:
     _universal_workers = int(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_WORKERS", "6") or 6)
 except (TypeError, ValueError):
     _universal_workers = 6
 try:
-    _universal_timeout = float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "8") or 8)
+    # Search engines answer slowly through the egress proxy. The engine
+    # timeout is generous by operator override (Nov 16: no time limit for
+    # web — a bit late beats a graphic fallback): each engine gets a full
+    # 300s latency budget (they run in parallel, and the wave waits for
+    # them under liveness gating instead of abandoning the batch at 15s).
+    # The runtime .env already sets 300; the code default now matches it
+    # so the behavior survives without the .env.
+    _universal_timeout = float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "300") or 300)
 except (TypeError, ValueError):
-    _universal_timeout = 8.0
+    _universal_timeout = 300.0
 _UNIVERSAL_SCRAPER = UniversalScraperManager(
     max_workers=_universal_workers,
     engine_timeout_seconds=_universal_timeout,
@@ -713,13 +1132,14 @@ _GALLERYDL_TIMEOUTS = {
 # scraper on this stack and consistently returns 12+ usable candidates.
 _FAST_SOURCES = [
     ("primary_archive", "hybrid"), # Official publishers enter the same identity/vision gates.
-    ("universal_scraper", "universal"), # six-engine parallel scraper adapter
+    ("universal_scraper", "universal"), # four-engine parallel scraper adapter
     ("yandex", "api"),             # Yandex Images HTML scraper — priority lane
-    ("flickr_api", "flickr_api"),  # Flickr REST API — fast, reliable, no scraping
     ("bing_hybrid", "hybrid"),     # Bing image search
+    ("flickr_api", "flickr_api"),  # Flickr REST API — fast, reliable, no scraping
     ("ddg_hybrid", "hybrid"),      # DuckDuckGo image search
     ("openverse", "api"),          # Openverse CC image API
     ("wikimedia", "api"),
+    ("library_of_congress", "api"),  # LOC public JSON API — no key, rights-documented
     ("google_images", "api"),      # Google Images HTML scraper (fail-soft, JS-gated)
     ("brave_images", "api"),       # Brave documented Image Search API
     ("searxng_images", "api"),     # Free SearXNG JSON image aggregation
@@ -732,9 +1152,60 @@ _SLOW_SOURCES = [
     ("reddit", "api"),             # Registered for diagnostics; disabled by default below
     ("reddit", "gdl"),             # Registered for diagnostics; disabled by default below
     ("flickr", "gdl"),             # gallery-dl Flickr (slow, fallback)
+    # 500px is listed in _GALLERYDL_SOURCES but deliberately NOT
+    # dispatched here: gallery-dl's 500px search needs a logged-in
+    # 'x-500px-access-token-prod' cookie and returns no URLs without it
+    # (verified live Nov 10, 2026 — 40s, zero URLs). Wiring it in would
+    # burn up to 10s of the slow-harvest budget per failed query for
+    # nothing. Revisit only if a 500px login is ever supplied.
 ]
 
 _ALL_SOURCES = _FAST_SOURCES + _SLOW_SOURCES
+
+# First-wave tier (GTA fix, Nov 16): the first query wave fans out to the
+# five real transports only — universal, Yandex, Flickr, Bing, DDG. The
+# other lanes (Openverse/Wikimedia/LOC/Google/Brave/SearXNG/Getty re-skins)
+# join later waves. Starting all 12 lanes per scene/query was the stampede:
+# six scenes × 12 sources × the universal four-engine fan-out through one
+# egress proxy, every engine dying on stacked 15s timeouts.
+_TIER_ONE_SOURCES = ("universal_scraper", "yandex", "flickr_api", "bing_hybrid", "ddg_hybrid")
+
+# Transport families sharing one host + proxy: at most one lane per family
+# per query wave. primary_archive/getty_bing are search_bing re-skins and
+# getty_ddg is a search_ddg re-skin (_discover_hybrid_urls), so running
+# them beside the plain lane triples Bing/DDG load for no new coverage.
+_BING_FAMILY_SOURCES = ("bing_hybrid", "primary_archive", "getty_bing")
+_DDG_FAMILY_SOURCES = ("ddg_hybrid", "getty_ddg")
+
+
+def _dedupe_transport_families(
+    source_rows: List[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    """Keep at most one Bing-family and one DDG-family lane per wave.
+
+    The plain hybrid lane wins when several family members are listed;
+    otherwise the first listed member wins. Non-family lanes pass through
+    untouched and in order.
+    """
+    rows = list(source_rows or [])
+    names = {name for name, _kind in rows}
+    keep: Set[str] = set()
+    for family, preferred in (
+        (_BING_FAMILY_SOURCES, "bing_hybrid"),
+        (_DDG_FAMILY_SOURCES, "ddg_hybrid"),
+    ):
+        members = [name for name in family if name in names]
+        if members:
+            keep.add(preferred if preferred in members else members[0])
+    out: List[Tuple[str, str]] = []
+    for name, kind in rows:
+        if name in _BING_FAMILY_SOURCES and name not in keep:
+            continue
+        if name in _DDG_FAMILY_SOURCES and name not in keep:
+            continue
+        out.append((name, kind))
+    return out
+
 
 from .constants import GENERIC_TOPIC_WORDS as _GENERIC_TOPIC_WORDS
 
@@ -753,6 +1224,7 @@ _PROVIDER_HOSTS = {
     # blocked by one serial DNS probe here.
     "universal_scraper": "",
     "wikimedia": "commons.wikimedia.org",
+    "library_of_congress": "www.loc.gov",
     "flickr_api": "www.flickr.com",
     "bing_hybrid": "www.bing.com",
     "ddg_hybrid": "duckduckgo.com",
@@ -769,7 +1241,23 @@ _PROVIDER_HOSTS = {
 def _report_provider_failure(source_name: str, exc: BaseException) -> None:
     health = _ACTIVE_PROVIDER_HEALTH
     if health is not None:
-        health.note_failure(source_name, f"{type(exc).__name__}: {str(exc)[:100]}")
+        reason = f"{type(exc).__name__}: {str(exc)[:100]}"
+        text = str(exc).lower()
+        status = re.search(r"\b(?:HTTP(?: status)?\s*|status\s*)(\d{3})\b", str(exc), re.I)
+        status_code = int(status.group(1)) if status else 0
+        is_definitive = (
+            status_code in {401, 403, 410, 451}
+            or "flickr 100" in text
+            or any(marker in text for marker in (
+                "bot-gate", "bot check", "bot challenge", "robot check",
+                "smartcaptcha", "captcha",
+                "invalid api key", "key not found", "unauthorized", "forbidden"
+            ))
+        )
+        if is_definitive:
+            health.trip(source_name, reason)
+        else:
+            health.note_failure(source_name, reason)
 
 
 def _report_provider_success(source_name: str) -> None:
@@ -799,36 +1287,28 @@ def _semantic_pending_wave_limit() -> int:
 
 
 def _enabled_fast_sources() -> List[Tuple[str, str]]:
-    """Return the bounded fast lanes enabled for this process.
+    """Return public fast lanes plus configured credentialed providers.
 
-    Bing and DDG are complementary hybrid lanes. Getty-restricted variants
-    are included by default so a single provider outage does not collapse
-    recall; the legacy expansion switch still enables every slow lane.
+    A broad default source mix improves scene coverage. Per-job provider
+    circuits retire failing services without disabling healthy alternatives.
     """
     # Operator-scoped allowlist used for controlled source benchmarks and
     # single-provider production jobs.  Keep it here so the shared warm pool,
     # per-scene waves, telemetry, and recovery all obey the same boundary.
+    # The universal scraper is the web-image path by deliberate, permanent
+    # operator instruction: it runs for every web-image query and no
+    # allowlist may drop it. The allowlist restricts the OTHER lanes only.
     only = str(os.environ.get("VIDZEO_WEB_ONLY_PROVIDER", "") or "").strip().lower()
     if only:
         wanted = {item.strip() for item in only.split(",") if item.strip()}
+        wanted.add("universal_scraper")
         return [(name, kind) for name, kind in _FAST_SOURCES if name in wanted]
-    legacy_setting = os.environ.get("VIDZEO_ENABLE_LEGACY_WEB_SEARCH")
-    legacy = str(legacy_setting or "0").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
-    # Getty-via-Bing/DDG used to be launched for every scene query.  Each of
-    # those lanes performs its own multi-pass search, so a 20-scene job could
-    # create hundreds of provider requests before *any* scene returned.  The
-    # default batch uses one complementary request per provider.  The older
-    # expansion lanes remain available behind the existing legacy switch.
+    # Public providers run by default. Their requests share the bounded scene
+    # pool; definitive 4xx responses open a circuit so blocked services do not
+    # consume every scene's retrieval budget.
     default_names = {
-        "universal_scraper",
-        # Keep every bounded HTTP/API lane in the normal resolver. The old
-        # default silently omitted Getty's complementary Bing/DDG searches,
-        # reducing recall and making a single provider outage look like a
-        # blank scene.
-        "wikimedia", "flickr_api", "bing_hybrid", "openverse",
-        "yandex", "google_images", "getty_bing", "getty_ddg",
+        name for name, _kind in _FAST_SOURCES
+        if name not in {"brave_images", "searxng_images"}
     }
     if _BRAVE_SOURCE.is_available():
         default_names.add("brave_images")
@@ -842,17 +1322,12 @@ def _enabled_fast_sources() -> List[Tuple[str, str]]:
         or os.environ.get("VIDZEO_SEARXNG_URLS")
         or os.environ.get("VIDZEO_SEARXNG_URL")
     )
-    if searx_configured and _SEARXNG_SOURCE.is_available():
+    if searx_configured:
         default_names.add("searxng_images")
-    # Preserve the broad provider mix for installations that have never set
-    # this switch. An explicit false value is an operator request to suppress
-    # the older DDG hybrid lane; an explicit true value enables every lane.
-    if legacy_setting is None:
-        default_names.add("ddg_hybrid")
     return [
         (name, kind)
         for name, kind in _FAST_SOURCES
-        if legacy or name in default_names
+        if name in default_names
     ]
 
 
@@ -1064,9 +1539,15 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
     try:
         if source_name == "openverse":
             candidates = _OPENVERSE_SOURCE.search(query, limit=20)
+            if not candidates and getattr(_OPENVERSE_SOURCE, "_circuit_open", False):
+                health = _ACTIVE_PROVIDER_HEALTH
+                if health is not None:
+                    health.trip("openverse", "Openverse circuit open (504 or unauthenticated)")
         elif source_name == "wikimedia":
             candidates = _WIKIMEDIA_SOURCE.search(query, limit=20)
             candidates = _WIKIMEDIA_SOURCE.enrich_rights(candidates, limit=6)
+        elif source_name == "library_of_congress":
+            candidates = _LOC_SOURCE.search(query, limit=20)
         elif source_name == "yandex":
             candidates = _YANDEX_SOURCE.search(query, limit=20)
             # Yandex signals a robot/challenge page by opening its own
@@ -1086,6 +1567,10 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
             candidates = _SEARXNG_SOURCE.search(query, limit=20)
         elif source_name == "duckduckgo":
             candidates = _DUCKDUCKGO_SOURCE.search(query, limit=20)
+            if not candidates and getattr(_DUCKDUCKGO_SOURCE, "_circuit_open", False):
+                health = _ACTIVE_PROVIDER_HEALTH
+                if health is not None:
+                    health.trip("duckduckgo", "DuckDuckGo circuit open (bot gate)")
         elif source_name == "reddit":
             candidates = _REDDIT_SOURCE.search(query, limit=20)
             return [{
@@ -1145,15 +1630,19 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
 
 
 def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> List[Dict]:
-    """Run the copied six-engine scraper and map rows into resolver records."""
+    """Run the copied four-engine scraper and map rows into resolver records."""
     global _UNIVERSAL_LAST_AUDIT
     try:
         enabled = str(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_ENGINES", "") or "").strip()
         engine_ids = [part.strip() for part in enabled.split(",") if part.strip()] or None
         limit = max(6, min(30, int(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_LIMIT", "20") or 20)))
-        timeout = max(2.0, min(15.0, float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "8") or 8)))
+        # Generous by operator override (Nov 16): the 300s engine timeout
+        # is a latency budget, not a wave wall — the resolver wave waits
+        # for the batch under liveness gating. The runtime .env already
+        # sets 300; the code default now matches it.
+        timeout = max(2.0, min(300.0, float(os.environ.get("VIDZEO_UNIVERSAL_SCRAPER_TIMEOUT_SECONDS", "300") or 300)))
     except (TypeError, ValueError):
-        engine_ids, limit, timeout = None, 20, 8.0
+        engine_ids, limit, timeout = None, 20, 300.0
     response = _UNIVERSAL_SCRAPER.search(
         query,
         engine_ids=engine_ids,
@@ -1161,6 +1650,56 @@ def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> L
         timeout_seconds=timeout,
         wait_until_complete=bool(wait_until_complete),
     )
+    # Wright (Nov 16): candidates arrived a minute after the stage gave
+    # up and were lost.  When a batch comes back empty — or any engine
+    # timed out — re-check the late spool before reporting zero: engines
+    # still running past their deadline may have landed meanwhile, and
+    # the spool holds rows from earlier batches for this exact query.
+    # This is a bounded wait, not another crawl.
+    timed_out = any(
+        (not stat.success) and "timeout" in str(stat.error or "").lower()
+        for stat in response.stats
+    )
+    if response.total == 0 or timed_out:
+        try:
+            # Late wait raised 5s → 120s (GTA fix, Nov 16): the old 5s was
+            # far short of the ~22s gap between the wave abandoning a batch
+            # and its engines landing, so every late row was orphaned. 120s
+            # covers the gap with headroom; the scene-level pre-broadened
+            # harvest is the second chance for rows that arrive later still.
+            late_wait = max(
+                0.0,
+                min(
+                    300.0,
+                    float(
+                        os.environ.get(
+                            "VIDZEO_UNIVERSAL_LATE_WAIT_SECONDS", "120"
+                        )
+                        or 120
+                    ),
+                ),
+            )
+        except (TypeError, ValueError):
+            late_wait = 120.0
+        late_rows = _UNIVERSAL_SCRAPER.collect_late_results(
+            query, wait_seconds=late_wait
+        )
+        if late_rows:
+            seen_urls = {
+                str(item.image_url or "").strip().casefold()
+                for item in response.results
+            }
+            extra = [
+                item for item in late_rows
+                if str(item.image_url or "").strip().casefold() not in seen_urls
+            ]
+            if extra:
+                response = UniversalSearchResponse(
+                    response.query,
+                    response.total + len(extra),
+                    list(response.results) + extra,
+                    list(response.stats),
+                )
     with _UNIVERSAL_AUDIT_LOCK:
         _UNIVERSAL_LAST_AUDIT = {
             "query": response.query,
@@ -1403,11 +1942,9 @@ def _warm_shared_discovery_pool(
     # Keep lower operator limits, but cap this non-authoritative substage.
     if scene_count >= 8:
         batch_seconds = min(batch_seconds, 12.0)
-    batch_deadline = (
-        float("inf")
-        if wait_until_complete
-        else min(stage_deadline_at, time.monotonic() + batch_seconds)
-    )
+    # Wait mode collects all providers that finish within this batch wall;
+    # it must not turn one slow provider into an unbounded stage wait.
+    batch_deadline = min(stage_deadline_at, time.monotonic() + batch_seconds)
     sources = []
     # Source *names* are unique; the transport kind is not. Treating every
     # ``api`` provider as the same kind used to warm only Yandex plus one
@@ -1422,6 +1959,11 @@ def _warm_shared_discovery_pool(
             continue
         sources.append((name, kind))
         seen_names.add(name)
+    # One Bing-family lane and one DDG-family lane per wave (GTA fix):
+    # the warm pool is the first wave of the job, and fanning the Bing /
+    # DDG re-skins beside the plain lanes tripled proxy load for the same
+    # host before any scene even started.
+    sources = _dedupe_transport_families(sources)
     if not sources:
         _web_log("shared batch pool: all providers unhealthy; skipping batch warm-up")
         return {"query": "", "candidates": 0, "providers_completed": 0, "providers_pending": 0}
@@ -1439,11 +1981,11 @@ def _warm_shared_discovery_pool(
             kind,
             query,
             gallery_cmd,
-            max_timeout=5,
+            max_timeout=30,
             wait_until_complete=wait_until_complete,
         )
         if discovery_cache is not None:
-            remaining = None if wait_until_complete else max(0.25, batch_deadline - time.monotonic())
+            remaining = max(0.25, batch_deadline - time.monotonic())
             return discovery_cache.get_or_fetch(
                 name,
                 query,
@@ -1460,11 +2002,11 @@ def _warm_shared_discovery_pool(
     futures = {pool.submit(fetch, name, kind): name for name, kind in sources}
     pending = set(futures)
     try:
-        while pending and (wait_until_complete or time.monotonic() < batch_deadline):
-            remaining = float("inf") if wait_until_complete else max(0.0, batch_deadline - time.monotonic())
+        while pending and time.monotonic() < batch_deadline:
+            remaining = max(0.0, batch_deadline - time.monotonic())
             done, pending = wait(
                 pending,
-                timeout=(0.25 if wait_until_complete else min(0.25, remaining)),
+                timeout=min(0.25, remaining),
                 return_when=FIRST_COMPLETED,
             )
             if not done:
@@ -1513,7 +2055,7 @@ def _warm_shared_discovery_pool(
                 )
             )
             # Universal discovery is the primary copied scraper lane. Let it
-            # finish its own six-engine fan-out before closing a full pool so
+            # finish its own four-engine fan-out before closing a full pool so
             # the winning rows are actually available to scene assignment;
             # otherwise a fast legacy provider could fill the numeric target
             # while the universal callback was still running in the background.
@@ -1530,13 +2072,11 @@ def _warm_shared_discovery_pool(
                 break
     finally:
         for future in pending:
-            if not wait_until_complete:
-                future.cancel()
-        # In wait mode every provider future is drained before handoff. The
-        # normal bounded mode keeps its historical non-blocking shutdown.
+            future.cancel()
+        # In-flight provider calls remain bounded by their own network timeout.
         pool.shutdown(
-            wait=wait_until_complete,
-            cancel_futures=not wait_until_complete,
+            wait=not pending,
+            cancel_futures=bool(pending),
         )
 
     _web_log(
@@ -1769,12 +2309,30 @@ def _pre_score_candidate(
 
 
 def _topic_candidate_mismatch(title: str, url: str, query: str, scene_text: str, main_subject: str = "") -> bool:
-    """Reject broad-topic image hits that drift into a different visual niche."""
+    """Reject broad-topic image hits that drift into a different visual niche.
+
+    Scene-subject aware (GTA VI proof job): a scene whose narration is
+    ABOUT an earlier installment (e.g. scene 0 narrates GTA V's sales
+    and the decade-long wait) legitimately shows that installment, so a
+    GTA V image is not a mismatch for THAT scene — only for scenes
+    about the newer installment's own content. The 2002 Vice City game
+    never gains an anchor: it is neither the narrated installment nor
+    the main subject.
+    """
     metadata_text = f"{title} {url}".lower()
     if not metadata_text.strip():
         return False
     subject = re.sub(r"\s+", " ", str(main_subject or "").strip())
     if not subject:
+        return False
+    if not _is_legacy_installment_image(
+        f"{title} {url}"
+    ) and alternate_anchor_allows(
+        _narrated_installment_anchor(scene_text, subject), metadata_text
+    ):
+        # Scene-subject anchor: the scene narrates this installment, so
+        # its imagery is on-topic here even though it is not the main
+        # subject. Legacy-cutscene rows never gain this exemption.
         return False
     discrim = _extract_discriminating_subject_terms(subject)
     terms = list(discrim) if discrim else [
@@ -1984,7 +2542,10 @@ def _extract_script_asset_variants(script: str, title: str, subject: str, limit:
             and not any(part in reject_terms for part in cleaned_lower.split())
         ):
             variants.append(f"{cleaned} photo")
-            variants.append(f"{cleaned} documentary")
+            # NOTE: the "{cleaned} documentary" variant used to be appended
+            # here too. It produced nonsense queries from sentence-start words
+            # ("Behind documentary", "Amtrak Long Run Through documentary")
+            # that no image engine can match, so it was removed.
 
     visual_terms = _extract_visual_keywords(text, max_kws=16) if "_extract_visual_keywords" in globals() else []
     if subject:
@@ -2034,10 +2595,13 @@ def _same_query_candidate_limit(max_candidate_downloads: int = 20, top_score: fl
     env_val = os.environ.get("VIDZEO_WEB_SAME_QUERY_CANDIDATES")
     if float(top_score or 0.0) >= 8.0:
         try:
-            configured = max(3, min(12, int(env_val))) if env_val else 8
+            # Default matches the per-scene top-12 pool (Nov 10, 2026):
+            # a high-confidence query keeps a full page of 12, not 8, so
+            # the vision shortlist can actually reach 12.
+            configured = max(3, min(12, int(env_val))) if env_val else 12
             return min(ceiling, configured)
         except Exception:
-            return min(ceiling, 8)
+            return min(ceiling, 12)
     if float(top_score or 0.0) >= 5.0:
         # A decent metadata hit still is not proof that the first result is
         # the best frame. Keep a wider bounded page so the cross-scene
@@ -2052,10 +2616,10 @@ def _vision_shortlist_limit() -> int:
     """Return the maximum downloaded candidates sent to visual comparison."""
     try:
         configured = int(
-            os.environ.get("VIDZEO_WEB_VISION_SHORTLIST", "8") or 8
+            os.environ.get("VIDZEO_WEB_VISION_SHORTLIST", "12") or 12
         )
     except Exception:
-        configured = 8
+        configured = 12
     return max(3, min(12, configured))
 
 
@@ -2241,7 +2805,7 @@ def _should_switch_active_subject(candidate: str, main_subject: str, scene_text:
 
 
 
-def _passes_web_relevance_floor(candidate: Dict, score: float, main_subject: str = "") -> bool:
+def _passes_web_relevance_floor(candidate: Dict, score: float, main_subject: str = "", scene_text: str = "") -> bool:
     title = str(candidate.get("title") or "")
     url = str(candidate.get("url") or candidate.get("source_url") or "")
     query = str(candidate.get("query_used") or candidate.get("query") or "")
@@ -2256,6 +2820,32 @@ def _passes_web_relevance_floor(candidate: Dict, score: float, main_subject: str
         return float(score) >= 0.0
     subject = str(main_subject or "").strip()
     subject_words = [w for w in re.findall(r"[a-z0-9]+", subject.lower()) if len(w) > 1]
+    # Scene-subject anchor (GTA VI proof job): when the scene itself
+    # narrates an earlier installment (scene 0: GTA V's sales and the
+    # decade-long wait), imagery of that installment anchors the scene
+    # even though it is not the main subject. The anchor never admits a
+    # 2002 Vice City row.
+    anchor = (
+        _narrated_installment_anchor(scene_text, subject)
+        if scene_text
+        else None
+    )
+    anchor_allows = bool(anchor) and alternate_anchor_allows(anchor, haystack)
+    if _is_legacy_installment_image(haystack):
+        # 2002 Vice City imagery is admissible only for scenes actually
+        # about that game (subject or narration names "Grand Theft Auto
+        # Vice City"). In a newer-installment video it is never the right
+        # still — not even for a scene set in the new Vice City, where
+        # "vice" + "city" word matches would otherwise admit it.
+        _legacy_subject = bool(
+            re.search(r"\bgrand\s+theft\s+auto\b.{0,24}\bvice\s+city\b", subject.lower())
+            or re.search(
+                r"\bgrand\s+theft\s+auto\b.{0,24}\bvice\s+city\b",
+                str(scene_text or "").lower(),
+            )
+        )
+        if not _legacy_subject:
+            return False
     if not subject_words:
         # Weak-but-topical fills (score just below zero) are allowed so hard
         # scenes resolve instead of forcing the job into the generic pool.
@@ -2276,10 +2866,10 @@ def _passes_web_relevance_floor(candidate: Dict, score: float, main_subject: str
     nearest_pending = bool(cand_ev.get("nearest_match") or candidate.get("nearest_match_pending"))
     if (terminal.isdigit() or terminal in version_aliases) and not nearest_pending:
         required_versions = version_aliases.get(terminal, {terminal})
-        if not any(re.search(r"\b" + re.escape(version) + r"\b", haystack) for version in required_versions):
+        if not any(re.search(r"\b" + re.escape(version) + r"\b", haystack) for version in required_versions) and not anchor_allows:
             return False
 
-    if cand_ev.get("canonical_entity_mismatch") and not nearest_pending:
+    if cand_ev.get("canonical_entity_mismatch") and not nearest_pending and not anchor_allows:
         return False
 
     if len(subject_words) >= 2:
@@ -2308,7 +2898,7 @@ def _passes_web_relevance_floor(candidate: Dict, score: float, main_subject: str
     else:
         anchored = any(re.search(r"\b" + re.escape(word) + r"\b", haystack) for word in subject_words)
 
-    if not anchored:
+    if not anchored and not anchor_allows:
         return False
 
     landscape_markers = {
@@ -2353,10 +2943,44 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
         return None
     if _is_biographical_person(main_subject) and not _metadata_has_identity(item.get("title", ""), url, "", identity_terms):
         return None
-    dl_results = download_bulk([url], scene_dir, max_concurrent=1, timeout_seconds=12)
-    for _url, fpath, err in dl_results:
-        if err or not fpath or not fpath.exists():
-            continue
+    download_headers = _provider_download_headers([item])
+    dl_results = download_bulk(
+        [url], scene_dir, max_concurrent=1, timeout_seconds=30,
+        headers_by_url=download_headers,
+    )
+    downloaded_url = url
+    usable_downloads = [
+        (fpath, err)
+        for _downloaded, fpath, err in dl_results
+        if not err and fpath and fpath.exists()
+    ]
+    if not usable_downloads:
+        preview_url = str(item.get("preview_url") or item.get("thumbnail_url") or "").strip()
+        preview_host = urllib.parse.urlparse(preview_url).netloc.lower()
+        preview_allowed = bool(
+            preview_host
+            and (
+                is_seen_host(preview_host, load_seen_hosts())
+                or _host_is_preferred(preview_host, _preferred_image_hosts())
+            )
+        )
+        if (
+            preview_allowed
+            and preview_url.startswith(("https://", "http://"))
+            and preview_url != url
+        ):
+            preview_results = download_bulk(
+                [preview_url], scene_dir, max_concurrent=1, timeout_seconds=30,
+                headers_by_url=download_headers,
+            )
+            usable_downloads = [
+                (fpath, err)
+                for _downloaded, fpath, err in preview_results
+                if not err and fpath and fpath.exists()
+            ]
+            if usable_downloads:
+                downloaded_url = preview_url
+    for fpath, err in usable_downloads:
         dims = _validate_image(fpath)
         if dims is None:
             continue
@@ -2408,8 +3032,9 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
             **item,
             "path": str(fpath),
             "query_used": item.get("query", main_subject),
+            "download_url_used": downloaded_url,
         }
-        if score < 0.0 or not _passes_web_relevance_floor(candidate_for_gate, score, main_subject):
+        if score < 0.0 or not _passes_web_relevance_floor(candidate_for_gate, score, main_subject, scene_text):
             try:
                 fpath.unlink(missing_ok=True)
             except OSError:
@@ -2418,6 +3043,7 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
         return {
             "path": str(fpath), "width": w, "height": h,
             "url": url, "domain": item.get("domain") or item.get("source", "flickr_api"),
+            "download_url_used": downloaded_url,
             "relevance": score, "final_score": score, "reused_from_scene": False,
             "title": item.get("title", "") or f"scene_{idx + 1}",
             "source_url": item.get("source_url") or item.get("page_url") or url,
@@ -2435,12 +3061,91 @@ def _download_and_accept_single_candidate(item: Dict, scene_dir: Path, idx: int,
     return None
 
 
-def _diverse_download_candidates(scored, limit):
-    """Diversify similarly relevant rows without promoting weak host results."""
+# Hosts the pipeline has already fetched images from in earlier jobs, so a
+# fetch from one of them does not pop a new per-host network approval card.
+# Proven by the running BNSF pool (51/51 candidates resolved on 2026-11-10):
+# i.ytimg.com, live.staticflickr.com, upload.wikimedia.org, i.pinimg.com,
+# pinterest.com, youtube.com, flickr.com, rrpicturearchives.net. Override
+# (comma-separated) with VIDZEO_PREFERRED_IMAGE_HOSTS; an empty value
+# disables the preference entirely.
+_DEFAULT_PREFERRED_IMAGE_HOSTS = (
+    "upload.wikimedia.org",
+    "live.staticflickr.com",
+    "i.ytimg.com",
+    "i.pinimg.com",
+    "mm.bing.net",
+    "gstatic.com",
+    "yandex.net",
+    "yandex.com",
+    "duckduckgo.com",
+    "pinterest.com",
+    "www.pinterest.com",
+    "flickr.com",
+    "youtube.com",
+    "rrpicturearchives.net",
+)
+
+
+def _preferred_image_hosts():
+    """Hosts whose fetches are already approved; env override, else default."""
+    raw = os.environ.get("VIDZEO_PREFERRED_IMAGE_HOSTS")
+    if raw is None:
+        return set(_DEFAULT_PREFERRED_IMAGE_HOSTS)
+    return {host.strip().lower() for host in raw.split(",") if host.strip()}
+
+
+def _host_is_preferred(host, preferred):
+    host = (host or "").lower()
+    return any(host == item or host.endswith("." + item) for item in preferred)
+
+
+def _diverse_download_candidates(scored, limit, preferred_hosts=None):
+    """Diversify similarly relevant rows without promoting weak host results.
+
+    Among hosts within the relevance slack, prefer hosts the pipeline has
+    already fetched from: each new host costs a per-host network approval
+    card and can stall media search, so a near-equal candidate from a
+    known host wins over a slightly better one from an unseen host. A
+    preferred host never overrides a real relevance gap — it must still be
+    within slack of the best candidate — and the alternate-host reserve
+    below is kept.
+
+    Diversity is measured by PUBLISHER/source host, not by image CDN
+    host (GTA VI proof job a57cb5c7: all 5 web images came from
+    Pinterest — ``i.pinimg.com`` image URLs behind ``br.pinterest.com``
+    pin pages — while the round-robin still saw "one host" and had
+    nothing to swap in). Grouping by source host makes ``i.pinimg.com``
+    and ``pinimg.com`` variants one source, so the reserve below can
+    actually fire. When the eligible set holds other sources, keep a
+    diversity reserve of up to a quarter of the shortlist for them even
+    when they sit outside the relevance slack: they still passed the
+    metadata floor, and vision — not the pre-score — decides whether
+    their pixels fit the scene. Without the reserve, a
+    Pinterest-dominated query fills every download slot with pins and
+    the scene can never pick a distinct non-Pinterest image.
+    """
+    preferred = (
+        _preferred_image_hosts()
+        if preferred_hosts is None
+        else {str(host).strip().lower() for host in preferred_hosts if str(host).strip()}
+    )
+
+    def _source_key(item):
+        source = _distinct_source_host(item) if isinstance(item, Mapping) else ""
+        return source or urllib.parse.urlparse(str(item.get("url") or "")).netloc.lower()
+
+    def _image_host(item):
+        return urllib.parse.urlparse(str(item.get("url") or "")).netloc.lower()
+
+    def _is_preferred_source(item):
+        return (
+            _host_is_preferred(_source_key(item), preferred)
+            or _host_is_preferred(_image_host(item), preferred)
+        )
+
     groups = {}
     for score, item in scored:
-        host = urllib.parse.urlparse(str(item.get("url") or "")).netloc.lower()
-        groups.setdefault(host, []).append((float(score), item))
+        groups.setdefault(_source_key(item), []).append((float(score), item))
     for rows in groups.values():
         rows.sort(key=lambda pair: pair[0], reverse=True)
     selected = []
@@ -2449,19 +3154,41 @@ def _diverse_download_candidates(scored, limit):
         best = max(rows[0][0] for rows in groups.values())
         slack = max(.25, abs(best) * .1)
         eligible = [host for host, rows in groups.items() if rows[0][0] >= best - slack]
-        host = min(eligible, key=lambda key: (uses.get(key, 0), -groups[key][0][0], key))
+        host = min(
+            eligible,
+            key=lambda key: (
+                0 if _is_preferred_source(groups[key][0][1]) else 1,
+                uses.get(key, 0),
+                -groups[key][0][0],
+                key,
+            ),
+        )
         selected.append(groups[host].pop(0))
         uses[host] = uses.get(host, 0) + 1
         if not groups[host]:
             del groups[host]
     # One failed host must not consume the entire transfer allowance. Keep
-    # one eligible reserve from another host even when its metadata is weaker.
-    selected_hosts = {urllib.parse.urlparse(str(item.get('url') or '')).netloc.lower()
-                      for _score, item in selected}
-    reserves = [(rows[0][0], host) for host, rows in groups.items() if host not in selected_hosts]
+    # a diversity reserve from other sources even when their metadata is
+    # weaker: without it a single-source query (Pinterest pins for a
+    # game-key-art search) fills every slot with one publisher and the
+    # scene's pool can never diversify. Reserve up to a quarter of the
+    # shortlist; the replaced rows are the lowest-scoring selected ones.
+    selected_hosts = {_source_key(item) for _score, item in selected}
+    reserves = [
+        (rows[0][0], host)
+        for host, rows in groups.items()
+        if host not in selected_hosts
+    ]
     if len(selected) > 1 and len(selected_hosts) == 1 and reserves:
-        _score, host = max(reserves)
-        selected[-1] = groups[host][0]
+        reserve_count = max(1, min(len(reserves), int(limit) // 4 or 1))
+        reserves.sort(key=lambda pair: (_is_preferred_source(groups[pair[1]][0][1]), pair[0]), reverse=True)
+        for _score, host in reserves[:reserve_count]:
+            replacement = groups[host].pop(0)
+            # Replace the lowest-scoring selected row, never the best.
+            worst_index = min(range(len(selected)), key=lambda i: selected[i][0])
+            selected[worst_index] = replacement
+            if not groups[host]:
+                del groups[host]
     return selected
 
 
@@ -2611,18 +3338,32 @@ def _download_candidate_batch(items, output_dir, max_concurrent, timeout_seconds
             if path and Path(path).is_file():
                 cache[url] = str(path)
             # Retain ownership while its preview rescue is still pending.
+    # A publisher may deny its original URL while the search provider's
+    # preview remains accessible. The normal image validation and visual gate
+    # still decide whether the recovered pixels are usable for this scene.
     fallback = {}
+    preview_seen_hosts = load_seen_hosts()
+    preview_preferred_hosts = _preferred_image_hosts()
     for url, path, error in results:
         item = by_url.get(url, {})
         preview = str(item.get("preview_url") or item.get("thumbnail_url") or "").strip()
         if not path and preview.startswith(("https://", "http://")) and preview != url:
-            fallback[url] = preview
+            _preview_host = urllib.parse.urlparse(preview).netloc.lower()
+            if _preview_host and (
+                is_seen_host(_preview_host, preview_seen_hosts)
+                or _host_is_preferred(_preview_host, preview_preferred_hosts)
+            ):
+                fallback[url] = preview
     if fallback:
-        previews = download_bulk(
-            list(dict.fromkeys(fallback.values())), output_dir,
-            max_concurrent=max_concurrent, timeout_seconds=timeout_seconds,
-            headers_by_url=headers,
-        )
+        try:
+            previews = download_bulk(
+                list(dict.fromkeys(fallback.values())), output_dir,
+                max_concurrent=max_concurrent, timeout_seconds=timeout_seconds,
+                headers_by_url=headers,
+            )
+        except Exception as exc:
+            _web_log(f"preview recovery failed: {type(exc).__name__}: {str(exc)[:160]}")
+            previews = []
         preview_paths = {url: path for url, path, error in previews if path}
         recovered = []
         for url, path, error in results:
@@ -2649,6 +3390,21 @@ def _download_candidate_batch(items, output_dir, max_concurrent, timeout_seconds
                 # scene. Retry after a short job-local cooldown, not forever.
                 cache[url] = failed_prefix + str(time.monotonic()) + ':' + str(error or 'download_failed')[:80]
     collect_pending()
+    # Learn the hosts this batch actually downloaded from, so the next job
+    # reuses them instead of popping a fresh per-host approval card. Only
+    # successful downloads count (a host in search results is not a fetch).
+    # Best-effort: a store failure must never fail the batch.
+    try:
+        _downloaded_hosts = {
+            urllib.parse.urlparse(str(url)).netloc.lower()
+            for url, path, _error in list(ready_results) + list(results)
+            if path and Path(path).is_file() and str(url).startswith(("http://", "https://"))
+        }
+        _downloaded_hosts.discard("")
+        if _downloaded_hosts:
+            record_hosts(_downloaded_hosts, source="job")
+    except Exception:
+        pass
     return ready_results + results
 
 
@@ -2728,9 +3484,21 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     download_cache_lock: Optional[threading.Lock] = None,
                     exhaustive_fallback: bool = False,
                     wait_until_complete: bool = False,
-                    prioritize_director_query: bool = False) -> Optional[Dict]:
+                    prioritize_director_query: bool = False,
+                    audit_token: Optional[str] = None) -> Optional[Dict]:
     if source_health is None:
         source_health = _ACTIVE_PROVIDER_HEALTH
+    # Start the per-scene budget when a worker begins, not when it is queued.
+    # Otherwise later scenes can lose most of their deadline waiting for a
+    # worker slot while one unhealthy provider owns the retrieval wall.
+    deadline_at = _scene_deadline(deadline_at)
+    # Per-scene universal engine audit trail (GTA fix, Nov 16): every
+    # universal batch's per-engine {engine, count, duration, error} is
+    # recorded via _fetch_source_query so the scene's audit entry shows
+    # what each engine did — even when the scene resolves to nothing.
+    # audit_token (one resolve_web_images_for_video_fast call) scopes the
+    # registry so concurrent jobs cannot mix scenes.
+    universal_engine_audits: List[Dict[str, object]] = []
     try:
         from .query import _extract_visual_keywords as _scene_visual_keywords
     except Exception:
@@ -2746,8 +3514,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
     # failures. The shared scene budget covers every query and replacement.
     if fast_mode:
         try:
+            # Default matches the per-scene top-12 pool (Nov 10, 2026):
+            # fast mode keeps 12 downloads per query, not 8, so the
+            # vision shortlist can actually reach 12.
             configured_fast_per_query = int(
-                os.environ.get("VIDZEO_WEB_FAST_CANDIDATES_PER_QUERY", "8") or 8
+                os.environ.get("VIDZEO_WEB_FAST_CANDIDATES_PER_QUERY", "12") or 12
             )
             # Named-person contracts need enough independent pixels for the
             # final vision gate to choose a real portrait.  Three downloads
@@ -2763,12 +3534,12 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             )
             fast_per_query = max(
                 1,
-                min(8, configured_fast_per_query),
+                min(12, configured_fast_per_query),
             )
             if person_recall:
                 fast_per_query = max(5, fast_per_query)
         except (TypeError, ValueError):
-            fast_per_query = 8
+            fast_per_query = 12
         try:
             scene_download_budget = max(
                 fast_per_query,
@@ -3409,9 +4180,12 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         rows = None
         try:
             if discovery_cache is not None:
-                remaining = None if wait_until_complete else 15.0
-                if deadline_at and not wait_until_complete:
-                    remaining = max(0.1, min(15.0, float(deadline_at) - time.monotonic()))
+                remaining = 15.0
+                if deadline_at:
+                    remaining = max(
+                        0.1,
+                        min(15.0, float(deadline_at) - time.monotonic()),
+                    )
                 rows = discovery_cache.get_or_fetch(
                     source_name,
                     q_str,
@@ -3443,6 +4217,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             return []
         if rows and source_health is not None:
             source_health.note_success(source_name)
+        if source_name == "universal_scraper":
+            _record_universal_audit_entry(
+                universal_engine_audits, q_str,
+                audit_token=audit_token, scene_index=idx,
+            )
         return list(rows or [])
 
     def _accept_source_rows(source_name: str, rows: List[Dict]) -> int:
@@ -3708,16 +4487,22 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         # unlock the remaining providers only if the scene is still unresolved.
         # Starting all 12 lanes for every scene/query created hundreds of live
         # requests and left every worker waiting at the shared stage deadline.
-        if exhaustive_fallback:
-            # After the primary wave has had first refusal, keep the
-            # secondary tier available for every later query. Restricting it
-            # to exactly query index 1 meant a useful Openverse/Wikimedia row
-            # on the final canonical query was never searched at all.
-            source_rows = list(
-                _FAST_SOURCES[5:] if q_idx > 0 else _FAST_SOURCES[:5]
-            )
+        # Tiered first wave (GTA fix, Nov 16): the first query fans out to
+        # the five real transports only (universal/Yandex/Flickr/Bing/DDG);
+        # later query variants unlock all enabled fast sources. The old
+        # _FAST_SOURCES[:5] tier smuggled in primary_archive — a Bing
+        # re-skin — and left DDG out. Every wave is then de-duplicated to
+        # at most one Bing-family and one DDG-family lane.
+        if q_idx == 0:
+            tier_one = [
+                (name, kind)
+                for name, kind in _enabled_fast_sources()
+                if name in _TIER_ONE_SOURCES
+            ]
+            source_rows = tier_one or _enabled_fast_sources()
         else:
             source_rows = _enabled_fast_sources()
+        source_rows = _dedupe_transport_families(source_rows)
         for src_name, src_type in source_rows:
             if src_type in ("api", "hybrid", "flickr_api", "universal"):
                 # Once a topic pool is warm, a scene correction only needs the
@@ -3732,7 +4517,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 ):
                     continue
                 # The universal lane already fanned out once for the shared
-                # topic. Avoid multiplying six-engine requests for every
+                # topic. Avoid multiplying four-engine requests for every
                 # scene query; existing provider lanes remain the per-scene
                 # fallback. A single-scene job (no shared pool) still uses it.
                 if (
@@ -3750,15 +4535,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     # pool before scenes resolve.
                     deferred_universal_task = (src_name, src_type, q_str)
                     continue
-                if (
-                    src_name == "universal_scraper"
-                    and not exhaustive_fallback
-                    and shared_pool_query
-                    and not is_shared_query
-                    and not universal_scene_fallback
-                    and not _scene_specific_wave_required
-                ):
-                    continue
+                # The universal scraper is the web-image path by deliberate,
+                # permanent operator instruction: it is never skipped for a
+                # scene query just because the shared topic pool already
+                # fanned out once. Scene queries differ from the topic query,
+                # so the scraper runs for them as well.
                 if source_health is not None and not source_health.healthy(src_name):
                     continue
                 api_tasks.append((src_name, src_type, q_str))
@@ -3798,24 +4579,21 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 return 0.0
 
         try:
-            if wait_until_complete:
-                # The web branch has no stage/query wall in production mode.
-                # Provider HTTP calls still carry their own transport timeout,
-                # so a dead socket cannot strand a worker forever.
-                query_seconds = float("inf")
-            else:
-                query_seconds = max(
-                    0.25,
-                    float(
-                        query_seconds_override
-                        if query_seconds_override is not None
-                        else os.environ.get(
-                            "VIDZEO_WEB_QUERY_DEADLINE_SECONDS",
-                            "10" if fast_mode else "15",
-                        )
-                        or (10 if fast_mode else 15)
-                    ),
+            default_query_seconds = (
+                90.0 if wait_until_complete else (10.0 if fast_mode else 15.0)
+            )
+            query_seconds = _bounded_web_seconds(
+                query_seconds_override
+                if query_seconds_override is not None
+                else os.environ.get(
+                    "VIDZEO_WEB_QUERY_DEADLINE_SECONDS",
+                    str(default_query_seconds),
                 )
+                or default_query_seconds,
+                default_query_seconds,
+                90.0,
+                floor=0.25,
+            )
         except Exception:
             query_seconds = 10.0 if fast_mode else 15.0
         query_deadline = time.monotonic() + query_seconds
@@ -3891,6 +4669,13 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             return 0.0
 
         start = time.time()
+        # Wave progress record (GTA fix): every wave emits engine
+        # completions + rows arrived here, readable by the driver via
+        # get_web_wave_progress(wave_id) / web_wave_progress_snapshot().
+        wave_id = (
+            f"scene-{idx + 1}-{int(time.monotonic() * 1000)}-{uuid.uuid4().hex[:6]}"
+        )
+        wave = _web_wave_progress_new(wave_id, scene_number=idx + 1, query=q_str)
         pool = ThreadPoolExecutor(
             max_workers=min(len(api_tasks), max(1, int(api_worker_limit or 8))),
             thread_name_prefix="web-query",
@@ -3901,12 +4686,45 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         }
         pending = set(futures)
         accepted_sources: set[str] = set()
+        universal_detached = False
         try:
-            while pending and time.monotonic() < query_deadline:
-                remaining = max(0.0, query_deadline - time.monotonic())
+            while pending:
+                now = time.monotonic()
+                universal_pending = any(
+                    futures[future] == "universal_scraper" for future in pending
+                )
+                if not universal_pending and now >= query_deadline:
+                    break
+                if universal_pending and now >= query_deadline:
+                    # The wave deadline is NOT a cap for the universal lane
+                    # (user override, Nov 16: no time limit for web — being
+                    # a bit late beats falling back to graphics). Keep
+                    # waiting while the wave is making progress; only a
+                    # provably dead wave gives up. Progress is any engine
+                    # completion or row arrival in this wave, or any engine
+                    # completion in the universal manager (its clock covers
+                    # engines still working inside the batch). The scene /
+                    # stage deadline above still bounds the wait — that
+                    # outer wall belongs to the stage budget, not this wave.
+                    last_progress = max(
+                        float(wave.get("last_progress_at") or 0.0),
+                        _universal_last_progress_at(),
+                    )
+                    if now - last_progress >= _web_liveness_window_seconds():
+                        _web_wave_progress_mark_stalled(
+                            wave_id, reason="web_retrieval_stalled"
+                        )
+                        _web_log(
+                            f"scene {idx + 1} web wave stalled: no progress "
+                            f"for {_web_liveness_window_seconds():.1f}s "
+                            f"(wave {wave_id})"
+                        )
+                        break
+                    if deadline_at is not None and now >= float(deadline_at):
+                        break
                 done, pending = wait(
                     pending,
-                    timeout=min(0.20, remaining),
+                    timeout=0.20,
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
@@ -3918,6 +4736,12 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     except Exception:
                         rows = []
                     accepted = _accept_source_rows(source_name, rows)
+                    _web_wave_progress_touch(
+                        wave_id,
+                        engines_completed=1,
+                        rows_arrived=int(accepted),
+                        event=f"{source_name}:+{int(accepted)}",
+                    )
                     if _web_verbose():
                         _web_log(
                             f"scene {idx + 1} provider complete: {source_name} "
@@ -3927,8 +4751,15 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                         accepted_sources.add(source_name)
                 # A completed provider with useful rows is enough to begin
                 # ranking/downloading. Do not make it wait for a throttled
-                # secondary provider.
-                if len(discovered_candidates) >= enough_candidates and not collect_all_sources:
+                # secondary provider. The universal scraper is exempt: it is
+                # the web-image path by operator instruction, so a wave must
+                # not close (and cancel its future) while it is still in
+                # flight. The query deadline still bounds the wait for the
+                # non-universal lanes; the universal lane is liveness-gated.
+                universal_pending = any(
+                    futures[future] == "universal_scraper" for future in pending
+                )
+                if len(discovered_candidates) >= enough_candidates and not collect_all_sources and not universal_pending:
                     break
                 # Even with collect-all enabled, stop the per-scene correction
                 # wave once it has a diverse shortlist.  The shared warm pool
@@ -3938,6 +4769,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     adaptive_fast_stop
                     and len(discovered_candidates) >= max(enough_candidates, 6)
                     and len(accepted_sources) >= 2
+                    and not universal_pending
                 ):
                     _web_log(
                         f"scene {idx + 1} adaptive provider stop: "
@@ -3947,11 +4779,26 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     break
         finally:
             for future in pending:
-                if not wait_until_complete:
-                    future.cancel()
+                source_name = futures.get(future)
+                if source_name == "universal_scraper" and future.running():
+                    # Never cancel a live universal future (GTA fix): the
+                    # wave abandoned it at 15s on GTA VI and its rows were
+                    # lost. A detached future keeps running in the pool;
+                    # its rows land in the manager's late spool and the
+                    # pre-broadened harvest recovers them.
+                    universal_detached = True
+                    _web_wave_progress_touch(
+                        wave_id, event="universal_detached"
+                    )
+                    _web_log(
+                        f"scene {idx + 1} universal future detached; rows "
+                        f"recoverable via late spool (wave {wave_id})"
+                    )
+                    continue
+                future.cancel()
             pool.shutdown(
-                wait=wait_until_complete,
-                cancel_futures=not wait_until_complete,
+                wait=not universal_detached,
+                cancel_futures=False,
             )
         # Free last-resort metasearch recovery. Keep it out of the normal
         # stampede, but give a completely empty scene one additional source
@@ -3965,7 +4812,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         if not discovered_candidates and searx_configured and not searx_fallback_used and not _deadline_reached():
             searx_fallback_used = True
             _harvest_source_query("searxng_images", "api", q_str, max_timeout=8)
-        # Standalone resolver calls use the universal six-engine scraper only
+        # Standalone resolver calls use the universal four-engine scraper only
         # after the established fast providers produced no usable candidates.
         # This preserves the layered fallback contract without multiplying
         # requests when a primary provider already succeeded.
@@ -4010,13 +4857,9 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         }
         pending = set(futures)
         slow_seconds = 12.0 if gdl else 5.0
-        slow_deadline = (
-            float("inf")
-            if wait_until_complete
-            else min(
-                float(deadline_at) if deadline_at else time.monotonic() + 5.0,
-                time.monotonic() + slow_seconds,
-            )
+        slow_deadline = min(
+            float(deadline_at) if deadline_at else time.monotonic() + 5.0,
+            time.monotonic() + slow_seconds,
         )
         try:
             while pending and time.monotonic() < slow_deadline:
@@ -4842,6 +5685,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         scene_phashes = set()
         validated_paths = set()
         candidates = []
+        # Downloaded rows that fail the lexical gates below are kept here
+        # instead of being erased: when the verified pool ends up empty,
+        # the best deferred rows are promoted as vision-pending
+        # alternates (proof job a57cb5c7: scene 0 downloaded 8, kept 1).
+        deferred_pool = []
         
         for item in top_candidates:
             url = item["url"]
@@ -4965,6 +5813,32 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 item.get("topic_query_pending")
                 and score >= _topic_query_pending_min_score
             )
+            candidate_row = {
+            "path": str(fpath),
+            "width": w, "height": h,
+             "url": url, "domain": item.get("domain") or item["source"],
+            "relevance": score,
+            "quality_score": min(w, h) / 2000.0,
+            "final_score": score,
+             "title": item["title"] or f"scene_{idx + 1}",
+              "source_url": item.get("source_url") or item.get("page_url") or url,
+              "page_url": item.get("page_url") or item.get("source_url") or url,
+              "preview_url": item.get("preview_url") or item.get("thumbnail_url") or "",
+              "provider": item.get("provider") or item.get("source", ""),
+             "license": item.get("license", ""),
+             "license_url": item.get("license_url", ""),
+             "attribution": item.get("attribution", ""),
+             "creator": item.get("creator", ""),
+             "query_used": item["query"],
+             "tags": item.get("tags", ""),
+             "description": item.get("description", ""),
+             "identity_failed": identity_failed,
+            "semantic_visual_pending": bool(item.get("semantic_visual_pending")),
+            "semantic_context_pending": bool(item.get("semantic_context_pending")),
+            "candidate_evidence": dict(item.get("candidate_evidence") or {}),
+            "discovery_method": item.get("discovery_method", ""),
+            "phash": phash,
+            }
             if (
                 score < 0.0
                 and not pending_score_ok
@@ -4972,12 +5846,15 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 and not topic_query_pending
                 and not soft_visual_pending
             ):
+                deferred_pool.append((score, dict(candidate_row)))
                 continue
             if not _passes_web_relevance_floor(
                 {**item, "path": str(fpath), "query_used": item.get("query", q)},
                 score,
                 main_subject,
+                score_scene_text,
             ) and not shared_topic_fallback and not topic_query_pending and not soft_visual_pending:
+                deferred_pool.append((score, dict(candidate_row)))
                 continue
             
             # Soft gate: only reject truly terrible identity-failed candidates
@@ -4988,34 +5865,21 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 and not shared_topic_fallback
                 and not soft_visual_pending
             ):
+                deferred_pool.append((score, dict(candidate_row)))
                 continue
             
-            candidates.append((score, {
-                "path": str(fpath),
-                "width": w, "height": h,
-                 "url": url, "domain": item.get("domain") or item["source"],
-                "relevance": score,
-                "quality_score": min(w, h) / 2000.0,
-                "final_score": score,
-                 "title": item["title"] or f"scene_{idx + 1}",
-                  "source_url": item.get("source_url") or item.get("page_url") or url,
-                  "page_url": item.get("page_url") or item.get("source_url") or url,
-                  "preview_url": item.get("preview_url") or item.get("thumbnail_url") or "",
-                  "provider": item.get("provider") or item.get("source", ""),
-                 "license": item.get("license", ""),
-                 "license_url": item.get("license_url", ""),
-                 "attribution": item.get("attribution", ""),
-                 "creator": item.get("creator", ""),
-                 "query_used": item["query"],
-                 "tags": item.get("tags", ""),
-                 "description": item.get("description", ""),
-                 "identity_failed": identity_failed,
-                "semantic_visual_pending": bool(item.get("semantic_visual_pending")),
-                "semantic_context_pending": bool(item.get("semantic_context_pending")),
-                "candidate_evidence": dict(item.get("candidate_evidence") or {}),
-                "discovery_method": item.get("discovery_method", ""),
-                "phash": phash,
-            }))
+            candidates.append((score, candidate_row))
+
+        if not candidates and deferred_pool:
+            # The metadata floor erased the whole downloaded pool (proof
+            # job scene 0: 8 downloads -> 1 candidate; scene 2: 6 -> 0).
+            # Promote the best deferred rows as vision-pending alternates
+            # instead of leaving the scene with nothing: vision is the
+            # validator and still rejects each wrong pixel, but a scene
+            # with deferred candidates can now pick a DISTINCT image
+            # instead of reusing a neighbour's still or going graphic.
+            # Legacy-cutscene rows are never promoted.
+            candidates.extend(_promote_deferred(deferred_pool, limit=3))
 
         if not candidates:
             if _web_verbose():
@@ -5031,7 +5895,25 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         # Identity metadata is a ranking hint, not a reason to throw away the
         # other downloaded shots before vision can compare their scene facets.
         candidate_pool = identity_passing + [row for row in candidates if row not in identity_passing]
-        
+
+        # Thin-pool top-up (proof job scene 0: pool=1, alternates=[]). The
+        # empty-pool promotion above only fires when NOTHING verified; a
+        # scene with one verified pick and seven deferred downloads still
+        # had no alternates, so a neighbour's reuse was the only rescue
+        # option. Top the pool up to 3 with the best deferred rows — as
+        # alternates only: they are appended AFTER the verified rows, so
+        # they can never outrank the winner, and vision still judges each
+        # one (they carry semantic_visual_pending) before it renders.
+        if 0 < len(candidate_pool) < 3 and deferred_pool:
+            _pool_paths = {cand.get("path") for _score, cand in candidate_pool}
+            for _score, _row in _promote_deferred(deferred_pool, limit=3):
+                if len(candidate_pool) >= 3:
+                    break
+                if _row.get("path") in _pool_paths:
+                    continue
+                candidate_pool.append((_score, _row))
+                _pool_paths.add(_row.get("path"))
+
         query_resolved = False
         for score, cand in candidate_pool:
             cand_path = cand["path"]
@@ -5219,37 +6101,139 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             if _web_verbose():
                 _web_log(f"scene {idx + 1} query '{q}' yielded only duplicate images. Trying next fallback...")
 
+    # Late-spool harvest (GTA fix, Nov 16): engines that finished after
+    # their wave gave up leave rows in the universal manager's late spool,
+    # keyed by exact query string — and each scene's queries are unique and
+    # never repeated, so without this harvest every late row is orphaned by
+    # construction. Before the broadened round (which spends fresh provider
+    # budget on new queries), re-check the spool for every query this scene
+    # already asked. The wait is capped by the scene's remaining wall so
+    # the harvest can never push the scene past its own deadline.
+    if selected_candidate is None and not _deadline_reached():
+        try:
+            harvest_wait = max(
+                0.0,
+                min(
+                    300.0,
+                    float(
+                        os.environ.get(
+                            "VIDZEO_UNIVERSAL_LATE_WAIT_SECONDS", "120"
+                        )
+                        or 120
+                    ),
+                ),
+            )
+        except (TypeError, ValueError):
+            harvest_wait = 120.0
+        if deadline_at is not None:
+            try:
+                harvest_wait = max(
+                    0.0, min(harvest_wait, float(deadline_at) - time.monotonic())
+                )
+            except (TypeError, ValueError):
+                harvest_wait = 0.0
+        harvested = _UNIVERSAL_SCRAPER.collect_late_results_for_queries(
+            queries, wait_seconds=harvest_wait
+        )
+        if harvested:
+            harvest_rows = [
+                universal_result_to_candidate(item, query=queries[0] if queries else "")
+                for item in harvested
+            ]
+            harvest_rows = [row for row in harvest_rows if row]
+            if harvest_rows:
+                _accept_source_rows("universal_scraper", harvest_rows)
+                _sel = _download_and_accept_single_candidate(
+                    harvest_rows[0], scene_dir, idx, scene_text,
+                    identity_terms, main_subject, global_phashes, global_md5s, used_files,
+                    phash_lock, md5_lock, file_lock, weak_terms)
+                if _sel:
+                    if _web_verbose():
+                        _web_log(
+                            f"scene {idx + 1} successfully rescued via "
+                            "late-spool harvest!"
+                        )
+                    selected_candidate = _sel
+
+    # Broadened-query round: the specific query waves above all failed.
+    # Before the fallbacks, progressively drop the most specific terms
+    # from the scene's own queries (the `broaden` flag is honoured here;
+    # it was previously accepted but never used). The universal scraper
+    # fans each broadened query out to all four engines with Yandex
+    # first, so this is one bounded multi-engine wave, not a
+    # per-provider retry loop. This round runs BEFORE the emergency
+    # subject fallback below: the bare canonical subject must stay the
+    # final query attempted (see
+    # test_full_query_pack_reserves_canonical_subject).
+    if selected_candidate is None and broaden and not _deadline_reached():
+        try:
+            from .query import _broaden_scene_queries
+        except Exception:
+            _broaden_scene_queries = None
+        if _broaden_scene_queries:
+            broadened = _broaden_scene_queries(queries, main_subject)
+            for _bq in broadened:
+                if _deadline_reached():
+                    break
+                if _web_verbose():
+                    _web_log(f"scene {idx + 1} broadened query: '{_bq}'")
+                _bq_rows = _fetch_source_query("universal_scraper", "universal", _bq)
+                if not _bq_rows:
+                    continue
+                _sel = _download_and_accept_single_candidate(
+                    _bq_rows[0], scene_dir, idx, scene_text,
+                    identity_terms, main_subject, global_phashes, global_md5s, used_files,
+                    phash_lock, md5_lock, file_lock, weak_terms)
+                if _sel:
+                    if _web_verbose():
+                        _web_log(f"scene {idx + 1} successfully rescued via broadened query '{_bq}'!")
+                    selected_candidate = _sel
+                    break
+
     # Emergency Rescue Fallback:
-    # If all query options failed, run an immediate emergency subject search on Flickr API
-    # to guarantee we find a valid image (e.g. searching "[Subject] portrait", "[Subject] photo", "[Subject]")
+    # If all query options failed, run an immediate emergency subject search across multi-engine
+    # providers to guarantee we find a valid image before considering any graphic fallback.
+    is_strict_person = bool(
+        semantic_requirement
+        and (
+            str(semantic_requirement.get("subject_type") or "").strip().lower() in {"person", "royal", "celebrity"}
+            or str(semantic_requirement.get("domain") or "").strip().lower() in {"person", "royal", "celebrity"}
+        )
+        and bool(semantic_requirement.get("strict_identity"))
+    )
+    rescue_subject = str((semantic_requirement.get("canonical_entity") if semantic_requirement else None) or main_subject or "").strip()
     if (
         selected_candidate is None
-        and main_subject
-        and not semantic_requirement
+        and rescue_subject
+        and not is_strict_person
         and not shared_pool_candidates
         and scene_downloaded_candidates < scene_download_budget
     ):
         if _web_verbose():
-            _web_log(f"scene {idx + 1} trigger EMERGENCY SUBJECT FALLBACK search for subject '{main_subject}'...")
+            _web_log(f"scene {idx + 1} trigger EMERGENCY SUBJECT FALLBACK search for subject '{rescue_subject}'...")
         try:
             from .query import _is_person_fallback_subject, _topic_fallback_queries
         except Exception:
             _is_person_fallback_subject = None
             _topic_fallback_queries = None
-        is_person_subject = bool(_is_person_fallback_subject and _is_person_fallback_subject(main_subject))
+        is_person_subject = bool(_is_person_fallback_subject and _is_person_fallback_subject(rescue_subject))
+        if is_person_subject and any(w in str(rescue_subject).lower() for w in ("train", "freight", "locomotive", "railway", "railroad", "diesel", "car", "engine")):
+            is_person_subject = False
         if is_person_subject:
-            emergency_queries = [f"{main_subject} portrait", f"{main_subject} photo", main_subject]
+            emergency_queries = [f"{rescue_subject} portrait", f"{rescue_subject} photo", rescue_subject]
         else:
             scene_kws = _scene_visual_keywords(scene_text, max_kws=4) if _scene_visual_keywords else []
             emergency_queries = []
             if _topic_fallback_queries:
-                emergency_queries.extend(_topic_fallback_queries(main_subject, scene_text, limit=6))
+                emergency_queries.extend(_topic_fallback_queries(rescue_subject, scene_text, limit=6))
             if len(scene_kws) >= 2:
-                emergency_queries.append(f"{main_subject} {' '.join(scene_kws[:2])}")
+                emergency_queries.append(f"{rescue_subject} {' '.join(scene_kws[:2])}")
             if scene_kws:
-                emergency_queries.append(f"{main_subject} {scene_kws[0]}")
-            if main_subject:
-                emergency_queries.append(main_subject)
+                emergency_queries.append(f"{rescue_subject} {scene_kws[0]}")
+            emergency_queries.append(f"{rescue_subject} photograph")
+            emergency_queries.append(f"{rescue_subject} documentary")
+            if rescue_subject:
+                emergency_queries.append(rescue_subject)
         
         # De-duplicate queries we already tried
         emergency_queries = [eq for eq in emergency_queries if eq.lower() not in [q.lower() for q in queries]]
@@ -5493,27 +6477,47 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                     f"(score={duplicate_score:.2f})"
                 )
 
-    # Absolute last resort: try bare main_subject + generic suffix on Flickr API
-    # This bypasses all query normalization/truncation and hits Flickr directly
-    if selected_candidate is None and main_subject and not semantic_requirement and not shared_pool_candidates:
+    # Absolute last resort: try bare rescue_subject across multi-engine web sources
+    # (Bing, Universal Scraper, Wikimedia, Openverse, Flickr API)
+    # to guarantee a real image is found before falling back to graphic placeholders.
+    if (
+        selected_candidate is None
+        and rescue_subject
+        and not is_strict_person
+        and not shared_pool_candidates
+    ):
         _bare_queries = [
-            f"{main_subject} photo",
-            f"{main_subject} photography",
-            main_subject,
+            f"{rescue_subject} photograph",
+            f"{rescue_subject} documentary",
+            rescue_subject,
         ]
         for _bq in _bare_queries:
             if _deadline_reached():
                 break
             if _web_verbose():
                 _web_log(f"scene {idx + 1} absolute last resort query: '{_bq}'")
-            _bq_cached = _fetch_source_query("flickr_api", "flickr_api", _bq)
-            if _bq_cached:
-                _bc = _bq_cached[0]
-                _sel = _download_and_accept_single_candidate(_bc, scene_dir, idx, scene_text,
-                    identity_terms, main_subject, global_phashes, global_md5s, used_files,
-                    phash_lock, md5_lock, file_lock, weak_terms)
-                if _sel:
-                    selected_candidate = _sel
+            _found_candidates = []
+            for _prov_name, _prov_type in (
+                ("bing_hybrid", "hybrid"),
+                ("universal_scraper", "universal"),
+                ("wikimedia", "api"),
+                ("openverse", "api"),
+                ("flickr_api", "flickr_api"),
+            ):
+                _bq_cached = _fetch_source_query(_prov_name, _prov_type, _bq)
+                if _bq_cached:
+                    _found_candidates.extend(_bq_cached)
+            if _found_candidates:
+                for _bc in _found_candidates[:4]:
+                    _sel = _download_and_accept_single_candidate(
+                        _bc, scene_dir, idx, scene_text,
+                        identity_terms, rescue_subject, global_phashes, global_md5s, used_files,
+                        phash_lock, md5_lock, file_lock, weak_terms
+                    )
+                    if _sel:
+                        selected_candidate = _sel
+                        break
+                if selected_candidate:
                     break
 
     if selected_candidate is None:
@@ -5534,6 +6538,14 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
         _web_log(f"scene {idx + 1} rejected unsafe final fallback ({final_reason})")
         return None
 
+    # Attach this scene's universal engine audit trail (engine, count,
+    # duration, error) and any wave-stall flag to the winner so the
+    # per-scene audit entry carries them. Unresolved scenes have no winner;
+    # their trail is read from the audit-token registry instead.
+    selected_candidate["universal_engine_audits"] = [
+        dict(entry) for entry in universal_engine_audits
+    ]
+    selected_candidate["web_wave_stalled"] = web_wave_stalled_for_scene(idx + 1)
     selected_candidate.pop("phash", None)
     selected_candidate.pop("md5", None)
     return selected_candidate
@@ -5986,13 +6998,14 @@ def _visual_retry_scene(
             fq = str(fq or "").strip()
             if fq and fq.lower() not in original_set and fq not in queries:
                 queries.append(fq)
-    if not queries and subject:
+    if not queries and (subject or global_topic):
+        anchor = subject or global_topic
         for fq in (
-            f"{subject} documentary photograph",
-            f"{subject} archival footage still",
-            f"{subject} historical event photo",
+            f"{anchor} documentary photograph",
+            f"{anchor} archival footage still",
+            f"{anchor} historical event photo",
         ):
-            if fq.lower() not in original_set:
+            if fq.lower() not in original_set and fq not in queries:
                 queries.append(fq)
     queries = queries[:6]
     if not queries:
@@ -6063,10 +7076,9 @@ def resolve_web_images_for_video_fast(
     wait_until_complete: bool = False,
 ) -> Dict:
     exhaustive_fallback = bool(exhaustive_fallback)
-    # A production web lane must not abandon scenes merely because one
-    # provider is slower than an arbitrary stage wall.  Keep transport-level
-    # request timeouts inside each scraper, but let the branch itself drain all
-    # scene/provider workers before handing media to the editor.
+    # Wait mode gathers all providers that finish within the same hard stage
+    # budget. It is not permission for a slow or wedged provider to keep the
+    # production job open indefinitely.
     wait_until_complete = bool(wait_until_complete)
     # Every invocation owns a DiscoveryCache below. Do not clear the optional
     # process cache here: one concurrent job must never invalidate another.
@@ -6110,23 +7122,22 @@ def resolve_web_images_for_video_fast(
     max_scene_workers = max(1, min(16, int(max_scene_workers)))
     api_worker_limit = max(1, min(12, int(api_worker_limit)))
     stage_started_at = time.monotonic()
-    # Keep the finite legacy wall for direct/test callers.  The application
-    # sets ``wait_until_complete`` so the web branch waits for all provider
-    # workers and never silently converts a slow scene into stock/neutral.
-    default_stage_deadline = max(45.0, min(300.0, len(scene_texts) * 12.0))
+    # Scale the finite wall with scene count. Request timeouts, the stage hard
+    # cap, and the shared delivery budget still bound unhealthy providers and
+    # protect the render reserve on long jobs.
+    default_stage_deadline = _default_web_stage_deadline_seconds(len(scene_texts))
+
     try:
-        stage_deadline_seconds = max(
-            1.0,
-            float(
-                stage_deadline_seconds
-                if stage_deadline_seconds is not None
-                else os.environ.get(
-                    "VIDZEO_WEB_STAGE_DEADLINE_SECONDS", ""
-                ) or (360.0 if wait_until_complete else default_stage_deadline)
-            ),
+        stage_deadline_seconds = _bounded_web_seconds(
+            stage_deadline_seconds
+            if stage_deadline_seconds is not None
+            else os.environ.get("VIDZEO_WEB_STAGE_DEADLINE_SECONDS", "")
+            or default_stage_deadline,
+            default_stage_deadline,
+            _web_stage_hard_cap_seconds(),
         )
     except Exception:
-        stage_deadline_seconds = 360.0 if wait_until_complete else default_stage_deadline
+        stage_deadline_seconds = default_stage_deadline
     if delivery_budget is not None:
         try:
             budget_stage_seconds = delivery_budget.allowance(
@@ -6141,11 +7152,35 @@ def resolve_web_images_for_video_fast(
             stage_deadline_seconds = max(0.05, budget_stage_seconds)
         except Exception:
             pass
+    if exhaustive_fallback and delivery_budget is not None:
+        # Recovery must get a real budget (Wright, Nov 16: the recovery
+        # run got only a ~22s wall and died before any engine could
+        # answer).  A recovery stage below one engine round-trip can never
+        # return a candidate, so floor it at one useful wave — bounded by
+        # the job's remaining wall time, never past the absolute deadline.
+        # This may dip into the render reserve by at most the floor; the
+        # render phase itself is progress-supervised, not wall-bound.
+        try:
+            remaining = float(delivery_budget.remaining_seconds())
+        except Exception:
+            remaining = 0.0
+        floored = _web_recovery_budget_floor_seconds(
+            stage_deadline_seconds, remaining
+        )
+        if floored > stage_deadline_seconds:
+            _web_log(
+                f"recovery budget: stage wall floored to "
+                f"{floored:.0f}s (one useful engine wave)"
+            )
+            stage_deadline_seconds = floored
     stage_deadline_at = stage_started_at + stage_deadline_seconds
     _web_log("=== WEB IMAGE PIPELINE START ===")
     _web_log(f"scenes: {len(scene_texts)}, title: {title[:60]}")
     if wait_until_complete:
-        _web_log("web branch wait mode: enabled; draining all provider workers before handoff")
+        _web_log(
+            "web branch wait mode: enabled; collecting all provider results "
+            f"within {stage_deadline_seconds:.0f}s hard stage budget"
+        )
     if exhaustive_fallback:
         _web_log(
             "pre-stock exhaustive recovery enabled: fast="
@@ -6619,32 +7654,41 @@ def resolve_web_images_for_video_fast(
                 )
                 queries = specific_queries if specific_queries else [active_subject]
             else:
+                subject_anchor = active_subject or main_subject or title or ""
                 if len(scene_kws) >= 3:
-                    queries.append(f"{scene_kws[0]} {scene_kws[1]}")
-                    queries.append(f"{scene_kws[1]} {scene_kws[2]}")
-                    if len(scene_kws) >= 4:
-                        queries.append(f"{scene_kws[0]} {scene_kws[2]}")
-                    queries.append(scene_kws[0])
-                    queries.append(scene_kws[1])
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} {scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{subject_anchor} {scene_kws[1]} {scene_kws[2]}")
+                        if len(scene_kws) >= 4:
+                            queries.append(f"{subject_anchor} {scene_kws[0]} {scene_kws[2]}")
+                        queries.append(f"{subject_anchor} {scene_kws[0]}")
+                    else:
+                        queries.append(f"{scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{scene_kws[1]} {scene_kws[2]}")
+                        if len(scene_kws) >= 4:
+                            queries.append(f"{scene_kws[0]} {scene_kws[2]}")
+                        queries.append(f"{scene_kws[0]} documentary photograph")
                 elif len(scene_kws) == 2:
-                    queries.append(f"{scene_kws[0]} {scene_kws[1]}")
-                    queries.append(scene_kws[0])
-                    queries.append(scene_kws[1])
-                    queries.append(f"{scene_kws[0]} photo")
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} {scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{subject_anchor} {scene_kws[0]}")
+                    else:
+                        queries.append(f"{scene_kws[0]} {scene_kws[1]}")
+                        queries.append(f"{scene_kws[0]} documentary photograph")
                 elif len(scene_kws) == 1:
-                    queries.append(scene_kws[0])
-                    queries.append(f"{scene_kws[0]} photo")
-                    queries.append(f"{scene_kws[0]} image")
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} {scene_kws[0]}")
+                        queries.append(f"{subject_anchor} documentary photograph")
+                    else:
+                        queries.append(f"{scene_kws[0]} documentary photograph")
                 else:
                     title_kws = _extract_visual_keywords(title or "", max_kws=4) if title else []
-                    if len(title_kws) >= 2:
+                    if subject_anchor:
+                        queries.append(f"{subject_anchor} documentary photograph")
+                    elif len(title_kws) >= 2:
                         queries.append(f"{title_kws[0]} {title_kws[1]}")
-                        queries.append(title_kws[0])
-                    elif title_kws:
-                        queries.append(title_kws[0])
-                        queries.append(f"{title_kws[0]} photo")
                     if not queries:
-                        queries = ["photo", "portrait"]
+                        queries = [subject_anchor or "documentary photograph"]
 
         queries = list(dict.fromkeys(q for q in queries if q and len(q) > 2))[:8]
         if not queries:
@@ -6881,6 +7925,10 @@ def resolve_web_images_for_video_fast(
     file_lock = threading.Lock()
     url_lock = threading.Lock()
     results = [None] * n
+    # One audit token per call (GTA fix, Nov 16): _resolve_scene records
+    # each scene's universal engine audits under this token so the
+    # per-scene audit entry carries them even for unresolved scenes.
+    audit_token = uuid.uuid4().hex[:12]
 
     # Terms appearing in two or more scene narrations are weak discriminators
     # (e.g. "deep sea" in both the welder and cave chapters) and must not
@@ -6981,6 +8029,7 @@ def resolve_web_images_for_video_fast(
                 and isinstance(scene_queries_override[idx], Mapping)
                 and (scene_queries_override[idx].get("director_web_query") or scene_queries_override[idx].get("_llm"))
             ),
+            audit_token=audit_token,
         )
         futures[f] = idx
     completed = 0
@@ -6988,14 +8037,18 @@ def resolve_web_images_for_video_fast(
     timed_out_scene_indexes: set[int] = set()
     progress_log_every = max(1, min(10, n // 5 or 1))
     pending = set(futures)
+    # Ground-truth activity for the preparation-stall detector: a scene
+    # completing here is real work even when the display pipeline filters
+    # the progress report out (a recovery wave restarts its counter).
+    record_activity("web")
     try:
         while pending and not scene_cancel_event.is_set():
             remaining = stage_deadline_at - time.monotonic()
-            if remaining <= 0 and not wait_until_complete:
+            if remaining <= 0:
                 break
             done, pending = wait(
                 pending,
-                timeout=(0.5 if wait_until_complete else min(0.5, remaining)),
+                timeout=min(0.5, remaining),
                 return_when=FIRST_COMPLETED,
             )
             for future in done:
@@ -7004,6 +8057,7 @@ def resolve_web_images_for_video_fast(
                 try:
                     results[idx] = future.result()
                     resolved_so_far = sum(1 for r in results if r is not None and r.get("path"))
+                    record_activity("web")
                     if completed <= 3 or completed == n or completed % progress_log_every == 0:
                         _web_log(f"scene progress: {completed}/{n} checked, {resolved_so_far} resolved")
                     if progress_callback:
@@ -7024,15 +8078,19 @@ def resolve_web_images_for_video_fast(
         # detach unfinished cooperative workers instead of turning 120s into
         # an unbounded wait.
         if pending and wait_until_complete:
-            # This path is reachable only on explicit cancellation.  Drain
-            # completed futures for a clean audit, then let the workers observe
-            # the shared event and finish cooperatively.
+            # Preserve partial results on deadline or cancellation. Wait mode
+            # is still bounded; a slow scene cannot pin the stage forever.
+            timed_out_scene_indexes.update(futures[future] for future in pending)
             scene_cancel_event.set()
             _web_log(
-                f"web branch cancelled: retaining {completed}/{n} completed scene(s); "
+                f"web branch deadline/cancel: retaining {completed}/{n} completed scene(s); "
                 f"draining {len(pending)} worker(s)"
             )
-            done, pending = wait(pending, timeout=5.0, return_when=FIRST_COMPLETED)
+            done, pending = wait(
+                pending,
+                timeout=_bounded_worker_drain_seconds(stage_deadline_seconds),
+                return_when=FIRST_COMPLETED,
+            )
             for future in done:
                 idx = futures[future]
                 try:
@@ -7901,8 +8959,8 @@ def resolve_web_images_for_video_fast(
         "exhaustive_fallback": bool(exhaustive_fallback),
         "gallery_enabled": bool(gdl),
         "elapsed_seconds": round(time.monotonic() - stage_started_at, 2),
-        "stage_deadline_seconds": None if wait_until_complete else stage_deadline_seconds,
-        "deadline_reached": False if wait_until_complete else time.monotonic() >= stage_deadline_at,
+        "stage_deadline_seconds": stage_deadline_seconds,
+        "deadline_reached": time.monotonic() >= stage_deadline_at,
         "worker_errors": worker_errors[:32],
         "worker_error_count": len(worker_errors),
         "visual_budget": {
@@ -7950,12 +9008,24 @@ def resolve_web_images_for_video_fast(
         to try and fell back to reusing a neighbouring still. Keep the
         alternate evidence local to this job and pass only existing files with
         their source metadata; the adapter snapshots them before rendering.
+
+        An alternate is never the winner under another filename: the
+        shortlist is built from the same downloaded pool, so a second
+        copy of the winner's bytes (same fingerprint, same MD5, same
+        canonical URL) is dropped here. Proof job a57cb5c7 scene 6
+        listed the key art (sha256 63a2158a…) as both winner AND
+        alternate, so its "pool of 1" was really a pool of 1 counted
+        twice — a duplicate that then looked like a distinct candidate
+        to the allocator.
         """
         primary_path = str(row.get("path") or "")
+        primary_identity = _distinct_content_identity(row)
         shortlist = row.get("_vision_shortlist") or row.get("alternates") or []
         if not isinstance(shortlist, (list, tuple)):
             return []
         seen = set()
+        if primary_identity:
+            seen.add(primary_identity)
         output: List[Dict] = []
         for candidate in shortlist:
             if not isinstance(candidate, dict):
@@ -7963,16 +9033,18 @@ def resolve_web_images_for_video_fast(
             path = str(candidate.get("path") or "").strip()
             if not path or path == primary_path or not Path(path).is_file():
                 continue
-            source_url = str(
-                candidate.get("source_url") or candidate.get("page_url")
-                or candidate.get("url") or ""
-            ).strip()
-            fingerprint = str(
-                candidate.get("asset_fingerprint") or candidate.get("md5") or ""
-            ).strip().casefold()
-            identity = f"fingerprint:{fingerprint}" if fingerprint else (
-                f"url:{source_url.casefold()}" if source_url else f"path:{path.casefold()}"
-            )
+            identity = _distinct_content_identity(candidate)
+            if not identity:
+                source_url = str(
+                    candidate.get("source_url") or candidate.get("page_url")
+                    or candidate.get("url") or ""
+                ).strip()
+                fingerprint = str(
+                    candidate.get("asset_fingerprint") or candidate.get("md5") or ""
+                ).strip().casefold()
+                identity = f"fingerprint:{fingerprint}" if fingerprint else (
+                    f"url:{source_url.casefold()}" if source_url else f"path:{path.casefold()}"
+                )
             if identity in seen:
                 continue
             seen.add(identity)
@@ -8019,6 +9091,15 @@ def resolve_web_images_for_video_fast(
             ),
             "downloaded_candidate_count": r.get("downloaded_candidate_count", 0),
             "alternates": alternates,
+            # Per-engine universal trail (GTA fix, Nov 16): engine, count,
+            # duration, error for every universal batch this scene ran, so
+            # the next failure is diagnosable from this artifact, not a
+            # log grep. web_wave_stalled flags a wave that gave up after a
+            # full liveness window with zero progress.
+            "universal_engine_audits": _merged_scene_universal_audits(audit_token, i, r),
+            "web_wave_stalled": bool(
+                r.get("web_wave_stalled") or web_wave_stalled_for_scene(i + 1)
+            ),
         }
         if r.get("path"):
             entry.update({
@@ -8055,6 +9136,11 @@ def resolve_web_images_for_video_fast(
             if r.get(key, "")
         })
         audit["scenes"].append(entry)
+
+    # Drop this call's per-scene audit registry entries now that the
+    # manifest carries them; the registry is per-call by token.
+    with _SCENE_UNIVERSAL_AUDITS_LOCK:
+        _SCENE_UNIVERSAL_AUDITS.pop(audit_token, None)
 
     manifests_dir = TEMP_DIR / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)

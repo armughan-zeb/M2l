@@ -251,6 +251,89 @@ def _tokens(value: Any) -> list[str]:
     return [token for token in _norm(value).split() if token]
 
 
+# action_terms must name what the camera can show — verbs and visible
+# nouns — never the subject itself. The old code took the first 6
+# non-stopword tokens, so a GTA VI scene got ['grand', 'theft', 'auto',
+# 'most', 'anticipated', 'video']: the title, a superlative, a participle
+# adjective, and a format word. None of those is an action.
+_ACTION_VERBS = {
+    # Base forms and irregular past forms; regular -ing/-ed forms are
+    # caught by morphology in _action_terms.
+    "keep", "kept", "sell", "sold", "make", "made", "take", "took", "taken",
+    "bring", "brought", "show", "showed", "shown", "break", "broke", "broken",
+    "arrive", "arrived", "walk", "walked", "drive", "drove", "driven",
+    "run", "ran", "fly", "flew", "flown", "sail", "sailed", "build", "built",
+    "launch", "launched", "release", "released", "delay", "delayed",
+    "push", "pushed", "return", "returned", "begin", "began", "begun",
+    "reveal", "revealed", "feature", "featured", "include", "included",
+    "follow", "followed", "lead", "led", "win", "won", "set", "put",
+    "give", "gave", "given", "find", "found", "tell", "told", "say", "said",
+    "go", "went", "gone", "come", "came", "see", "saw", "seen", "watch",
+    "watched", "play", "played", "work", "worked", "live", "lived",
+    "die", "died", "kill", "killed", "fight", "fought", "escape", "escaped",
+    "chase", "chased", "shoot", "shot", "sing", "sang", "sung", "dance",
+    "danced", "cook", "cooked", "pour", "poured", "brew", "brewed",
+    "climb", "climbed", "swim", "swam", "swum", "march", "marched",
+    "race", "raced", "crash", "crashed", "sink", "sank", "sunk",
+    "cross", "crossed", "travel", "travelled", "enter", "entered",
+    "leave", "left", "meet", "met", "join", "joined", "open", "opened",
+    "close", "closed", "rise", "rose", "risen", "fall", "fell", "fallen",
+}
+_ACTION_VISIBLE_NOUNS = {
+    "aerial", "neon", "streets", "street", "city", "beach", "island",
+    "keys", "prison", "gates", "police", "chase", "mission", "gameplay",
+    "console", "controller", "crowd", "fans", "stadium",
+    "bridge", "harbor", "ship", "airport", "aircraft", "rocket",
+    "laboratory", "factory", "engine", "cabin", "cab", "interior",
+    "exterior", "wheels", "screen", "interface", "dashboard", "charger",
+    "battery", "solar", "panels", "race", "field", "courtroom", "rubble",
+    "rescue", "snowstorm", "blizzard", "whiteout", "carriage", "cars",
+    "chapel", "insignia", "procession", "throne", "banquet", "regalia",
+    "document", "portrait", "car", "vehicle", "vehicles", "skyline",
+    "downtown", "highway", "ocean", "swamp", "swamps", "night",
+}
+# -ing/-ed participles that are adjectives or time words, never actions.
+_ACTION_PARTICIPLE_DENYLIST = {
+    "anticipated", "expected", "supposed", "alleged", "beloved",
+    "dedicated", "related", "based", "known", "called", "titled",
+    "named", "morning", "evening", "during", "something", "anything",
+    "nothing", "king", "ring", "spring",
+}
+# Format/generic words that describe the medium, not the shot.
+_ACTION_FORMAT_WORDS = {
+    "video", "videos", "game", "games", "footage", "trailer", "documentary",
+    "film", "movie", "clip", "clips", "most", "more", "best", "biggest",
+    "first", "second", "third", "decade", "years", "year", "million",
+    "hundred", "copies", "series", "episode", "season",
+}
+
+
+def _action_terms(scene_text: str, excluded_tokens) -> list[str]:
+    """Verbs and visible nouns from the scene text — never the subject.
+
+    Positive selection only: a token qualifies as a verb (lexicon or
+    -ing/-ed morphology) or a visible noun; anything else is dropped.
+    The subject's own tokens, stopwords, generic subjects and format
+    words never qualify.
+    """
+    excluded = {str(token or "").lower() for token in (excluded_tokens or ())}
+    actions: list[str] = []
+    for token in _unique(_tokens(scene_text)):
+        if len(token) < 4 or token in _STOPWORDS or token in _GENERIC_SUBJECTS:
+            continue
+        if token in excluded or token in _ACTION_FORMAT_WORDS:
+            continue
+        if token in _ACTION_VERBS or token in _ACTION_VISIBLE_NOUNS:
+            actions.append(token)
+        elif token.endswith("ing") and len(token) > 5 and token not in _ACTION_PARTICIPLE_DENYLIST:
+            actions.append(token)
+        elif token.endswith("ed") and len(token) > 5 and token not in _ACTION_PARTICIPLE_DENYLIST:
+            actions.append(token)
+        if len(actions) >= 6:
+            break
+    return actions
+
+
 def _contains_phrase(text: str, phrase: str) -> bool:
     if not phrase:
         return False
@@ -462,6 +545,27 @@ def _title_subject(title: str) -> str:
 _SCENE_COMMON_CAPITALS = {
     "a", "an", "the", "in", "on", "at", "by", "from", "for", "today",
     "this", "these", "those", "some", "one", "when", "after", "before",
+    "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "he", "she", "it", "they", "we", "you", "his", "her", "its", "their", "our",
+    "as", "while", "during", "since", "until", "inside", "outside", "over", "under",
+    "with", "without", "then", "there", "here", "just", "now", "first", "second", "third",
+    "each", "every", "all", "both", "neither", "either", "another", "other",
+    "deep", "thick", "thin", "cold", "hot", "warm", "high", "low", "snow", "rain", "wind",
+    "throws", "throw", "pulls", "pull", "pushes", "push", "sets", "set",
+    "turns", "turn", "starts", "start", "stops", "stop", "runs", "run",
+    "stands", "stand", "sits", "sit", "climbs", "climb", "walks", "walk",
+    "psi", "rpm", "mph", "kph", "hp", "kw", "mw", "volts", "amps",
+    "gauges", "gauge", "meters", "meter", "dials", "dial", "screens", "screen",
+    "sensors", "sensor", "cables", "cable", "wires", "wire", "pipes", "pipe", "valves", "valve",
+    "looks", "look", "sees", "see", "watches", "watch",
+    "covers", "cover", "charges", "charge", "powers", "power", "sweeps", "sweep",
+    "presses", "press", "drops", "drop", "rises", "rise", "flows", "flow",
+    "enters", "enter", "leaves", "leave", "builds", "build", "cuts", "cut",
+    "holds", "hold", "blows", "blow", "freezes", "freeze", "cranks", "crank",
+    "spins", "spin", "roars", "roar", "hums", "hum", "idles", "idle",
+    "primes", "prime", "clears", "clear", "catches", "catch", "stabilizes", "stabilize",
+    "charging", "climbing", "rolling", "starting", "procedure", "crew", "members",
+    "walkway", "temperature", "temperatures",
     "german", "british", "american", "french", "italian", "spanish", "russian",
     "chinese", "japanese", "irish", "european", "world", "u", "boat", "liner",
     "ship", "ships", "vessel", "vessels", "boat", "boats", "car", "cars",
@@ -601,9 +705,12 @@ def _scene_subject(scene_text: str) -> str:
             continue
         if len(parts) == 1 and parts[0].casefold() in _SCENE_COMMON_CAPITALS:
             continue
+        is_sentence_start = match.start() == 0 or bool(re.search(r"[.!?]\s+$", text[:match.start()]))
+        if is_sentence_start and (parts[0].casefold() in _SCENE_COMMON_CAPITALS or _norm(parts[0]) in _STOPWORDS):
+            continue
         prefix = text[max(0, match.start() - 12):match.start()].casefold()
         score = 50 + min(18, (len(parts) - 1) * 8)
-        if re.search(r"\b(?:in|off|near|at|from|on)\s+$", prefix):
+        if re.search(r"\b(?:in|off|near|at|from|on|across|through|over|into|along|around|past|beyond)\s+$", prefix):
             score -= 18
         candidates.append((score, -match.start(), name))
 
@@ -1124,9 +1231,47 @@ def _attributes(text: str, subject: str, subject_type: str) -> Dict[str, str]:
     return attributes
 
 
+# Major North American rail operators, current and historic. A scene about one
+# of them must not be illustrated with another's footage — the metadata gate
+# cannot tell an Amtrak passenger train from a CSX freight locomotive without
+# this list, and heritage units are the same trap: a Denver & Rio Grande
+# Western locomotive is real rail footage but the wrong operator for an
+# Amtrak scene. Historic names are included for the same reason; "santa fe"
+# is deliberately absent (it collides with the place name) — only the
+# unambiguous "santa fe railway" is listed.
+_RAIL_OPERATORS = (
+    "amtrak",
+    "bnsf",
+    "csx",
+    "union pacific",
+    "norfolk southern",
+    "canadian national",
+    "canadian pacific",
+    "kansas city southern",
+    "cpkc",
+    "rio grande",
+    "denver and rio grande western",
+    "southern pacific",
+    "pennsylvania railroad",
+    "new york central",
+    "great northern",
+    "northern pacific",
+    "chessie system",
+    "conrail",
+    "santa fe railway",
+)
+
+
 def _forbidden(subject: str, subject_type: str, attributes: Mapping[str, Any]) -> Tuple[str, ...]:
     values: list[str] = []
     subject_norm = _norm(subject)
+    # A rail subject naming one operator must not accept another operator's
+    # footage: a CSX freight frame is not an Amtrak passenger shot, and the
+    # metadata gate cannot tell them apart without this list.
+    for operator in _RAIL_OPERATORS:
+        if operator in subject_norm:
+            values.extend(other for other in _RAIL_OPERATORS if other != operator)
+            break
     if "prince harry" in subject_norm:
         values.extend(["harry potter", "potter", "half-blood prince", "half blood prince", "hogwarts", "voldemort", "quidditch", "dumbledore", "gryffindor", "slytherin", "order of the phoenix"])
         # A royal-person contract must never silently accept an animal/toy
@@ -1150,6 +1295,10 @@ class VisualRequirementV1:
     schema_version: str = "visual_requirement.v2"
     canonical_entity: str = ""
     subject_type: str = "concept"
+    # Scene-relative game key (e.g. "gta_v"): the game THIS scene narrates,
+    # derived from its own narration. The relevance gate compares a
+    # candidate's game against this, not the video title's game.
+    scene_subject_game: str = ""
     domain: str = ""
     ambiguity_status: str = "resolved"
     domain_evidence: Tuple[str, ...] = field(default_factory=tuple)
@@ -1220,6 +1369,7 @@ class VisualRequirementV1:
             schema_version=str(values.get("schema_version") or "visual_requirement.v2"),
             canonical_entity=_text(values.get("canonical_entity") or values.get("entity") or values.get("subject")),
             subject_type=_text(values.get("subject_type") or "concept"),
+            scene_subject_game=_text(values.get("scene_subject_game") or ""),
             domain=_text(values.get("domain") or ""),
             ambiguity_status=_text(values.get("ambiguity_status") or "resolved"),
             domain_evidence=tuple(values.get("domain_evidence") or ()),
@@ -1287,15 +1437,22 @@ def build_visual_requirement(
         and len(title_tokens & _TITLE_CONTAINER_WORDS) >= max(1, len(title_tokens) - 1)
     )
     from .documentary_subject import collection_title_subject
+    spec_title = bool(re.match(
+        r"^(?:(?:top|best|greatest|worst|most)\s+)?(?:\d+(?:\s+\d+)*|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(?:horsepower|hp|ton|tons|mile|miles|meter|meters|foot|feet|cc|liter|litre|rpm|psi|volt|volts|amp|amps|watt|watts|cylinder|valve|gauge|year|years|hour|hours|minute|minutes|day|days|mph|kph)\b",
+        _norm(title_subject),
+    ))
     title_is_container = bool(
-        collection_title_subject(title) or
-        re.match(
-            r"^(?:(?:top|best|greatest|worst|most)\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-            _norm(title_subject),
+        not spec_title and (
+            collection_title_subject(title) or
+            re.match(
+                r"^(?:(?:top|best|greatest|worst|most)\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+                _norm(title_subject),
+            )
+            or re.fullmatch(r"(?:\d{3,4}|\d{1,2}(?:st|nd|rd|th)?)", _norm(title_subject or title))
+            or title_is_broad_category
+            or not title_subject
         )
-        or re.fullmatch(r"(?:\d{3,4}|\d{1,2}(?:st|nd|rd|th)?)", _norm(title_subject or title))
-        or title_is_broad_category
-        or not title_subject
     )
     role_subject = _scene_role_subject(scene_text)
     # Intro/transition beats often contain only a pronoun (``Harry and
@@ -1345,6 +1502,32 @@ def build_visual_requirement(
                 if re.match(r'^(?:on|in|at|for|road|everyday|reliability|practical|engineering|driving|history|story|explained)\b', suffix):
                     canonical = anchor
                     break
+    # Scene-relative game (GTA VI fix): the scene's own narration decides
+    # which game this requirement is about, not the video title. A scene
+    # narrating GTA V sales carries gta_v even in a GTA VI film, so the
+    # relevance gate can allow GTA V footage there and only there. When
+    # the requirement's subject IS a game and the scene's game differs,
+    # the scene's game is the canonical identity (aliases are built from
+    # it below, and __post_init__ adds its GTA aliases at construction).
+    scene_game_key = ""
+    try:
+        scene_game_key = str((semantic_context or {}).get("scene_subject_game") or "").strip().lower()
+    except Exception:
+        scene_game_key = ""
+    if not scene_game_key:
+        try:
+            from .vidzeo_brain import scene_subject_game_for_scene
+            scene_game_key = str(scene_subject_game_for_scene(scene_text, title).get("key") or "")
+        except Exception:
+            scene_game_key = ""
+    if scene_game_key and subject_type == "video_game":
+        try:
+            from .vidzeo_brain import game_canonical_title, game_keys_named_in_text
+            scene_game_title = game_canonical_title(scene_game_key)
+            if scene_game_title and scene_game_key not in game_keys_named_in_text(canonical):
+                canonical = scene_game_title
+        except Exception:
+            pass
     # The full script is valid evidence for the global subject and domain,
     # but it is not scene-local evidence for a year, model, era, or vehicle
     # class. Using the first year in the full narration used to stamp (for
@@ -1425,10 +1608,14 @@ def build_visual_requirement(
     elif subject_type == "rail_crew":
         required_terms.extend(("railway crew", "conductor", "locomotive engineer"))
     required_terms.extend(value for key, value in attrs.items() if key in {"year", "decade", "model", "model_or_make", "vehicle_class"})
-    actions = [
-        token for token in _unique(_tokens(scene_text))
-        if token not in _STOPWORDS and token not in _GENERIC_SUBJECTS and len(token) >= 4
-    ][:6]
+    # Verbs and visible nouns only — never the subject's own tokens
+    # (grand/theft/auto), superlatives (most), participle adjectives
+    # (anticipated) or format words (video/game). See _action_terms.
+    actions = _action_terms(
+        scene_text,
+        (*_tokens(canonical), *_tokens(subject), *_tokens(title),
+         *(token for alias in aliases for token in _tokens(alias))),
+    )
     strict = bool(canonical or subject_type in {"automobile", "animal", "ship", "rail_crew", "person"})
     if subject_type == 'concept' and _is_generic_process(canonical):
         strict = False
@@ -1444,6 +1631,7 @@ def build_visual_requirement(
     requirement = VisualRequirementV1(
         canonical_entity=canonical,
         subject_type=subject_type,
+        scene_subject_game=scene_game_key,
         domain=domain,
         ambiguity_status=ambiguity_status,
         domain_evidence=domain_evidence,
@@ -1556,6 +1744,17 @@ def requirement_from_scene(scene: Mapping[str, Any], *, title: str = "", script:
 def provider_query_variants(requirement: Mapping[str, Any], *, provider: str) -> list[str]:
     req = VisualRequirementV1.from_mapping(requirement)
     identity = req.canonical_entity or "documentary subject"
+    # Scene-relative game: provider variants seek the game THIS scene
+    # narrates, not the title's game. A GTA V-history scene's variants
+    # must name GTA V.
+    if req.subject_type == "video_game" and req.scene_subject_game:
+        try:
+            from .vidzeo_brain import game_canonical_title, game_keys_named_in_text
+            scene_game_title = game_canonical_title(req.scene_subject_game)
+            if scene_game_title and req.scene_subject_game not in game_keys_named_in_text(identity):
+                identity = scene_game_title
+        except Exception:
+            pass
     attrs = req.required_attributes
 
     def domain_query_qualifier() -> str:
@@ -1680,6 +1879,10 @@ def provider_query_variants(requirement: Mapping[str, Any], *, provider: str) ->
         "depend", "remember", "remembering", "begins", "begin", "began", "becomes",
         "worth", "looking", "closely", "visible", "whole", "idea", "challenge",
         "changed", "changes", "explain", "explains", "practical", "experience",
+        "throws", "throw", "pulls", "pull", "pushes", "push", "sets", "set",
+        "turns", "turn", "starts", "start", "stops", "stop", "runs", "run",
+        "stands", "stand", "sits", "sit", "climbs", "climb", "walks", "walk",
+        "sees", "see", "watches", "watch", "slowly", "quickly", "draw", "draws",
     }
     identity_tokens = set(_tokens(identity))
     attribute_tokens = {
@@ -1993,6 +2196,21 @@ def candidate_requirement_match(requirement: Mapping[str, Any], candidate: Mappi
             for token in identity_tokens
         )
     ) or any(_contains_phrase(normalized, alias) for alias in req.aliases)
+    if not identity_proof:
+        # Rail-operator proof: a title-derived canonical ("Amtrak's Long
+        # Run…") rarely matches in full, so a candidate naming the required
+        # operator in its asset metadata is proof of identity even without
+        # a full-phrase match. Wrong-operator candidates are rejected below
+        # via forbidden_subjects. Record it in the evidence now so it
+        # survives the canonical-mismatch early return below.
+        required_operator = next(
+            (operator for operator in _RAIL_OPERATORS if operator in _norm(req.canonical_entity)),
+            None,
+        )
+        if required_operator and _contains_phrase(normalized, required_operator):
+            identity_proof = True
+    if identity_proof:
+        evidence["identity_proof"] = req.canonical_entity
     forbidden_hits = [
         forbidden for forbidden in req.forbidden_subjects
         if _contains_phrase(normalized, forbidden)

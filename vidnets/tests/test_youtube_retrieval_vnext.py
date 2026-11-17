@@ -1113,6 +1113,64 @@ class YouTubeRetrievalVNextTests(unittest.TestCase):
         self.assertEqual(expected, "cricket")
         self.assertEqual(candidate, "football")
 
+    def test_niche_conflict_rejects_san_andreas_for_gta_vi(self):
+        # Same niche (gaming), different title: the taxonomy alone scores
+        # both sides "gaming" and would call them a match. A San Andreas
+        # video is never a GTA VI cut.
+        conflict, expected, candidate = detect_niche_conflict(
+            "Grand Theft Auto VI official trailer gameplay",
+            "Grand Theft Auto: San Andreas – The Introduction",
+        )
+        self.assertTrue(conflict)
+        self.assertEqual(expected, "gaming")
+        self.assertEqual(candidate, "gaming")
+
+    def test_niche_conflict_allows_same_gta_vi_entry(self):
+        conflict, _, _ = detect_niche_conflict(
+            "Grand Theft Auto VI official trailer gameplay",
+            "Grand Theft Auto VI Trailer 2 official",
+        )
+        self.assertFalse(conflict)
+
+    def test_gaming_exact_title_gate_blocks_wrong_title(self):
+        from services.youtube_pipeline_v2 import _gaming_exact_title_gate, _score_candidate
+
+        scene = "The game returns to Vice City, now set in the fictional state of Leonida."
+        context = {"domain_category": "gaming", "domain_anchor": "Grand Theft Auto VI"}
+        san_andreas = {
+            "title": "Grand Theft Auto: San Andreas – The Introduction",
+            "description": "The introduction to GTA San Andreas.",
+            "channel": "Rockstar Games",
+        }
+        self.assertTrue(_gaming_exact_title_gate(
+            san_andreas, "Grand Theft Auto VI", scene, context))
+        scored_candidate = dict(san_andreas)
+        scored = _score_candidate(
+            scored_candidate, "Grand Theft Auto VI", scene,
+            "Grand Theft Auto VI gameplay", context)
+        self.assertEqual(scored, -999.0)
+        self.assertEqual(scored_candidate.get("v2_reject_reason"), "gaming_exact_title_missing")
+
+    def test_gaming_exact_title_gate_allows_trailer_two_and_fan_gameplay(self):
+        from services.youtube_pipeline_v2 import _gaming_exact_title_gate
+
+        scene = "The game returns to Vice City, now set in the fictional state of Leonida."
+        context = {"domain_category": "gaming", "domain_anchor": "Grand Theft Auto VI"}
+        trailer_two = {
+            "title": "Grand Theft Auto VI Trailer 2",
+            "description": "Watch Trailer 2 for Grand Theft Auto VI.",
+            "channel": "Rockstar Games",
+        }
+        self.assertFalse(_gaming_exact_title_gate(
+            trailer_two, "Grand Theft Auto VI", scene, context))
+        fan_gameplay = {
+            "title": "GTA 6 Most Incredible Locations Gameplay | Fan Gameplay Across Leonida",
+            "description": "GTA 6 fan gameplay across Leonida.",
+            "channel": "Five Star District",
+        }
+        self.assertFalse(_gaming_exact_title_gate(
+            fan_gameplay, "Grand Theft Auto VI", scene, context))
+
 
 if __name__ == "__main__":
     unittest.main()

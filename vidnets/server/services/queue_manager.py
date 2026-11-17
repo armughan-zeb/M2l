@@ -12,6 +12,8 @@ import sys
 import json
 import uuid
 import copy
+import math
+import re
 import threading
 from .job_context import JobThread
 import time
@@ -37,12 +39,80 @@ from config import normalize_generation_config
 from services.cancellation import CancellationContext, JobCancelled
 from services.pipeline_contracts import MediaContractError
 from services.delivery_budget import install_delivery_budget
+from services.pipeline_activity import last_activity as _pipeline_last_activity
+from services.pipeline_activity import reset_activity as _reset_pipeline_activity
 
 # Queue file location
 QUEUE_FILE = Path(
     os.environ.get("VIDZEO_QUEUE_FILE") or SERVER_DIR / "queue.json"
 ).expanduser().resolve()
 MAX_FINISHED_HISTORY = 12
+_RECOVERY_PAUSE_TEXT = {
+    'delivery_deadline': 'Processing time limit reached. Click Retry to continue from saved work.',
+    'preparation_stall': 'Preparation stalled. Click Retry to continue from saved work.',
+    'system_cancel_recovered': 'Interrupted by the system. Click Retry to continue from saved work.',
+    'system_error_interrupted': 'Interrupted by a transient error. Click Retry to continue from saved work.',
+}
+# Paused reasons that are always system-caused (never a user choice): the
+# job driver and startup maintenance auto-resume these. A PAUSED job with
+# any other (or missing) reason is left alone — it may have been parked
+# deliberately.
+#
+# The five retryable worker-loop pauses belong here too. Each is set by the
+# worker only with retryable=True, a checkpoint dir, and "Click Retry"
+# text — a stage that failed transiently (low RAM, a bad edit plan, a
+# failed render, a media-contract miss, a scene-plan failure), never a
+# user park. Before this they were stranded: the driver, startup
+# maintenance and the reboot path all skipped them, so a render-failed
+# job like GTA VI ef306926 (paused remotion_render at 78%, checkpoints
+# intact, render_failure.json retryable:true) sat forever until a human
+# clicked Retry. The driver still bounds how often it auto-resumes one
+# (see the resume streak in job_debugger.py), so a deterministically
+# failing stage escalates instead of looping.
+SYSTEM_RECOVERY_PAUSED_REASONS = frozenset({
+    'backend_restart',
+    'cancellation_cleanup_timeout',
+    'delivery_deadline',
+    'preparation_stall',
+    'system_cancel_recovered',
+    'system_error_interrupted',
+    'low_memory',
+    'openrouter_scene_plan',
+    'remotion_edit_plan',
+    'media_contract',
+    'remotion_render',
+})
+_TRANSIENT_QUEUE_ERROR_MARKERS = (
+    'timeout', 'timed out', 'deadline', 'network', 'connection',
+    'reset', 'refused', 'unreachable', 'temporarily', 'try again',
+    '502', '503', '504', '530',
+)
+
+
+def _system_cancel_pause_reason(cancellation_reason) -> Optional[str]:
+    """Map a system cancellation reason to a resumable pause reason.
+
+    Returns None for user cancellations and anything unrecognized — those
+    stay CANCELLED. The delivery-deadline watchdog and the preparation-stall
+    path cancel directly (no staged pause), so this is what lets them land
+    PAUSED instead of being lost.
+    """
+    reason = str(cancellation_reason or '')
+    if reason.startswith('Shared video processing deadline'):
+        return 'delivery_deadline'
+    if reason.startswith('Preparation stopped advancing'):
+        return 'preparation_stall'
+    return None
+
+
+def _is_transient_queue_error(error_text) -> bool:
+    """True when an error looks like a passing storm, not a broken job.
+
+    Reboot/crash/network/deadline failures auto-retry; a hard contract
+    failure (no media at all, bad config) must not loop forever.
+    """
+    text = str(error_text or '').lower()
+    return any(marker in text for marker in _TRANSIENT_QUEUE_ERROR_MARKERS)
 _REDACTED_SECRET = ""
 _SENSITIVE_CONFIG_KEYS = {
     "api_key",
@@ -395,6 +465,15 @@ class QueueManager:
                 recovered += 1
                 recovered_processing += 1
             elif status == JobStatus.CANCELLATION_REQUESTED:
+                pause_text = _RECOVERY_PAUSE_TEXT.get(item.get('paused_reason'))
+                if pause_text and not item.get('cancel_requested'):
+                    item['status'] = JobStatus.PAUSED
+                    item['retryable'] = True
+                    item['progress_text'] = pause_text
+                    record_recovery_event(item, pause_text)
+                    recovered += 1
+                    recovered_processing += 1
+                    continue
                 # A cancellation request is persisted before the worker has
                 # acknowledged it.  If the process starts with no active
                 # worker state, the old request can otherwise remain in this
@@ -409,6 +488,21 @@ class QueueManager:
                 recovered += 1
                 recovered_cancellations += 1
             elif status == JobStatus.SHUTDOWN_TIMEOUT:
+                # A shutdown timeout after a USER cancellation is still a
+                # user cancellation: finalize it as CANCELLED, never park
+                # it PAUSED as a retryable interruption — otherwise the
+                # record presents "click Resume" for a job the user
+                # explicitly stopped. Only a system-caused timeout (no
+                # cancel_requested flag) becomes a resumable pause.
+                if item.get('cancel_requested'):
+                    item['status'] = JobStatus.CANCELLED
+                    item['progress_text'] = 'Cancelled after backend restart'
+                    item['cancelled_at'] = datetime.now().isoformat()
+                    item['cancel_recovered'] = True
+                    record_recovery_event(item, item['progress_text'])
+                    recovered += 1
+                    recovered_cancellations += 1
+                    continue
                 # No child process can still be tracked after a restart. Keep
                 # the job resumable, but make the interruption visible rather
                 # than presenting an indefinitely stopping card.
@@ -419,6 +513,66 @@ class QueueManager:
                 record_recovery_event(item, item['progress_text'])
                 recovered += 1
                 recovered_timeouts += 1
+            elif status == JobStatus.CANCELLED:
+                # A system-caused cancellation (deadline watchdog, crash,
+                # reboot mid-finalize) can leave a job CANCELLED even though
+                # nobody asked for it to stop. The guardrail is the
+                # cancel_requested flag: the user-cancel path always sets
+                # it, system cancels never do. A system-cancelled job with
+                # real checkpoints on disk is resumable — auto-requeue it,
+                # or park it PAUSED so Retry works. A user-cancelled job is
+                # never touched, and a cancelled job with no checkpoints
+                # has nothing to resume.
+                if item.get('cancel_requested'):
+                    continue
+                checkpoint_dir = item.get('checkpoint_dir')
+                if not checkpoint_dir or not Path(str(checkpoint_dir)).is_dir():
+                    continue
+                if auto_requeue:
+                    item['status'] = JobStatus.QUEUED
+                    item['progress'] = 0
+                    item['progress_text'] = 'Queued (auto-resumed after system cancellation)'
+                    item.pop('cancelled_at', None)
+                    item.pop('error', None)
+                    item.pop('error_detail', None)
+                else:
+                    item['status'] = JobStatus.PAUSED
+                    item['progress_text'] = 'Paused after system cancellation - click Resume to continue'
+                    item['paused_reason'] = 'system_cancel_recovered'
+                    item['retryable'] = True
+                record_recovery_event(item, item['progress_text'])
+                recovered += 1
+                recovered_cancellations += 1
+            elif status == JobStatus.ERROR:
+                # A job the user cancelled must never be auto-retried as a
+                # "transient error", even with auto-requeue on: the worker
+                # routes a cancelled run to CANCELLATION_REQUESTED, not
+                # ERROR, so this is purely defensive — but the guardrail
+                # is the cancel_requested flag, and it is checked
+                # everywhere a job can be brought back.
+                if item.get('cancel_requested'):
+                    continue
+                # A transient error (timeout, network, gateway 502/503/504/
+                # 530) is a passing storm: auto-retry it, bounded by the
+                # attempt cap — the worker increments attempt on each run,
+                # so a job that keeps failing transiently still ends after
+                # 3 attempts instead of looping forever. Hard errors stay
+                # ERROR for a human to retry.
+                if int(item.get('attempt') or 0) >= 3:
+                    continue
+                if not _is_transient_queue_error(
+                    item.get('error') or item.get('error_detail') or ''
+                ):
+                    continue
+                if auto_requeue:
+                    item['status'] = JobStatus.QUEUED
+                    item['progress'] = 0
+                    item['progress_text'] = 'Queued (auto-resumed after transient error)'
+                    item['paused_reason'] = 'system_error_interrupted'
+                    item['retryable'] = True
+                    record_recovery_event(item, item['progress_text'])
+                    recovered += 1
+                    recovered_processing += 1
 
         if recovered > 0:
             action = "auto-requeued" if auto_requeue else "paused"
@@ -595,38 +749,159 @@ class QueueManager:
     def resume_item(self, job_id: str, config: Optional[Dict] = None) -> bool:
         """
         Resume a paused or error job by setting status back to queued.
+
+        A job the queue marked CANCELLED is also resumable when the
+        cancellation was system-caused (deadline watchdog, crash): it
+        carries no ``cancel_requested`` flag and has checkpoints on disk.
+        A job the user explicitly cancelled (``cancel_requested`` set) is
+        never resumable — auto-retry must not fight the user.
         """
-        # A cancellation-cleanup timeout may still have a live callback. Do
-        # not permit Retry to start a second attempt for the same item while
-        # the original worker can still be writing its package or rendering.
+        updated_config = normalize_generation_config(config) if config is not None else None
         with self._queue_lock:
-            if job_id in self.active_jobs:
+            item = self.get_item(job_id)
+            if not item:
                 return False
-        for item in self.queue:
-            if item['id'] == job_id:
-                if item['status'] in [JobStatus.PAUSED, JobStatus.ERROR, JobStatus.SHUTDOWN_TIMEOUT]:
-                    if config is not None:
-                        item['config'] = normalize_generation_config(config)
-                    item['status'] = JobStatus.QUEUED
-                    item['progress'] = 0
-                    item['progress_text'] = 'Queued (Resumed)'
-                    item['progress_seq'] = 1
-                    item['progress_events'] = [
-                        {'seq': 1, 'progress': 0, 'text': 'Queued (Resumed)'}
-                    ]
-                    item.pop('error', None)
-                    item.pop('error_detail', None)
-                    item.pop('paused_reason', None)
-                    item.pop('cancel_recovered', None)
-                    item.pop('retryable', None)
-                    item.pop('memory_warning', None)
-                    self._save_queue()
-                    with self._queue_condition:
-                        self._queue_condition.notify_all()
-                    print(f"▶️ Resumed job {job_id}")
-                    return True
-        return False
-    
+            # The user-cancel guardrail applies to EVERY status, not just
+            # CANCELLED. A user-cancelled job whose cleanup timed out lands
+            # SHUTDOWN_TIMEOUT and is re-parked PAUSED
+            # (cancellation_cleanup_timeout) on reboot with
+            # cancel_requested still set; without this check the manual
+            # retry endpoint, startup maintenance and any other
+            # resume_item caller would auto-resume a job the user
+            # explicitly stopped. The driver has its own identical check,
+            # but resume_item is the choke point every path funnels
+            # through — it must refuse on its own.
+            if item.get('cancel_requested'):
+                return False
+            status = item['status']
+            if status == JobStatus.CANCELLED:
+                checkpoint_dir = item.get('checkpoint_dir')
+                if not checkpoint_dir or not Path(str(checkpoint_dir)).is_dir():
+                    return False
+            elif status not in {JobStatus.PAUSED, JobStatus.ERROR, JobStatus.SHUTDOWN_TIMEOUT}:
+                return False
+            # A timed-out cleanup can be released only after the callback
+            # returned and every registered worker stopped.
+            active = self.active_jobs.get(job_id)
+            if active is not None:
+                if (active.get('cleanup_status') != 'shutdown_timeout'
+                        or active.get('requested_at')
+                        or not active['context'].wait_for_quiescence(0)):
+                    return False
+                active['context'].clear_registries()
+                self.active_jobs.pop(job_id, None)
+            if updated_config is not None:
+                item['config'] = updated_config
+            item.update(status=JobStatus.QUEUED, progress=0, progress_text='Queued (Resumed)', progress_seq=1,
+                        progress_events=[{'seq': 1, 'progress': 0, 'text': 'Queued (Resumed)'}])
+            for key in ('error', 'error_detail', 'paused_reason', 'cancel_recovered', 'retryable', 'memory_warning', 'cancelled_at', 'cancel_reason', 'needs_human'):
+                item.pop(key, None)
+        self._save_queue()
+        with self._queue_condition:
+            self._queue_condition.notify_all()
+        print(f"Resumed job {job_id}")
+        return True
+
+    def mark_needs_human(self, job_id: str, reason: str) -> bool:
+        """Flag a job the driver cannot recover, for a human to look at.
+
+        Sets ``needs_human`` so the driver never loops on it, stamps the
+        reason as the visible progress text, and records a progress event.
+        Never raises; returns False when the job is gone. A later manual
+        resume (via :meth:`resume_item`) clears the flag.
+        """
+        clean = str(reason or '').strip() or 'Needs a human to look at this job.'
+        with self._queue_lock:
+            item = self.get_item(job_id)
+            if not item:
+                return False
+            item['needs_human'] = True
+            item['progress_text'] = clean
+        self._save_queue()
+        try:
+            self.record_debugger_event(job_id, clean)
+        except Exception:
+            pass
+        return True
+
+    def record_debugger_event(self, job_id: str, text: str) -> bool:
+        """Append a stuck-job debugger diagnosis/action line to a job's
+        progress history. Same event shape as the startup-recovery events:
+        next seq, capped at the last 12. Best-effort visibility -- never
+        raises, never touches the worker's own progress values."""
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return False
+        try:
+            with self._queue_lock:
+                item = next(
+                    (row for row in self.queue if row.get("id") == job_id),
+                    None,
+                )
+                if item is None:
+                    return False
+                events = list(item.get("progress_events") or [])
+                try:
+                    seq = max(
+                        int(item.get("progress_seq") or 0),
+                        max(
+                            (int(event.get("seq") or 0) for event in events
+                             if isinstance(event, dict)),
+                            default=0,
+                        ),
+                    ) + 1
+                except (TypeError, ValueError):
+                    seq = len(events) + 1
+                try:
+                    progress = max(0, min(100, int(item.get("progress") or 0)))
+                except (TypeError, ValueError):
+                    progress = 0
+                item["progress_seq"] = seq
+                events.append(
+                    {"seq": seq, "progress": progress, "text": clean_text}
+                )
+                item["progress_events"] = events[-12:]
+            self._save_queue()
+            return True
+        except Exception as exc:
+            print(f"⚠️ Debugger event record failed for {job_id}: {exc}")
+            return False
+
+    def request_scene_advance(
+        self, job_id: str, scene_number: int, reason: str = ""
+    ) -> bool:
+        """Record a debugger scene advance on the queue item and register it
+        with the in-process advance registry the media coordinator checks.
+        The scene number is the 1-based number from the progress label
+        (``Preparing media N/M``). Returns False when the job is unknown."""
+        try:
+            from services.job_debugger import set_scene_advance
+        except Exception:
+            set_scene_advance = None  # type: ignore[assignment]
+        with self._queue_lock:
+            item = next(
+                (row for row in self.queue if row.get("id") == job_id),
+                None,
+            )
+            if item is None:
+                return False
+            item["debugger_advance"] = {
+                "scene_number": int(scene_number),
+                "reason": str(reason or ""),
+                "at": datetime.now().isoformat(),
+            }
+        self._save_queue()
+        if set_scene_advance is not None:
+            try:
+                set_scene_advance(job_id, int(scene_number), str(reason or ""))
+            except Exception as exc:
+                print(f"⚠️ Debugger advance registry failed: {exc}")
+        print(
+            f"⏭️ Debugger advance requested for job {job_id} "
+            f"scene {scene_number}: {reason}"
+        )
+        return True
+
     def clear_completed(self) -> int:
         """Remove all completed/cancelled/error items"""
         with self._queue_lock:
@@ -713,7 +988,7 @@ class QueueManager:
                     'id', 'created_at', 'started_at', 'completed_at', 'status',
                     'progress', 'progress_text', 'progress_seq', 'progress_events',
                     'type', 'error', 'error_detail', 'paused_reason',
-                    'cancel_requested', 'retryable', 'memory_warning',
+                    'cancel_requested', 'retryable', 'memory_warning', 'needs_human',
                     'checkpoint_dir', 'edit_plan_path', 'last_run_id', 'config', 'result',
                 )
                 items = []
@@ -849,9 +1124,28 @@ class QueueManager:
                     # have quiesced.  This prevents a fast callback from
                     # racing the DELETE response and makes the UI's
                     # cancellation_requested state reliable to pollers.
-                    if item.get('paused_reason') == 'delivery_deadline':
+                    pause_text = _RECOVERY_PAUSE_TEXT.get(item.get('paused_reason'))
+                    if not pause_text and not state.get('requested_at'):
+                        # System-caused cancellation with no user request:
+                        # the delivery-deadline watchdog (and the preparation
+                        # stall path) cancels directly, without staging the
+                        # resumable pause the heartbeat path stages. Land
+                        # these as PAUSED instead of CANCELLED so the job
+                        # auto-resumes from its checkpoint on the next
+                        # startup instead of being lost. A job the user
+                        # cancelled (requested_at set) always stays CANCELLED.
+                        system_pause = _system_cancel_pause_reason(
+                            getattr(cancellation, 'reason', '')
+                        )
+                        if system_pause:
+                            item['paused_reason'] = system_pause
+                            item['cancel_reason'] = str(
+                                getattr(cancellation, 'reason', '') or ''
+                            )
+                            pause_text = _RECOVERY_PAUSE_TEXT.get(system_pause)
+                    if not state.get('requested_at') and pause_text:
                         item['status'] = JobStatus.PAUSED
-                        item['progress_text'] = 'Processing time limit reached. Click Retry to continue from saved work.'
+                        item['progress_text'] = pause_text
                         item['retryable'] = True
                     else:
                         item['status'] = JobStatus.CANCELLED
@@ -931,22 +1225,33 @@ class QueueManager:
             heartbeat_last_emit = 0.0
             heartbeat_job_started = heartbeat_last_activity
             heartbeat_thread = None
-            delivery_deadline_reached = False
+            recovery_stop_text = ''
             delivery_budget = None
-            expire_delivery_deadline = None
+            stop_for_recovery = None
             
             try:
                 # Install before invoking any generation callback so the queue
                 # and all pipeline stages share one fresh clock per attempt.
                 delivery_budget = install_delivery_budget(callback_config)
                 try:
+                    preparation_stall_seconds = float(callback_config.get('preparation_stall_seconds') or 0)
+                    if not math.isfinite(preparation_stall_seconds):
+                        preparation_stall_seconds = 0
+                except (TypeError, ValueError):
+                    preparation_stall_seconds = 0
+                try:
                     from services.web_image_service import reset_web_runtime_state
                     reset_web_runtime_state(f"queue job {job_id} start")
                 except Exception as reset_exc:
                     print(f"⚠️ Web runtime reset skipped: {reset_exc}")
+                # A new attempt starts from a clean activity clock: work
+                # recorded by the previous attempt must not mask a stall
+                # in this one.
+                _reset_pipeline_activity(f"queue job {job_id} start")
 
                 # Define progress callback
                 _last_progress_save = 0.0
+                last_work_progress = None
                 try:
                     progress_save_interval = max(
                         1.0,
@@ -956,7 +1261,7 @@ class QueueManager:
                     progress_save_interval = 3.0
 
                 def update_progress(progress: int, text: str, force_save: bool = False):
-                    nonlocal _last_progress_save, heartbeat_last_activity
+                    nonlocal _last_progress_save, heartbeat_last_activity, last_work_progress
                     cancellation.raise_if_cancelled()
                     try:
                         numeric_progress = max(0, min(100, int(round(float(progress)))))
@@ -975,11 +1280,12 @@ class QueueManager:
                             'checking youtube', 'downloading youtube', 'generating captions', 'planning visual')):
                         return
                     numeric_progress = max(previous_progress, numeric_progress)
-                    if numeric_progress != previous_progress or clean_text != previous_text:
-                        # Repeated identical provider callbacks can chatter
-                        # while a socket/download is stalled. Only an actual
-                        # visible state change resets the quiet-stage timer.
-                        with heartbeat_lock:
+                    work_progress = (numeric_progress, clean_text)
+                    with heartbeat_lock:
+                        if work_progress != last_work_progress and not re.search(
+                            r'\bstill working\b', clean_text, flags=re.I
+                        ):
+                            last_work_progress = work_progress
                             heartbeat_last_activity = time.monotonic()
                     next_item['progress'] = numeric_progress
                     next_item['progress_text'] = clean_text
@@ -994,41 +1300,51 @@ class QueueManager:
                         _last_progress_save = now
                         self._save_queue()
 
-                def expire_delivery_deadline():
-                    """Stop an over-budget attempt and leave it available for Retry."""
-                    nonlocal delivery_deadline_reached
-                    if delivery_deadline_reached:
-                        return
-                    delivery_deadline_reached = True
-                    next_item['paused_reason'] = 'delivery_deadline'
-                    next_item['retryable'] = True
-                    next_item['error'] = 'The shared processing deadline was exceeded.'
+                def stop_for_recovery(reason, text):
+                    """Stop owned work before the same queue item can be retried."""
+                    nonlocal recovery_stop_text
+                    with self._queue_lock:
+                        if recovery_stop_text or cancellation.cancelled() or next_item.get('status') != JobStatus.PROCESSING:
+                            return
+                        recovery_stop_text = text
+                        next_item['paused_reason'] = reason
+                        next_item['retryable'] = True
+                        next_item['error'] = text
+                        next_item['status'] = JobStatus.CANCELLATION_REQUESTED
                     try:
-                        record_terminal_event(
-                            next_item.get('progress', 0),
-                            'Processing time limit reached; stopping background work.',
-                        )
+                        record_terminal_event(next_item.get('progress', 0), text)
                     finally:
-                        # Persisting a progress event must never be able to
-                        # disable the watchdog that stops the actual work.
-                        cancellation.cancel('Shared processing deadline exceeded')
+                        cancellation.cancel(text)
 
                 def _progress_heartbeat_loop():
                     """Publish truthful waiting activity during quiet stages."""
-                    nonlocal heartbeat_last_emit, delivery_deadline_reached
+                    nonlocal heartbeat_last_emit
                     poll_seconds = max(0.02, float(self._progress_heartbeat_poll_seconds))
                     idle_seconds = max(0.02, float(self._progress_heartbeat_idle_seconds))
                     emit_seconds = max(0.02, float(self._progress_heartbeat_emit_seconds))
                     while not heartbeat_stop.wait(poll_seconds):
                         try:
                             if not cancellation.cancelled() and delivery_budget.remaining_seconds() <= 0:
-                                expire_delivery_deadline()
+                                stop_for_recovery('delivery_deadline', 'Processing time limit reached; stopping background work.')
                                 return
                             if cancellation.cancelled() or next_item.get('status') != JobStatus.PROCESSING:
                                 continue
                             now = time.monotonic()
                             with heartbeat_lock:
                                 idle_for = now - heartbeat_last_activity
+                            # Lanes record raw activity (web collection,
+                            # downloads, vision rounds) that display
+                            # progress may filter out. A working lane must
+                            # not look idle just because the displayed
+                            # count stands still while it collects.
+                            lane_activity = _pipeline_last_activity()
+                            if lane_activity is not None:
+                                idle_for = min(idle_for, now - lane_activity)
+                            if (preparation_stall_seconds > 0 and not delivery_budget.render_started
+                                    and idle_for >= preparation_stall_seconds):
+                                stop_for_recovery('preparation_stall', 'Preparation stopped advancing; saving work for retry.')
+                                return
+                            with heartbeat_lock:
                                 if idle_for < idle_seconds or (now - heartbeat_last_emit) < emit_seconds:
                                     continue
                                 heartbeat_last_emit = now
@@ -1043,7 +1359,6 @@ class QueueManager:
                             heartbeat_progress = current
                             elapsed = max(1, int(now - heartbeat_job_started))
                             base = str(next_item.get('progress_text') or 'Processing').strip()
-                            import re
                             base = re.sub(r'\s*[—-]\s*still working.*$', '', base, flags=re.I).strip()
                             heartbeat_text = f'{base} — still working ({elapsed}s); please wait'
                             next_item['progress'] = heartbeat_progress
@@ -1122,37 +1437,39 @@ class QueueManager:
                 # Close the boundary race if a callback returns just after
                 # expiry but before the watchdog's next poll.
                 if delivery_budget.remaining_seconds() <= 0:
-                    expire_delivery_deadline()
-                cancellation.raise_if_cancelled()
-
-                next_item['status'] = JobStatus.COMPLETED
-                next_item['progress'] = 100
-                next_item['progress_text'] = 'Completed'
-                next_item['progress_seq'] = int(next_item.get('progress_seq') or 0) + 1
-                next_item.setdefault('progress_events', []).append({
-                    'seq': next_item['progress_seq'], 'progress': 100, 'text': 'Completed'
-                })
-                next_item['completed_at'] = datetime.now().isoformat()
-                next_item['result'] = result
+                    stop_for_recovery('delivery_deadline', 'Processing time limit reached; stopping background work.')
+                with self._queue_lock:
+                    cancellation.raise_if_cancelled()
+                    if recovery_stop_text or next_item.get('status') == JobStatus.CANCELLATION_REQUESTED:
+                        raise JobCancelled(recovery_stop_text or 'Cancellation requested')
+                    next_item['status'] = JobStatus.COMPLETED
+                    next_item['progress'] = 100
+                    next_item['progress_text'] = 'Completed'
+                    next_item['progress_seq'] = int(next_item.get('progress_seq') or 0) + 1
+                    next_item.setdefault('progress_events', []).append({
+                        'seq': next_item['progress_seq'], 'progress': 100, 'text': 'Completed'
+                    })
+                    next_item['completed_at'] = datetime.now().isoformat()
+                    next_item['result'] = result
                 print(f"✅ Job {job_id} completed successfully")
                 
             except InterruptedError:
-                if delivery_budget is not None and delivery_budget.remaining_seconds() <= 0 and callable(expire_delivery_deadline):
-                    expire_delivery_deadline()
+                if delivery_budget is not None and delivery_budget.remaining_seconds() <= 0 and callable(stop_for_recovery):
+                    stop_for_recovery('delivery_deadline', 'Processing time limit reached; stopping background work.')
                 next_item['status'] = JobStatus.CANCELLATION_REQUESTED
                 record_terminal_event(next_item.get('progress', 0),
-                    'Processing time limit reached; stopping background work.' if delivery_deadline_reached else 'Cancellation requested')
+                    recovery_stop_text or 'Cancellation requested')
                 print(f"🛑 Job {job_id} was cancelled")
                 
             except Exception as e:
-                if delivery_budget is not None and delivery_budget.remaining_seconds() <= 0 and callable(expire_delivery_deadline):
-                    expire_delivery_deadline()
+                if delivery_budget is not None and delivery_budget.remaining_seconds() <= 0 and callable(stop_for_recovery):
+                    stop_for_recovery('delivery_deadline', 'Processing time limit reached; stopping background work.')
                 memory_warning = None
-                if cancellation.cancelled():
+                if cancellation.cancelled() or recovery_stop_text:
                     next_item['status'] = JobStatus.CANCELLATION_REQUESTED
                     record_terminal_event(next_item.get('progress', 0),
-                        'Processing time limit reached; stopping background work.' if delivery_deadline_reached else 'Cancellation requested')
-                    if not delivery_deadline_reached:
+                        recovery_stop_text or 'Cancellation requested')
+                    if not recovery_stop_text:
                         next_item.pop('error', None)
                     next_item.pop('error_detail', None)
                     print(f"🛑 Job {job_id} was cancelled")
@@ -1271,7 +1588,7 @@ class QueueManager:
                     reset_web_runtime_state(f"queue job {job_id} cleanup")
                 except Exception:
                     pass
-                was_cancelled = cancellation.cancelled()
+                was_cancelled = cancellation.cancelled() or bool(recovery_stop_text)
                 if was_cancelled:
                     self._finalize_cancelled_job(job_id, next_item, cancellation)
                 else:

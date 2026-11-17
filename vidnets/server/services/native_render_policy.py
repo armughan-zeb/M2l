@@ -43,16 +43,29 @@ def _stop_remotion_process(process) -> None:
 
 
 def _transient_remotion_failure(error: BaseException) -> bool:
-    """Classify failures that are safe to retry with one render worker.
+    """Classify failures that are safe to retry immediately with one render worker.
 
     The retry reuses the exact manifest, narration and media package. Source
     or React-plan defects stay terminal so production does not repeat an
     expensive render that cannot succeed without a code/data correction.
+
+    Deterministic Remotion prop-validation errors (e.g. the media cache
+    computed under low memory falling below Remotion's 240 MB minimum) are
+    NOT transient: an immediate retry with the same memory conditions fails
+    identically — GTA VI ef306926 burned its in-process retry this way
+    (``mediaCacheSizeInBytes`` 64 MB vs the 240 MB minimum, wrapped as a
+    ``CancelledError`` behind ``exit code 1``). They are still retryable
+    later (see :func:`_retryable_remotion_failure`) once memory is freed or
+    the cache floor is fixed, so they must not be marked terminal either.
     """
     message = str(error or "").lower()
     hard = (
         "syntaxerror", "referenceerror", "cannot find module", "module not found",
         "edit plan", "invalid manifest", "unsupported component", "cardinality mismatch", "attempt limit reached",
+        # Deterministic Remotion prop validation: retrying the identical
+        # config cannot succeed. "exit code" alone must not rescue these.
+        "mediacachesizeinbytes", "offthreadvideocachesizeinbytes",
+        "minimum value for the",
     )
     if any(token in message for token in hard):
         return False
@@ -62,6 +75,27 @@ def _transient_remotion_failure(error: BaseException) -> bool:
         "econnreset", "timed out", "timeout", "stalled", "exit code",
     )
     return any(token in message for token in transient)
+
+
+def _retryable_remotion_failure(error: BaseException) -> bool:
+    """Whether a LATER retry (new attempt, changed conditions) can succeed.
+
+    Unlike :func:`_transient_remotion_failure`, this does not gate the
+    immediate in-process retry — it gates the queue/driver decision to pause
+    the job for retry instead of failing it terminally. Only defects that no
+    retry can fix without a code or plan correction are terminal here:
+    syntax/reference errors, missing modules, invalid edit plans. Everything
+    else — including deterministic config errors such as an undersized media
+    cache, which a later attempt can pass once render-mode has freed memory
+    or the cache floor is fixed — stays retryable, because a failed render
+    must never kill a video except for no usable media / zero real media.
+    """
+    message = str(error or "").lower()
+    hard = (
+        "syntaxerror", "referenceerror", "cannot find module", "module not found",
+        "edit plan", "invalid manifest", "unsupported component", "cardinality mismatch", "attempt limit reached",
+    )
+    return not any(token in message for token in hard)
 
 
 def _enabled(value: Any) -> bool:
@@ -848,9 +882,16 @@ def render_semantic_documentary_remotion(
         env["VIDZEO_REMOTION_CRF"] = str(selected_crf)
         # Resource preflight chose the fastest safe count for the current RAM,
         # CPU and frame size. The Node renderer applies its own fresh RAM cap.
+        # NOTE: the M2l worker sends its request as `concurrency` AND
+        # `semantic_render_concurrency` (adapters/vidnets.js buildRequest,
+        # MUSE_RENDER_CONCURRENCY, default 2). The server layer only
+        # forwards semantic_render_concurrency into the render config, so
+        # read it here too — otherwise the requested count never reaches
+        # the Node script and the render silently uses its own default.
         user_concurrency = (
             cfg.get("concurrency")
             or cfg.get("remotion_concurrency")
+            or cfg.get("semantic_render_concurrency")
             or os.environ.get("VIDZEO_REMOTION_CONCURRENCY")
         )
         if user_concurrency:
@@ -910,7 +951,17 @@ def render_semantic_documentary_remotion(
             archive = None
             vision_key = str(cfg.get('openrouter_api_key') or os.environ.get('OPENROUTER_API_KEY') or os.environ.get('VIDZEO_OPENROUTER_API_KEY') or '')
             client_factory = cfg.get('_creative_review_client_factory')
-            if not callable(client_factory) and vision_key:
+            # Muse inference is compulsory for external_agent jobs: the
+            # creative-review pixel audit must never call Qwen directly when
+            # this render belongs to a Muse-inference job. (The audit is
+            # advisory — when the factory is unset the render proceeds
+            # without it — so skipping it here loses nothing.)
+            from .job_context import current_job as _current_job
+            _is_external_agent = (
+                str(cfg.get('llm_provider') or '') == 'external_agent'
+                or str(_current_job().get('llm_provider') or '') == 'external_agent'
+            )
+            if not callable(client_factory) and vision_key and not _is_external_agent:
                 from .visual_intelligence.vision_client import QwenVisionClient
                 client_factory = lambda remaining: QwenVisionClient(api_key=vision_key, max_attempts=1,
                 timeout_seconds=max(1,min(18,remaining)),fast_mode=True)
@@ -1445,12 +1496,13 @@ def render_semantic_documentary_remotion(
             now=time.monotonic(),
             timeout_seconds=timeout_seconds,
         )
+        default_stall_seconds = 300.0 if cfg.get("llm_provider") == "external_agent" else 1200.0
         try:
-            stall_timeout = float(os.environ.get("VIDZEO_REMOTION_STALL_TIMEOUT_SECONDS", "1200"))
+            stall_timeout = float(os.environ.get("VIDZEO_REMOTION_STALL_TIMEOUT_SECONDS", default_stall_seconds))
             if not math.isfinite(stall_timeout):
-                stall_timeout = 1200.0
+                stall_timeout = default_stall_seconds
         except (TypeError, ValueError):
-            stall_timeout = 1200.0
+            stall_timeout = default_stall_seconds
         stall_timeout = max(180.0, min(1200.0, stall_timeout))
         stream_closed = False
         while not stream_closed:
@@ -1705,7 +1757,11 @@ def render_semantic_documentary(
     try:
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-        from .render_resource_manager import prepare_render_resources, RenderMemoryLowError
+        from .render_resource_manager import (
+            prepare_render_resources,
+            RenderMemoryLowError,
+            wait_for_render_memory,
+        )
 
         selected_backend = str(
             (config or {}).get("render_backend")
@@ -1732,32 +1788,73 @@ def render_semantic_documentary(
                     break
             if video_heavy:
                 break
-        waiting_on_resources = False
         try:
             memory_wait_seconds = max(1.0, min(1200.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_WAIT_SECONDS') or 120)))
         except (TypeError, ValueError):
             memory_wait_seconds = 120.0
-        memory_wait_deadline = min(wait_deadline, time.monotonic() + memory_wait_seconds)
-        while True:
+        try:
+            memory_poll_seconds = max(0.1, min(5.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_POLL_SECONDS') or 0.5)))
+        except (TypeError, ValueError):
+            memory_poll_seconds = 0.5
+        try:
+            memory_worker_extend_seconds = max(1.0, min(300.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_WORKER_EXTEND_SECONDS') or 30)))
+        except (TypeError, ValueError):
+            memory_worker_extend_seconds = 30.0
+        try:
+            memory_no_worker_grace_seconds = max(0.0, min(120.0, float(os.environ.get('VIDZEO_REMOTION_MEMORY_NO_WORKER_GRACE_SECONDS') or 10)))
+        except (TypeError, ValueError):
+            memory_no_worker_grace_seconds = 10.0
+        # Worker-aware memory wait (Nov 10, 2026): the old loop slept a
+        # fixed 2s and expired after a flat 120s even while this job's own
+        # media workers (YouTube ffmpeg downloads, search workers) were
+        # still running — the job then paused and burned wrapper retries
+        # until a retry happened to land after a worker exit. Now admission
+        # is re-checked every ~0.5s, the deadline extends in 30s steps
+        # while media workers are alive (bounded by the delivery budget),
+        # and the wait fails fast once no worker is left to free memory.
+        prepare_state = {'attempts': 0}
+
+        def _prepare_once():
+            prepare_state['attempts'] += 1
+            return prepare_render_resources(
+                require_remotion=selected_backend in {"remotion", "react"},
+                width=render_width, height=render_height, video_heavy=video_heavy,
+                release_idle=prepare_state['attempts'] <= 1,
+            )
+
+        def _check_active():
             check_job_active()
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            try:
-                memory_snapshot = prepare_render_resources(
-                    require_remotion=selected_backend in {"remotion", "react"},
-                    width=render_width, height=render_height, video_heavy=video_heavy,
-                    release_idle=not waiting_on_resources,
-                )
-                break
-            except RenderMemoryLowError as exc:
-                if not continue_render or time.monotonic() >= memory_wait_deadline:
-                    raise
-                waiting_on_resources = True
-                message = f"Waiting for render memory ({exc.memory_snapshot.get('available_mb', 0)} MB available); saved edit retained"
-                print(f"   [render-memory] {message}", flush=True)
-                if progress_callback:
+
+        def _on_memory_wait(info):
+            workers = info.get('live_workers') or []
+            message = (
+                f"Waiting for render memory ({info.get('available_mb', 0)} MB available; "
+                f"{len(workers)} media worker(s) holding "
+                f"{info.get('live_worker_rss_mb', 0)} MB, "
+                f"{info.get('deadline_in_seconds', 0):.0f}s of memory wait left); saved edit retained"
+            )
+            print(f"   [render-memory] {message}", flush=True)
+            if progress_callback:
+                try:
                     progress_callback(0.0, message)
-                time.sleep(2.0)
+                except Exception:
+                    pass
+
+        if continue_render:
+            memory_snapshot = wait_for_render_memory(
+                _prepare_once,
+                wait_deadline=wait_deadline,
+                base_wait_seconds=memory_wait_seconds,
+                poll_seconds=memory_poll_seconds,
+                worker_extend_seconds=memory_worker_extend_seconds,
+                no_worker_grace_seconds=memory_no_worker_grace_seconds,
+                on_wait=_on_memory_wait,
+                check_active=_check_active,
+            )
+        else:
+            memory_snapshot = _prepare_once()
         result = _render_semantic_documentary_unlocked(
             manifest=manifest,
             output_path=output_path,
@@ -1834,6 +1931,21 @@ def _render_semantic_documentary_unlocked(
                         )
                     except Exception:
                         pass
+                # Back off before the single retry: an immediate re-run under
+                # the same memory pressure re-fails identically and burns a
+                # bundle + browser launch. The pause lets render-mode and the
+                # memory wait on the next attempt free RAM first. Completed
+                # sections are checkpointed by the JS runner, so the retry
+                # resumes them instead of re-rendering finished frames.
+                try:
+                    retry_backoff = float(os.environ.get("VIDZEO_REMOTION_RETRY_BACKOFF_SECONDS", "10") or 10)
+                except (TypeError, ValueError):
+                    retry_backoff = 10.0
+                retry_backoff = max(0.0, min(120.0, retry_backoff))
+                if retry_backoff > 0:
+                    time.sleep(retry_backoff)
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
                 try:
                     return render_semantic_documentary_remotion(
                         manifest=manifest,
@@ -1855,7 +1967,14 @@ def _render_semantic_documentary_unlocked(
                     f"Required Remotion render failed; legacy fallback is disabled: {exc}"
                 )
                 wrapped.stage = 'remotion_render'
-                wrapped.retryable = _transient_remotion_failure(exc)
+                # Driver retryability is broader than immediate retryability:
+                # a deterministic config error (undersized media cache) must
+                # not burn the in-process retry, but the job must pause for a
+                # later retry — not fail terminally — once memory is freed or
+                # the cache floor is fixed. Only proven-terminal defects are
+                # non-retryable here.
+                wrapped.retryable = _retryable_remotion_failure(exc)
+                wrapped.immediate_retry = _transient_remotion_failure(exc)
                 memory_snapshot = getattr(exc, "memory_snapshot", None)
                 if memory_snapshot:
                     wrapped.memory_snapshot = dict(memory_snapshot)
