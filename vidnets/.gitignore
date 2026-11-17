@@ -45,6 +45,11 @@ venv*/
 .venv/
 tools/python/
 tools/ffmpeg/
+tools/node/
+tools/models/
+tools/youtube-pot-provider/.github/
+tools/youtube-pot-provider/.vidzeo-provider-ready
+secure/
 
 # Generated media and runtime state
 output/

@@ -35,7 +35,15 @@ def _number(value: Any, default: Optional[float]) -> Optional[float]:
 
 @dataclass
 class DeliveryBudget:
-    """One monotonic deadline shared by planning, retrieval and rendering."""
+    """One monotonic deadline shared by planning, retrieval and rendering.
+
+    The deadline is progress-aware: every genuine progress report extends it
+    by ``stall_grace_seconds`` (see :meth:`note_progress`), so a job that
+    keeps moving is never killed for being slow. Only a true stall — no
+    progress for a full grace window — lets the deadline expire. The absolute
+    cap bounds even a steadily inching job so a hung worker cannot hold the
+    queue hostage forever.
+    """
 
     total_seconds: float
     render_reserve_seconds: float
@@ -43,6 +51,31 @@ class DeliveryBudget:
     deadline_at: float
     clock: Clock = field(default=time.monotonic, repr=False, compare=False)
     render_started: bool = False
+    stall_grace_seconds: float = 1200.0
+    absolute_cap_seconds: float = 14400.0
+    last_progress_at: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.last_progress_at is None:
+            self.last_progress_at = self.started_at
+
+    def note_progress(self) -> float:
+        """Record genuine progress and extend the deadline by the stall grace.
+
+        Returns the new deadline. The extension is capped at the absolute
+        deadline so a job that inches forward forever still ends. Heartbeat
+        re-emissions ("still working …") must NOT call this — only real
+        advances (a higher fraction, a further scene count) count, otherwise
+        a stalled job would keep its own deadline alive.
+        """
+        now = float(self.clock())
+        self.last_progress_at = now
+        absolute_deadline = self.started_at + max(0.0, float(self.absolute_cap_seconds))
+        self.deadline_at = min(
+            absolute_deadline,
+            max(self.deadline_at, now + max(0.0, float(self.stall_grace_seconds))),
+        )
+        return self.deadline_at
 
     def begin_render_phase(self) -> None:
         """Local rendering uses progress/stall supervision, not a delivery wall."""
@@ -57,6 +90,8 @@ class DeliveryBudget:
         total_seconds: float = 900.0,
         render_reserve_seconds: float = 330.0,
         max_cap_seconds: Optional[float] = None,
+        stall_grace_seconds: Optional[float] = None,
+        absolute_cap_seconds: Optional[float] = None,
         clock: Clock = time.monotonic,
     ) -> "DeliveryBudget":
         # Historical contract: maximum fifteen minutes.  Long-form jobs (75+
@@ -69,12 +104,24 @@ class DeliveryBudget:
         total = max(1.0, min(cap, float(total_seconds)))
         reserve = max(0.0, min(float(render_reserve_seconds), total * 0.60))
         started = float(clock())
+        grace = _number(
+            stall_grace_seconds if stall_grace_seconds is not None
+            else os.environ.get("VIDZEO_DELIVERY_BUDGET_STALL_GRACE_SECONDS"),
+            1200.0,
+        )
+        absolute_cap = _number(
+            absolute_cap_seconds if absolute_cap_seconds is not None
+            else os.environ.get("VIDZEO_DELIVERY_BUDGET_ABSOLUTE_CAP_SECONDS"),
+            14400.0,
+        )
         return cls(
             total_seconds=total,
             render_reserve_seconds=reserve,
             started_at=started,
             deadline_at=started + total,
             clock=clock,
+            stall_grace_seconds=max(60.0, float(grace or 1200.0)),
+            absolute_cap_seconds=max(total, float(absolute_cap or 14400.0)),
         )
 
     def elapsed_seconds(self) -> float:
@@ -120,6 +167,9 @@ class DeliveryBudget:
             "elapsed_seconds": round(self.elapsed_seconds(), 3),
             "remaining_seconds": None if self.render_started else round(self.remaining_seconds(), 3),
             "render_progress_supervised": self.render_started,
+            "stall_grace_seconds": self.stall_grace_seconds,
+            "absolute_cap_seconds": self.absolute_cap_seconds,
+            "last_progress_at": self.last_progress_at,
         }
 
 
@@ -144,13 +194,29 @@ def install_delivery_budget(
         word_count = len(script.split()) if script else 0
         est_audio_seconds = (word_count / 2.3) if word_count > 0 else 0.0
         if est_audio_seconds > 600.0:
-            total = max(900.0, min(7200.0, est_audio_seconds * 2.5 + 600.0))
+            total = max(900.0, min(14400.0, est_audio_seconds * 2.5 + 600.0))
         else:
             total = 900.0
         if str(config.get('llm_provider') or '') == 'external_agent':
             # One connected host services bounded scene/vision inbox turns.
             # Explicit configured ceilings remain authoritative.
-            total = max(total, 1800.0)
+            # Preparation is dominated by per-scene inbox round trips (each
+            # direction/retrieval turn waits ~4.5 min for the hook to wake a
+            # worker), so the budget must scale with scene count, not just
+            # audio length. Cooper (2,243 words, 147 scenes) got 3037s from
+            # the audio formula and its tail scenes fell back to graphics
+            # when preparation ran out. A 1-min Wright Brothers job (270
+            # words, 14 scenes) burned 2419s of media preparation and was
+            # killed by the old 1800 + scenes*35 formula (~2395s). Estimate
+            # scenes from the script (~16 words/scene observed on Zephyr +
+            # Cooper) and allow ~90s/scene of preparation for agent jobs,
+            # floor 2400s, capped at 14400s. The deadline is also
+            # progress-aware (DeliveryBudget.note_progress): a job that
+            # keeps moving is never killed for being slow — only a true
+            # stall (no progress for the stall grace) lets it expire.
+            est_scenes = (word_count / 16.0) if word_count > 0 else 0.0
+            scene_floor = 2400.0 + est_scenes * 90.0
+            total = max(total, 2400.0, min(14400.0, scene_floor))
     else:
         total = configured_total
 

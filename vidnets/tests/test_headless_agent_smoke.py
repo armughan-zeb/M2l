@@ -7,9 +7,49 @@ import sys
 import tempfile
 import time
 from unittest.mock import patch
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'server'))
+
+
+def test_recovery_refuses_to_start_a_second_service_while_previous_pid_exists(tmp_path):
+    import headless_agent
+    from services import agent_access
+
+    secure = tmp_path / 'secure'
+    secure.mkdir()
+    (secure / 'agent-service.json').write_text(json.dumps({
+        'pid': os.getpid(), 'resource_root': str(ROOT),
+    }))
+    with patch.object(agent_access, '_read', side_effect=PermissionError), \
+            patch.object(headless_agent, 'service_url', side_effect=ConnectionRefusedError), \
+            patch.object(headless_agent.subprocess, 'Popen') as spawn:
+        with pytest.raises(RuntimeError, match='previous Vidnets process still exists'):
+            headless_agent.start(ROOT, tmp_path, {}, recover=True)
+        spawn.assert_not_called()
+
+
+def test_recovery_restarts_a_dead_service_in_the_same_runtime(tmp_path):
+    import headless_agent
+    from services import agent_access
+
+    secure = tmp_path / 'secure'
+    secure.mkdir()
+    descriptor = secure / 'agent-service.json'
+    descriptor.write_text(json.dumps({'pid': 100, 'resource_root': str(ROOT)}))
+    with patch.object(agent_access, '_read', side_effect=PermissionError), \
+            patch.object(headless_agent, 'service_url', side_effect=ConnectionRefusedError), \
+            patch.object(headless_agent, '_json_http', return_value={
+                'pipeline_build_id': headless_agent.BUILD_ID, 'resource_root': str(ROOT),
+            }), patch('psutil.pid_exists', return_value=False), \
+            patch.object(headless_agent.subprocess, 'Popen') as spawn:
+        spawn.return_value.pid = 101
+        spawn.return_value.poll.return_value = None
+        result = headless_agent.start(ROOT, tmp_path, {}, recover=True)
+        assert result['ready']
+        assert json.loads(descriptor.read_text())['pid'] == 101
+        assert spawn.call_args.kwargs['env']['VIDZEO_AGENT_RECOVER_QUEUE'] == '1'
 
 
 def test_live_headless_start_and_authenticated_inbox():

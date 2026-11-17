@@ -45,15 +45,17 @@ docker compose exec worker curl -s http://127.0.0.1:5010/   # Vidnets answers in
 No ports are published to the host by default. To inspect Vidnets from the
 host, uncomment the `ports:` block in `docker-compose.yml` and re-up.
 
-## Fast inference first: the resident worker (primary), the host hook (fallback)
+## Fast inference first: the resident worker pool (primary), the host hook (fallback)
 
-Inference answers land in seconds when the resident inference worker runs.
-Before the first job, spawn it from
-`scripts/resident-inference-worker/WORKER_BRIEF.md` — one background agent
-that polls the spool and answers every inbox request with real Muse
-inference. The daemon's resident inbox calls the spool transport by
+Inference answers land in seconds when the resident inference worker pool
+runs. Before the first job, spawn the pool supervisor from
+`scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md` — it spawns
+2–8 worker agents that claim spool requests in parallel and answer each
+with real Muse inference (each worker follows
+`scripts/resident-inference-worker/WORKER_BRIEF.md`). The daemon's
+resident inbox calls the spool transport by
 default (`MUSE_INFERENCE_COMMAND=node /app/scripts/muse-inference-spool.cjs`).
-`start-daemon.sh` warns if the worker heartbeat is stale; the worker is
+`start-daemon.sh` warns if no worker heartbeat is fresh; the pool is
 the fix, not the warning.
 
 ## Host Muse hook (setup installs the script)
@@ -102,15 +104,15 @@ floor is set by downloads and rendering, not inference waits.
 
 | Symptom | Cause / fix |
 |---|---|
-| `doctor` fails on the hook | Hook missing/disabled on the host — see "Host Muse hook" above. Only fatal when no resident transport is configured; with the spool transport set, the resident worker owns the inbox. |
+| `doctor` fails on the hook | Hook missing/disabled on the host — see "Host Muse hook" above. Only fatal when no resident transport is configured; with the spool transport set, the resident worker pool owns the inbox. |
 | `doctor` fails on Vidnets unreachable | Check `./data/runtime/logs/agent-service.log`. |
-| Resident worker heartbeat stale | The worker agent is not running — spawn it from `scripts/resident-inference-worker/WORKER_BRIEF.md`. Jobs keep working via the hook fallback, just slower. |
+| Resident worker pool heartbeat stale | No pool worker agent is running — spawn the pool from `scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md`. Jobs keep working via the hook fallback, just slower. |
 | CMS 502 / 530 / error 1033 | His PC's Cloudflare Tunnel is down. **Do nothing** — the daemon retries in-process, work is never lost. Restart the tunnel on his PC. |
 | Upload HTTP 413 | Master over ~100 MB. The worker auto-transcodes before upload; a 413 means the transcode path was bypassed — check the logs, do not re-upload the same file. |
 | `401` / credential revoked | Re-run `./setup.sh` and re-pair with a fresh key from the CMS. |
 | Container stopped / VM rebooted | `docker compose up -d`. State lives in `./data`; the daemon resumes the saved job from its checkpoint. Never delete `./data` while a job runs. |
 | Out of disk | `./data/runtime/temp` accumulates render scratch; prune it by hand. Never delete `./data/runtime/temp/agent-bridge` while a job runs. |
-| Slow job / "stuck" scene | First check the resident worker heartbeat — if it is stale, inference round trips fall back to ~4.5 min hook wakes (the 3600s agent-bridge request floor exists because a wake alone can exceed 20 min). Spawn the worker; do not kill the job. The server's debugger reuses already-downloaded vision-checked media first, then same-job approved media, graphic last. If a request does expire, check `doctor`, hook `last-run`, and bridge metrics. |
+| Slow job / "stuck" scene | First check the resident worker pool heartbeats — if none is fresh, inference round trips fall back to ~4.5 min hook wakes (the 3600s agent-bridge request floor exists because a wake alone can exceed 20 min). Spawn the pool; do not kill the job. The server's debugger reuses already-downloaded vision-checked media first, then same-job approved media, graphic last. If a request does expire, check `doctor`, hook `last-run`, and bridge metrics. |
 | Low-memory test/build failures | The reference box has 4 vCPU / 7.7 GB and render concurrency is pinned to 1. Do not raise it. |
 
 ## Updating

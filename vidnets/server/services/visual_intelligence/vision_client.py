@@ -439,6 +439,9 @@ class QwenVisionClient:
             fallback_models = []
         self.timeout_seconds = float(timeout_seconds or _default_timeout())
         self.fast_mode = bool(fast_mode)
+        if self.fast_mode:
+            # Validator-only fast path: exactly one attempt (see _post).
+            self.max_attempts = 1
         configured = fallback_models if fallback_models is not None else FREE_VISION_FALLBACK_MODELS
         self.fallback_models = []
         seen = {self.model}
@@ -478,6 +481,17 @@ class QwenVisionClient:
         self._telemetry.last_latency_ms = max(0.0, float(value or 0.0))
 
     # -------- public -------------------------------------------------------
+
+    def as_fast_mode(self) -> "QwenVisionClient":
+        """Return a validator-only view of this client: exactly one attempt,
+        no repair retry. Shares credentials/model; used for recovery and
+        frame-fallback candidates so one slow inbox cannot eat the reserve."""
+        import copy
+
+        fast = copy.copy(self)
+        fast.fast_mode = True
+        fast.max_attempts = 1
+        return fast
 
     def is_available(self) -> bool:
         """Return whether the client is locally configured, without a paid ping."""
@@ -739,23 +753,16 @@ class QwenVisionClient:
             json_mode=True,
             max_tokens=min(int(budget), 900) if self.fast_mode else budget,
         )
+        if self.fast_mode:
+            # Validator-only fast path: exactly one attempt, no plain-text
+            # repair retry. A malformed fast verdict is a miss, not a reason
+            # to spend a second network round trip on a fallback candidate.
+            return raw
         if _extract_json_text(raw) is None:
-            if self.fast_mode:
-                # Mixed Media uses a bounded advisory gate. Give a malformed
-                # JSON response one cheap plain-text repair shot, then let the
-                # normal metadata/fallback policy decide; do not spend a third
-                # network request on a single finalist.
-                raw = self._post(
-                    content,
-                    system=system,
-                    json_mode=False,
-                    max_tokens=min(int(retry_budget), 1000),
-                )
-            else:
-                raw = self._post(
-                    content, system=system, json_mode=True, max_tokens=retry_budget
-                )
-        if not self.fast_mode and _extract_json_text(raw) is None:
+            raw = self._post(
+                content, system=system, json_mode=True, max_tokens=retry_budget
+            )
+        if _extract_json_text(raw) is None:
             # Some providers route response_format/json_object to a strict
             # variant that truncates reasoning models. Plain text mode lets us
             # extract the JSON from the raw response.
@@ -866,7 +873,12 @@ class QwenVisionClient:
         last_error = ""
         structured_fallback_used = False
         attempts = min(self.max_attempts, 2) if current_job().get('cost_profile') == 'efficient' else self.max_attempts
-        request_budget = attempts + (1 if json_mode else 0)
+        if self.fast_mode:
+            # Validator-only fast path: exactly one network attempt, no
+            # retries, no structured-output fallback shot. The caller
+            # (recovery / frame candidates) treats a fast miss as a miss.
+            attempts = 1
+        request_budget = 1 if self.fast_mode else attempts + (1 if json_mode else 0)
         # An agent-backed verifier answers through the polling inbox, so one
         # attempt needs the full agent answer floor — otherwise the phase
         # scope below caps the request wall under it and the verdict expires
@@ -899,6 +911,7 @@ class QwenVisionClient:
                     and json_mode
                     and "response_format" in payload
                     and not structured_fallback_used
+                    and not self.fast_mode
                 ):
                     # Provider routing differs. Retry once without structured
                     # output only for an explicit incompatibility response.

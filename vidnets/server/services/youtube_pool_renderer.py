@@ -161,6 +161,7 @@ def _scene_offsets_grid(shift: float) -> tuple:
     """
     return tuple(round(offset + shift, 2) for offset in _SCENE_OFFSET_BASE)
 from .youtube_overlay_policy import preserve_source_overlays
+from .pipeline_activity import record_activity
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
@@ -1583,9 +1584,9 @@ def _probe_pool_candidates(
         )
     )
     try:
-        probe_workers = max(2, min(10, int(os.environ.get("VIDZEO_YT_POOL_PROBE_CONCURRENCY", "8") or 8)))
+        probe_workers = _pool_probe_workers()
     except (TypeError, ValueError):
-        probe_workers = 8
+        probe_workers = 10
     probe_duration = max(
         1.5,
         min(5.0, float(os.environ.get("VIDZEO_YT_POOL_PROBE_SECONDS", "3") or 3)),
@@ -1670,10 +1671,24 @@ def _probe_pool_candidates(
         candidate = _source_candidate(record)
         duration = max(0.0, float(getattr(record, "duration", 0.0) or 0.0))
         safe_max_start = max(0.0, duration - probe_duration - 0.25) if duration else 0.0
-        # Deterministic quarter/center sampling gives different candidates a
-        # stable preview without pretending the full source is already known.
-        fraction = ((sum(ord(char) for char in source_id) % 3) + 1) / 4.0
-        start = min(safe_max_start, max(0.0, safe_max_start * fraction))
+        # Transcript + frame selection: when a scene assigned to this source
+        # has a transcript moment, probe AT the moment so vision scores the
+        # frames the cut will actually use. The cut starts at the moment too,
+        # so the probe window and the first cut agree. Only a real transcript
+        # match steers the window; otherwise fall back to deterministic
+        # quarter/center sampling, exactly as before.
+        probe_moment = _best_probe_moment(pools, source_id)
+        probe_window_source = "quarter_center"
+        if probe_moment is not None:
+            try:
+                moment_start = float(getattr(probe_moment, "start", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                moment_start = 0.0
+            start = min(safe_max_start, max(0.0, moment_start))
+            probe_window_source = "transcript_moment"
+        else:
+            fraction = ((sum(ord(char) for char in source_id) % 3) + 1) / 4.0
+            start = min(safe_max_start, max(0.0, safe_max_start * fraction))
         probe_path = probe_root / f"{source_id}.probe.mp4"
         row = {
             "source_id": source_id,
@@ -1682,11 +1697,24 @@ def _probe_pool_candidates(
             "metadata_score": float(getattr(record, "metadata_score", 0.0) or 0.0),
             "probe_start": round(float(start), 3),
             "probe_duration": round(float(probe_duration), 3),
+            "probe_window_source": probe_window_source,
             "status": "probe_started",
             "overlay_policy": "preserve_source_no_blur",
             "overlay_types": [],
             "rejection_reason": "",
         }
+        if probe_moment is not None:
+            try:
+                row.update({
+                    "probe_moment_start": round(float(getattr(probe_moment, "start", 0.0) or 0.0), 3),
+                    "probe_moment_end": round(float(getattr(probe_moment, "end", 0.0) or 0.0), 3),
+                    "probe_moment_text": str(getattr(probe_moment, "transcript_text", "") or "")[:240],
+                    "probe_moment_score": round(float(getattr(probe_moment, "match_score", 0.0) or 0.0), 3),
+                    "probe_moment_scene": int(getattr(probe_moment, "scene_index", 0) or 0),
+                    "probe_moment_reason": str(getattr(probe_moment, "match_reason", "") or ""),
+                })
+            except (TypeError, ValueError):
+                pass
         try:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
@@ -2168,6 +2196,41 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _pool_probe_workers() -> int:
+    """Parallel 1-4s probe downloads per pool (default 10, cap 12).
+
+    Probes are tiny segments; the cost is one yt-dlp invocation each, so
+    parallelism is the whole win. Counts stay modest: the egress proxy
+    serializes concurrent connections (sequential 1-3s, ~72 concurrent
+    collapse to 30s+). Env VIDZEO_YT_POOL_PROBE_CONCURRENCY wins.
+    """
+    return _env_int("VIDZEO_YT_POOL_PROBE_CONCURRENCY", 10, minimum=2, maximum=12)
+
+
+def _source_download_workers() -> int:
+    """Parallel full shared-source downloads (default 6, cap 8).
+
+    Was default 4, cap 6. Env VIDZEO_YT_SOURCE_DOWNLOAD_CONCURRENCY wins.
+    """
+    return _env_int("VIDZEO_YT_SOURCE_DOWNLOAD_CONCURRENCY", 6, minimum=1, maximum=8)
+
+
+def _source_batch_deadline_seconds() -> float:
+    """Wall for the shared-source download batch (default 300s).
+
+    Was 120s: a batch of several 1080p segments through the throttled
+    egress can exceed it, cancelling work the direct-clip lane then has to
+    re-download. The deadline is a wall, not a target — fast batches still
+    finish fast. Env VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS wins.
+    """
+    return _env_float(
+        "VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS",
+        300.0,
+        minimum=0.05,
+        maximum=1800.0,
+    )
+
+
 class _DeadlineCancellation:
     """Compose job cancellation with a local cooperative wall deadline."""
 
@@ -2343,6 +2406,131 @@ def _build_visual_veto_policy(
     }
 
 
+def _best_probe_moment(pools: Any, source_id: str) -> Any | None:
+    """Return the best transcript moment for a probe candidate, if any.
+
+    Only a real transcript match counts: heuristic moments carry score 0.0
+    and an ungrounded timestamp, so they must never steer the probe window.
+    The highest match_score wins; ties break toward the earliest start.
+    """
+    try:
+        assignments = getattr(pools, "moment_assignments", None) or {}
+    except Exception:
+        return None
+    best = None
+    try:
+        moments = []
+        for scene_moments in assignments.values():
+            for moment in scene_moments or []:
+                moment_id = str(
+                    getattr(moment, "source_id", "") or getattr(moment, "video_id", "")
+                )
+                if moment_id != str(source_id):
+                    continue
+                if bool(getattr(moment, "heuristic", False)):
+                    continue
+                try:
+                    score = float(getattr(moment, "match_score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if score <= 0.0:
+                    continue
+                moments.append((score, moment))
+        if not moments:
+            return None
+        moments.sort(
+            key=lambda pair: (
+                -pair[0],
+                float(getattr(pair[1], "start", 0.0) or 0.0),
+            )
+        )
+        best = moments[0][1]
+    except Exception:
+        return None
+    return best
+
+
+def _prefetch_probe_transcript_moments(
+    pipeline: Any,
+    pools: Any,
+    probe_candidates_by_pool: Mapping[str, list[str]],
+    records: Mapping[str, Any],
+    session_jar: Any = None,
+) -> dict[str, Any]:
+    """Fetch transcripts for the bounded probe set so probes can sample at
+    transcript moments instead of arbitrary quarter/center windows.
+
+    Mirrors the post-probe admitted-source refresh, but runs BEFORE the
+    probe and is capped at a tight deadline (default 60s) so a slow
+    transcript provider cannot eat the probe wall. Cache-first: sources
+    already in the transcript disk cache return in milliseconds. Never
+    raises: a failure leaves moment_assignments empty and the probe falls
+    back to quarter/center sampling.
+    """
+    audit: dict[str, Any] = {"requested": 0, "available": 0, "status": "not_requested"}
+    prepare = getattr(pipeline, "_prepare_pool_transcript_moments", None)
+    if prepare is None or not probe_candidates_by_pool:
+        return audit
+    try:
+        probe_pool_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        seen: set[str] = set()
+        for pool_key, source_ids in probe_candidates_by_pool.items():
+            for source_id in source_ids or []:
+                if source_id in seen or source_id not in records:
+                    continue
+                seen.add(source_id)
+                probe_pool_candidates[pool_key].append(_source_candidate(records[source_id]))
+        if not probe_pool_candidates:
+            return audit
+        try:
+            preprobe_deadline = max(
+                5.0,
+                min(
+                    300.0,
+                    float(os.environ.get("VIDZEO_YT_POOL_PREPROBE_TRANSCRIPT_DEADLINE_SECONDS", "60") or 60),
+                ),
+            )
+        except (TypeError, ValueError):
+            preprobe_deadline = 60.0
+        documents, moments, metadata = prepare(
+            list(getattr(pools, "rows", None) or []),
+            dict(probe_pool_candidates),
+            scene_durations=list(getattr(pools, "scene_durations", None) or []),
+            force=True,
+            session_jar=session_jar,
+            deadline_seconds=preprobe_deadline,
+        )
+        if documents:
+            pools.transcript_documents = documents
+        if moments:
+            pools.moment_assignments = moments
+        if metadata:
+            pools.source_metadata = metadata
+        audit = {
+            "requested": len(seen),
+            "available": sum(
+                1 for document in (documents or {}).values()
+                if getattr(document, "available", False)
+            ),
+            "moments": sum(len(items or []) for items in (moments or {}).values()),
+            "status": "completed",
+        }
+        print(
+            f"   [yt-pool] pre-probe transcripts: {audit['available']}/"
+            f"{audit['requested']} available, {audit['moments']} moment(s)",
+            flush=True,
+        )
+    except Exception as exc:
+        audit = {
+            "requested": 0,
+            "available": 0,
+            "status": "failed",
+            "error": f"{type(exc).__name__}:{exc}"[:240],
+        }
+        print(f"   [yt-pool] pre-probe transcript fetch failed: {type(exc).__name__}", flush=True)
+    return audit
+
+
 def resolve_pool_first(
     pipeline,
     pools,
@@ -2372,7 +2560,26 @@ def resolve_pool_first(
     probe_audit: dict[str, dict[str, Any]] = {}
     selected_source_ids = _source_shortlist(pools)
     selected_by_pool: dict[str, dict[str, Any]] = {}
+    # Direct ranged mode is deliberately transcript-optional (see the
+    # post-probe refresh below). The pre-probe fetch is skipped there too.
+    direct_clip_mode = str(
+        os.environ.get("VIDZEO_YT_POOL_DIRECT_CLIPS_ONLY", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     if probe_candidates_by_pool:
+        # Transcript + frame selection: fetch transcripts for the bounded
+        # probe set BEFORE probing, so each probe samples at the transcript
+        # moment matching its scene. A failed or empty fetch leaves
+        # moment_assignments empty and the probe falls back to quarter/center
+        # sampling; the post-probe refresh below still runs for admitted
+        # sources as before.
+        if not direct_clip_mode:
+            _prefetch_probe_transcript_moments(
+                pipeline,
+                pools,
+                probe_candidates_by_pool,
+                records,
+                session_jar=session_jar,
+            )
         probe_audit = _probe_pool_candidates(
             pipeline,
             pools,
@@ -2435,9 +2642,6 @@ def resolve_pool_first(
     # moving-footage timestamp.  Start cutting immediately; transcript data is
     # still used whenever it is already cached, but it must never block clip
     # transport in the fast path.
-    direct_clip_mode = str(
-        os.environ.get("VIDZEO_YT_POOL_DIRECT_CLIPS_ONLY", "0") or "0"
-    ).strip().lower() in {"1", "true", "yes", "on"}
     if probe_candidates_by_pool and selected_source_ids and hasattr(pipeline, "_prepare_pool_transcript_moments") and not direct_clip_mode:
         try:
             admitted_pool_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2489,6 +2693,7 @@ def resolve_pool_first(
         flush=True,
     )
     report_progress(0.40, f"YouTube pool: downloading {len(source_candidates)} shared sources")
+    record_activity("youtube")
 
     for source_id in selected_source_ids:
         candidate = source_candidates[source_id]
@@ -2595,13 +2800,8 @@ def resolve_pool_first(
         audit.setdefault("status", "transport_unavailable")
         return source_id, None
 
-    source_workers = max(1, min(6, int(os.environ.get("VIDZEO_YT_SOURCE_DOWNLOAD_CONCURRENCY", "4") or 4)))
-    source_batch_seconds = _env_float(
-        "VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS",
-        120.0,
-        minimum=0.05,
-        maximum=1800.0,
-    )
+    source_workers = _source_download_workers()
+    source_batch_seconds = _source_batch_deadline_seconds()
     source_batch_started = time.monotonic()
     source_batch_deadline = source_batch_started + source_batch_seconds
     source_deadline_reached = False
@@ -2655,6 +2855,10 @@ def resolve_pool_first(
                 source_paths[completed_source_id] = path
                 ready_sources += 1
             completed_sources += 1
+            # Ground-truth activity for the preparation-stall detector:
+            # a finished download is real work even if the display
+            # pipeline de-duplicates the progress label.
+            record_activity("youtube")
             report_progress(
                 0.40 + 0.12 * (completed_sources / max(1, len(future_sources))),
                 f"YouTube pool: source {completed_sources}/{len(future_sources)} "
@@ -3285,6 +3489,42 @@ def resolve_pool_first(
                 cut_record.setdefault("reason", "source_recovery_failed")
                 cut_audit.append(cut_record)
                 return scene_index, None
+        # F1 verify-cheap/cut-once: a rejected candidate used to cost a full
+        # 1080p lanczos re-encode before any gate saw it. Cut a cheap probe
+        # (640p, ultrafast, crf 28) first and run every gate on the probe;
+        # the full 1080p cut is made only for the accepted winner. The final
+        # video stays 1080p. A probe failure falls back to the old path so a
+        # probe hiccup never loses a scene.
+        probe_first = _env_bool("VIDZEO_YT_PROBE_FIRST", True)
+        verification_path = output_path
+        probe_cut = False
+        probe_path = output_path.with_name(f"{output_path.stem}.probe{output_path.suffix}")
+        if probe_first and not direct_clip and source_path is not None:
+            try:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
+                soft_probe_timeout = bool(cancellation is not None and _soft_branch_timeout())
+                probe_kwargs = {
+                    "cancellation": None if soft_probe_timeout else cancellation
+                } if cancellation is not None else {}
+                probe_cut = bool(pipeline._cut_local_segment(
+                    source_path,
+                    probe_path,
+                    float(moment.start),
+                    duration,
+                    width=_env_int("VIDZEO_YT_PROBE_WIDTH", 640, minimum=320, maximum=1280),
+                    height=_env_int("VIDZEO_YT_PROBE_HEIGHT", 360, minimum=180, maximum=720),
+                    preset=os.environ.get("VIDZEO_YT_PROBE_PRESET", "ultrafast") or "ultrafast",
+                    crf=_env_int("VIDZEO_YT_PROBE_CRF", 28, minimum=18, maximum=32),
+                    timeout_seconds=_env_float("VIDZEO_YT_PROBE_TIMEOUT_SECONDS", 60.0, minimum=10.0, maximum=300.0),
+                    **probe_kwargs,
+                ))
+            except Exception:
+                probe_cut = False
+            if probe_cut:
+                verification_path = probe_path
+                cut_record["probe_first"] = True
+                cut_record["probe_path"] = str(probe_path)
         try:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
@@ -3296,13 +3536,16 @@ def resolve_pool_first(
             cut_kwargs = {
                 "cancellation": None if soft_timeout else cancellation
             } if cancellation is not None else {}
-            cut_ok = direct_clip or pipeline._cut_local_segment(
-                source_path,
-                output_path,
-                float(moment.start),
-                duration,
-                **cut_kwargs,
-            )
+            if direct_clip or probe_cut:
+                cut_ok = True
+            else:
+                cut_ok = pipeline._cut_local_segment(
+                    source_path,
+                    output_path,
+                    float(moment.start),
+                    duration,
+                    **cut_kwargs,
+                )
         except Exception as exc:
             if cancellation is not None and cancellation.cancelled():
                 raise
@@ -3322,7 +3565,7 @@ def resolve_pool_first(
         cut_native_overlay_lane = _native_overlay_lane_for_category(cut_domain_category)
         try:
             quality = _screen_moment_quality(
-                str(output_path),
+                str(verification_path),
                 ffmpeg_bin=pipeline._ffmpeg_bin("ffmpeg"),
                 archival_lane=cut_archival_lane,
             )
@@ -3372,15 +3615,15 @@ def resolve_pool_first(
                 })
                 cut_audit.append(cut_record)
                 try:
-                    Path(str(output_path)).unlink(missing_ok=True)
+                    Path(str(verification_path)).unlink(missing_ok=True)
                 except Exception:
                     pass
                 return scene_index, None
         overlay = {"checked": False, "clean": True}
-        raw_output_path = output_path
+        raw_output_path = verification_path
         if _env_bool("VIDZEO_YT_OVERLAY_SCREEN", True):
             overlay = _screen_moment_overlays(
-                str(output_path),
+                str(verification_path),
                 archival_lane=cut_archival_lane,
                 gaming_lane=cut_gaming_lane,
                 native_overlay_lane=cut_native_overlay_lane,
@@ -3444,26 +3687,7 @@ def resolve_pool_first(
                 except Exception:
                     pass
             return scene_index, None
-        cut_record["path"] = str(output_path)
-        try:
-            from services.youtube_media_cache import put_verified_cut
-            cached_path = put_verified_cut(
-                source_id,
-                float(moment.start),
-                duration,
-                str(output_path),
-                metadata={
-                    "source_url": str((source_candidates.get(source_id) or {}).get("webpage_url") or ""),
-                    "title": str((source_candidates.get(source_id) or {}).get("title") or "")[:180],
-                    "overlay_policy": str(overlay.get("overlay_policy") or ""),
-                    "overlay_types": list(overlay.get("overlay_types") or []),
-                },
-            )
-            if cached_path:
-                cut_record["cache_stored"] = True
-                cut_record["cache_path"] = cached_path
-        except Exception:
-            cut_record["cache_stored"] = False
+        cut_record["path"] = str(verification_path)
         accepted = True
         score = float(getattr(moment, "match_score", 0.0) or 0.0)
         available = False
@@ -3505,7 +3729,7 @@ def resolve_pool_first(
             if visual_checked:
                 try:
                     accepted, visual_score, available, reason = pipeline._visual_verdict_scored(
-                        str(output_path),
+                        str(verification_path),
                         scene_index,
                         topic,
                         str(row.get("scene_text") or ""),
@@ -3553,6 +3777,56 @@ def resolve_pool_first(
                         vision_stats["disabled_bypasses"] += 1
                     elif policy_reason == "vision_veto_budget_bypass":
                         vision_stats["budget_bypasses"] += 1
+        # F1: the gates above ran on the cheap probe. Only now, for the
+        # accepted winner, pay for the full 1080p cut. A rejected candidate
+        # keeps its probe path so the caller deletes the probe, never a
+        # full cut that was never made.
+        final_path = verification_path
+        if accepted and probe_cut:
+            try:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
+                full_cut_ok = bool(pipeline._cut_local_segment(
+                    source_path,
+                    output_path,
+                    float(moment.start),
+                    duration,
+                    **cut_kwargs,
+                ))
+            except Exception:
+                full_cut_ok = False
+            if not full_cut_ok:
+                cut_record.update({"status": "cut_failed", "reason": "ffmpeg_or_empty_output"})
+                cut_audit.append(cut_record)
+                try:
+                    Path(str(verification_path)).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return scene_index, None
+            final_path = output_path
+            cut_record["path"] = str(output_path)
+        if accepted and final_path == output_path:
+            # Only a verified full cut is cached for later jobs. (Previously
+            # this ran before the vision veto, caching rejected cuts too.)
+            try:
+                from services.youtube_media_cache import put_verified_cut
+                cached_path = put_verified_cut(
+                    source_id,
+                    float(moment.start),
+                    duration,
+                    str(output_path),
+                    metadata={
+                        "source_url": str((source_candidates.get(source_id) or {}).get("webpage_url") or ""),
+                        "title": str((source_candidates.get(source_id) or {}).get("title") or "")[:180],
+                        "overlay_policy": str(overlay.get("overlay_policy") or ""),
+                        "overlay_types": list(overlay.get("overlay_types") or []),
+                    },
+                )
+                if cached_path:
+                    cut_record["cache_stored"] = True
+                    cut_record["cache_path"] = cached_path
+            except Exception:
+                cut_record["cache_stored"] = False
         cut_record.update({
             "status": "accepted" if accepted else "visual_rejected",
             "visual_checked": visual_checked,
@@ -3591,7 +3865,7 @@ def resolve_pool_first(
         if accepted:
             try:
                 from services.youtube_clip_provenance import write_clip_provenance
-                write_clip_provenance(output_path, scene_index, {
+                write_clip_provenance(final_path, scene_index, {
                     **cut_record, 'status': 'downloaded', 'video_id': source_id,
                     'timestamp': float(moment.start), 'clip_duration': duration,
                     'source_url': str((source_candidates.get(source_id) or {}).get('webpage_url') or
@@ -3599,7 +3873,7 @@ def resolve_pool_first(
                 })
             except (OSError, ValueError, TypeError):
                 pass
-        return scene_index, (score, str(output_path.resolve()), moment, accepted, available, reason)
+        return scene_index, (score, str(final_path.resolve()), moment, accepted, available, reason)
 
     def resolve_scene_progressively(scene_plans):
         attempted = []

@@ -128,13 +128,18 @@ def test_title_card_screen_reuses_decoded_samples_without_unbounded_capture(monk
 
 
 def test_small_host_reserves_serial_download_waves_before_child_memory_changes(monkeypatch):
+    # GTA fix (Nov 16): the wall is budgeted with the real memory-fitted
+    # worker count, not serial transfers. On this mocked 8 GB host with
+    # 3 GB available the fit is 4 workers (was a flat 1 for every host
+    # under 12 GB), so the 5-scene quota wall is the honest parallel
+    # 263s instead of the serial 503s+ the old test asserted.
     import psutil
     from types import SimpleNamespace
     import server.app as app
     monkeypatch.setattr(psutil, 'virtual_memory', lambda: SimpleNamespace(
         total=8 * 1024 ** 3, available=3 * 1024 ** 3))
-    assert app._mixed_youtube_download_worker_capacity({'yt_download_concurrency': 5}) == 1
-    assert app._mixed_youtube_branch_wall_cap_seconds({'_youtube_quota_preselected': True}, 5) >= 503
+    assert app._mixed_youtube_download_worker_capacity({'yt_download_concurrency': 5}) == 4
+    assert app._mixed_youtube_branch_wall_cap_seconds({'_youtube_quota_preselected': True}, 5) == 263.0
 
 
 def test_active_transcription_keeps_its_model_when_idle_cache_is_released(monkeypatch):

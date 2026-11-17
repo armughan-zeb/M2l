@@ -15,9 +15,9 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
-from .media_resolution_coordinator import SceneResolution, resolve_storyboard_media_v2, _is_moving_youtube_source
+from .media_resolution_coordinator import SceneResolution, resolve_storyboard_media_v2, _is_moving_youtube_source, _is_youtube_source
 from .media_integrity import probe_media
 from .media_asset_policy import emergency_media_allowed, is_synthetic_media
 from .pipeline_contracts import MediaContractError
@@ -55,12 +55,18 @@ def mixed_youtube_time_budget(
     *,
     download_workers: int = 2,
     coverage_target: float = 0.60,
+    max_wall_seconds: Any = None,
 ) -> tuple[float, float]:
     """Bound the YouTube accent lane so an unreachable host cannot stall media.
 
     Mixed Media already retrieves web assets in parallel. Short videos need a
     quick YouTube attempt and a timely handoff to those verified assets; long
-    jobs receive a larger but still finite clip window.
+    jobs receive a larger but still finite clip window. The absolute cap
+    scales with the transfer waves the scene count actually needs — the old
+    fixed 900s cap starved long jobs (e.g. 44 YouTube scenes at 1 worker =
+    27 waves = 2288s required, capped to 900s) — and is bounded at 3600s so
+    one slow lane can never eat the whole job. ``max_wall_seconds`` lets a
+    caller tighten the wall further (e.g. to the delivery-budget allowance).
     """
     try:
         requested_wall = float(branch_wall_seconds or 480)
@@ -90,7 +96,9 @@ def mixed_youtube_time_budget(
     # returned zero clips even though the internet search succeeded. Allow
     # 60s for each transfer plus 20s for merge/probe, search, handoff and the
     # worker reserve. The outer wall remains finite; healthier hosts finish
-    # concurrent waves sooner. Long films remain bounded at 900s.
+    # concurrent waves sooner. The absolute cap scales with the transfer
+    # waves the job actually needs (long jobs are no longer starved by a
+    # fixed 900s wall) and is hard-bounded at 3600s.
     if count <= 10:
         base_cap, search_cap = 240.0, 35.0
     elif count <= 12:
@@ -101,7 +109,14 @@ def mixed_youtube_time_budget(
     # second candidate just after a still/slideshow winner was rejected.
     # This is a shared reserve, not another full transfer budget per scene.
     required_wall = search_cap + 10.0 + 18.0 + transfer_waves * 80.0 + 40.0
-    absolute_cap = 900.0
+    absolute_cap = min(3600.0, max(900.0, required_wall))
+    if max_wall_seconds is not None:
+        try:
+            caller_cap = float(max_wall_seconds)
+            if math.isfinite(caller_cap) and caller_cap > 0:
+                absolute_cap = min(absolute_cap, caller_cap)
+        except (TypeError, ValueError, OverflowError):
+            pass
     wall_cap = min(absolute_cap, max(base_cap, required_wall))
     minimum_wall = min(wall_cap, max(150.0, required_wall))
     wall = max(minimum_wall, min(requested_wall, wall_cap))
@@ -567,21 +582,33 @@ def _web_candidate_is_explicitly_pending_visual(candidate: Mapping[str, Any]) ->
 def _mixed_web_scene_worker_limit(config: Mapping[str, Any] | None = None) -> int:
     """Return the bounded Mixed Media web fan-out.
 
-    Packaged builds can carry a legacy six-worker value in ``config`` even
-    when the deployment environment is configured for the newer 12-worker
-    shared pool.  Treat the lower value as stale, while preserving an
-    explicitly higher setting up to the process-safe cap.
+    GTA fix (Nov 16): 6 parallel scene workers × 12 sources × the
+    universal four-engine fan-out stampeded one egress proxy and every
+    engine died on stacked 15s timeouts. The fan-out is now 2 workers by
+    default, and the code default carries the behavior (the live .env is
+    not in git). The operator raises it only via
+    VIDZEO_MIXED_WEB_SCENE_WORKERS; a higher packaged
+    ``web_max_scene_workers`` is stale legacy and no longer overrides the
+    env default — the most restrictive value wins.
     """
     settings = config or {}
     try:
-        env_workers = int(os.environ.get("VIDZEO_MIXED_WEB_SCENE_WORKERS", "12") or 12)
+        env_raw = os.environ.get("VIDZEO_MIXED_WEB_SCENE_WORKERS")
+        env_workers = (
+            2
+            if env_raw is None or str(env_raw).strip() == ""
+            else int(env_raw)
+        )
     except (TypeError, ValueError):
-        env_workers = 12
+        env_workers = 2
     try:
         configured_workers = int(settings.get("web_max_scene_workers") or 0)
     except (TypeError, ValueError):
         configured_workers = 0
-    return max(1, min(12, max(configured_workers, env_workers)))
+    candidates = [env_workers]
+    if configured_workers > 0:
+        candidates.append(configured_workers)
+    return max(1, min(12, min(candidates)))
 
 
 
@@ -619,6 +646,71 @@ def _web_recovery_hard_cap_seconds() -> float:
         return 1800.0
 
 
+def _web_recovery_min_seconds() -> float:
+    """Minimum useful wall for one web-recovery stage.
+
+    Wright (Nov 16): the recovery run got only a ~22s wall — a 10s query
+    deadline plus a 12s batch-discovery window — while a single universal
+    engine needs up to 30s through the egress proxy.  A recovery wall
+    below one engine round-trip can never return a candidate.  The live
+    delivery-budget clamp in the resolver remains the final guard, so
+    this floor only stops a stale allowance snapshot from collapsing the
+    stage before it starts.
+    """
+    try:
+        return max(
+            30.0,
+            min(
+                180.0,
+                float(
+                    os.environ.get("VIDZEO_WEB_RECOVERY_MIN_SECONDS", "60")
+                    or 60
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _web_recovery_query_deadline_seconds(config: Mapping[str, Any]) -> float:
+    """Per-query wall for a web-recovery wave.
+
+    Wright (Nov 16): the recovery wave used a 10s query deadline while a
+    single universal engine needs up to 30s through the egress proxy, so
+    every engine was cut mid-flight.  A recovery query wall must fit at
+    least one full engine round-trip.
+    """
+    try:
+        return max(
+            15.0,
+            min(
+                60.0,
+                float(config.get("web_fallback_query_deadline_seconds") or 30.0),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _web_recovery_batch_discovery_seconds(config: Mapping[str, Any]) -> float:
+    """Shared-discovery wall for a web-recovery wave.
+
+    Wright (Nov 16): the recovery wave used a 12s discovery window while
+    the engines behind it need tens of seconds through the proxy.  The
+    discovery window must fit at least one full parallel engine wave.
+    """
+    try:
+        return max(
+            15.0,
+            min(
+                120.0,
+                float(config.get("web_fallback_batch_discovery_seconds") or 45.0),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 45.0
+
+
 def _web_recovery_stage_seconds(scene_count: int, workers: int, configured: Any = None) -> float:
     """Completion-scaled web-recovery wall: 12s per scene, floored at 90s.
 
@@ -641,11 +733,15 @@ def _web_recovery_stage_seconds(scene_count: int, workers: int, configured: Any 
     if configured not in (None, "", 0, "0"):
         try:
             # The delivery-budget allowance is a ceiling, not a target:
-            # never let the wall spend the render reserve.
-            wall = min(wall, max(1.0, float(configured)))
+            # never let the wall spend the render reserve.  But it must
+            # never collapse the wall below one useful recovery wave
+            # either: a 22s allowance produced a recovery that died before
+            # any engine could answer.  The resolver's live budget clamp
+            # still bounds the stage from above.
+            wall = min(wall, max(_web_recovery_min_seconds(), float(configured)))
         except (TypeError, ValueError):
             pass
-    return max(1.0, wall)
+    return max(_web_recovery_min_seconds(), wall)
 
 
 def _score(value: Any) -> float:
@@ -722,7 +818,7 @@ _IDENTITY_OR_CONTEXT_FATAL_MARKERS = (
 )
 
 
-def _normalize_action_only_fatal_mismatch(verdict: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_action_only_fatal_mismatch(verdict: Mapping[str, Any], scene: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Downgrade an over-broad vision fatality when identity is still strong.
 
     Vision models sometimes use ``fatal_mismatch`` for a documentary image that
@@ -734,7 +830,7 @@ def _normalize_action_only_fatal_mismatch(verdict: Mapping[str, Any]) -> dict[st
 
     result = dict(verdict or {})
     from .visual_intelligence.semantic_guard import explicit_scene_conflict
-    if explicit_scene_conflict({key: value for key, value in result.items() if key != "fatal_mismatch"}):
+    if explicit_scene_conflict({key: value for key, value in result.items() if key != "fatal_mismatch"}, scene=scene):
         return result
     if not _as_bool(result.get("fatal_mismatch")):
         return result
@@ -1163,8 +1259,8 @@ def _validate_qwen_verdict_schema(
 
 
 def _score_verdict(scene: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict[str, Any]:
-    result = _normalize_action_only_fatal_mismatch(verdict)
-    from .visual_intelligence.semantic_guard import explicit_domain_conflict, explicit_scene_conflict, explicit_visual_facet_conflict, exact_scene_identity_required, explicit_low_visual_match
+    result = _normalize_action_only_fatal_mismatch(verdict, scene)
+    from .visual_intelligence.semantic_guard import explicit_domain_conflict, explicit_scene_conflict, explicit_visual_facet_conflict, exact_scene_identity_required, explicit_low_visual_match, is_gaming_scene
     requirement = scene.get('visual_requirement') or {}
     policy = dict(scene.get("source_policy") or {})
     if exact_scene_identity_required(scene):
@@ -1188,7 +1284,7 @@ def _score_verdict(scene: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict
         result.update(accepted=False, scene_match=False, fatal_mismatch=True,
                       status='rejected', rejection_reason=pixel_conflict)
         return result
-    if explicit_low_visual_match(result):
+    if explicit_low_visual_match(result, scene=scene):
         result.update(accepted=False, fatal_mismatch=True, status='rejected',
                       rejection_reason='insufficient_visible_subject_match')
         return result
@@ -1227,7 +1323,7 @@ def _score_verdict(scene: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict
     true_conflict = explicit_scene_conflict({
         key: value for key, value in result.items()
         if key not in {"fatal_mismatch", "scene_match", "accepted", "status", "rejection_reason"}
-    }, relaxed=is_relaxed) or (not is_relaxed and any(marker in reason for marker in (
+    }, relaxed=is_relaxed, scene=scene) or (not is_relaxed and any(marker in reason for marker in (
         "wrong model", "different model", "wrong era", "different era",
         "wrong year", "different year", "anachronistic", "unrelated",
     )))
@@ -1252,15 +1348,20 @@ def _score_verdict(scene: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict
             "wrong entity", "different entity", "wrong subject", "different subject",
             "required entity is absent", "required subject is absent",
         )
+        # Gaming scene: "game-engine" is required footage, not a hard marker.
+        _hard_markers = (
+            "wrong domain", "different_sport", "simulation_for_real_world",
+            "wrong era", "different era", "anachronistic", "anachronism",
+        ) if is_gaming_scene(scene) else (
+            "wrong domain", "different_sport", "simulation_for_real_world", "game-engine",
+            "wrong era", "different era", "anachronistic", "anachronism",
+        )
         if any(token in reason for token in spurious_tokens) and not any(
-            marker in reason for marker in (
-                "wrong domain", "different_sport", "simulation_for_real_world", "game-engine",
-                "wrong era", "different era", "anachronistic", "anachronism",
-            )
+            marker in reason for marker in _hard_markers
         ):
             result["spurious_mismatch"] = True
             result["fatal_mismatch"] = False
-    if explicit_scene_conflict({key: value for key, value in result.items() if key != "fatal_mismatch"}, relaxed=is_relaxed):
+    if explicit_scene_conflict({key: value for key, value in result.items() if key != "fatal_mismatch"}, relaxed=is_relaxed, scene=scene):
         result.update({"accepted": False, "fatal_mismatch": True, "status": "rejected", "rejection_reason": "explicit_scene_conflict"})
         return result
     # A factual scene can legitimately use a contextual establishing shot
@@ -2913,6 +3014,7 @@ def resolve_and_build_media_plan(
     web_wait_until_complete: bool = False,
     external_cancel_event: threading.Event | None = None,
     adaptive_media_review: bool = False,
+    vision_reserve_seconds: float | None = None,
 ) -> tuple[dict[str, Any], dict[int, SceneResolution]]:
     resolutions = resolve_storyboard_media_v2(
         scenes,
@@ -2930,6 +3032,7 @@ def resolve_and_build_media_plan(
         web_wait_until_complete=bool(web_wait_until_complete),
         external_cancel_event=external_cancel_event,
         adaptive_media_review=adaptive_media_review,
+        vision_reserve_seconds=vision_reserve_seconds,
     )
     paths: list[str | None] = []
     labels: list[str] = []
@@ -3083,6 +3186,14 @@ def _source_lane_policy(config: Mapping[str, Any]) -> dict[str, Any]:
         stock = False
     if mode == 'Mixed Media':
         stock_last_resort_no_vision = True
+    # Gaming mode: YouTube is primary for every scene and real-world stock
+    # cannot depict a named game's world, so the planned stock lane stays
+    # off (the last-resort guard in guarded_stock_lane and the coordinator
+    # skip below are the remaining stock gates). Web stays enabled as the
+    # rescue lane for YouTube quota misses.
+    gaming_mode = bool(_as_bool(config.get("_gaming_mode"), False))
+    if gaming_mode and mode == "Mixed Media":
+        stock = False
     stock_last_resort_enabled = bool(
         allow_stock
         and allow_stock_last_resort
@@ -3098,9 +3209,14 @@ def _source_lane_policy(config: Mapping[str, Any]) -> dict[str, Any]:
         "youtube_enabled": youtube,
         "web_enabled": web,
         "stock_enabled": stock,
+        "gaming_mode": gaming_mode,
         "stock_last_resort_enabled": stock_last_resort_enabled,
         "stock_last_resort_no_vision": stock_last_resort_no_vision,
-        "media_source_priority": list(config.get('media_source_priority') or ['youtube', 'web', 'stock']),
+        "media_source_priority": (
+            ["youtube", "web", "stock"]
+            if gaming_mode and mode == "Mixed Media"
+            else list(config.get('media_source_priority') or ['youtube', 'web', 'stock'])
+        ),
         # Source selection controls the preferred lane, not the set of
         # truthful recovery options.  The coordinator may ask the opposite
         # real-media lane for a candidate after the preferred lane fails.
@@ -3132,6 +3248,21 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
                 return max(0.0, min(1.0, val))
             except (TypeError, ValueError):
                 pass
+
+    # Gaming mode (config['_gaming_mode'], set by
+    # app._resolve_mixed_media_niche_policy) binds the 0.90 YouTube target.
+    # The copied gaming weights alone only reach 0.80, and a deployment env
+    # default (e.g. 0.8) must not silently cap a gaming job below it. An
+    # explicit per-job coverage key above still wins. The target value
+    # itself lives in config['_gaming_youtube_target'] (stamped by
+    # app._apply_gaming_mode_policy from the planner constant) so the
+    # number has one source of truth; 0.90 is the fallback.
+    if _as_bool(config.get("_gaming_mode"), False):
+        try:
+            stamped = float(config.get("_gaming_youtube_target") or 0.90)
+        except (TypeError, ValueError):
+            stamped = 0.90
+        return max(0.0, min(1.0, stamped))
 
     env_target = os.environ.get("VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET")
     if env_target is not None and str(env_target).strip() != "":
@@ -3407,8 +3538,13 @@ def _mixed_youtube_branch_wall_seconds(config: Mapping[str, Any]) -> float:
         requested = 360.0
     quota_count = _bounded_audit_int(config.get("_youtube_budget_scene_count"), 0, 10000)
     if quota_count:
+        try:
+            from .youtube_pipeline_v2 import mixed_youtube_download_worker_capacity
+            fitted_workers = mixed_youtube_download_worker_capacity(config)
+        except Exception:
+            fitted_workers = 1
         requested, _ = mixed_youtube_time_budget(
-            quota_count, requested, download_workers=1, coverage_target=1.0,
+            quota_count, requested, download_workers=fitted_workers, coverage_target=1.0,
         )
     if str(config.get("llm_provider") or "") == "external_agent":
         # No fixed branch wall for agent jobs: the shared delivery budget
@@ -3544,6 +3680,21 @@ def _mixed_web_wall_seconds(
         min(cap_value, max(1, int(scene_count)) * _mixed_web_per_scene_seconds()),
     )
     return min(cap_value, max(floor_value, configured_value, scaled_value))
+
+
+def _vision_reserve_seconds(config: Mapping[str, Any]) -> float:
+    """Seconds of the media wall kept for verification (one external-agent
+    inbox round trip, >=300s, for agent jobs). The coordinator subtracts
+    this from the discovery wall; this helper only threads the value."""
+    try:
+        value = config.get("vision_reserve_seconds")
+        if value is None:
+            value = os.environ.get("VIDZEO_VISION_RESERVE_SECONDS")
+        if value is None:
+            value = 300.0 if str(config.get("llm_provider") or "") == "external_agent" else 120.0
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 300.0 if str(config.get("llm_provider") or "") == "external_agent" else 120.0
 
 
 def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> float:
@@ -3737,6 +3888,109 @@ def _web_fallback_coordinator_grace_seconds(
     return max(
         0.0,
         min(requested, float(available_total) - max(1.0, float(media_deadline_seconds))),
+    )
+
+
+def _youtube_quota_coverage_indices(
+    primary_indices: Sequence[int],
+    resolutions: Mapping[int, Any],
+) -> tuple[list[int], list[int]]:
+    """Return ``(accepted, missing)`` YouTube quota indices for a resolved plan.
+
+    Accepted means a *moving* YouTube source with a real selected path whose
+    terminal status is accepted, resolved, or degraded: a pool-recovered or
+    quota-upgraded clip still renders as real footage even though its status
+    stays degraded. Extracted frames never count (they are stills, not
+    footage), and a scene whose only YouTube media is a frame stays short of
+    the moving quota. This keeps the retrieval-time shortfall consistent with
+    the render-validation warning, which counts actual YouTube video paths:
+    GTA scene 0 held a degraded clip and was listed missing here (shortfall
+    5) while the warning counted 4.
+    """
+    accepted = sorted(
+        int(index)
+        for index, resolution in resolutions.items()
+        if _is_moving_youtube_source(resolution)
+        and str(
+            resolution.get("selected_path", "")
+            if isinstance(resolution, Mapping)
+            else getattr(resolution, "selected_path", "")
+            or ""
+        ).strip()
+        and str(
+            resolution.get("status", "")
+            if isinstance(resolution, Mapping)
+            else getattr(resolution, "status", "")
+            or ""
+        ).strip().casefold()
+        in {"accepted", "resolved", "degraded"}
+    )
+    missing = sorted(set(int(index) for index in primary_indices) - set(accepted))
+    return accepted, missing
+
+
+def _real_youtube_scene_indices(
+    resolutions: Mapping[int, Any],
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Return ``(indices, details)`` for scenes served by real YouTube media.
+
+    Scene-aware companion to the strict moving quota above: a scene counts
+    when its accepted media is YouTube, whether a moving clip or a
+    vision-accepted extracted frame. The proof job's ledger said 0/8 while
+    the delivered video held one accepted YouTube frame (scene 5) — the
+    moving quota is the footage target, but real-YT share is what the
+    viewer sees, and a GTA V clip correctly serving a GTA V-history scene
+    counts here exactly like a GTA VI clip serving a VI scene: what
+    matters is the scene's game, not the video title. ``details`` carries
+    one row per counted scene for the coverage ledger.
+    """
+    accepted: list[int] = []
+    details: list[dict[str, Any]] = []
+    for index, resolution in sorted(resolutions.items(), key=lambda item: int(item[0])):
+        if not _is_youtube_source(resolution):
+            continue
+        if isinstance(resolution, Mapping):
+            path = str(resolution.get("selected_path") or resolution.get("path") or "")
+            status = str(resolution.get("status") or "").strip().casefold()
+            media_type = str(resolution.get("media_type") or "")
+            kind = str(resolution.get("resolution_kind") or "")
+            candidate_id = str(resolution.get("candidate_id") or "")
+        else:
+            path = str(getattr(resolution, "selected_path", "") or "")
+            status = str(getattr(resolution, "status", "") or "").strip().casefold()
+            media_type = str(getattr(resolution, "media_type", "") or "")
+            kind = str(getattr(resolution, "resolution_kind", "") or "")
+            candidate_id = str(getattr(resolution, "candidate_id", "") or "")
+        if not path.strip() or status not in {"accepted", "resolved", "degraded"}:
+            continue
+        accepted.append(int(index))
+        details.append({
+            "scene_index": int(index),
+            "candidate_id": candidate_id,
+            "media_type": media_type,
+            "resolution_kind": kind,
+            "moving_footage": bool(_is_moving_youtube_source(resolution)),
+        })
+    return accepted, details
+
+
+def _gaming_stock_blocked(scene: Mapping[str, Any], title: str = "") -> bool:
+    """True when stock must not run for a gaming scene.
+
+    Real-world stock cannot depict a named game's world. The guard needs
+    both a gaming category (subject/domain) and a game title signal, so a
+    generic real-world scene keeps the stock lane. Used by
+    ``guarded_stock_lane``; the coordinator hoists the same rule and skips
+    the stock window entirely for such scenes.
+    """
+    requirement = scene.get('visual_requirement') or {}
+    subject_type = str((requirement.get('subject_type') if isinstance(requirement, Mapping) else '') or scene.get('subject_type') or '').strip().lower()
+    domain_category = str((requirement.get('domain_category') if isinstance(requirement, Mapping) else '') or scene.get('domain_category') or '').strip().lower()
+    title_lower = str(title or "").lower()
+    is_game_title = any(t in title_lower for t in ("gta", "grand theft auto", "gameplay", "walkthrough", "video game", "playstation", "xbox", "nintendo"))
+    return bool(
+        (subject_type in {"gaming", "video_game", "game"} or domain_category in {"gaming", "video_game", "game"})
+        and (is_game_title or any(t in title_lower for t in ("gta", "grand theft auto")))
     )
 
 
@@ -4578,14 +4832,21 @@ def resolve_existing_provider_branches_v2(
                         6,
                         int(
                             os.environ.get(
-                                "VIDZEO_MIXED_YT_DOWNLOAD_ATTEMPTS", "6"
+                                "VIDZEO_MIXED_YT_DOWNLOAD_ATTEMPTS", "3"
                             )
-                            or 6
+                            or 3
                         ),
                     ),
                 )
             except (TypeError, ValueError):
-                mixed_attempt_cap = 6
+                mixed_attempt_cap = 3
+            if len(youtube_scene_indices) <= 8:
+                # Small jobs cap at 3 attempts/scene (the pipeline pass cap
+                # enforces the same bound): 6 passes of mostly throttled
+                # ranged transfers was the download sink on GTA VI (up to 48
+                # transfers). Anything still missing falls through to the
+                # parallel web lane instead of a fourth re-queue.
+                mixed_attempt_cap = min(mixed_attempt_cap, 3)
             try:
                 lane_config["yt_download_candidate_limit"] = min(
                     mixed_candidate_cap,
@@ -5841,7 +6102,20 @@ def resolve_existing_provider_branches_v2(
                     youtube_fallback_cache[index] = rows.get(index)
         return youtube_fallback_cache.get(scene_index)
 
-    web_indices_ref = {"indices": [index for index in range(len(scenes)) if index not in (completed_web_indices | completed_stock_indices | set(saved_youtube_rows))]}
+    # Gaming mode: YouTube is primary for every scene; web is rescue-only
+    # for YouTube quota misses. An empty primary web index disables the
+    # primary web batch (see fresh_web_lane below); the web fallback lane —
+    # fed by the coordinator with the rejected/missing scenes — remains the
+    # rescue path. Scenes with already-completed web rows keep them via
+    # web_lane's saved-row branch.
+    gaming_web_rescue_only = bool(
+        _as_bool(config.get("_gaming_mode"), False)
+        and lane_policy.get("mode") == "Mixed Media"
+        and lane_policy.get("youtube_enabled")
+    )
+    web_indices_ref = {"indices": [] if gaming_web_rescue_only else [index for index in range(len(scenes)) if index not in (completed_web_indices | completed_stock_indices | set(saved_youtube_rows))]}
+    if gaming_web_rescue_only:
+        print("   [v2] gaming mode: web primary disabled; web is rescue-only for YouTube quota misses", flush=True)
     web_fallback_mode = {"enabled": False}
     primary_web_audit: dict[str, Any] | None = None
     primary_web_failed: str = ""
@@ -5920,12 +6194,10 @@ def resolve_existing_provider_branches_v2(
         )
         # The V2 caller often receives a legacy ``web_max_scene_workers``
         # value (the packaged app historically defaulted this to six).  That
-        # value must not silently cap the contract-backed Mixed Media lane:
-        # the shared provider pool is already warmed, and leaving only six
-        # workers causes the first query wave to monopolize the stage while
-        # later scenes never reach retrieval.  Keep an explicit higher
-        # operator setting, but promote stale lower defaults to the bounded
-        # mixed-media fan-out configured for this deployment.
+        # value must not silently widen the Mixed Media fan-out: six scene
+        # workers stampeded the egress proxy on GTA VI. The bounded limit
+        # (2 by default, VIDZEO_MIXED_WEB_SCENE_WORKERS to raise it) wins
+        # over the packaged value; see _mixed_web_scene_worker_limit.
         if lane_policy.get("mode") == "Mixed Media":
             configured_scene_workers = int(lane_config.get("web_max_scene_workers") or 0)
             lane_config["web_max_scene_workers"] = _mixed_web_scene_worker_limit(lane_config)
@@ -5943,13 +6215,6 @@ def resolve_existing_provider_branches_v2(
         # bounded and parallel; the coordinator's shared visual verifier
         # remains authoritative for correctness.
         if is_scene_recovery:
-            def _recovery_float(key: str, default: float, lower: float, upper: float) -> float:
-                try:
-                    value = float(config.get(key) or default)
-                except (TypeError, ValueError):
-                    value = float(default)
-                return max(float(lower), min(float(upper), value))
-
             _recovery_configured = config.get("web_fallback_stage_deadline_seconds")
             if (
                 _recovery_configured in (None, "", 0, "0")
@@ -5982,17 +6247,11 @@ def resolve_existing_provider_branches_v2(
                 int(lane_config.get("web_max_scene_workers") or 6),
                 _recovery_configured,
             )
-            lane_config["web_query_deadline_seconds"] = max(
-                1.5,
-                _recovery_float(
-                    "web_fallback_query_deadline_seconds", 10.0, 2.0, 15.0,
-                ),
+            lane_config["web_query_deadline_seconds"] = _web_recovery_query_deadline_seconds(
+                config
             )
-            lane_config["web_batch_discovery_seconds"] = max(
-                3.0,
-                _recovery_float(
-                    "web_fallback_batch_discovery_seconds", 12.0, 3.0, 15.0,
-                ),
+            lane_config["web_batch_discovery_seconds"] = _web_recovery_batch_discovery_seconds(
+                config
             )
             # gallery-dl is an optional, bounded slow-web tier. Use it only
             # during exhaustive recovery (after the fast scrapers), and let
@@ -6754,15 +7013,7 @@ def resolve_existing_provider_branches_v2(
                 return [dict(saved_stock)]
         # Real-world stock cannot depict a named game's world. Avoid spending
         # the render reserve downloading assets the identity gate must reject.
-        requirement = scene.get('visual_requirement') or {}
-        subject_type = str((requirement.get('subject_type') if isinstance(requirement, Mapping) else '') or scene.get('subject_type') or '').strip().lower()
-        domain_category = str((requirement.get('domain_category') if isinstance(requirement, Mapping) else '') or scene.get('domain_category') or '').strip().lower()
-        title_lower = str(title or "").lower()
-        is_game_title = any(t in title_lower for t in ("gta", "grand theft auto", "gameplay", "walkthrough", "video game", "playstation", "xbox", "nintendo"))
-        if (
-            (subject_type in {"gaming", "video_game", "game"} or domain_category in {"gaming", "video_game", "game"})
-            and (is_game_title or any(t in title_lower for t in ("gta", "grand theft auto")))
-        ):
+        if _gaming_stock_blocked(scene, title):
             return None
         from .delivery_budget import get_delivery_budget
         budget = get_delivery_budget(config)
@@ -7056,7 +7307,8 @@ def resolve_existing_provider_branches_v2(
         coordinator_scenes.append(row)
 
     deadline_config = {**config, '_youtube_budget_scene_count': len(primary_youtube_scene_indices),
-                       '_web_budget_scene_count': len(coordinator_scenes)}
+                       '_web_budget_scene_count': len(coordinator_scenes),
+                       'vision_reserve_seconds': _vision_reserve_seconds(config)}
     media_deadline_seconds = _media_stage_deadline_seconds(deadline_config, lane_policy["mode"])
     web_recovery_grace_seconds = _web_fallback_coordinator_grace_seconds(
         config,
@@ -7095,6 +7347,7 @@ def resolve_existing_provider_branches_v2(
             str(config.get("llm_provider") or "").strip().lower() == "external_agent"
             and _as_bool(os.environ.get("VIDZEO_MUSE_ADAPTIVE_MEDIA"), True)
         ),
+        vision_reserve_seconds=_vision_reserve_seconds(config),
     )
     print(
         "   [v2] coordinator resolution summary: "
@@ -7255,16 +7508,27 @@ def resolve_existing_provider_branches_v2(
     # shared relevance gate rather than counting merely downloaded files.
     target = _mixed_media_youtube_target_ratio(config)
     eligible_count = len(scenes)
-    accepted_youtube_indices = sorted(
-        int(index)
-        for index, resolution in resolutions.items()
-        if _is_moving_youtube_source(resolution)
-        and str(getattr(resolution, "selected_path", "") or "").strip()
-        and str(getattr(resolution, "status", "") or "").strip().casefold()
-        in {"accepted", "resolved"}
+    accepted_youtube_indices, missing_quota_indices = _youtube_quota_coverage_indices(
+        primary_youtube_scene_indices, resolutions
     )
     accepted_youtube_count = len(accepted_youtube_indices)
-    missing_quota_indices = sorted(set(primary_youtube_scene_indices) - set(accepted_youtube_indices))
+    # Scene-aware real-YouTube share: the strict quota above counts moving
+    # footage only, so a job whose only YouTube media is vision-accepted
+    # frames reads 0/8 there while the video visibly holds real YouTube
+    # media. Record both, plus WHY each missing quota scene missed: a
+    # shortfall must never be silent. Reasons come from the terminal
+    # resolution (fallback_reason), not from a fresh guess.
+    real_youtube_indices, real_youtube_details = _real_youtube_scene_indices(resolutions)
+    missing_quota_reasons = {}
+    for index in missing_quota_indices:
+        resolution = resolutions.get(index) if isinstance(resolutions, Mapping) else None
+        if resolution is None:
+            reason = "scene_unresolved"
+        elif isinstance(resolution, Mapping):
+            reason = str(resolution.get("fallback_reason") or resolution.get("rejection_reason") or "no_youtube_candidate_accepted")
+        else:
+            reason = str(getattr(resolution, "fallback_reason", "") or getattr(resolution, "rejection_reason", "") or "no_youtube_candidate_accepted")
+        missing_quota_reasons[str(index)] = reason
     media_plan["metadata"]["youtube_coverage"] = {
         "target": target,
         "eligible_scene_count": eligible_count,
@@ -7275,6 +7539,11 @@ def resolve_existing_provider_branches_v2(
         "missing_quota_scene_indices": missing_quota_indices,
         "quota_shortfall_scene_count": len(missing_quota_indices),
         "measured_after_relevance_gate": True,
+        "real_youtube_scene_indices": real_youtube_indices,
+        "real_youtube_scene_count": len(real_youtube_indices),
+        "real_youtube_ratio": round(len(real_youtube_indices) / eligible_count, 4) if eligible_count else 0.0,
+        "real_youtube_scenes": real_youtube_details,
+        "missing_quota_reasons": missing_quota_reasons,
     }
     return media_plan, resolutions, visual_context
 
@@ -7343,7 +7612,7 @@ def _visual_requirement_issue(
         return ""
     from .visual_intelligence.semantic_guard import explicit_visual_facet_conflict, explicit_low_visual_match
     pixel_decision = row.get('visual_decision') if isinstance(row, Mapping) else None
-    if explicit_low_visual_match(pixel_decision):
+    if explicit_low_visual_match(pixel_decision, scene=scene if isinstance(scene, Mapping) else None):
         return 'insufficient_visible_subject_match'
     pixel_description = pixel_decision.get('scene_description', '') if isinstance(pixel_decision, Mapping) else ''
     narration = _scene_value(scene, 'text', '') or _scene_value(scene, 'narration', '')
@@ -7794,6 +8063,108 @@ def _visual_requirement_issue(
     return "visual_requirement_mismatch"
 
 
+def _try_late_gate_alternate(
+    scene: Any,
+    row: Mapping[str, Any],
+    resolution: SceneResolution | None,
+    source_label: str,
+    paths: Sequence[str],
+    reason: str,
+) -> dict[str, Any] | None:
+    """Try the scene's next-best ranked alternate after a late-gate rejection.
+
+    A watermark / verification / requirement rejection on the selected asset
+    must move to the next candidate for THIS scene before borrowing from
+    another scene or falling to a graphic. Alternates are the ranked pool the
+    coordinator retained for the scene (``row["alternates"]``); each one is
+    validated exactly like a fresh selection — decodable, ownership-clean,
+    no requirement issue — and its verified digest is stamped from the
+    file's real hash, never from a stored value. Returns the row update to
+    apply, or ``None`` when no alternate survives.
+    """
+    alternates = row.get("alternates") if isinstance(row, Mapping) else None
+    if not isinstance(alternates, list) or not alternates:
+        return None
+    rejected_path = str(row.get("selected_path") or row.get("path") or "")
+    requirement = _scene_value(scene, "visual_requirement", {})
+    requirement_hash = str(requirement.get("requirement_hash") or "") if isinstance(requirement, Mapping) else ""
+    for alternate in alternates:
+        if not isinstance(alternate, Mapping):
+            continue
+        alt_path = str(
+            alternate.get("path")
+            or alternate.get("asset_path")
+            or alternate.get("selected_path")
+            or alternate.get("local_path")
+            or ""
+        ).strip()
+        if not alt_path or alt_path == rejected_path:
+            continue
+        if list(paths).count(alt_path) >= 2:
+            continue
+        valid, _reason, media_type = _validate_renderable_asset(alt_path)
+        if not valid:
+            continue
+        try:
+            from .web_image.ownership_mark import inspect_ownership_mark
+            if inspect_ownership_mark(alt_path).get("watermark"):
+                continue
+        except Exception:
+            # Ownership OCR is best-effort and fails open; never let it
+            # block a real alternate.
+            pass
+        fingerprint = _asset_fingerprint(alt_path)
+        if not fingerprint:
+            continue
+        decision = alternate.get("visual_decision")
+        # Never fabricate visual_checked=True. An alternate is eligible only
+        # when its stored decision is a live verdict bound to THIS scene's
+        # requirement and to these exact bytes (a deterministic_degraded or
+        # unverified decision, or no decision at all, does not qualify).
+        # There is no verifier in this validate scope to route it through, so
+        # an unbound alternate is skipped and the caller falls through to
+        # donor reuse / graphic — the render never stops for one image, but
+        # an unverified alternate must not be stamped vision-checked.
+        if not isinstance(decision, Mapping):
+            continue
+        bound_row = dict(alternate)
+        bound_row.update({"path": alt_path, "selected_path": alt_path})
+        if not _has_bound_pixel_review(requirement, bound_row, alt_path):
+            continue
+        decision = dict(decision)
+        decision["verified_asset_sha256"] = fingerprint
+        decision["accepted"] = True
+        candidate_row = dict(alternate)
+        candidate_row.update({
+            "path": alt_path,
+            "selected_path": alt_path,
+            "visual_decision": decision,
+            "asset_fingerprint": fingerprint,
+            # The requirement check reads the row's hash, not the decision's.
+            "requirement_hash": requirement_hash,
+            "status": "accepted",
+            "verification_status": "verified_reuse",
+        })
+        if _visual_requirement_issue(scene, candidate_row, resolution, source_label):
+            continue
+        return {
+            "candidate_id": str(alternate.get("candidate_id") or f"late_gate_alternate:{alt_path}"),
+            "selected_path": alt_path,
+            "path": alt_path,
+            "provider": str(alternate.get("provider") or alternate.get("source") or "web"),
+            "source": str(alternate.get("source") or alternate.get("provider") or "web"),
+            "status": "accepted",
+            "verification_status": "verified_reuse",
+            "resolution_kind": "late_gate_alternate",
+            "fallback_reason": f"late_gate_alternate_after:{reason}",
+            "asset_fingerprint": fingerprint,
+            "requirement_hash": requirement_hash,
+            "visual_decision": decision,
+            "media_type": media_type,
+        }
+    return None
+
+
 def validate_media_plan_for_render_v2(
     media_plan: dict[str, Any],
     scenes: Sequence[Any],
@@ -8041,6 +8412,36 @@ def validate_media_plan_for_render_v2(
             continue
         if valid:
             continue
+        # Late-gate alternate trial: a watermark / verification rejection on
+        # the selected asset moves to the next-best ranked candidate for
+        # THIS scene before borrowing from another scene or falling to a
+        # graphic. (Berlin Wall scene 2: the ranked alternates were already
+        # gone by this point, so the plan fell straight to a graphic.)
+        alternate_update = _try_late_gate_alternate(
+            scene,
+            row,
+            resolution,
+            labels[index] if index < len(labels) else "",
+            paths,
+            reason,
+        )
+        if alternate_update is not None:
+            paths[index] = str(alternate_update["path"])
+            labels[index] = "Web Images"
+            row.update(alternate_update)
+            resolution_rows[index] = row
+            metadata["media_resolution_v2"] = resolution_rows
+            metadata.setdefault("late_gate_substitutions", []).append({
+                "scene_index": index,
+                "reason": reason,
+                "from": path,
+                "to": str(alternate_update["path"]),
+            })
+            if resolution is not None:
+                for key in ("provider", "media_type", "status", "verification_status", "resolution_kind"):
+                    if key in alternate_update:
+                        setattr(resolution, key, alternate_update[key])
+            continue
         # Reuse real media only when its existing review covers this exact
         # requirement and these bytes. A decodable emergency plate must never
         # become a "borrowed verified" source for the rest of the documentary.
@@ -8142,6 +8543,27 @@ def validate_media_plan_for_render_v2(
                         "resolution_kind": "grounded_graphic_fallback",
                         "fallback_reason": f"terminal_grounded_graphic_after_real_media_exhausted:{reason}",
                         "asset_fingerprint": fingerprint,
+                        # A graphic must never inherit the rejected photo's
+                        # verified digest: the render gate compares the
+                        # shot's verified digest against the file on disk,
+                        # and a stale photo digest hard-fails the whole
+                        # render (Berlin Wall scene 2). Stamp the graphic's
+                        # own hash everywhere the digest is read from.
+                        "verified_asset_sha256": fingerprint,
+                        "asset_sha256": fingerprint,
+                        "visual_decision": {
+                            "accepted": False,
+                            "status": "graphic_fallback",
+                            "verification_status": "graphic_fallback",
+                            "rejection_reason": reason,
+                            "verified_asset_sha256": fingerprint,
+                            "verified_requirement_hash": str(
+                                row.get("requirement_hash")
+                                or (row.get("visual_decision") if isinstance(row.get("visual_decision"), dict) else {}).get("verified_requirement_hash")
+                                or ""
+                            ),
+                        },
+                        "is_graphic_fallback": True,
                         "graphic_fallback": {
                             "schema_version": "graphic_fallback.v1",
                             "scene_index": index,
@@ -9082,6 +9504,203 @@ def validate_media_plan_for_render_v2(
                     f"{swap_repairs} verified slot(s)",
                     flush=True,
                 )
+
+            # Pre-render repeated-media check (Wright: "Visually repeated
+            # media remains" only surfaced in release review, after the
+            # render).  The adjacent repair above only fixes consecutive
+            # duplicates; a still reused at non-adjacent scenes — or two
+            # different files showing the same pixels — sails through to
+            # the post-render perceptual audit.  Catch it here, while the
+            # verified candidate pool is still available: swap the later
+            # scene to a distinct verified candidate that is used nowhere
+            # else in the plan.  A repeat with no distinct alternate is
+            # recorded, not fatal — it is a quality defect, never a
+            # missing-media failure, so it must not kill the video.
+            _ahash_cache: dict[str, Optional[int]] = {}
+
+            def _average_hash(asset_path: str) -> Optional[int]:
+                if asset_path in _ahash_cache:
+                    return _ahash_cache[asset_path]
+                digest: Optional[int] = None
+                try:
+                    from PIL import Image
+
+                    with Image.open(asset_path) as source:
+                        gray = source.convert("L").resize((8, 8), Image.LANCZOS)
+                        pixels = list(gray.tobytes())
+                    mean = sum(pixels) / max(1, len(pixels))
+                    digest = 0
+                    for bit, value in enumerate(pixels):
+                        if value >= mean:
+                            digest |= 1 << bit
+                except Exception:
+                    digest = None
+                _ahash_cache[asset_path] = digest
+                return digest
+
+            def _slot_row(slot_index: int) -> Mapping[str, Any]:
+                if 0 <= slot_index < len(resolution_rows) and isinstance(
+                    resolution_rows[slot_index], Mapping
+                ):
+                    return resolution_rows[slot_index]
+                return {}
+
+            def _slot_media_kind(slot_index: int) -> str:
+                valid, _reason, kind = _validate_local_asset(
+                    str(paths[slot_index] or "")
+                )
+                return kind if valid else ""
+
+            repeat_repairs = 0
+            repeat_shortfalls: list[dict[str, Any]] = []
+            for target_index in range(len(paths)):
+                target_row = _slot_row(target_index)
+                target_path = str(paths[target_index] or "")
+                if not target_path:
+                    continue
+                target_identity = _identity(target_row, target_path)
+                if not target_identity:
+                    continue
+                target_kind = _kind(
+                    target_row.get("provider")
+                    or (labels[target_index] if target_index < len(labels) else "")
+                )
+                target_hash = (
+                    _average_hash(target_path)
+                    if _slot_media_kind(target_index) == "image"
+                    else None
+                )
+                match_index: Optional[int] = None
+                for earlier_index in range(target_index):
+                    earlier_path = str(paths[earlier_index] or "")
+                    if not earlier_path:
+                        continue
+                    earlier_identity = _identity(
+                        _slot_row(earlier_index), earlier_path
+                    )
+                    if earlier_identity and earlier_identity == target_identity:
+                        match_index = earlier_index
+                        break
+                    if (
+                        target_hash is not None
+                        and _slot_media_kind(earlier_index) == "image"
+                    ):
+                        earlier_hash = _average_hash(earlier_path)
+                        if earlier_hash is not None and bin(
+                            target_hash ^ earlier_hash
+                        ).count("1") <= 4:
+                            match_index = earlier_index
+                            break
+                if match_index is None:
+                    continue
+                used_identities = {
+                    _identity(_slot_row(slot), str(paths[slot] or ""))
+                    for slot in range(len(paths))
+                    if paths[slot]
+                }
+                used_paths = {
+                    os.path.normcase(os.path.normpath(str(path or "")))
+                    for path in paths
+                    if path
+                }
+                used_hashes = {
+                    _average_hash(str(path or ""))
+                    for path in paths
+                    if path and _validate_local_asset(str(path or ""))[2] == "image"
+                }
+                used_hashes.discard(None)
+                options = [
+                    entry for entry in candidate_pool
+                    if _kind(entry[1].get("provider") or entry[1].get("source") or target_kind) == target_kind
+                    and entry[3] not in used_identities
+                    and os.path.normcase(os.path.normpath(entry[2])) not in used_paths
+                    and usage[entry[3]] == 0
+                    and _bound_to_target(target_index, entry[1], entry[2])
+                    and (
+                        _validate_local_asset(entry[2])[2] != "image"
+                        or _average_hash(entry[2]) is None
+                        or all(
+                            bin(_average_hash(entry[2]) ^ used).count("1") > 4
+                            for used in used_hashes
+                        )
+                    )
+                ]
+                if not options:
+                    repeat_shortfalls.append({
+                        "scene_index": target_index,
+                        "matches_scene_index": match_index,
+                        "identity": target_identity,
+                        "source_kind": target_kind,
+                        "reason": "no_distinct_verified_local_alternate",
+                    })
+                    continue
+                _source_index, candidate, candidate_path, candidate_identity = min(
+                    options,
+                    key=lambda entry: (usage[entry[3]], abs(entry[0] - target_index), -float(entry[1].get("final_score") or entry[1].get("score") or 0.0)),
+                )
+                paths[target_index] = candidate_path
+                usage[target_identity] = max(0, usage[target_identity] - 1)
+                usage[candidate_identity] += 1
+                labels[target_index] = (
+                    "YouTube Clips (verified reuse)" if target_kind == "youtube"
+                    else "Web Images (verified reuse)"
+                )
+                candidate_fingerprint = str(
+                    candidate.get("asset_fingerprint")
+                    or candidate.get("fingerprint")
+                    or candidate.get("md5")
+                    or ""
+                )
+                if not candidate_fingerprint:
+                    candidate_fingerprint = _asset_fingerprint(candidate_path)
+                target_row = dict(target_row)
+                target_row.update({
+                    "scene_index": target_index,
+                    "selected_path": candidate_path,
+                    "provider": "youtube" if target_kind == "youtube" else "web",
+                    "media_type": str(candidate.get("media_type") or candidate.get("type") or ("video" if target_kind == "youtube" else "image")),
+                    "status": "accepted",
+                    "verification_status": str(candidate.get("verification_status") or (candidate.get("qwen_result") or {}).get("verification_status") or "verified_reuse"),
+                    "resolution_kind": "repeated_media_pre_render_repair",
+                    "fallback_reason": "repeated_media_pre_render_repair",
+                    "candidate_id": str(candidate.get("candidate_id") or candidate.get("id") or f"pre_render_repeat:{target_index}"),
+                    "asset_fingerprint": candidate_fingerprint,
+                    "source_url": str(candidate.get("origin_url") or candidate.get("source_url") or candidate.get("url") or target_row.get("source_url") or ""),
+                    "candidate_evidence": dict(candidate.get("candidate_evidence") or target_row.get("candidate_evidence") or {}),
+                    "visual_decision": dict(candidate.get("visual_decision") or candidate.get("qwen_result") or target_row.get("visual_decision") or {}) or None,
+                })
+                while len(resolution_rows) <= target_index:
+                    resolution_rows.append({})
+                resolution_rows[target_index] = target_row
+                target_resolution = (resolutions or {}).get(target_index)
+                if target_resolution is not None:
+                    for attr, value in {
+                        "selected_path": candidate_path,
+                        "provider": target_row["provider"],
+                        "media_type": target_row["media_type"],
+                        "status": "accepted",
+                        "verification_status": target_row["verification_status"],
+                        "resolution_kind": "repeated_media_pre_render_repair",
+                        "fallback_reason": "repeated_media_pre_render_repair",
+                        "candidate_id": target_row["candidate_id"],
+                        "asset_fingerprint": target_row["asset_fingerprint"],
+                        "source_url": target_row["source_url"],
+                    }.items():
+                        try:
+                            setattr(target_resolution, attr, value)
+                        except Exception:
+                            pass
+                repeat_repairs += 1
+            if repeat_repairs:
+                metadata["media_resolution_v2"] = resolution_rows
+                metadata["pre_render_repeat_repairs"] = repeat_repairs
+                print(
+                    f"   [v2] pre-render repeated-media repair: swapped "
+                    f"{repeat_repairs} repeated slot(s) to distinct verified alternates",
+                    flush=True,
+                )
+            if repeat_shortfalls:
+                metadata["pre_render_repeat_shortfalls"] = repeat_shortfalls
 
     if degraded:
         print(

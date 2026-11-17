@@ -604,9 +604,12 @@ def test_mixed_youtube_coordinator_includes_cleanup_and_salvage_tail():
             {"media_deadline_seconds": 990, "_youtube_budget_scene_count": 24},
             "Mixed Media",
         )
-    # One-worker transfer budgeting raises the clip wall to 900s; reserve a
-    # separate 180s for cancellation, executor drain, salvage, and snapshots.
-    assert deadline == 1080.0
+    # One-worker transfer budgeting scales with the waves the quota needs:
+    # 24 clips at full coverage = 24 waves x 80s + 128s overhead = 2048s
+    # (the old fixed 900s cap starved long jobs). Reserve a separate 180s
+    # for cancellation, executor drain, salvage, and snapshots. In
+    # production the delivery budget still clamps this coordinator wall.
+    assert deadline == 2228.0
 
 
 def test_mixed_direct_clip_lane_uses_bounded_coordinator_wall():
@@ -646,6 +649,45 @@ def test_mixed_youtube_lane_budget_fits_clip_quota_waves():
     assert mixed_youtube_time_budget(8, 480, 150) == (343.0, 35.0)
     assert mixed_youtube_time_budget(24, 900, 150) == (768.0, 60.0)
     assert mixed_youtube_time_budget(8, 90, 35) == (343.0, 35.0)
+
+
+def test_mixed_youtube_branch_wall_uses_fitted_download_workers(monkeypatch):
+    """Regression (Nov 16): ``_mixed_youtube_branch_wall_seconds`` priced
+    the wall with ``download_workers=1`` — serial transfers the downloader
+    never runs — so an 8-scene GTA wall was 743s instead of the honest
+    parallel ~263s at the memory-fitted 4 workers. The wall call must use
+    the same fitted capacity as ``app._mixed_youtube_download_worker_capacity``.
+    """
+    import psutil
+    from types import SimpleNamespace
+    from services.pipeline_v2_media_adapter import _mixed_youtube_branch_wall_seconds
+    from services.youtube_pipeline_v2 import mixed_youtube_download_worker_capacity
+
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(
+        total=8 * 1024 ** 3, available=3 * 1024 ** 3))
+    monkeypatch.setenv("VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY", "4")
+    config = {
+        "yt_branch_wall_timeout_seconds": 360,
+        "_youtube_budget_scene_count": 8,
+    }
+    assert mixed_youtube_download_worker_capacity(config) == 4
+    assert _mixed_youtube_branch_wall_seconds(config) == 263.0
+
+
+def test_mixed_youtube_lane_budget_scales_for_long_jobs():
+    """The old fixed 900s cap starved long jobs: 44 YouTube scenes at 1
+    worker need 27 transfer waves (2288s) and got 900s. The cap now scales
+    with the waves the job actually needs, hard-bounded at 3600s so one
+    slow lane can never eat the whole job; a caller may tighten it further
+    with max_wall_seconds (the delivery-budget allowance)."""
+    from services.pipeline_v2_media_adapter import mixed_youtube_time_budget
+
+    assert mixed_youtube_time_budget(44, 480, 150, download_workers=1) == (2288.0, 60.0)
+    assert mixed_youtube_time_budget(44, 480, 150, download_workers=2) == (1248.0, 60.0)
+    assert mixed_youtube_time_budget(200, 480, 150, download_workers=1) == (3600.0, 60.0)
+    assert mixed_youtube_time_budget(
+        44, 480, 150, download_workers=1, max_wall_seconds=1000
+    ) == (1000.0, 60.0)
 
 
 def test_mixed_youtube_lane_reserves_serial_waves_when_host_memory_limits_workers():
@@ -866,15 +908,20 @@ def test_mixed_media_lane_does_not_reopen_stock_after_validated_policy_disables_
 
 
 def test_mixed_web_scene_workers_promote_legacy_packaged_cap():
+    # GTA fix (Nov 16): the most restrictive value wins — a stale packaged
+    # ``web_max_scene_workers`` can no longer raise the fan-out above the
+    # bounded env default (2), which is what stops the egress stampede.
+    # An explicit higher operator value is still honoured up to the cap.
     with mock.patch.dict(
         os.environ,
         {"VIDZEO_MIXED_WEB_SCENE_WORKERS": "12"},
         clear=True,
     ):
-        assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 12
-        # Keep an explicit higher operator value bounded by the process-safe
-        # cap rather than silently reverting to the old default.
+        assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 6
         assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 20}) == 12
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 2
+        assert _mixed_web_scene_worker_limit({}) == 2
 
 
 def test_explicit_stock_opt_out_overrides_cached_mixed_plan_weights():
@@ -2490,3 +2537,242 @@ def test_unresolved_scene_uses_grounded_graphic_when_no_donor_and_emergency_medi
     row0 = result["metadata"]["media_resolution_v2"][0]
     assert row0["verification_status"] == "grounded_graphic_fallback"
 
+
+# ---------------------------------------------------------------------------
+# Gaming mode (worker E): 90% YouTube target, weights wiring, quota math
+# ---------------------------------------------------------------------------
+
+_GAMING_WEIGHTS = {
+    "Web Images": 0.15,
+    "YouTube Clips": 0.80,
+    "Stock Media": 0.05,
+    "AI Images": 0.0,
+}
+
+
+def _gaming_config(**overrides):
+    config = {"_gaming_mode": True, "mixed_media_weights": dict(_GAMING_WEIGHTS)}
+    config.update(overrides)
+    return config
+
+
+def test_gaming_mode_youtube_target_ratio_is_90_percent():
+    from services.pipeline_v2_media_adapter import _mixed_media_youtube_target_ratio
+
+    # The copied gaming weights alone only reach 0.80; gaming mode binds 0.90.
+    assert _mixed_media_youtube_target_ratio(_gaming_config()) == 0.90
+    # ... even when the deployment env default says 0.8 (the GTA run's case).
+    with mock.patch.dict(
+        os.environ, {"VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET": "0.8"}, clear=True
+    ):
+        assert _mixed_media_youtube_target_ratio(_gaming_config()) == 0.90
+    # Without the flag the same weights give 0.80.
+    assert (
+        _mixed_media_youtube_target_ratio({"mixed_media_weights": dict(_GAMING_WEIGHTS)})
+        == 0.80
+    )
+    # An explicit per-job coverage key still wins over gaming mode.
+    assert (
+        _mixed_media_youtube_target_ratio(
+            _gaming_config(youtube_accepted_coverage_target=0.60)
+        )
+        == 0.60
+    )
+
+
+def test_gaming_mode_lane_policy_is_youtube_first_without_planned_stock():
+    from services.pipeline_v2_media_adapter import _source_lane_policy
+
+    policy = _source_lane_policy(
+        _gaming_config(image_source="Mixed Media", mixed_media_policy="automatic")
+    )
+    assert policy["mode"] == "Mixed Media"
+    assert policy["gaming_mode"] is True
+    assert policy["youtube_enabled"] is True
+    assert policy["web_enabled"] is True
+    assert policy["stock_enabled"] is False
+    assert policy["media_source_priority"] == ["youtube", "web", "stock"]
+
+
+def test_gaming_quota_requests_all_eight_scenes():
+    from services.pipeline_v2_media_adapter import _automatic_youtube_scene_indices
+
+    indices = _automatic_youtube_scene_indices(
+        _gaming_config(),
+        [f"GTA VI scene {index}" for index in range(8)],
+        title="GTA VI",
+        script="Grand Theft Auto VI gameplay trailer breakdown.",
+    )
+    assert indices == list(range(8))
+
+
+def test_gaming_mode_wiring_copies_weights_and_enforces_candidate_limit():
+    import app as server_app
+
+    policy = {
+        "niche": "gaming",
+        "weights": dict(_GAMING_WEIGHTS),
+        "retrieval_policy": {
+            "yt_download_candidate_limit": 10,
+            "web_max_candidate_downloads": 18,
+        },
+    }
+    config = {"category": "gaming"}
+    server_app._apply_gaming_mode_policy(
+        config, policy, "GTA VI", "Grand Theft Auto VI gameplay trailer.", ["scene"]
+    )
+    assert config["_gaming_mode"] is True
+    # The GTA hole: policy weights now reach the config the ratio reads.
+    assert config["mixed_media_weights"] == dict(_GAMING_WEIGHTS)
+    assert config["yt_download_candidate_limit"] == 10
+    # A pre-existing stale limit (GTA got 6 via setdefault) is overwritten.
+    stale = {"category": "gaming", "yt_download_candidate_limit": 6}
+    server_app._apply_gaming_mode_policy(
+        stale, policy, "GTA VI", "Grand Theft Auto VI gameplay.", ["scene"]
+    )
+    assert stale["yt_download_candidate_limit"] == 10
+    # Explicit operator weights stay authoritative: no copy over them.
+    explicit = {
+        "mixed_media_weights": {"Web Images": 0.5, "YouTube Clips": 0.5},
+    }
+    server_app._apply_gaming_mode_policy(
+        explicit, policy, "GTA VI", "Grand Theft Auto VI gameplay.", ["scene"]
+    )
+    assert explicit["_gaming_mode"] is True
+    assert explicit["mixed_media_weights"] == {"Web Images": 0.5, "YouTube Clips": 0.5}
+    # Non-gaming: flag False, no copy, no candidate-limit override.
+    plain = {}
+    server_app._apply_gaming_mode_policy(
+        plain,
+        {"niche": "history", "weights": {"Web Images": 0.45, "YouTube Clips": 0.45}},
+        "Titanic",
+        "A documentary about the Titanic.",
+        ["scene"],
+    )
+    assert plain["_gaming_mode"] is False
+    assert "mixed_media_weights" not in plain
+    assert "yt_download_candidate_limit" not in plain
+
+
+def test_gaming_stock_guard_blocks_gta_scene_only():
+    from services.pipeline_v2_media_adapter import _gaming_stock_blocked
+
+    gta = {
+        "visual_requirement": {"domain_category": "gaming", "subject_type": "game"},
+        "scene_index": 0,
+    }
+    assert _gaming_stock_blocked(gta, "GTA VI: Vice City") is True
+    # Same category, but no game title: a generic real-world scene keeps stock.
+    assert _gaming_stock_blocked(gta, "A Florida beach documentary") is False
+    # Game title but no gaming category: not blocked.
+    documentary = {
+        "visual_requirement": {"domain_category": "documentary"},
+        "scene_index": 0,
+    }
+    assert _gaming_stock_blocked(documentary, "GTA VI: Vice City") is False
+
+
+def test_missing_quota_excludes_accepted_degraded_clip_scene_zero(tmp_path):
+    """GTA scene 0 held a degraded clip yet was listed missing (5 vs 4)."""
+    from services.media_resolution_coordinator import SceneResolution
+    from services.pipeline_v2_media_adapter import _youtube_quota_coverage_indices
+
+    clip = tmp_path / "gta-trailer2.mp4"
+    clip.write_bytes(b"x" * 1024)
+    frame = tmp_path / "gta-frame.jpg"
+    frame.write_bytes(b"x" * 1024)
+
+    def resolution(index, status, path, media_type):
+        return SceneResolution(
+            scene_index=index,
+            provider="youtube",
+            selected_path=str(path),
+            media_type=media_type,
+            status=status,
+            verification_status=(
+                "verified" if status == "accepted" else "deterministic_degraded"
+            ),
+        )
+
+    resolutions = {
+        0: resolution(0, "degraded", clip, "video"),
+        3: resolution(3, "accepted", frame, "image"),
+        5: resolution(5, "accepted", clip, "video"),
+        6: resolution(6, "accepted", clip, "video"),
+    }
+    accepted, missing = _youtube_quota_coverage_indices(
+        [0, 1, 3, 4, 5, 6, 7], resolutions
+    )
+    # Scene 0's degraded clip is real footage: accepted, not missing.
+    assert accepted == [0, 5, 6]
+    assert 0 not in missing
+    # Scene 3's accepted frame is a still, never moving quota: still missing.
+    assert 3 in missing
+    assert missing == [1, 3, 4, 7]
+
+
+def test_late_gate_alternate_rejects_deterministic_degraded_verdict(tmp_path, monkeypatch):
+    """_try_late_gate_alternate must not fabricate visual_checked=True."""
+    import hashlib
+
+    import services.pipeline_v2_media_adapter as adapter
+
+    rejected = tmp_path / "rejected.jpg"
+    rejected.write_bytes(b"rejected photo bytes")
+    alternate = tmp_path / "alt.jpg"
+    alternate.write_bytes(b"alternate photo bytes")
+    requirement = {
+        "canonical_entity": "Berlin Wall",
+        "strict_identity": False,
+        "requirement_hash": "scene-b",
+    }
+    row = {
+        "provider": "web",
+        "path": str(rejected),
+        "selected_path": str(rejected),
+        "status": "accepted",
+        "verification_status": "verified",
+        "requirement_hash": "scene-b",
+        "visual_decision": {
+            "accepted": True,
+            "visual_checked": True,
+            "verified_requirement_hash": "scene-b",
+            "verified_asset_sha256": hashlib.sha256(
+                rejected.read_bytes()
+            ).hexdigest(),
+        },
+        "alternates": [
+            {
+                "path": str(alternate),
+                "candidate_id": "web:alt-degraded",
+                # Stored deterministic_degraded: never a live verdict.
+                "visual_decision": {
+                    "accepted": True,
+                    "visual_checked": False,
+                    "verification_status": "deterministic_degraded",
+                },
+            },
+            {
+                "path": str(alternate),
+                "candidate_id": "web:alt-no-decision",
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        adapter, "_validate_renderable_asset", lambda path: (True, "ok", "image")
+    )
+    monkeypatch.setattr(
+        "services.web_image.ownership_mark.inspect_ownership_mark",
+        lambda path: {"watermark": False},
+    )
+    scene = {
+        "scene_id": "scene-0",
+        "text": "The Berlin Wall fell.",
+        "visual_requirement": requirement,
+    }
+    assert (
+        adapter._try_late_gate_alternate(
+            scene, row, None, "Web Images", [str(rejected)], "watermark_detected"
+        )
+        is None
+    )

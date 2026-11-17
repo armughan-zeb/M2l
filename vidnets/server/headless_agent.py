@@ -10,6 +10,13 @@ import time
 import urllib.error
 import urllib.request
 
+_SERVER_DIR = Path(__file__).resolve().parent
+_RESOURCES_DIR = _SERVER_DIR.parent
+if str(_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVER_DIR))
+if str(_RESOURCES_DIR) not in sys.path:
+    sys.path.insert(0, str(_RESOURCES_DIR))
+
 BUILD_ID = '2026-10-09-local-agent-v1'
 
 
@@ -45,16 +52,34 @@ def configure(runtime_root=None):
               'VIDZEO_NODE_PATH': node_candidate,
               'NODE_PATH': resources / 'node_modules', 'VIDZEO_PACKAGED': '1' if packaged else '0',
               'VIDZEO_NO_BROWSER': '1', 'VIDZEO_BIND_HOST': '127.0.0.1',
-              'VIDZEO_AUTH_MODE': saved.get('auth_mode') or env.get('VIDZEO_AUTH_MODE') or 'supabase'}
-    if saved.get('allow_packaged_local_auth') == '1':
+              'VIDZEO_AUTH_MODE': saved.get('auth_mode') or env.get('VIDZEO_AUTH_MODE') or 'local'}
+    # Sign-in-free local mode is the default for this worker build. Packaged
+    # installs gate local auth behind an explicit opt-in, which is granted here
+    # rather than requiring a desktop pairing session first.
+    if str(os.environ.get('VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH', '')) == '1':
         values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
+    elif values['VIDZEO_AUTH_MODE'] == 'local' and packaged:
+        values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
+    elif saved.get('allow_packaged_local_auth') == '1':
+        values['VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH'] = '1'
+    if os.name != 'nt':
+        # Node's os.tmpdir() (Remotion bundle cache, staged assets, and the
+        # render's disk-space check) defaults to the system temp dir, which
+        # on hosts with a small tmpfs /tmp (e.g. 512 MB) fails mid-render.
+        # Point it at the runtime temp dir on the data disk instead.
+        values.setdefault('TMPDIR', root / 'temp')
     env.update({key: str(value) for key, value in values.items()})
     env['PATH'] = os.pathsep.join([str(resources / 'tools' / 'node'), str(resources / 'tools' / 'ffmpeg'), env.get('PATH', '')])
     os.environ.update({key: env[key] for key in values})
     return resources, root, env
 
 
-def _json_http(url, *, key='', body=None, timeout=20):
+def _json_http(url, *, key='', body=None, timeout=None):
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("VIDZEO_AGENT_HTTP_TIMEOUT", "60") or 60)
+        except (ValueError, TypeError):
+            timeout = 60
     headers = {'Content-Type': 'application/json'}
     if key:
         headers['Authorization'] = 'Bearer ' + key
@@ -82,10 +107,17 @@ def service_url(root):
     return f'http://127.0.0.1:{port}'
 
 
-def start(resources, root, env):
+def start(resources, root, env, *, recover=False):
     from services.agent_access import _read
     from services.agent_bridge import atomic_json, _request_lock
-    _read()  # Requires explicit pairing; never silently enables account bypass.
+    # A paired credential is optional here. The service boots without any
+    # account, and unpaired requests use the local 'local-bypass' worker token
+    # instead of a Vidnets-supabase delegated session.
+    try:
+        _read()
+        paired = True
+    except PermissionError:
+        paired = False
     secure = root / 'secure'
     secure.mkdir(parents=True, exist_ok=True)
     with _request_lock(secure / 'agent-service.json'):
@@ -96,6 +128,15 @@ def start(resources, root, env):
                 return {'ready': True, 'url': url, 'reused': True}
         except (OSError, ValueError, RuntimeError, urllib.error.URLError):
             pass
+        if recover:
+            # An unresponsive status endpoint can still have a live queue owner.
+            import psutil
+            descriptor = json.loads((secure / 'agent-service.json').read_text(encoding='utf-8'))
+            pid = int(descriptor.get('pid') or 0)
+            if pid <= 1 or Path(descriptor.get('resource_root') or '').resolve() != resources:
+                raise RuntimeError('Cannot establish ownership of the previous Vidnets service.')
+            if psutil.pid_exists(pid):
+                raise RuntimeError('The previous Vidnets process still exists; waiting for it to respond.')
         port = None
         for candidate in range(5010, 5110):
             with socket.socket() as probe:
@@ -112,6 +153,8 @@ def start(resources, root, env):
         if port is None:
             raise RuntimeError('No free local service port was found.')
         env['VIDZEO_PORT'] = str(port)
+        if recover:
+            env['VIDZEO_AGENT_RECOVER_QUEUE'] = '1'
         logs = root / 'logs'
         logs.mkdir(parents=True, exist_ok=True)
         logfile = logs / 'agent-service.log'
@@ -120,7 +163,11 @@ def start(resources, root, env):
         if not python.is_file():
             python = Path(sys.executable)
         with logfile.open('ab') as stream:
-            spawn_kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
+            if os.name == 'nt':
+                nt_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+                spawn_kwargs = {'creationflags': nt_flags, 'close_fds': True}
+            else:
+                spawn_kwargs = {'start_new_session': True}
             child = subprocess.Popen([str(python), '-u', str(resources / 'main.py')],
                 cwd=str(resources), env=env, stdout=stream, stderr=stream, stdin=subprocess.DEVNULL,
                 **spawn_kwargs)
@@ -153,10 +200,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Vidnets service for an external agent\'s own reasoning and vision.')
     parser.add_argument('--runtime-root', help='Writable Vidnets data folder; normally discovered from Settings pairing.')
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('start')
+    commands.add_parser('start').add_argument('--recover', action='store_true')
     commands.add_parser('capabilities')
     commands.add_parser('pending')
-    for name in ('request', 'job', 'retry'):
+    for name in ('request', 'job', 'retry', 'reuse'):
         commands.add_parser(name).add_argument('id')
     commands.add_parser('submit').add_argument('file')
     answer = commands.add_parser('answer')
@@ -165,12 +212,25 @@ def main(argv=None):
     args = parser.parse_args(argv)
     resources, root, env = configure(args.runtime_root)
     if args.command == 'start':
-        result = start(resources, root, env)
+        result = start(resources, root, env, recover=args.recover)
     else:
         from services.agent_access import _read
-        key = _read()['key']
+        try:
+            key = _read()['key']
+        except PermissionError:
+            # Sign-in-free worker build: without a paired account the CLI uses
+            # the fixed local worker token, which the local-mode server maps to
+            # the 'local-user' agent owner.
+            key = 'local-bypass'
+        if args.command == 'reuse':
+            # Answer-cache reuse needs no server: it reads the bridge dir
+            # directly, so it works even while the server is slow or down.
+            from services.agent_bridge import reuse_cached_answer
+            result = reuse_cached_answer(args.id)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
         url = service_url(root)
-        status = _json_http(url + '/api/status', timeout=5)
+        status = _json_http(url + '/api/status', timeout=float(os.environ.get("VIDZEO_AGENT_STATUS_TIMEOUT", "30") or 30))
         if status.get('pipeline_build_id') != BUILD_ID or Path(status.get('resource_root', '')).resolve() != resources:
             raise RuntimeError('The local service belongs to a different installation. Run start again.')
         if args.command == 'submit':

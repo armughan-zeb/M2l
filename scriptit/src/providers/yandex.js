@@ -65,6 +65,23 @@ function extractDateFromSnippet(snippet) {
   return '';
 }
 
+function isYandexChallengePage(html) {
+  // Yandex serves its SmartCaptcha page (HTTP 200) instead of results
+  // when the egress IP is gated: title "Are you not a robot?" plus the
+  // captcha_smart bundle. No parser update can fix it — there are no
+  // results in the page at all (verified live 2026-11-09). Fail fast
+  // with a distinct, non-retryable code instead of retrying a captcha.
+  const text = String(html || '');
+  return /Are you not a robot\?/i.test(text)
+    || (/captcha_smart/i.test(text) && /captcha/i.test(text) && !/serp-item|Organic/i.test(text));
+}
+
+function botChallengeError() {
+  const err = new Error('Yandex bot challenge (SmartCaptcha; egress IP gated)');
+  err.code = 'BOT_CHALLENGE';
+  return err;
+}
+
 function parseYandexResults(html, limit = 8) {
   const results = [];
   const seen = new Set();
@@ -102,7 +119,13 @@ function parseYandexResults(html, limit = 8) {
   return results;
 }
 
-async function yandexSearch(query, { limit = 8, timeoutMs = 7000 } = {}) {
+async function yandexSearch(query, { limit = 8, timeoutMs = 12000 } = {}) {
+  // Was: every failure (HTTP error, abort, bot challenge) silently returned
+  // []. The caller then treated Yandex as a healthy provider with zero
+  // results, so it was never retried and never appeared in research.errors.
+  // Now transport/HTTP failures throw, and an HTTP 200 page with no
+  // parseable results throws too — Yandex serves captcha pages with 200,
+  // and those must be visible, not mistaken for "no results".
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -116,15 +139,21 @@ async function yandexSearch(query, { limit = 8, timeoutMs = 7000 } = {}) {
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`Yandex HTTP ${response.status}`);
-    return parseYandexResults(await response.text(), limit);
-  } catch (err) {
-    return [];
+    const pageText = await response.text();
+    if (isYandexChallengePage(pageText)) throw botChallengeError();
+    const results = parseYandexResults(pageText, limit);
+    if (!results.length) {
+      const err = new Error('Yandex returned no parseable results (markup changed or bot challenge)');
+      err.code = 'NO_PARSEABLE_RESULTS';
+      throw err;
+    }
+    return results;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function yandexNewsSearch(query, { limit = 6, timeoutMs = 7000 } = {}) {
+async function yandexNewsSearch(query, { limit = 6, timeoutMs = 12000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -137,17 +166,23 @@ async function yandexNewsSearch(query, { limit = 6, timeoutMs = 7000 } = {}) {
       },
       signal: controller.signal,
     });
-    if (!response.ok) return [];
-    return parseYandexResults(await response.text(), limit).map((r) => ({
+    if (!response.ok) throw new Error(`Yandex News HTTP ${response.status}`);
+    const newsText = await response.text();
+    if (isYandexChallengePage(newsText)) throw botChallengeError();
+    const results = parseYandexResults(newsText, limit).map((r) => ({
       ...r,
       category: 'news',
       source: 'Yandex News'
     }));
-  } catch (_) {
-    return [];
+    if (!results.length) {
+      const err = new Error('Yandex News returned no parseable results (markup changed or bot challenge)');
+      err.code = 'NO_PARSEABLE_RESULTS';
+      throw err;
+    }
+    return results;
   } finally {
     clearTimeout(timer);
   }
 }
 
-module.exports = { yandexSearch, yandexNewsSearch, parseYandexResults };
+module.exports = { yandexSearch, yandexNewsSearch, parseYandexResults, isYandexChallengePage };

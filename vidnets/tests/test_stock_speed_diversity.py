@@ -145,6 +145,11 @@ def test_coverage_check_records_graphics_without_percentage_rejection(tmp_path, 
     monkeypatch.setenv('VIDZEO_MAX_EMERGENCY_VISUAL_RATIO','1')
     summary=validate_documentary_coverage(plan,[1]*10)
     assert summary['passed'] and summary['warnings'] and summary['advisory_only']
+    with pytest.raises(MediaContractError) as failure:
+        validate_documentary_coverage(plan, [1]*10, {'media_fallback_policy': 'real_media_only'})
+    assert failure.value.detail['emergency_scene_indices'] == [0, 1]
+    with pytest.raises(MediaContractError, match='Expected 11 media slots, found 10'):
+        validate_documentary_coverage(plan, [1]*11, {'media_fallback_policy': 'real_media_only'})
 
 
 def test_web_rescue_limits_repetition_without_replaying_youtube():

@@ -6,10 +6,10 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 const { test } = require('node:test');
 const { writeJsonAtomic } = require('../lib/config');
-const { startResidentInbox, probeInbox, pendingRequests, completeLocally, createInboxReadiness } = require('../lib/museInbox');
+const { startResidentInbox, probeInbox, pendingRequests, completeLocally, createInboxReadiness, resetResidentLivenessForTests, PROBE_WALL_MS, REQUEST_WALL_MS } = require('../lib/museInbox');
 const { runInferenceHttp } = require('../adapters/vidnets');
 const { sleep } = require('../lib/sleep');
 
@@ -72,11 +72,16 @@ test('an enabled hook without an answer fails the readiness probe', async t => {
   assert.equal(pendingRequests(root).length, 0);
 });
 
-test('readiness requires a first answer, refreshes without blocking claims, and backs off after failure', async () => {
+test('readiness requires a first answer, refreshes without blocking claims, and backs off after failure', async t => {
+  // No live pool here: the readiness gate must fall back to the probe, so
+  // point it at an empty spool dir instead of the machine's real one.
+  const spool = path.join(fixture(t), 'spool');
+  fs.mkdirSync(spool);
   let time = 1;
   let probes = 0;
   let finish;
   const ready = createInboxReadiness({
+    spoolDir: spool,
     now: () => time,
     probe: () => {
       probes += 1;
@@ -272,6 +277,40 @@ test('daemon start proves the configured transport before its first CMS claim', 
   } finally { clearTimeout(timer); }
 });
 
+test('real requests wait up to the 15-minute request wall while probes still cap at 2 minutes', async t => {
+  const root = fixture(t);
+  const seen = new Map();
+  const stop = startResidentInbox({
+    root, pollMs: 10, logger,
+    complete: async (root, row, reply) => writeJsonAtomic(path.join(root, row.id, 'response.json'), reply),
+    answer: async (row, opts) => { seen.set(row.id, opts.timeoutMs); return 'ok'; }
+  });
+  try {
+    // Both expire in an hour: the wall, not the expiry, must bind.
+    const real = request(root, 1, { expires_at: Date.now() / 1000 + 3600 });
+    const probe = request(root, 2, { operation: 'muse.inbox_probe', expires_at: Date.now() / 1000 + 3600 });
+    await until(() => seen.size >= 2, 8000);
+    // Real request: min(900000, 3600s) minus the 20s buffer = 880000.
+    assert.ok(seen.get(real.id) > 600000, `real request wall ${seen.get(real.id)}ms`);
+    assert.ok(seen.get(real.id) <= REQUEST_WALL_MS, `real request wall ${seen.get(real.id)}ms`);
+    // Probe: min(120000, 3600s) minus the 20s buffer = 100000. The old
+    // code capped EVERYTHING at 2 minutes, which failed large requests
+    // terminally while the worker was still composing them.
+    assert.ok(seen.get(probe.id) > 0 && seen.get(probe.id) <= PROBE_WALL_MS, `probe wall ${seen.get(probe.id)}ms`);
+  } finally { stop(); }
+});
+
+test('MUSE_INBOX_REQUEST_WALL_MS overrides the default request wall', async () => {
+  const run = env => new Promise((resolve, reject) => {
+    execFile(process.execPath, ['-e', 'console.log(require("./lib/museInbox").REQUEST_WALL_MS)'], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, ...env }
+    }, (error, stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve(Number(stdout.trim())));
+  });
+  assert.equal(await run({}), 900000);
+  assert.equal(await run({ MUSE_INBOX_REQUEST_WALL_MS: '60000' }), 60000);
+  assert.equal(await run({ MUSE_INBOX_REQUEST_WALL_MS: 'nonsense' }), 900000);
+});
+
 test('transport-unavailable leaves the request pending for the hook and retries after the cooldown', async t => {
   const root = fixture(t);
   const row = request(root, 1);
@@ -298,5 +337,117 @@ test('transport-unavailable leaves the request pending for the hook and retries 
     await until(() => calls >= 2, 8000);
     await until(() => JSON.parse(fs.readFileSync(path.join(root, row.id, 'request.json'))).state === 'answered', 8000);
     assert.equal(pendingRequests(root).length, 0);
+  } finally { stop(); }
+});
+
+// Regression (2026-11-16): workers refuse every inbox probe (token echo),
+// so a probe-based readiness gate kept claims paused forever — 1256
+// "Muse claims paused" lines in daemon.log while real inference was
+// working. Readiness must come from real-request answers and a live pool
+// heartbeat; a probe is only the fallback when neither proves liveness.
+
+test('readiness stays open on a recent real answer while probes fail', async t => {
+  resetResidentLivenessForTests();
+  const root = fixture(t);
+  const row = request(root, 1);
+  const stop = startResidentInbox({
+    root, pollMs: 10, logger,
+    complete: async (root, row, reply) => writeJsonAtomic(path.join(root, row.id, 'response.json'), reply),
+    answer: async () => 'a real answer'
+  });
+  try {
+    await until(() => fs.existsSync(path.join(root, row.id, 'response.json')));
+    // Let the inbox finish its success path (it records the real answer
+    // for the readiness gate just after complete() returns).
+    await sleep(100);
+    let probes = 0;
+    const ready = createInboxReadiness({
+      // No spool heartbeat here: only the real answer may open the gate.
+      spoolDir: path.join(root, 'no-spool-here'),
+      probe: async () => { probes += 1; throw new Error('probe refused: token echo not performed'); },
+      onReady() {}, onFailure() {}
+    });
+    assert.equal(await ready(), true);
+    assert.equal(probes, 0, 'no probe is filed while a real answer proves liveness');
+    assert.equal(await ready(), true);
+    assert.equal(probes, 0);
+  } finally { stop(); }
+});
+
+test('readiness opens on a fresh pool heartbeat without filing a probe', async t => {
+  resetResidentLivenessForTests();
+  const root = fixture(t);
+  const spool = path.join(root, 'spool');
+  fs.mkdirSync(spool);
+  fs.writeFileSync(path.join(spool, 'worker-alive-worker-1.json'), JSON.stringify({
+    updatedAt: Date.now(), worker: 'resident-inference', workerId: 'worker-1', pending: 0, answered: 3
+  }));
+  let probes = 0;
+  const stop = startResidentInbox({ root, pollMs: 50, logger, answer: async () => 'unused' });
+  try {
+    const ready = createInboxReadiness({
+      spoolDir: spool,
+      probe: async () => { probes += 1; throw new Error('probe refused'); },
+      onReady() {}, onFailure() {}
+    });
+    assert.equal(await ready(), true);
+    assert.equal(probes, 0, 'no probe is filed while the pool heartbeat is fresh');
+  } finally { stop(); }
+});
+
+test('readiness closes after the spool reports the pool dead, even with a fresh heartbeat', async t => {
+  resetResidentLivenessForTests();
+  const root = fixture(t);
+  const spool = path.join(root, 'spool');
+  fs.mkdirSync(spool);
+  fs.writeFileSync(path.join(spool, 'worker-alive-worker-1.json'), JSON.stringify({
+    updatedAt: Date.now(), worker: 'resident-inference', workerId: 'worker-1', pending: 0, answered: 0
+  }));
+  const row = request(root, 1);
+  let calls = 0;
+  const stop = startResidentInbox({
+    root, pollMs: 10, logger,
+    answer: async () => {
+      calls += 1;
+      throw Object.assign(new Error('MUSE_TRANSPORT_UNAVAILABLE: test pool down'), { code: 3 });
+    }
+  });
+  try {
+    await until(() => calls >= 1);
+    await sleep(50);
+    assert.equal(fs.existsSync(path.join(root, row.id, 'response.json')), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, row.id, 'request.json'))).state, 'pending');
+    let probes = 0;
+    const ready = createInboxReadiness({
+      spoolDir: spool,
+      probe: async () => { probes += 1; throw new Error('probe refused'); },
+      onReady() {}, onFailure() {}
+    });
+    assert.equal(await ready(), false);
+    assert.equal(probes, 1, 'with the pool known dead the probe is the only remaining check');
+  } finally { stop(); }
+});
+
+test('invalidate after expiries requires fresh proof even with a live pool heartbeat', async t => {
+  resetResidentLivenessForTests();
+  const root = fixture(t);
+  const spool = path.join(root, 'spool');
+  fs.mkdirSync(spool);
+  fs.writeFileSync(path.join(spool, 'worker-alive-worker-1.json'), JSON.stringify({
+    updatedAt: Date.now(), worker: 'resident-inference', workerId: 'worker-1', pending: 0, answered: 0
+  }));
+  let probes = 0;
+  const stop = startResidentInbox({ root, pollMs: 50, logger, answer: async () => 'unused' });
+  try {
+    const ready = createInboxReadiness({
+      spoolDir: spool,
+      probe: async () => { probes += 1; throw new Error('probe refused'); },
+      onReady() {}, onFailure() {}
+    });
+    assert.equal(await ready(), true);
+    assert.equal(probes, 0);
+    ready.invalidate();
+    assert.equal(await ready(), false);
+    assert.equal(probes, 1, 'after invalidate the gate needs a fresh proof, not heartbeat optimism');
   } finally { stop(); }
 });

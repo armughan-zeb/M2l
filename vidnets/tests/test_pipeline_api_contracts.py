@@ -385,6 +385,24 @@ class PipelineApiContractTests(unittest.TestCase):
         self.assertIn("primary_query", bundle["stock"][0])
         self.assertIn("Kylian Mbappe", bundle["yt"][0]["forbidden_subjects"])
 
+
+    def test_adapter_keeps_mechanical_fallback_marker_on_timed_out_chunk_rows(self):
+        """A plan the brain filled mechanically for a timed-out chunk must
+        stay marked as a fallback. Laundering it as directed is how
+        word-salad queries got cached and reused for every re-run."""
+        scene_texts = ["In February 2006, Amtrak ran 233 to 286 departures a day."]
+        plans = [{
+            "container_subject": "Amtrak",
+            "scene_subject": "Amtrak departures",
+            "youtube": {"primary": "Amtrak trains footage", "supporting": "Amtrak stations", "fallback": "Amtrak footage"},
+            "web": {"primary": "Amtrak train photo", "supporting": "Amtrak station", "fallback": "Amtrak"},
+            "stock": {"primary_query": "train station", "alt_query": "railway", "fallback_query": "train"},
+            "_query_fallback": "incomplete_or_timed_out_chunk",
+        }]
+        bundle = server_app._adapt_scene_brain_plans(plans, scene_texts, "Amtrak", ["Amtrak"], [{}])
+        for source in ("yt", "web", "stock"):
+            self.assertEqual(bundle[source][0].get("_query_fallback"), "incomplete_or_timed_out_chunk")
+
     def test_shared_scene_brain_adapter_prefers_container_map_over_bad_scene_plan(self):
         scene_texts = [
             "Lionel Messi controls the tempo and waits for the final pass.",

@@ -5,13 +5,40 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Sequence
 
-from .vidzeo_brain import _fallback_retrieval_context, _mechanical_scene_plan
+from .vidzeo_brain import _default_youtube_intents, _fallback_retrieval_context, _mechanical_scene_plan
 from .youtube_query_normalizer import normalize_youtube_query
 
 
 def _clean_query(value: Any, fallback: str = "") -> str:
     text = re.sub(r"\s+", " ", str(value or fallback or "")).strip(" \t\r\n\"'`.,:;")
     return " ".join(text.split()[:14]).strip()
+
+
+# Filler words that carry no search value in a title anchor. A title such as
+# "Amtrak's Long Run Through the Crew's Day" is a made-up phrase: used
+# verbatim it produces queries no search engine can match ("Amtrak Long Run
+# Through documentary crew history photograph"). Stripping the filler leaves
+# the searchable subject ("Amtrak Crew").
+_COMPACT_SUBJECT_FILLER = {
+    "a", "an", "the", "of", "and", "in", "on", "to", "for", "with", "from",
+    "into", "over", "under", "after", "before", "during", "through", "across",
+    "between", "about", "than", "then", "there", "here", "while", "since",
+    "until", "per", "via", "at", "by", "as", "or", "but", "not", "no", "is",
+    "are", "was", "were", "be", "been", "how", "what", "when", "where", "why",
+    "who", "which", "that", "this", "these", "those", "very", "just", "also",
+    "still", "yet", "more", "most", "other", "another", "first", "second",
+    "new", "old", "great", "big", "small", "real", "true", "full", "complete",
+    "entire", "long", "run", "runs", "day", "days", "history", "story",
+    "stories", "look", "looks", "closely", "behind", "familiar", "primary",
+}
+
+
+def _compact_search_subject(anchor: str) -> str:
+    """Shorten a title anchor to its searchable content words (max 4)."""
+    text = re.sub(r"'s\b", "", str(anchor or ""))
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", text)
+    kept = [word for word in words if word.casefold() not in _COMPACT_SUBJECT_FILLER]
+    return " ".join(kept[:4]).strip()
 
 
 def _variants(*values: str) -> List[str]:
@@ -43,7 +70,7 @@ _DOMAIN_VISUAL_TERMS = {
     "gaming": (
         "gameplay", "driving", "vehicle", "vehicles", "police", "plane", "city",
         "mission", "missions", "character", "characters", "npc", "npcs", "interior",
-        "interiors", "animation", "animations", "physics", "trailer", "leak", "leaks",
+        "interiors", "animation", "animations", "physics", "trailer",
         "rockstar", "take-two", "netflix", "microsoft", "discord", "court", "subpoena",
         "radio", "music", "jason", "lucia", "vice city", "release",
     ),
@@ -146,6 +173,16 @@ def _entity_visual_kind(subject: str, scene_text: str, domain: str, section: Dic
     subject_text = str(subject or "").strip()
     subject_lower = subject_text.casefold()
     context = f"{subject_text} {scene_text or ''} {domain or ''}".casefold()
+    # A studio, a game title, or a place is never a person, however
+    # name-like its capitalization ("Rockstar Games", "Grand Theft Auto
+    # VI", "Vice City" all match the two-capitalized-words pattern below).
+    # Check those first: the old order returned "person" for all of them.
+    if re.search(r"\b(?:grand theft auto|gta)\s+(?:vi|v|iv|iii|6|5|4|3|six|five|four|three)\b", subject_lower):
+        return "topic"
+    if re.search(r"\b(?:games|studios|entertainment|interactive|company|corporation|pictures)\s*$", subject_lower):
+        return "topic"
+    if re.search(r"\b(?:city|streets?|island|keys|beach|state|county|country|neighborhood|district|town|village|province|coast|peninsula)\b", subject_lower):
+        return "place"
     if re.match(r"^(?:rms|hms|uss|ss|mv|ms|hmt)\b", subject_lower):
         # Initialed vessels are named maritime subjects (RMS Titanic, HMS
         # Victory), not retail products.  Give them an archive/ship query lane
@@ -171,6 +208,13 @@ def _entity_visual_kind(subject: str, scene_text: str, domain: str, section: Dic
         "biography", "portrait", "interview",
     }
     name_like = bool(re.fullmatch(r"[A-Z][A-Za-z0-9'’-]*(?:\s+[A-Z][A-Za-z0-9'’-]*){1,3}", subject_text))
+    if not name_like:
+        # Multi-person subjects joined by "and"/"&" ("Lucia Caminos and
+        # Jason Duval"): each part is a capitalized name on its own.
+        name_parts = [part.strip() for part in re.split(r"\s+(?:and|&)\s+", subject_text) if part.strip()]
+        name_like = len(name_parts) >= 2 and all(
+            re.fullmatch(r"[A-Z][A-Za-z0-9'’-]*(\s+[A-Z][A-Za-z0-9'’-]*)*", part)
+            for part in name_parts)
     if any(re.search(rf"\b{re.escape(term)}\b", context) for term in role_terms) or name_like:
         return "person"
     return "thing"
@@ -214,6 +258,10 @@ def build_mechanical_query_bundle(
         " ".join(scene_texts),
         global_anchor,
     )
+    # The scene plans also take the title as their topic; give them the
+    # compact subject too, so YouTube/stock queries don't repeat the full
+    # made-up title phrase before the scene words.
+    plan_topic = _compact_search_subject(global_anchor) or global_anchor
     bundle: Dict[str, List[Dict[str, Any]]] = {"web": [], "yt": [], "stock": []}
 
     for idx, scene_text in enumerate(scene_texts):
@@ -221,14 +269,18 @@ def build_mechanical_query_bundle(
         subject = str(section_subjects[idx] if idx < len(section_subjects) else "").strip()
         if section.get("is_intro") or str(section.get("container_id") or "").lower() == "outro":
             subject = ""
-        active = subject or global_anchor
+        # When no section subject exists, the raw title anchor is usually a
+        # made-up phrase, not a searchable subject. Compact it to its content
+        # words ("Amtrak's Long Run Through the Crew's Day" -> "Amtrak Crew")
+        # so every lane's queries can actually match real media.
+        active = subject or _compact_search_subject(global_anchor) or global_anchor
         context = _fallback_retrieval_context(active, scene_text, global_anchor)
         domain_category = context.get("domain_category") or "other"
         if domain_category == "other":
             domain_category = global_context.get("domain_category") or "other"
         facet = _scene_visual_facet(scene_text, active, domain_category)
         entity_kind = _entity_visual_kind(active, scene_text, domain_category, section)
-        plan = _mechanical_scene_plan(scene_text, idx + 1, section_subject=subject, topic=global_anchor)
+        plan = _mechanical_scene_plan(scene_text, idx + 1, section_subject=subject, topic=plan_topic)
         container_id = str(
             section.get("container_id")
             or plan.get("section_label")
@@ -243,8 +295,10 @@ def build_mechanical_query_bundle(
             "scene_number": idx + 1,
             "section_subject": subject,
             "scene_subject": str(section.get("scene_subject") or subject or active).strip(),
-            "scene_subject_type": entity_kind if subject and entity_kind in {"person", "place", "object", "food", "ship", "animal", "event"} else ("entity" if subject else "topic"),
-            "container_type": entity_kind if subject and entity_kind in {"person", "place", "object", "food", "ship", "animal", "event"} else ("entity" if subject else "topic"),
+            # "thing" means unknown: the neutral type is "topic", never the
+            # schema-invalid "entity" the old mapping emitted here.
+            "scene_subject_type": entity_kind if entity_kind in {"person", "place", "object", "food", "ship", "animal", "event", "topic", "product"} else "topic",
+            "container_type": entity_kind if entity_kind in {"person", "place", "object", "food", "ship", "animal", "event", "topic", "product"} else "topic",
             "subject_query": active,
             "topic_anchor": active,
             "global_topic": global_anchor,
@@ -253,6 +307,7 @@ def build_mechanical_query_bundle(
             "search_disambiguator": context.get("search_disambiguator") or active,
             "retrieval_positive_terms": list(context.get("retrieval_positive_terms") or [active])[:10],
             "retrieval_negative_terms": list(context.get("retrieval_negative_terms") or [])[:10],
+            "youtube_query_intents": _default_youtube_intents(domain_category),
             "container_id": container_id,
             "section_id": container_id,
             "container_boundary": boundary,

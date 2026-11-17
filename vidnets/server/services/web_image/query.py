@@ -408,6 +408,63 @@ _KNOWN_CRICKET_VENUES: Set[str] = {
 }
 
 
+# Concrete identifiers worth appending to a non-cricket scene query: vehicle /
+# unit numbers ("locomotive 160", "BNSF 1555") and the scene's named place
+# ("Cajon Pass"). The old non-cricket path returned at most a year, and
+# _extract_visual_keywords strips all digits, so a scene about a specific
+# locomotive searched as if it were about trains in general. Numbers are
+# only accepted with a vehicle/operator word attached — a bare number in
+# narration ("82 not out", "10 minutes") is a score or a duration, not an
+# identifier, and must never become a query term.
+_VEHICLE_NUMBER_RE = re.compile(
+    r'\b(?:locomotive|engine|unit|train)\s+(?:no\.?\s+|#\s*)?(\d{2,4})\b', re.I)
+_OPERATOR_NUMBER_RE = re.compile(
+    r'\b(BNSF|Amtrak|Union Pacific|CSX|Norfolk Southern|Canadian National|'
+    r'Canadian Pacific|Southern Pacific|Santa Fe|Indian Railways)\s+(\d{2,4})\b')
+_HASH_NUMBER_RE = re.compile(r'#(\d{2,4})\b')
+_PLACE_PHRASE_RE = re.compile(r'\b([A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,}){1,2})\b')
+_PLACE_PHRASE_SKIP_FIRST = {
+    'the', 'a', 'an', 'in', 'on', 'at', 'from', 'with', 'this', 'that',
+    'it', 'they', 'he', 'she', 'when', 'where', 'after', 'before',
+}
+
+
+def _extract_scene_identifiers(text: str, subject: str = "") -> List[str]:
+    """Return up to 2 concrete identifiers from scene text, most specific first."""
+    if not text:
+        return []
+    found: List[str] = []
+
+    def _add(value: str) -> None:
+        cleaned = re.sub(r'\s+', ' ', str(value or '').strip())
+        if cleaned and cleaned.lower() not in {v.lower() for v in found}:
+            found.append(cleaned)
+
+    has_vehicle_word = bool(re.search(
+        r'\b(?:locomotive|engine|unit|train|railway|railroad)\b', text, re.I))
+    for m in _OPERATOR_NUMBER_RE.finditer(text):
+        _add(f"{m.group(1)} {m.group(2)}")
+    for m in _VEHICLE_NUMBER_RE.finditer(text):
+        _add(f"locomotive {m.group(1)}")
+    if has_vehicle_word:
+        for m in _HASH_NUMBER_RE.finditer(text):
+            _add(f"locomotive {m.group(1)}")
+    if len(found) < 2:
+        subject_lower = (subject or '').casefold()
+        for m in _PLACE_PHRASE_RE.finditer(text):
+            phrase = m.group(1)
+            words = phrase.split()
+            if words[0].lower() in _PLACE_PHRASE_SKIP_FIRST:
+                continue
+            if phrase.casefold() == subject_lower:
+                continue
+            if all(w.lower() in subject_lower for w in words):
+                continue
+            _add(phrase)
+            break
+    return found[:2]
+
+
 def _extract_scene_context(scene_text: str, full_script: str = "",
                              subject: str = "") -> Dict[str, List[str]]:
     """Extract years, match types, potential opponents, venues from scene text + script.
@@ -430,6 +487,7 @@ def _extract_scene_context(scene_text: str, full_script: str = "",
         "opponents": [],
         "venues": [],
         "qualifiers": [],
+        "identifiers": [],
     }
 
     # 1. Years (broad range 1900-2099 for general content)
@@ -437,7 +495,17 @@ def _extract_scene_context(scene_text: str, full_script: str = "",
     ctx["years"] = sorted(y for y in years if 1900 <= int(y) <= 2099)
 
     if not cricketish:
-        ctx["qualifiers"] = ctx["years"][-1:] if ctx["years"] else []
+        # Non-cricket scenes used to qualify with at most a year, so a scene
+        # about locomotive 160 searched as "trains in general". Concrete
+        # identifiers (vehicle/unit numbers, named places) outrank the year:
+        # they are the terms that separate this scene's footage from any
+        # other train/snow/bridge photo. Cap stays 2 qualifiers.
+        identifiers = _extract_scene_identifiers(combined, subject)
+        ctx["identifiers"] = identifiers
+        qualifiers = list(identifiers)
+        if ctx["years"]:
+            qualifiers.append(ctx["years"][-1])
+        ctx["qualifiers"] = qualifiers[:2]
         return ctx
 
     # 2. Match types / tournaments
@@ -495,6 +563,9 @@ _WEAK_SINGLE_SUBJECTS = {
     "iran", "usa", "us", "canada", "mexico", "qatar", "argentina", "senegal",
     "welcome", "message", "tel", "aviv", "ivory", "coast", "cape", "verde",
     "saudi", "arabia", "algeria", "tunisia",
+    "snow", "covers", "throws", "pulls", "gauges", "temperatures", "temperature",
+    "inside", "outside", "cold", "start", "starting", "procedure", "members", "crew",
+    "minute", "minutes", "hours", "they", "he", "she", "massive",
 }
 
 _QUERY_LEAK_TERMS = {
@@ -527,6 +598,7 @@ _QUERY_OUTPUT_GARBAGE_TERMS = {
 }
 
 _GENERIC_VISUAL_FALLBACKS = {
+    "transportation": ["freight locomotive photograph", "diesel locomotive prime mover", "railway tracks archival", "train yard diesel locomotive"],
     "gaming": ["official gameplay screenshot", "official trailer still", "game environment screenshot", "official key art"],
     "history": ["old archive photo", "historic city street", "historical photograph", "old newspaper"],
     "vehicle": ["photograph", "exterior photograph", "detail photograph", "vintage photograph"],
@@ -647,6 +719,8 @@ def _is_person_fallback_subject(subject: str) -> bool:
     if _topic_family(subject) != 'general':
         return False
     topic_words = {
+        "freight", "train", "trains", "locomotive", "locomotives", "railway", "railroad",
+        "diesel", "track", "tracks", "cab", "cabs", "engine", "engines", "yard", "yards",
         "fans", "supporters", "crowd", "team", "world", "cup", "fifa", "football",
         "soccer", "cricket", "stadium", "tickets", "ticket", "protest", "boycott",
         "war", "battle", "history", "documentary", "truck", "trucks", "city",
@@ -668,6 +742,8 @@ def _topic_family(subject: str, scene_text: str = "") -> str:
     def has_any(terms: Tuple[str, ...]) -> bool:
         return any(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) for term in terms)
 
+    if has_any(("train", "trains", "locomotive", "locomotives", "railway", "railroad", "freight", "diesel", "caboose", "boxcar", "track", "depot", "switchman", "conductor", "engineer", "cab", "bogie", "wagon", "carriage", "tram", "subway")):
+        return "transportation"
     if has_any(("gta", "grand theft auto", "game", "gameplay", "gaming", "playstation", "xbox", "rockstar games", "nintendo", "steam", "tetris", "tetromino")):
         return "gaming"
     if has_any(("football", "soccer", "fifa", "world cup", "cricket", "basketball", "baseball", "tennis", "rugby", "golf", "nfl", "nba", "championship", "tournament", "athlete", "olympics")):
@@ -732,6 +808,50 @@ def _topic_fallback_queries(subject: str, scene_text: str = "", limit: int = 5) 
         _add(f"{base} {' '.join(kws[:2])}")
     _add(base)
     return queries[:limit]
+
+
+def _broaden_scene_queries(
+    queries: List[str],
+    main_subject: str = "",
+    tried: Optional[List[str]] = None,
+    limit: int = 6,
+) -> List[str]:
+    """Progressively broaden specific queries that returned nothing.
+
+    Drop the most specific (trailing) terms one at a time, so a query like
+    "Single wheel climbing rail diagram photograph" degrades through
+    "Single wheel climbing rail diagram" to "Single wheel" before the bare
+    subject is tried. Generic subject queries come last. Queries already
+    tried (including the originals) are never repeated.
+    """
+    tried_lower = {str(q or "").strip().lower() for q in (tried or [])}
+    tried_lower |= {str(q or "").strip().lower() for q in (queries or [])}
+    subject = str(main_subject or "").strip()
+    out: List[str] = []
+
+    def _add(raw: str) -> None:
+        cleaned = _clean_query(raw)
+        if not cleaned:
+            return
+        # Single-word variants are only useful as the bare subject itself.
+        if len(cleaned.split()) < 2 and cleaned.lower() != subject.lower():
+            return
+        if cleaned.lower() in tried_lower:
+            return
+        tried_lower.add(cleaned.lower())
+        out.append(cleaned)
+
+    for query in (queries or []):
+        tokens = [token for token in str(query or "").split() if token]
+        for end in range(len(tokens) - 1, 1, -1):
+            _add(" ".join(tokens[:end]))
+            if len(out) >= limit:
+                return out
+    if subject:
+        _add(f"{subject} photo")
+        _add(f"{subject} photograph")
+        _add(subject)
+    return out[:limit]
 
 
 def _history_visual_terms(scene_text: str) -> List[str]:
@@ -851,8 +971,14 @@ def _should_switch_topic_subject(candidate: str, main_subject: str, scene_text: 
         "rms", "hms", "uss", "mv", "ss", "titanic", "ship", "ships",
         "liner", "vessel", "ferry", "steamship", "airship", "submarine",
     }
+    _RAIL_ANCHOR_TERMS = {
+        "locomotive", "locomotives", "train", "trains", "railway", "railroad",
+        "sd70ace", "diesel", "freight", "engine",
+    }
     main_tokens = set(re.findall(r"[a-z0-9]+", main_lower)) | {main_lower}
     if main_tokens & _VESSEL_ANCHOR_TERMS:
+        return False
+    if (main_tokens & _RAIL_ANCHOR_TERMS) and not (set(re.findall(r"[a-z0-9]+", str(candidate).lower())) & (_RAIL_ANCHOR_TERMS | {"cab", "switch", "pump", "prime", "mover", "cabinet", "starter", "air", "gauges", "rail yard"})):
         return False
     main_words = [w for w in re.findall(r"[a-z0-9]+", main_lower) if w not in STOPWORDS]
     candidate_words = [w for w in re.findall(r"[a-z0-9]+", str(candidate).lower()) if w not in STOPWORDS]
@@ -1152,6 +1278,9 @@ _NON_NAME_WORDS = {
 _WEAK_SUBJECT_PHRASES = {
     "quietly pulled", "country quietly", "nation quietly", "pulled fans",
     "country pulled", "fans quietly", "didn lose", "didn fail",
+    "snow covers", "snow cover", "throws the", "throws primary", "gauges sweep",
+    "temperatures drop", "temperature drops", "crew members", "climb aboard",
+    "cold start", "cold procedure", "massive cylinder",
 }
 
 
@@ -1683,6 +1812,20 @@ def _clean_query(q: str) -> str:
     return q
 
 
+_WEAK_SOLITARY_TERMS = {
+    "crews", "crew", "members", "begin", "begins", "began", "beginning",
+    "minute", "minutes", "hours", "deep", "inside", "every", "around",
+    "first", "second", "third", "cold", "start", "starting", "procedure",
+    "knowing", "pull", "pulls", "pulled", "sitting", "sits", "dead",
+    "covers", "covered", "another", "something", "everything", "nothing",
+}
+
+_ALLOWED_VISUAL_OBJECT_TERMS = {
+    "dashboard", "cockpit", "display", "screen", "interface", "instrument",
+    "cluster", "switch", "gauges", "gauge", "cabinet", "controls", "telemetry",
+}
+
+
 def _extract_visual_keywords(text: str, max_kws: int = 8) -> List[str]:
     """Extract visually-searchable keywords from text."""
     cleaned = text.lower()
@@ -1690,7 +1833,10 @@ def _extract_visual_keywords(text: str, max_kws: int = 8) -> List[str]:
     cleaned = re.sub(r"[^a-z\s]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return [w for w in re.findall(r'[a-z]{3,}', cleaned)
-            if w not in STOPWORDS and w not in BAD_QUERY_TERMS and w not in _NON_NAME_WORDS][:max_kws]
+            if w not in STOPWORDS
+            and w not in BAD_QUERY_TERMS
+            and w not in _WEAK_SOLITARY_TERMS
+            and (w not in _NON_NAME_WORDS or w in _ALLOWED_VISUAL_OBJECT_TERMS)][:max_kws]
 
 
 def _classify_scene_type(scene_text: str, main_subject: str) -> str:
@@ -1921,9 +2067,9 @@ def _generate_queries_mechanical(script: str, title: str, scene_texts: List[str]
                 ]
             elif entity_kind == "object":
                 fallback_queries = [
-                    f"{active_subject} product photograph",
-                    f"{active_subject} detail photo",
-                    f"{active_subject} reference image",
+                    f"{active_subject} documentary photograph",
+                    f"{active_subject} archival photo",
+                    f"{active_subject} photograph",
                 ]
             elif entity_kind == "food":
                 fallback_queries = [
@@ -1976,9 +2122,9 @@ def _generate_queries_mechanical(script: str, title: str, scene_texts: List[str]
                     ]
                 elif entity_kind == "object":
                     extra_fallbacks = [
-                        f"{active_subject} detail photo",
-                        f"{active_subject} product photograph",
-                        f"{active_subject} official reference image",
+                        f"{active_subject} documentary photograph",
+                        f"{active_subject} archival photo",
+                        f"{active_subject} photograph",
                     ]
                 elif entity_kind == "food":
                     extra_fallbacks = [
@@ -2032,7 +2178,7 @@ def _generate_queries_mechanical(script: str, title: str, scene_texts: List[str]
                         [f"{active_subject} landmark photograph", f"{active_subject} location photo", f"{active_subject} travel photograph"]
                         if entity_kind == "place"
                         else (
-                            [f"{active_subject} product photograph", f"{active_subject} detail photo", f"{active_subject} reference image"]
+                            [f"{active_subject} documentary photograph", f"{active_subject} archival photo", f"{active_subject} photograph"]
                             if entity_kind == "object"
                             else (
                                 [f"{active_subject} food photograph", f"{active_subject} fresh produce photo", f"{active_subject} recipe ingredient photograph"]
@@ -2201,6 +2347,13 @@ def _pick_enrichments(subject: str, scene_type: str,
     # Phase 1: Extract scene-specific multi-word action phrases from scene text.
     # Only extract if at least one word in the pair expresses a concrete visual action.
     _VISUAL_ACTION_WORDS = {
+        "locomotive", "diesel", "engine", "prime", "mover", "battery", "switch",
+        "cabinet", "starter", "motor", "motors", "exhaust", "turbocharger",
+        "compressor", "gauge", "gauges", "valves", "piston", "radiator", "brake",
+        "coupler", "bogie", "wheel", "pantograph", "generator", "alternator",
+        "cylinder", "throttle", "injector", "telemetry", "control", "stand",
+        "yard", "track", "freight", "rail", "railway", "frozen", "snow",
+        "pressure", "psi", "starting", "startup", "climb", "aboard",
         "cover", "drive", "pull", "shot", "cut", "sweep", "hook", "glance",
         "bowl", "bowling", "spin", "pace", "throw", "catch", "field",
         "dive", "six", "four", "boundary", "century", "wicket", "stump",

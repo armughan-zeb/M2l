@@ -26,10 +26,11 @@ Settings that must be in `.env` (see `.env.example` for the full list):
 `VIDZEO_TEMP_DIR=<runtime>/temp`.
 `MUSE_INFERENCE_COMMAND=node <absolute-repo-path>/scripts/muse-inference-spool.cjs`
 (the shipped spool transport — the default; `MUSE_INFERENCE_URL` is the
-HTTP alternative, never both). The resident inference worker answers it —
-spawn it from `scripts/resident-inference-worker/WORKER_BRIEF.md` before
-the first job. Hook-only installs use the host inbox hook. No API keys go
-in `.env`.
+HTTP alternative, never both). The resident inference worker pool answers
+it — spawn the supervisor from
+`scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md` before the
+first job (it spawns 2–8 workers, scaling with the backlog). Hook-only
+installs use the host inbox hook. No API keys go in `.env`.
 
 Start Vidnets (the server is stateful — one instance only):
 
@@ -112,6 +113,7 @@ Every knob lives in `.env` / `.env.example`. Defaults are production.
 | `MUSE_SCRIPT_MAX_DRAFTS` | 2 | Script model calls max (draft 1 + one fix pass) |
 | `MUSE_RESEARCH_TIMEOUT_MS` | 180000 | One shared research deadline for all providers |
 | `MUSE_REPLAN_MIN_REMAINING_MS` | 600000 | Render budget left required to attempt the one bounded media re-plan |
+| `VIDZEO_MAX_GRAPHIC_SCENES` | 5 | Graphic-fallback scenes allowed per video before the audit warns (render still continues; 0 real-media scenes overall is still the only hard fail) |
 | `VIDZEO_AGENT_MIN_WALL_SECONDS` | 3600 | Floor on agent-bridge inbox request TTLs (server side; raised Nov 15 from 600 — hook wakes alone can exceed 20 min) |
 | `MUSE_RENDER_CONCURRENCY` | 2 (code) / 1 (live `.env`) | Workers sharding ONE video's frames (see §8.4); live pins 1, the tested safe count |
 | `MUSE_RENDER_TIMEOUT_MS` | 21600000 | Overall render budget per job (6 h, matches the CMS hard limit) |
@@ -141,7 +143,7 @@ claims, delivers, or restarts a job mid-render.
 | Failure | Cause (seen) | Fix |
 |---|---|---|
 | Script `RESEARCH_INSUFFICIENT` | Zero external claims; providers thin for a niche title | Fail loudly; re-queue a different title or add sources. Do not loop research |
-| Inbox request expires unanswered | Muse did not answer within the 3600-second agent-bridge request floor (`VIDZEO_AGENT_MIN_WALL_SECONDS`) — with the resident worker down, the polling watcher alone needs ~4.5 min to wake | Check the resident worker heartbeat first (`worker-alive.json` in the spool dir), then run `node muse-agent.js doctor` and check the hook is enabled and the operator side chat is alive |
+| Inbox request expires unanswered | Muse did not answer within the 3600-second agent-bridge request floor (`VIDZEO_AGENT_MIN_WALL_SECONDS`) — with the resident worker pool down, the polling watcher alone needs ~4.5 min to wake | Check the pool heartbeats first (`worker-alive-<workerId>.json` in the spool dir, or `pool-status.json`), then run `node muse-agent.js doctor` and check the hook is enabled and the operator side chat is alive |
 | CMS 502/530 | CMS tunnel flapping | Daemon survives in-process with backoff — wait; do not restart it. Monitor reports outage duration |
 | VM reboot | VM restarts kill daemon + server | Health monitor restarts both; server auto-requeues interrupted jobs (`VIDZEO_AUTO_REQUEUE_INTERRUPTED=1`) |
 | Low memory / render held | Vidnets holds renders when available memory < ~384 MB estimate | Concurrency 1; wait for memory to free; never raise concurrency on this VM |

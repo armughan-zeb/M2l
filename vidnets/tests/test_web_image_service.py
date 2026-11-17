@@ -29,6 +29,11 @@ class WebImageModularTests(unittest.TestCase):
     def setUp(self):
         from services.web_image import flickr_api_source
         flickr_api_source._flickr_session = None
+        # Module-global latch: any earlier real Flickr call returning code
+        # 100/105 flips this and reroutes later searches to the HTML lane,
+        # which breaks this test's JSON-only mock (Mock .text). Reset it so
+        # the test is hermetic regardless of full-suite order.
+        flickr_api_source._flickr_api_key_invalid = False
 
     def test_derive_effective_web_title(self):
         title, terms = _derive_effective_web_title(
@@ -227,6 +232,42 @@ class WebImageModularTests(unittest.TestCase):
             0.5,
             "Grand Theft Auto VI",
         ))
+
+    def test_broadened_queries_drop_specific_terms_before_bare_subject(self):
+        from services.web_image.query import _broaden_scene_queries
+
+        broadened = _broaden_scene_queries(
+            ["Single wheel climbing rail diagram photograph"],
+            "train wheel",
+        )
+        # Progressive specificity loss, never the original query again, and
+        # the generic subject queries come last.
+        self.assertEqual(
+            broadened,
+            [
+                "Single wheel climbing rail diagram",
+                "Single wheel climbing rail",
+                "Single wheel climbing",
+                "Single wheel",
+                "train wheel photo",
+                "train wheel photograph",
+            ][:6],
+        )
+        self.assertNotIn(
+            "Single wheel climbing rail diagram photograph", broadened
+        )
+
+    def test_broadened_queries_never_repeat_tried_queries(self):
+        from services.web_image.query import _broaden_scene_queries
+
+        broadened = _broaden_scene_queries(
+            ["train wheel flange close up photograph", "train wheel flange"],
+            "train wheel",
+            tried=["train wheel flange close up"],
+        )
+        self.assertNotIn("train wheel flange close up", broadened)
+        self.assertNotIn("train wheel flange", broadened)
+        self.assertIn("train wheel photo", broadened)
 
     def test_topic_fallback_queries_keep_generic_terms_anchored(self):
         from services.web_image.query import _topic_fallback_queries

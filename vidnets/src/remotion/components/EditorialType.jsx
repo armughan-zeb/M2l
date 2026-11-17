@@ -167,7 +167,7 @@ export function EditorialType({ scene = {}, visualDNA = {}, text, spans = [], st
       textShadow: textShadowStyle,
       WebkitTextStroke: hasCardPanel ? undefined : `${Math.max(.6, 1.2 * scale)}px rgba(0,0,0,.8)`,
       paintOrder: 'stroke fill',
-      filter: 'drop-shadow(0 18px 28px rgba(0,0,0,.35))',
+      textShadow: '0 18px 28px rgba(0,0,0,.35)',
     }}>
       {words.map((match, index) => {
         const delay = index * Math.max(2, Math.round((stacked ? .075 : .045) * fps));

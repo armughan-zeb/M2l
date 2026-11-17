@@ -6,7 +6,7 @@ export function recoveryVisualKind(scene = {}, niche = '') {
   if (/braking|brakes?|hydraulic pressure/.test(blob)) return 'braking';
   if (/\b(?:nfl|football|quarterback|touchdown|super bowl|soccer|basketball|baseball|sports?)\b/.test(blob)) return 'sports';
   if (/\b(?:crime|murder|investigat|evidence|witness|court|case file|forensic|mystery|heist)\b/.test(blob)) return 'evidence';
-  if (/\b(?:automobile|car|vehicle|engine|motor|battery|electric|energy|charging)\b/.test(blob)) return /battery|electric|energy|charging/.test(blob) ? 'energy' : 'vehicle';
+  if (/\b(?:automobile|car|vehicle|engine|motor|battery|electric|energy|charging|locomotive|train|railway|freight|diesel)\b/.test(blob)) return /battery|electric|energy|charging/.test(blob) ? 'energy' : 'vehicle';
   if (/\b(?:software|computer|technology|processor|robot|semiconductor)\b/.test(blob)) return 'technology';
   if (/\b(?:travel|route|geography|map|border|country|city|journey|canal|river)\b/.test(blob)) return 'geography';
   if (/\b(?:ship|vessel|ocean|maritime|aviation|aircraft|airplane|flight|spacecraft)\b/.test(blob)) return 'transport';

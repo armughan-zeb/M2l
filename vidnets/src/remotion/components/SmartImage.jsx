@@ -448,7 +448,7 @@ function SmartImageFrame({ scene = {}, visualDNA = {}, props = {}, asset = {} })
             style={{
               zIndex: 4,
               transform: `scale(${fgScale}) translate(${fgTranslateX}px, ${fgTranslateY}px)`,
-              filter: 'drop-shadow(0 24px 45px rgba(0,0,0,0.75))',
+              boxShadow: '0 24px 45px rgba(0,0,0,0.75)',
             }}
           >
             <GuardedImg src={cutoutSrc} style={imageStyle({ objectFit: 'contain' })} />
