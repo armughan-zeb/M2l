@@ -24,9 +24,9 @@ services:
       MUSE_AUTO_LOOP: "1"
       MUSE_RENDER_COMMAND: "node /app/render-vidnets-linux.js"
       # Resident inference (default): the daemon's resident inbox calls this
-      # spool command and the resident inference worker agent answers in
-      # seconds (scripts/resident-inference-worker/WORKER_BRIEF.md). The
-      # host hook is the fallback when the worker is down. Never a stub.
+      # spool command and the resident inference worker pool answers in
+      # parallel (scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md).
+      # The host hook is the fallback when the pool is down. Never a stub.
       MUSE_INFERENCE_COMMAND: "node /app/scripts/muse-inference-spool.cjs"
       MUSE_VIDNETS_ROOT: "/app/vidnets"
       MUSE_VIDNETS_COMMAND: "bash /app/vidnets/VIDNETS_AGENT.sh --runtime-root /data/runtime"

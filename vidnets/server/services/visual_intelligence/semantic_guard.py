@@ -6,6 +6,42 @@ from urllib.parse import unquote
 VISUAL_REVIEW_POLICY_VERSION = 24
 
 
+_GAMING_CATEGORIES = {"gaming", "video_game", "game"}
+_GAMING_TERMS_RE = re.compile(
+    r"\b(?:gaming|gameplay|video games?|gta|grand theft auto|playstation|xbox|nintendo)\b",
+    re.I,
+)
+
+
+def is_gaming_scene(scene: Mapping | None) -> bool:
+    """True when the scene's own topic is a video game.
+
+    Reads the scene's ``domain_category`` / gaming flag first (authoritative
+    when the planner set it); falls back to the visual requirement's
+    domain/subject_type and to gaming terms in the scene text/title. A
+    gaming scene's footage is game-engine footage by definition, so the
+    "game-engine" / "video-game simulation" markers are advisory there,
+    never a veto.
+    """
+    if not isinstance(scene, Mapping):
+        return False
+    for key in ("domain_category", "subject_type"):
+        if str(scene.get(key) or "").strip().lower() in _GAMING_CATEGORIES:
+            return True
+    requirement = scene.get("visual_requirement")
+    if isinstance(requirement, Mapping):
+        for key in ("domain_category", "domain", "subject_type"):
+            if str(requirement.get(key) or "").strip().lower() in _GAMING_CATEGORIES:
+                return True
+    if scene.get("is_gaming") or scene.get("gaming_mode"):
+        return True
+    text = " ".join(
+        str(scene.get(key) or "")
+        for key in ("text", "visual_intent", "content_title", "title")
+    )
+    return bool(_GAMING_TERMS_RE.search(text))
+
+
 def exact_scene_identity_required(scene: Mapping | None) -> bool:
     """A grounded named subject keeps its identity even in the moving-clip lane."""
     if not isinstance(scene, Mapping):
@@ -21,12 +57,29 @@ def exact_scene_identity_required(scene: Mapping | None) -> bool:
     }
 
 
-def explicit_low_visual_match(verdict: Mapping | None) -> bool:
-    """Do not promote a completed pixel review that found almost no subject match."""
+def explicit_low_visual_match(verdict: Mapping | None, *, scene: Mapping | None = None) -> bool:
+    """Do not promote a completed pixel review that found almost no subject match.
+
+    For a gaming scene, a low score whose reason is only that the pixels are
+    game-engine / video-game-simulation footage is not a genuine mismatch:
+    the footage is a game because the topic is a game. It still rejects
+    when the reason carries a wrong-entity/event/domain signal.
+    """
     if not isinstance(verdict, Mapping) or not (verdict.get('visual_available') or verdict.get('visual_checked')):
         return False
     if verdict.get('identity_score') is None or verdict.get('final_score') is None:
         return False
+    if is_gaming_scene(scene):
+        reason = " ".join(str(verdict.get(key) or "") for key in (
+            "reason", "rejection_reason", "status",
+        )).lower()
+        if any(marker in reason for marker in ("game-engine", "video-game simulation")) and not any(
+            token in reason for token in (
+                "wrong entity", "wrong event", "wrong domain", "different entity",
+                "different event", "wrong game", "different game", "wrong subject",
+            )
+        ):
+            return False
     try:
         return float(verdict['identity_score']) < 35 and float(verdict['final_score']) < 35
     except (TypeError, ValueError):
@@ -98,9 +151,15 @@ def calculate_youtube_weighted_score(
     return round(score, 2)
 
 
-def explicit_scene_conflict(verdict: Mapping | None, *, relaxed: bool = False) -> bool:
+def explicit_scene_conflict(verdict: Mapping | None, *, relaxed: bool = False, scene: Mapping | None = None) -> bool:
     if not isinstance(verdict, Mapping):
         return False
+    # For a gaming scene, "game-engine" / "video-game simulation" describe
+    # the required footage, not a contradiction: they are advisory, never
+    # fatal, in either mode. Every other veto (wrong game/event, unsafe,
+    # domain mismatch) still applies in full.
+    gaming = is_gaming_scene(scene)
+    game_markers = ("game-engine", "video-game simulation")
     def yes(value):
         return value is True or str(value).strip().lower() in {"true", "1", "yes"}
 
@@ -129,8 +188,18 @@ def explicit_scene_conflict(verdict: Mapping | None, *, relaxed: bool = False) -
             "required entity is absent", "required subject is absent",
         )
         if yes(verdict.get("fatal_mismatch")):
+            # Gaming scene, reason only "game-engine" / "video-game
+            # simulation": the flag describes required footage, not a
+            # mismatch. Any wrong-entity/event/domain wording keeps it fatal.
+            game_only = gaming and any(marker in reason for marker in game_markers) and not any(
+                token in reason for token in (
+                    "wrong entity", "wrong event", "wrong domain", "wrong game",
+                    "different entity", "different event", "different game",
+                    "wrong subject",
+                )
+            )
             # If fatal_mismatch was triggered solely by a spurious token, do not veto
-            if not any(token in reason for token in spurious_tokens):
+            if not game_only and not any(token in reason for token in spurious_tokens):
                 return True
         if yes(verdict.get("entity_conflict")):
             # An entity conflict in relaxed mode without domain match failure is advisory
@@ -140,6 +209,10 @@ def explicit_scene_conflict(verdict: Mapping | None, *, relaxed: bool = False) -
 
         # Check fatal relaxed markers (strict domain/simulation contradictions and era conflicts)
         fatal_relaxed_markers = (
+            "simulation_for_real_world",
+            "wrong domain", "different_sport", "literal_hardware_for_sports_metaphor",
+            "wrong era", "different era", "anachronistic", "anachronism", "era mismatch",
+        ) if gaming else (
             "game-engine", "video-game simulation", "simulation_for_real_world",
             "wrong domain", "different_sport", "literal_hardware_for_sports_metaphor",
             "wrong era", "different era", "anachronistic", "anachronism", "era mismatch",
@@ -157,11 +230,24 @@ def explicit_scene_conflict(verdict: Mapping | None, *, relaxed: bool = False) -
                     return True
         return False
 
-    # Strict mode checks
-    if any(yes(verdict.get(key)) for key in (
-        "fatal_mismatch", "entity_conflict", "event_mismatch", "location_mismatch",
-        "era_mismatch", "year_mismatch",
-    )):
+    # Strict mode checks. For a gaming scene a fatal_mismatch / entity_conflict
+    # flag whose reason is only "game-engine" / "video-game simulation" is
+    # advisory: the model is describing required game footage, not a wrong
+    # game. Any wrong-entity/event/domain wording keeps the flag fatal.
+    if gaming and any(marker in reason for marker in game_markers) and not any(
+        token in reason for token in (
+            "wrong entity", "wrong event", "wrong domain", "wrong game",
+            "different entity", "different event", "different game",
+            "wrong subject",
+        )
+    ):
+        flag_keys = ("event_mismatch", "location_mismatch", "era_mismatch", "year_mismatch")
+    else:
+        flag_keys = (
+            "fatal_mismatch", "entity_conflict", "event_mismatch", "location_mismatch",
+            "era_mismatch", "year_mismatch",
+        )
+    if any(yes(verdict.get(key)) for key in flag_keys):
         return True
     if any(key in verdict and (
         verdict[key] is False or str(verdict[key]).strip().lower() == "false"
@@ -169,6 +255,13 @@ def explicit_scene_conflict(verdict: Mapping | None, *, relaxed: bool = False) -
         return True
 
     markers = (
+        "different event", "distinct events", "wrong event", "competing event",
+        "contradictory event", "wrong location", "different location",
+        "wrong venue", "different matchup", "wrong matchup",
+        "wrong subject", "wrong entity", "wrong domain",
+        "wrong era", "different era", "wrong year", "different year",
+        "anachronistic", "anachronism", "historical mismatch",
+    ) if gaming else (
         "different event", "distinct events", "wrong event", "competing event",
         "contradictory event", "wrong location", "different location",
         "wrong venue", "different matchup", "wrong matchup", "game-engine",

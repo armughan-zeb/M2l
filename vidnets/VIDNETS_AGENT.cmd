@@ -1,5 +1,7 @@
 @echo off
 setlocal
+set "VIDZEO_AUTH_MODE=local"
+set "VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH=1"
 set "VIDNETS_AGENT_ROOT=%~dp0"
 if exist "%VIDNETS_AGENT_ROOT%resources\server\headless_agent.py" set "VIDNETS_AGENT_ROOT=%VIDNETS_AGENT_ROOT%resources\"
 

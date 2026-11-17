@@ -174,7 +174,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         source = self._cookie_jar()
         with yt_dlp, mock.patch.dict(
             os.environ,
-            {"VIDZEO_YT_SEARCH_CACHE_TTL_SECONDS": "0"},
+            {"VIDZEO_YT_SEARCH_CACHE_TTL_SECONDS": "0", "VIDZEO_YT_FRAGMENT_CONCURRENCY": "4"},
             clear=False,
         ):
             converted = ytv2._adapt_youtube_cookie_jar(source)
@@ -193,6 +193,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                     0.0,
                     4.0,
                     session_jar=converted,
+                    stream_downloads=True,
                 )
 
         self.assertEqual(len(search_results), 1)
@@ -200,6 +201,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         self.assertEqual(len(instances), 2)
         self.assertTrue(all(hasattr(instance.cookiejar, "get_cookie_header") for instance in instances))
         self.assertTrue(all(instance.cookiejar is converted for instance in instances))
+        self.assertEqual(instances[1].options["concurrent_fragment_downloads"], 4)
         selected_format = instances[1].options["format"]
         self.assertIn("bestvideo", selected_format)
         self.assertIn("height<=1080", selected_format)
@@ -312,7 +314,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                 Path(command[-1]).write_bytes(b"clip" * 2048),
                 None,
             )[1],
-        ), mock.patch.object(ytv2, "_source_video_height", return_value=720), mock.patch.dict(os.environ, {"VIDZEO_YT_SOURCE_MAX_MB": "80", "VIDZEO_YT_SOURCE_MAX_HEIGHT": "720"}, clear=False):
+        ), mock.patch.object(ytv2, "_source_video_height", return_value=720), mock.patch.dict(os.environ, {"VIDZEO_YT_SOURCE_MAX_MB": "80", "VIDZEO_YT_SOURCE_MAX_HEIGHT": "720", "VIDZEO_YT_FRAGMENT_CONCURRENCY": "12"}, clear=False):
             with tempfile.TemporaryDirectory() as temp_dir:
                 output = Path(temp_dir) / "source.mp4"
                 output.write_bytes(b"placeholder")
@@ -320,10 +322,12 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                     {"id": "video-1", "webpage_url": "https://youtube.com/watch?v=video-1"},
                     output,
                     session_jar=None,
+                    stream_downloads=True,
                 ))
         self.assertEqual(len(instances), 1)
         self.assertIsInstance(instances[0].options["max_filesize"], int)
         self.assertEqual(instances[0].options["max_filesize"], 80 * 1024 * 1024)
+        self.assertEqual(instances[0].options["concurrent_fragment_downloads"], 8)
 
     def test_source_download_rejects_audio_only_artifact(self):
         instances, yt_dlp = self._mock_yt_dlp()
@@ -1022,14 +1026,15 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertFalse(vision_available)
 
-    def test_visual_gate_frames_clamped_to_three_or_five(self):
+    def test_visual_gate_frames_clamped_to_one_or_two(self):
+        # Media-selection spec: 1-2 frames per clip at the matched timestamp.
         with mock.patch.dict(os.environ, {"VIDZEO_YT_VISUAL_GATE_FRAMES": "8"}, clear=False):
-            self.assertEqual(ytv2._visual_gate_frames(), 5)
+            self.assertEqual(ytv2._visual_gate_frames(), 2)
         with mock.patch.dict(os.environ, {"VIDZEO_YT_VISUAL_GATE_FRAMES": "1"}, clear=False):
-            self.assertEqual(ytv2._visual_gate_frames(), 3)
+            self.assertEqual(ytv2._visual_gate_frames(), 1)
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VIDZEO_YT_VISUAL_GATE_FRAMES", None)
-            self.assertEqual(ytv2._visual_gate_frames(), 5)
+            self.assertEqual(ytv2._visual_gate_frames(), 2)
 
     def test_whisper_timing_windows_override_provisional_scene_durations(self):
         self.assertAlmostEqual(
@@ -1744,6 +1749,162 @@ class YouTubePipelineV2Tests(unittest.TestCase):
     def test_classify_visual_result_outcomes(self):
         self.assertEqual(ytv2._classify_visual_result(False, 0.0, False, "unavailable"), "unavailable")
         self.assertEqual(ytv2._classify_visual_result(True, 95.0, True, "high_quality"), "pass")
+
+    def test_search_container_pools_honours_explicit_timeout(self):
+        """The rounds floor must not inflate past an explicit search timeout.
+
+        With 8 queries on 8 workers the floor is worst_per_search (24s) x
+        1 round + 15s = 39s. An explicit 2s timeout used to be inflated to
+        that floor, so a mocked slow yt-dlp held the batch ~5s; now the
+        explicit wall binds and the pass returns in ~2s.
+        """
+        import time
+
+        def slow_search(query, results_per_query, session_jar=None, cancellation=None):
+            time.sleep(5)
+            return []
+
+        row = {
+            "scene_index": 0,
+            "scene_text": "Grand Theft Auto VI neon streets at night.",
+            "candidate_subject": "Grand Theft Auto VI",
+            "queries": [f"Grand Theft Auto VI gameplay footage {i}" for i in range(8)],
+        }
+        started = time.monotonic()
+        with mock.patch.object(ytv2, "_search_youtube", side_effect=slow_search), \
+             mock.patch.dict(os.environ, {
+                 "VIDZEO_YT_SEARCH_PACE_SECONDS": "0",
+             }, clear=False):
+            # VIDZEO_YT_V2_SEARCH_TIMEOUT set in the ambient env would also
+            # count as explicit; clear it so only the passed timeout binds.
+            os.environ.pop("VIDZEO_YT_V2_SEARCH_TIMEOUT", None)
+            os.environ.pop("VIDZEO_YT_SCENE_SEARCH_BUDGET_SECONDS", None)
+            pools = ytv2._search_container_pools(
+                {"grand theft auto vi": [row]},
+                search_timeout_seconds=2,
+                session_jar=None,
+            )
+        elapsed = time.monotonic() - started
+        self.assertEqual(pools, {})
+        self.assertLess(elapsed, 4.0, f"explicit 2s timeout inflated past the rounds floor ({elapsed:.1f}s)")
+
+    def test_assign_candidates_returns_ranked_options_per_scene(self):
+        """GTA-style pool: >=3 ranked, timestamped options per scene.
+
+        The old top-1-only assignment (break after the first timestamp)
+        starved scenes to 1 candidate each. The primary stays
+        assignments[idx]; the ranked list rides on it as ranked_options.
+        """
+        rows = [
+            {
+                "scene_index": 0,
+                "candidate_subject": "Grand Theft Auto VI",
+                "scene_subject": "Grand Theft Auto VI",
+                "scene_text": "Grand Theft Auto VI neon streets at night.",
+                "domain_category": "gaming",
+            },
+            {
+                "scene_index": 1,
+                "candidate_subject": "Grand Theft Auto VI",
+                "scene_subject": "Grand Theft Auto VI",
+                "scene_text": "Grand Theft Auto VI Leonida world showcase.",
+                "domain_category": "gaming",
+            },
+        ]
+        pool = [
+            {
+                "id": f"trailer-{i}",
+                "title": "Grand Theft Auto VI Trailer 2 official gameplay footage",
+                "description": "Grand Theft Auto VI official trailer gameplay",
+                "channel": "Rockstar Games",
+                "duration": 180.0,
+                "webpage_url": f"https://www.youtube.com/watch?v=trailer-{i}",
+                "query_text": "Grand Theft Auto VI trailer gameplay footage",
+            }
+            for i in range(4)
+        ]
+        assignments = ytv2._assign_candidates(
+            rows,
+            {"grand theft auto vi": pool},
+            [8.0, 8.0],
+            lenient_acceptance=True,
+        )
+        for idx in (0, 1):
+            assigned = assignments[idx]
+            self.assertIsNotNone(assigned, f"scene {idx} got no assignment")
+            options = assigned.get("ranked_options") or []
+            self.assertGreaterEqual(len(options), 3, f"scene {idx} has {len(options)} ranked options")
+            self.assertEqual(len({ytv2._video_id(o) for o in options}), len(options))
+            for option in options:
+                self.assertIsNotNone(option.get("best_timestamp"))
+
+    def test_transcript_fetch_many_second_call_hits_cache(self):
+        """Second fetch_many for the same ids makes zero provider calls."""
+        from services.youtube_transcript_index import YouTubeTranscriptIndex
+
+        calls = []
+
+        def provider(video_id):
+            calls.append(video_id)
+            return {
+                "segments": [{"start": 0.0, "end": 4.0, "text": "hello world"}],
+                "language": "en",
+                "source": "test",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index = YouTubeTranscriptIndex(
+                path=os.path.join(tmp, "transcripts.db"), provider=provider
+            )
+            first = index.fetch_many(["vid-abc"], deadline_seconds=30)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first["vid-abc"].status, "ready")
+            calls.clear()
+            second = index.fetch_many(["vid-abc"], deadline_seconds=30)
+            self.assertEqual(calls, [])
+            self.assertEqual(second["vid-abc"].status, "ready")
+            self.assertEqual(second["vid-abc"].segments[0].text, "hello world")
+
+    def test_youtube_frame_fallback_yields_multiple_frames_per_clip(self):
+        """Frame fallback yields several frames per clip, not one.
+
+        With VIDZEO_YT_FRAME_FALLBACK_SOURCES=3 / FRAMES=4 (the recommended
+        .env values) a single downloaded YouTube clip yields up to 4
+        timestamp frames for vision. The frame builder itself lives in the
+        coordinator; this pins the env-driven behaviour the YT lane relies
+        on for its YT->web/frame recovery.
+        """
+        from services.media_resolution_coordinator import (
+            _youtube_frame_fallback_candidates,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            clip.write_bytes(b"fake-clip")
+            frames = []
+            for i in range(4):
+                frame = Path(tmp) / f"frame-{i}.jpg"
+                frame.write_bytes(b"fake-frame")
+                frames.append(str(frame))
+            candidate = {
+                "source": "youtube",
+                "path": str(clip),
+                "candidate_id": "vid1",
+                "final_score": 90.0,
+            }
+            with mock.patch.dict(os.environ, {
+                "VIDZEO_YT_FRAME_FALLBACK_SOURCES": "3",
+                "VIDZEO_YT_FRAME_FALLBACK_FRAMES": "4",
+            }, clear=False), mock.patch(
+                "services.visual_intelligence.frame_extractor.extract_clip_frames",
+                return_value=(frames, 60.0),
+            ):
+                out = _youtube_frame_fallback_candidates({}, [candidate], 0)
+        self.assertGreaterEqual(len(out), 3)
+        self.assertGreaterEqual(len({row["path"] for row in out}), 3)
+        self.assertTrue(all(
+            row.get("fallback_layer") == "same_video_timestamp_frame" for row in out
+        ))
 
 
 if __name__ == "__main__":

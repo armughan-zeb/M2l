@@ -3586,6 +3586,7 @@ _DIRECTOR_RESPONSE_SCHEMA = {
     "properties": {
         "scenes": {
             "type": "array",
+            "minItems": 1,
             "maxItems": 8,
             "items": {
                 "type": "object",

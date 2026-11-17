@@ -93,7 +93,12 @@ def _fallback_retrieval_context(subject: str, scene_text: str, topic: str, categ
     domain_anchor = topic or subject or "general topic"
     domain_category = (category or "").strip().lower()
     if not domain_category:
-        if any(has_term(term) for term in ("video game", "gaming", "gameplay", "game trailer", "console game")):
+        # A named game title is gaming evidence on its own: "The game
+        # returns to Vice City" in a Grand Theft Auto VI film is a gaming
+        # scene even though no "video game" phrase appears.
+        if game_keys_named_in_text(f"{subject} {scene_text} {topic}"):
+            domain_category = "gaming"
+        elif any(has_term(term) for term in ("video game", "gaming", "gameplay", "game trailer", "console game")):
             domain_category = "gaming"
         elif any(has_term(term) for term in ("iphone", "android", "software", "app", "laptop", "ai", "gadget", "smartphone")):
             domain_category = "technology"
@@ -110,6 +115,13 @@ def _fallback_retrieval_context(subject: str, scene_text: str, topic: str, categ
         else:
             domain_category = "other"
     positive = _term_list([subject, domain_anchor, domain_category])
+    # Scene-relative game: when this scene's narration names a game, its
+    # canonical title is a positive retrieval term, so mechanical rows
+    # seek the scene's game (a GTA V-history scene retrieves GTA V),
+    # not only the video title's game.
+    scene_game = scene_subject_game_for_scene(scene_text, topic)
+    if scene_game["key"]:
+        positive = _term_list([subject, scene_game["title"], domain_anchor, domain_category])
     negative: List[str] = []
     if domain_category == "technology" and "apple" in text:
         positive.extend(_term_list(["iphone", "smartphone", "ios", "apple event"]))
@@ -173,19 +185,46 @@ _SCENE_SEARCH_TIERS_SCHEMA = {
     "required": ["primary"],
 }
 
+# visual_subject_type values named in SCENE_QUERY_SYSTEM_PROMPT. The schema
+# carries the same list as an enum so an invented type is caught by
+# validation (and fixed by the worker) instead of flowing into
+# visual_requirement, which switches on this value.
+VISUAL_SUBJECT_TYPES = [
+    "person", "organization", "product", "place", "event", "animal",
+    "automobile", "ship", "rail_crew", "video_game", "component",
+    "activity", "process", "named_entity", "concept",
+]
+
 SCENE_PLAN_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "scene_number": {"type": "integer"},
-        "container_subject": {"type": "string"},
-        "scene_subject": {"type": "string"},
-        "visual_intent": {"type": "string"},
+        "scene_number": {"type": "integer", "minimum": 1},
+        "container_subject": {"type": "string", "minLength": 1},
+        "scene_subject": {"type": "string", "minLength": 1},
+        "visual_intent": {"type": "string", "minLength": 1},
         "visual_subject": {"type": "string"},
-        "visual_subject_type": {"type": "string"},
+        "visual_subject_type": {"type": "string", "enum": VISUAL_SUBJECT_TYPES},
         "subject_evidence": {"type": "string"},
         "visible_target": {"type": "string"},
         "identity_scope": {"type": "string", "enum": ["subject", "event", "context"]},
+        # Retrieval contract (the prompt already demands these; the schema
+        # used to forbid them via additionalProperties: false, so the LLM
+        # dropped them and every row shipped with empty domain/intents).
+        # They are required so an empty-field row fails validation and is
+        # re-planned mechanically instead of poisoning retrieval.
+        "domain_category": {"type": "string"},
+        "scene_subject_type": {"type": "string", "enum": ["person", "object", "place", "event", "product", "topic", "animal", "food"]},
+        # NOTE: scene_subject_game is deliberately NOT a schema property.
+        # It is derived server-side from the scene's own narration
+        # (scene_subject_game_for_scene) and stamped onto the row after
+        # validation. Adding it here would make it required: the strict
+        # normaliser promotes every property to required, so every plan
+        # without it would fail validation — the same class of bug the
+        # retrieval-contract comment above describes.
+        "retrieval_positive_terms": {"type": "array", "items": {"type": "string"}},
+        "retrieval_negative_terms": {"type": "array", "items": {"type": "string"}},
+        "youtube_query_intents": {"type": "array", "items": {"type": "string"}},
         "youtube": _SCENE_SEARCH_TIERS_SCHEMA,
         "web": _SCENE_SEARCH_TIERS_SCHEMA,
         "stock": {
@@ -202,6 +241,8 @@ SCENE_PLAN_SCHEMA = {
     "required": [
         "scene_number", "container_subject", "scene_subject", "visual_intent",
         "visual_subject", "visual_subject_type", "subject_evidence", "visible_target", "identity_scope",
+        "domain_category", "scene_subject_type",
+        "retrieval_positive_terms", "retrieval_negative_terms", "youtube_query_intents",
         "youtube", "web", "stock",
     ],
 }
@@ -239,6 +280,12 @@ Every scene needs three distinct search tiers for each source:
 
 Plan diversity across the complete script, including neighboring chunks. Primary queries identify the exact beat's action/place/era, supporting queries seek another grounded angle or detail, and fallback queries broaden recall while retaining the subject. Do not repeat the same topic-only query or portrait for successive beats. Prefer a distinct event photograph, document, location, actor or physical detail when the narration supports it. Match photo queries to photographs and footage queries to visible motion. Several distant moments from the same authentic long source can work; the same short cut repeated cannot. Never label illustrative stock or a related person's image as evidence of a named subject.
 
+Scene-relative game rule: each scene's queries must name the game THAT scene narrates, not the video title's game. If a scene narrates an earlier game — its sales, the wait for the sequel, its legacy — query FOR that earlier game (e.g. a scene about Grand Theft Auto Five's two hundred million copies queries "Grand Theft Auto V", "GTA V Los Santos gameplay", never only "GTA VI"). A scene about the new game's trailers, world, or characters queries for the new game. Never put a game in a query that the scene does not narrate. Never query for the 2002 Vice City game ("Grand Theft Auto: Vice City", "GTA Vice City", "GTA III") under any circumstances; "Vice City" beside the new game's title is the new city and is fine.
+
+Subject-type rule: scene_subject_type must match the subject itself, not the container default. A company or studio (Rockstar Games) is topic, never person. A place (Vice City, Leonida, Leonida Keys) is place, never person. A game title (Grand Theft Auto VI) is topic, never person. A named person is person. A wrong type fails validation and the whole chunk is re-planned.
+
+Distinctness rule: no two scenes share a primary query. Every scene's primary YouTube and web queries must contain a word from that scene's own narration that no other scene shares — its distinctive entity, action, viewpoint, or moment (aerial, prison gates, delay announcement, 200 million copies). If two scenes genuinely narrate the same moment word for word, and only then, they may share a query.
+
 Keep each query concise, specific, and grounded in the supplied narration. Preserve names, dates, and places from the script. Never invent facts, routes, quotes, or visual evidence. Do not borrow another section's subject. All required strings must be nonempty. Return only the supplied JSON schema."""
 
 CONTAINER_MAP_SCHEMA = {
@@ -270,12 +317,22 @@ CONTAINER_MAP_SCHEMA = {
                     "youtube_supporting": {"type": "string"},
                     "youtube_fallback": {"type": "string"},
                 },
+                # Retrieval fields are required, not optional: the prompt
+                # already demands them, and the merge used to fill an
+                # omitted youtube_query_intents with nothing (no fallback),
+                # so rows shipped with empty intents. Required lets the
+                # worker fix a missing field instead of omitting it.
                 "required": [
                     "scene_number",
                     "container_id",
                     "container_subject",
                     "scene_subject",
                     "container_boundary",
+                    "domain_category",
+                    "scene_subject_type",
+                    "retrieval_positive_terms",
+                    "retrieval_negative_terms",
+                    "youtube_query_intents",
                 ],
             },
         },
@@ -286,19 +343,24 @@ CONTAINER_MAP_SCHEMA = {
 YT_WINNER_SCHEMA = {
     "type": "object",
     "properties": {
-        "winner_index": {"type": "integer"},
-        "confidence": {"type": "number"},
+        "winner_index": {"type": "integer", "minimum": 0},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "reasoning": {"type": "string"},
         "scores": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "index": {"type": "integer"},
-                    "relevance": {"type": "number"},
-                    "footage_signal": {"type": "number"},
-                    "visual_match": {"type": "number"},
-                    "total": {"type": "number"},
+                    "index": {"type": "integer", "minimum": 0},
+                    # Per-candidate scores are 0-10 each (see
+                    # YT_WINNER_SYSTEM_PROMPT); total is their sum, 0-30.
+                    # Bounds are enforced here so the worker fixes an
+                    # out-of-range value instead of the consumer silently
+                    # clamping it to candidate 0.
+                    "relevance": {"type": "number", "minimum": 0, "maximum": 10},
+                    "footage_signal": {"type": "number", "minimum": 0, "maximum": 10},
+                    "visual_match": {"type": "number", "minimum": 0, "maximum": 10},
+                    "total": {"type": "number", "minimum": 0, "maximum": 30},
                 },
                 "required": ["index", "relevance", "footage_signal", "visual_match", "total"],
             },
@@ -419,6 +481,8 @@ CRITICAL YOUTUBE RAW FOOTAGE & CLEAN B-ROLL MANDATE:
 - For gaming scripts, every query must include the exact game title followed by raw gameplay or official trailer terms.
 
 - scene_subject_type should be one of: person, object, place, event, product, topic, animal, food.
+  It must match the subject itself: a company/studio is topic, never person; a place is place, never person; a game title is topic, never person. A format phrase ("video game official trailer gameplay") is never a subject.
+- Scene-relative game rule: a scene's subject is the game THAT scene narrates. A scene about an earlier game's sales or legacy takes that earlier game as its subject, not the video title's game. Never seek the 2002 Vice City game ("Grand Theft Auto: Vice City", "GTA Vice City", "GTA III").
 - Also output retrieval context for each row:
   - domain_anchor: the video/container world, e.g. "consumer technology", "fruit nutrition", "true crime documentary", "Paris travel".
   - domain_category: sports, gaming, technology, food, travel, disaster, crime, documentary, finance, history, entertainment, health, education, science, politics, lifestyle, automotive, other.
@@ -589,7 +653,10 @@ def _mechanical_container_map(topic: str, scene_texts: List[str]) -> Dict[str, A
             "container_subject": query_subject,
             "subcontainer_subject": "",
             "scene_subject": query_subject,
-            "scene_subject_type": "topic" if is_intro or is_outro else "entity",
+            # Never "entity": it is outside the schema enum and the
+            # validator treats it as a wrong type. Infer from the subject
+            # (studio -> topic, place -> place) or fall back to "topic".
+            "scene_subject_type": _infer_scene_subject_type(query_subject, "", scene_text),
             "container_type": "topic" if is_intro or is_outro else "entity",
             "domain_anchor": context.get("domain_anchor") or topic or query_subject,
             "domain_category": context.get("domain_category") or "other",
@@ -684,6 +751,10 @@ def _is_directed_scene_row(row: Any) -> bool:
     direction fields, a usable query for every source, and no
     _query_fallback marker. Mechanical rows are never served as directed —
     that is how word-salad queries were once cached and reused forever.
+    Also enforces the retrieval contract (see _directed_scene_row_error):
+    a row with empty domain_category/intents, a format-phrase subject, a
+    wrong subject type, or queries that carry no entity/viewpoint words is
+    not directed — it is re-planned mechanically on resume.
     """
     if not isinstance(row, dict) or row.get("_query_fallback"):
         return False
@@ -701,7 +772,677 @@ def _is_directed_scene_row(row: Any) -> bool:
             return False
         if not any(str(queries.get(field) or "").strip() for field in fields):
             return False
+    return _directed_scene_row_error(row) is None
+
+
+# Query-shape contract (GTA VI fix). The prompts already demand the right
+# thing, but the schema used to forbid these fields, so the LLM dropped
+# them and every row shipped with empty domain_category, empty
+# retrieval_positive_terms and empty youtube_query_intents — and a format
+# phrase ("video game official trailer gameplay") as the container
+# subject, typed "person" for Vice City, Leonida Keys and Rockstar Games.
+_QUERY_SHAPE_STOPWORDS = set(
+    "the a an of on in to and or with at by for from was were is are had have has its it their they "
+    "this that these those over under after before during between into about around across aboard along "
+    "among behind below beneath beside beyond despite until up upon within without".split()
+)
+_FORMAT_PHRASE_WORDS = {
+    "video", "videos", "game", "games", "gameplay", "trailer", "trailers",
+    "official", "footage", "documentary", "clip", "clips", "4k", "hd",
+    "preview", "teaser", "reveal", "episode", "series", "show", "movie",
+    "film", "streaming", "live", "stream", "cinematic", "montage",
+}
+# visual_subject_type -> scene_subject_types that may describe it. Only
+# the definite families are mapped; vague types (named_entity, concept,
+# activity, process, component) carry no verdict here.
+_VISUAL_TO_SCENE_TYPES = {
+    "person": {"person"},
+    "place": {"place"},
+    "video_game": {"topic"},
+    "organization": {"topic"},
+    "product": {"product", "object"},
+    "event": {"event"},
+    "animal": {"animal"},
+    "ship": {"topic", "object"},
+    "automobile": {"object", "product"},
+    "food": {"food"},
+    "rail_crew": {"person"},
+}
+_ORG_SUFFIX_RE = re.compile(r"\b(?:games|studios|entertainment|interactive|company|corporation|pictures)\s*$", re.I)
+_PLACE_WORD_RE = re.compile(
+    r"\b(?:city|streets?|island|keys|beach|state|county|country|neighborhood|district|town|village|province|coast|peninsula|canal)\b", re.I)
+_GAME_TITLE_RE = re.compile(r"\b(?:grand theft auto|gta)\s*(?:vi|6|v|5|iv|4|iii|3|six|five|four|three)?\b", re.I)
+
+# Scene-relative game identity (GTA VI fix, user correction Nov 16).
+# Relevance is scene-relative, not title-absolute: a scene whose narration
+# is ABOUT an earlier game (GTA V sales / the decade-long wait / its
+# legacy) must query FOR that game, not the video title's game. The game
+# is derived from the scene's OWN narration, never assumed from the title.
+_GAME_ROMAN_TO_NUMBER = {
+    "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "viii": "8",
+    "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8",
+}
+_GAME_NUMERAL_RE = re.compile(
+    r"\b(?:grand theft auto|gta)\s+(iii|iv|v|vi|vii|viii|3|4|5|6|7|8|three|four|five|six|seven|eight)\b", re.I)
+
+
+def _game_key_for_numeral(numeral: str) -> str:
+    number = _GAME_ROMAN_TO_NUMBER.get(str(numeral or "").strip().lower(), str(numeral or "").strip())
+    return f"gta_{number}" if number else ""
+
+
+def game_canonical_title(game_key: str) -> str:
+    """Canonical title for a scene-subject game key (``gta_v``)."""
+    key = str(game_key or "").strip().lower()
+    if not key.startswith("gta_"):
+        return ""
+    numeral = key[4:]
+    roman = {"3": "III", "4": "IV", "5": "V", "6": "VI", "7": "VII", "8": "VIII"}.get(numeral, numeral.upper())
+    return f"Grand Theft Auto {roman}"
+
+
+def game_aliases(game_key: str) -> List[str]:
+    """Searchable aliases for a scene-subject game key."""
+    title = game_canonical_title(game_key)
+    if not title:
+        return []
+    numeral = str(game_key or "").strip().lower()[4:]
+    roman = title.rsplit(" ", 1)[-1]
+    return [title, f"GTA {roman}", f"GTA {numeral}", f"Grand Theft Auto {numeral}"]
+
+
+def game_keys_named_in_text(text: Any) -> List[str]:
+    """Game keys explicitly named in this text, in order of first mention.
+
+    Token-boundary matching only: the garbled LLM token "GTA VI V" names
+    GTA VI, not GTA V (``auto v`` inside ``auto vi v`` is not a match).
+    A bare "Grand Theft Auto" with no numeral names no game — it cannot
+    tell which instalment the scene means.
+    """
+    found: List[str] = []
+    for match in _GAME_NUMERAL_RE.finditer(str(text or "")):
+        key = _game_key_for_numeral(match.group(1))
+        if key and key not in found:
+            found.append(key)
+    return found
+
+
+def title_game_key(title: Any) -> str:
+    """The game named in the video title, or "" when the title names none."""
+    named = game_keys_named_in_text(title)
+    return named[0] if named else ""
+
+
+def scene_subject_game_for_scene(scene_text: Any, title: Any = "") -> Dict[str, Any]:
+    """The game a scene's queries must seek, derived from ITS narration.
+
+    - The scene names a game other than the title's game -> that game is
+      the subject (a GTA V-history scene queries for GTA V, even in a
+      GTA VI video). First-named non-title game wins.
+    - The scene names only the title's game -> the title's game.
+    - The scene names no game -> the title's game, implicitly (``from_title``).
+    - Nothing names a game -> no subject game (``key`` is "").
+    """
+    named = game_keys_named_in_text(scene_text)
+    title_game = title_game_key(title)
+    if named:
+        non_title = [key for key in named if key != title_game]
+        key = non_title[0] if non_title else named[0]
+        return {"key": key, "title": game_canonical_title(key),
+                "aliases": game_aliases(key), "named_in_scene": True, "from_title": False}
+    if title_game:
+        return {"key": title_game, "title": game_canonical_title(title_game),
+                "aliases": game_aliases(title_game), "named_in_scene": False, "from_title": True}
+    return {"key": "", "title": "", "aliases": [], "named_in_scene": False, "from_title": False}
+
+
+# The 2002 Vice City game is never a retrieval target: no query may seek
+# it. "Grand Theft Auto: Vice City" / "GTA Vice City" is that game's title,
+# not the new Vice City — but "Vice City" next to "GTA VI" is the new city
+# and stays allowed. Year/III markers are forbidden in any combination.
+_FORBIDDEN_2002_RE = re.compile(
+    r"\b(?:gta\s+iii|grand theft auto\s+iii|grand theft auto\s+vice city|"
+    r"gta\s+vice city|vice city\s+2002|2002\s+vice city|vice city\s+(?:ps2|original)\b)", re.I)
+
+
+def query_seeks_forbidden_2002(query: Any) -> bool:
+    """True when a query seeks the 2002 Vice City game (GTA III-era)."""
+    return bool(_FORBIDDEN_2002_RE.search(str(query or "")))
+
+
+def _query_game_keys(query: Any) -> set:
+    """Game keys a query names, via the same token-boundary match."""
+    return set(game_keys_named_in_text(query))
+
+
+# visual_subject_type -> the scene_subject_type it may be described as.
+# (Single-value inference default for the same mapping.)
+_VISUAL_TO_SCENE_TYPE_DEFAULT = {
+    "person": "person",
+    "place": "place",
+    "video_game": "topic",
+    "organization": "topic",
+    "product": "product",
+    "event": "event",
+    "animal": "animal",
+    "ship": "object",
+    "automobile": "object",
+    "food": "food",
+    "rail_crew": "person",
+}
+
+
+def _infer_scene_subject_type(subject: Any, visual_subject_type: Any = "", scene_text: Any = "") -> str:
+    """Infer scene_subject_type from evidence, never defaulting to "person".
+
+    The container-map default used to stamp "person" on everything, which
+    is how Rockstar Games (organization), Vice City / Leonida (places) and
+    Grand Theft Auto VI (video game) all shipped typed as a person. Order:
+    the brain's visual type when present, then the subject text itself
+    (game title / company suffix / place word), then a name-like
+    multi-word capitalized name -> "person" (the same heuristic the
+    mechanical bundle uses: "Erling Haaland", "Lucia Caminos and Jason
+    Duval"), then the neutral "topic". "person" requires person evidence;
+    a bare capitalized name with no org/place/game signal is that
+    evidence — without it the adapter's wrong-global-person stripping,
+    which only runs for person subjects, stops firing.
+    """
+    visual = str(visual_subject_type or "").strip().lower()
+    if visual in _VISUAL_TO_SCENE_TYPE_DEFAULT:
+        return _VISUAL_TO_SCENE_TYPE_DEFAULT[visual]
+    text = str(subject or "").strip()
+    if _GAME_TITLE_RE.search(text) and game_keys_named_in_text(text):
+        return "topic"
+    if _ORG_SUFFIX_RE.search(text):
+        return "topic"
+    if _PLACE_WORD_RE.search(text):
+        return "place"
+    words = [w for w in re.split(r"\s+", text) if w]
+    capitals = [w for w in words if w[:1].isupper()]
+    connectors = {"and", "&", "of", "the", "de", "van", "von"}
+    if (len(capitals) >= 2
+            and all(w[:1].isupper() or w.lower().strip(",") in connectors for w in words)):
+        return "person"
+    return "topic"
+
+
+# Fallback YouTube intent suffixes per domain, mirroring the intent map in
+# CONTAINER_SYSTEM_PROMPT. The container merge used to leave
+# youtube_query_intents empty when the LLM omitted them; the fresh-path
+# validator then failed the whole chunk. An omitted field is filled from
+# the category instead of shipping empty.
+_YOUTUBE_INTENTS_BY_CATEGORY = {
+    "gaming": ["raw gameplay no commentary", "direct gameplay capture 4k",
+               "official gameplay trailer", "uncut gameplay 60fps", "cinematic trailer 4k"],
+    "person": ["public appearance footage", "ceremony arrival footage",
+               "archival event footage", "documentary archive footage", "daily life b-roll"],
+    "sports": ["match action clean broadcast", "skills goals 4k no commentary",
+               "training raw footage", "stadium broadcast 4k", "slow motion highlights 1080p"],
+    "disaster": ["raw footage", "aftermath uncut", "rescue raw footage",
+                 "aerial location clean footage", "archival broadcast footage", "newsreel archive uncut"],
+    "travel": ["4k walking tour no talking", "drone footage clean 4k",
+               "street b roll footage", "city location 4k b-roll", "landmark raw footage"],
+    "technology": ["hands on demo b-roll 4k", "product close up clean",
+                   "official launch clean footage", "technology 4k b roll", "unboxing no talking b roll"],
+    "automotive": ["car driving raw footage 4k", "exterior b-roll clean",
+                   "interior detail 4k", "track testing raw footage", "official promo b-roll"],
+    "history": ["raw archival film footage", "newsreel moving footage clean",
+                "historic location b roll", "ship at sea archival clean"],
+    "science": ["laboratory experiment 4k b roll", "microscope raw footage",
+                "research facility clean footage", "scientific demonstration clean"],
+    "crime": ["case location raw b-roll", "archive newsreel uncut",
+              "police investigation archival footage", "aerial scene location 4k"],
+    "food": ["close up food b roll 4k", "cooking preparation raw footage",
+             "fresh produce market b roll", "harvesting farm clean footage"],
+    "animals": ["4k wildlife b roll", "animal habitat raw footage",
+                "nature close up clean footage", "safari animal behavior 4k"],
+    "finance": ["trading floor raw b roll", "factory manufacturing 4k",
+                "shipping logistics clean footage", "office corporate b roll 4k"],
+}
+
+
+def _default_youtube_intents(domain_category: Any) -> List[str]:
+    return list(_YOUTUBE_INTENTS_BY_CATEGORY.get(
+        str(domain_category or "").strip().lower(),
+        ["raw footage", "archival footage", "documentary archive footage", "location b-roll"],
+    ))
+
+
+def _is_format_phrase_subject(subject: Any) -> bool:
+    """True when a subject is only format words, not a real subject.
+
+    "video game official trailer gameplay" is a format phrase; "Grand
+    Theft Auto VI" is not (grand/theft/auto/vi are not format words).
+    Stopwords are ignored, so "Game of Thrones" survives via "thrones".
+    """
+    words = [word for word in re.findall(r"[a-z0-9]+", str(subject or "").lower())
+             if word not in _QUERY_SHAPE_STOPWORDS]
+    return bool(words) and all(word in _FORMAT_PHRASE_WORDS for word in words)
+
+
+_SCENE_SUBJECT_TYPE_ENUM = {"person", "object", "place", "event", "product", "topic", "animal", "food"}
+
+
+def _subject_type_mismatch(row: Dict[str, Any]) -> bool:
+    """True when scene_subject_type contradicts the subject itself.
+
+    The container-map default stamps "person" on everything; a game title,
+    a studio, or a place typed "person" is a wrong row, not a person beat.
+    The text checks apply to ANY claimed type, not just "person": a studio
+    typed "place" and a place typed "product" are wrong too. A value
+    outside the schema enum (e.g. the mechanical "entity") is a mismatch
+    by itself. One direction is deliberately NOT enforced: a personal
+    name typed as a place cannot be told apart from a place name by
+    capitalization alone ("Berlin Wall"), so it is left to the visual
+    type mapping.
+    """
+    subject = str(row.get("scene_subject") or row.get("container_subject") or "").strip()
+    scene_type = str(row.get("scene_subject_type") or "").strip().lower()
+    if not subject or not scene_type:
+        return False
+    if scene_type not in _SCENE_SUBJECT_TYPE_ENUM:
+        return True
+    visual_type = str(row.get("visual_subject_type") or "").strip().lower()
+    allowed = _VISUAL_TO_SCENE_TYPES.get(visual_type)
+    if allowed is not None and scene_type not in allowed:
+        return True
+    if game_keys_named_in_text(subject) and scene_type in {"person", "place"}:
+        return True
+    if _ORG_SUFFIX_RE.search(subject) and scene_type in {"person", "place"}:
+        return True
+    if _PLACE_WORD_RE.search(subject) and scene_type in {"person", "product"}:
+        return True
+    return False
+
+
+def _stem(word: str) -> str:
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _visual_intent_action_words(visual_intent: str, entity_words: set) -> set:
+    """Viewpoint/action words mined from the scene's visual intent.
+
+    Viewpoint phrases (aerial, street-level, from the cab, prison gates)
+    plus visible/action words: -ing verbs and content words that are not
+    the entity, not stopwords, and not format words. Empty when the intent
+    carries no usable shot words — then the shape check cannot enforce the
+    viewpoint half and skips it.
+    """
+    intent = re.sub(r"\s+", " ", str(visual_intent or "")).strip()
+    if not intent:
+        return set()
+    words: set = set()
+    try:
+        from .media_query_strategy import _viewpoint_phrases, _VISIBLE
+        for phrase in _viewpoint_phrases(intent):
+            words.add(phrase.lower())
+        for visible in _VISIBLE:
+            if re.search(r"\b" + re.escape(visible) + r"\b", intent, re.I):
+                words.add(visible.lower())
+    except Exception:
+        pass
+    for word in re.findall(r"[a-z0-9]+", intent.lower()):
+        if (len(word) >= 4 and word not in _QUERY_SHAPE_STOPWORDS
+                and word not in _FORMAT_PHRASE_WORDS and word not in entity_words
+                and word not in {"context", "shows", "show", "depicts", "features",
+                                 "featuring", "shot", "shots", "view", "scene"}):
+            words.add(word)
+    return words
+
+
+def _primary_query_shape_ok(primary: Any, entity_words: set, viewpoint_words: set) -> bool:
+    """One primary query must carry the entity + a viewpoint/action word.
+
+    Shared by the plan-row shape check and the flat adapted-row check
+    (cache loader), which only ever sees one source's primary at a time.
+    Either half is skipped when the row gives it nothing to check against.
+    """
+    text = str(primary or "").strip().lower()
+    if not text:
+        return False
+    if not entity_words:
+        return True
+    primary_words = {_stem(word) for word in re.findall(r"[a-z0-9]+", text)}
+    if not any(_stem(word) in primary_words for word in entity_words):
+        return False
+    if viewpoint_words:
+        for item in viewpoint_words:
+            parts = [_stem(word) for word in re.findall(r"[a-z0-9]+", item.lower())
+                     if word not in _QUERY_SHAPE_STOPWORDS]
+            if parts and all(part in primary_words for part in parts):
+                return True
+        return False
     return True
+
+
+def _scene_query_shape_ok(row: Dict[str, Any]) -> bool:
+    """Primary YT + web queries must carry entity + viewpoint/action words.
+
+    Entity: a distinctive token of the scene/container subject. Viewpoint/
+    action: a word or phrase mined from the visual intent (aerial,
+    street-level, prison gates, driving, ...). Either half is skipped when
+    the row gives it nothing to check against.
+    """
+    entity_words = set()
+    for field in ("scene_subject", "container_subject"):
+        for word in re.findall(r"[a-z0-9]+", str(row.get(field) or "").lower()):
+            if (len(word) >= 3 and word not in _QUERY_SHAPE_STOPWORDS
+                    and word not in _FORMAT_PHRASE_WORDS):
+                entity_words.add(word)
+    if not entity_words:
+        return True
+    viewpoint_words = _visual_intent_action_words(row.get("visual_intent") or "", entity_words)
+    for source in ("youtube", "web"):
+        queries = row.get(source)
+        if not isinstance(queries, dict):
+            return False
+        if not _primary_query_shape_ok(queries.get("primary"), entity_words, viewpoint_words):
+            return False
+    return True
+
+
+def _scene_game_query_error(primary_queries: List[str], scene_text: Any, title: Any = "") -> Optional[str]:
+    """Scene-relative game consistency for a scene's primary queries.
+
+    The queries must seek the game THIS scene narrates: a GTA V-history
+    scene must name GTA V in at least one primary (a query set that only
+    ever says GTA VI for such a scene is wrong), and no primary may name
+    a game the scene does not narrate (plus the title's game, which a
+    scene may always use implicitly). The 2002 Vice City game is
+    forbidden in every query, whatever the scene narrates.
+    """
+    if not scene_text:
+        return None
+    primaries = [str(query or "").strip() for query in (primary_queries or []) if str(query or "").strip()]
+    if not primaries:
+        return None
+    for query in primaries:
+        if query_seeks_forbidden_2002(query):
+            return "query seeks the 2002 Vice City game"
+    named = game_keys_named_in_text(scene_text)
+    title_game = title_game_key(title)
+    allowed = set(named)
+    if title_game:
+        allowed.add(title_game)
+    if not named and not title_game:
+        return None
+    for query in primaries:
+        foreign = _query_game_keys(query) - allowed
+        if foreign:
+            return f"query names {game_canonical_title(sorted(foreign)[0])}, which this scene does not narrate"
+    subject_game = scene_subject_game_for_scene(scene_text, title)
+    if subject_game["key"]:
+        # Token-boundary game detection only: the garbled LLM token
+        # "Grand Theft Auto VI V" must NOT count as naming GTA V — a
+        # substring check would pass it ("grand theft auto v" is a prefix
+        # of "grand theft auto vi v").
+        if not any(subject_game["key"] in _query_game_keys(query) for query in primaries):
+            return (f"no primary query names the scene's subject game "
+                    f"{subject_game['title']}")
+    return None
+
+
+def _directed_scene_row_error(row: Any, scene_text: Any = None, title: Any = "") -> Optional[str]:
+    """First retrieval-contract violation in a plan row, or None.
+
+    Shared by _is_directed_scene_row (resume reuse) and the fresh-path
+    validation in _plan_scenes_impl (LLM output). A row failing any of
+    these is re-planned mechanically, never shipped with empty fields.
+    Pass the scene's narration text (and the video title) when available:
+    without it the scene-relative game check cannot run and is skipped.
+    """
+    if not isinstance(row, dict):
+        return "not a scene row"
+    if not str(row.get("domain_category") or "").strip():
+        return "empty domain_category"
+    positive = row.get("retrieval_positive_terms")
+    if not isinstance(positive, list) or len([term for term in positive if str(term or "").strip()]) < 3:
+        return "fewer than 3 retrieval_positive_terms"
+    intents = row.get("youtube_query_intents")
+    if not isinstance(intents, list) or not any(str(term or "").strip() for term in intents):
+        return "empty youtube_query_intents"
+    for field in ("container_subject", "scene_subject"):
+        if _is_format_phrase_subject(row.get(field)):
+            return f"{field} is a format phrase, not a subject"
+    if _subject_type_mismatch(row):
+        return "scene_subject_type does not match the subject"
+    # The game check runs before the shape check: a query seeking the
+    # 2002 Vice City game, or naming a game this scene does not narrate,
+    # is wrong as a game query whatever its shape.
+    primaries = []
+    for source in ("youtube", "web"):
+        queries = row.get(source)
+        if isinstance(queries, dict):
+            primaries.append(str(queries.get("primary") or ""))
+    game_error = _scene_game_query_error(primaries, scene_text, title)
+    if game_error:
+        return game_error
+    if not _scene_query_shape_ok(row):
+        return "primary youtube/web query lacks entity or viewpoint/action words"
+    return None
+
+
+def _normalized_query_tokens(query: Any) -> List[str]:
+    return [word for word in re.findall(r"[a-z0-9]+", str(query or "").lower())
+            if word not in _QUERY_SHAPE_STOPWORDS]
+
+
+def _scene_distinctive_tokens(scene_text: Any, sibling_texts: List[str]) -> set:
+    """Content tokens this scene owns and no sibling scene shares.
+
+    Narration only — never the visual intent. The intent is the LLM's
+    own paraphrase, so counting its words would let the LLM grade its
+    own homework (a generic intent word would rescue a generic query).
+    A scene's query must carry at least one of these narration tokens
+    (or the scene has none, and the check is skipped — two scenes with
+    near-identical narration cannot be told apart by tokens).
+    """
+    own = set()
+    for word in re.findall(r"[a-z0-9]+", str(scene_text or "").lower()):
+        if (len(word) >= 4 and word not in _QUERY_SHAPE_STOPWORDS
+                and word not in _FORMAT_PHRASE_WORDS):
+            own.add(word)
+    sibling_words = set()
+    for sibling in (sibling_texts or []):
+        sibling_words.update(re.findall(r"[a-z0-9]+", str(sibling or "").lower()))
+    return {word for word in own if word not in sibling_words}
+
+
+def validate_scene_query_plan(rows: List[Dict[str, Any]], scene_texts: List[str],
+                              title: Any = "") -> List[Dict[str, Any]]:
+    """Plan-level query errors: duplicates + scene-distinctiveness.
+
+    Returns one {"scene_number", "error"} per failing scene (empty = valid).
+    Per-row contract errors are reported by _directed_scene_row_error;
+    this adds what a single row cannot see:
+    - two scenes share a primary query (exact, or identical once the
+      shared title anchor is stripped), unless their narrations are
+      genuinely identical — proven by comparing the actual texts.
+    - a scene's primary queries carry no token distinctive to its own
+      narration (the query could belong to any sibling scene).
+    """
+    rows = list(rows or [])
+    scene_texts = list(scene_texts or [])
+    errors: List[Dict[str, Any]] = []
+    seen: Dict[str, Any] = {}
+
+    def _norm_text(text: Any) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+    anchor_words = set(_normalized_query_tokens(title))
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        scene_number = row.get("scene_number", index + 1)
+        text = scene_texts[index] if index < len(scene_texts) else ""
+        siblings = [t for j, t in enumerate(scene_texts) if j != index]
+        # Scene-distinctiveness: at least one primary must carry a token
+        # this scene owns and no sibling shares.
+        distinctive = _scene_distinctive_tokens(text, siblings)
+        if distinctive:
+            primaries = []
+            for source in ("youtube", "web"):
+                queries = row.get(source)
+                if isinstance(queries, dict):
+                    primaries.append(str(queries.get("primary") or ""))
+            primary_words = set()
+            for query in primaries:
+                primary_words.update(_stem(word) for word in re.findall(r"[a-z0-9]+", query.lower()))
+            if not any(_stem(word) in primary_words for word in distinctive):
+                errors.append({"scene_number": scene_number,
+                               "error": "primary queries carry no token distinctive to this scene's narration"})
+                continue
+        # Cross-scene duplicates, per source.
+        for source in ("youtube", "web"):
+            queries = row.get(source)
+            primary = str(queries.get("primary") or "").strip() if isinstance(queries, dict) else ""
+            if not primary:
+                continue
+            tokens = _normalized_query_tokens(primary)
+            key = " ".join(tokens)
+            stripped = " ".join(word for word in tokens if word not in anchor_words)
+            for seen_key, seen_info in list(seen.get(source, {}).items()):
+                seen_index, seen_stripped = seen_info
+                if _norm_text(text) and _norm_text(text) == _norm_text(scene_texts[seen_index] if seen_index < len(scene_texts) else ""):
+                    continue  # genuinely identical narration: same query allowed
+                if key == seen_key or (stripped and stripped == seen_stripped):
+                    errors.append({"scene_number": scene_number,
+                                   "error": f"{source} primary query duplicates scene {seen_index + 1}"})
+                    break
+            seen.setdefault(source, {})[key] = (index, stripped)
+    return errors
+
+
+def _adapted_row_primaries(row: Dict[str, Any]) -> List[str]:
+    """Primary query strings carried by one flat adapted row."""
+    primaries = []
+    for field in ("search_query", "youtube_query", "web_query", "primary_query"):
+        value = str(row.get(field) or "").strip()
+        if value:
+            primaries.append(value)
+    return primaries
+
+
+def _adapted_scene_row_error(row: Any, scene_text: Any = None, title: Any = "") -> Optional[str]:
+    """Retrieval-contract error for one FLAT adapted row, or None.
+
+    Adapted rows (app.py _adapt_scene_brain_plans / queries.json) carry
+    one source's queries as flat strings, not nested youtube/web dicts —
+    the plan-row validator cannot run on them as-is. The contract checks
+    (fields, format phrase, subject type, game) run on the flat fields;
+    the shape check runs on this row's own primary only.
+    """
+    if not isinstance(row, dict):
+        return "not a scene row"
+    if not str(row.get("domain_category") or "").strip():
+        return "empty domain_category"
+    positive = row.get("retrieval_positive_terms")
+    if not isinstance(positive, list) or len([term for term in positive if str(term or "").strip()]) < 3:
+        return "fewer than 3 retrieval_positive_terms"
+    intents = row.get("youtube_query_intents")
+    if not isinstance(intents, list) or not any(str(term or "").strip() for term in intents):
+        return "empty youtube_query_intents"
+    for field in ("section_subject", "container_subject", "scene_subject"):
+        if _is_format_phrase_subject(row.get(field)):
+            return f"{field} is a format phrase, not a subject"
+    if _subject_type_mismatch(row):
+        return "scene_subject_type does not match the subject"
+    primaries = _adapted_row_primaries(row)
+    if not primaries:
+        return "no primary query"
+    for query in primaries:
+        if query_seeks_forbidden_2002(query):
+            return "query seeks the 2002 Vice City game"
+    if scene_text:
+        named = game_keys_named_in_text(scene_text)
+        title_game = title_game_key(title)
+        allowed = set(named)
+        if title_game:
+            allowed.add(title_game)
+        if named or title_game:
+            for query in primaries:
+                foreign = _query_game_keys(query) - allowed
+                if foreign:
+                    return f"query names {game_canonical_title(sorted(foreign)[0])}, which this scene does not narrate"
+    entity_words = set()
+    for field in ("scene_subject", "container_subject"):
+        for word in re.findall(r"[a-z0-9]+", str(row.get(field) or "").lower()):
+            if (len(word) >= 3 and word not in _QUERY_SHAPE_STOPWORDS
+                    and word not in _FORMAT_PHRASE_WORDS):
+                entity_words.add(word)
+    # Stock queries are generic by design ("generic visible subjects and
+    # actions suitable for stock libraries"): the entity + visual-intent
+    # viewpoint shape check does not apply to them. Contract fields,
+    # subject type, and the game checks above still do.
+    if str(row.get("query_source") or "").strip().lower() == "stock":
+        return None
+    viewpoint_words = _visual_intent_action_words(row.get("visual_intent") or "", entity_words)
+    if not any(_primary_query_shape_ok(primary, entity_words, viewpoint_words) for primary in primaries):
+        return "primary query lacks entity or viewpoint/action words"
+    return None
+
+
+def validate_adapted_scene_plan(bundle: Dict[str, Any], scene_texts: List[str],
+                                title: Any = "") -> Optional[str]:
+    """First error in a flat adapted bundle (web/yt/stock rows), or None.
+
+    What the shared-plan cache loader must run before serving a stored
+    bundle: per-row contract errors on every source, the scene-level
+    subject-game requirement (at least one primary across web+yt names
+    the scene's subject game), and cross-scene primary duplicates.
+    """
+    if not isinstance(bundle, dict):
+        return "not a query bundle"
+    scene_texts = list(scene_texts or [])
+    for source in ("web", "yt", "stock"):
+        rows = bundle.get(source)
+        if not isinstance(rows, list):
+            return f"missing {source} rows"
+        for index, row in enumerate(rows):
+            text = scene_texts[index] if index < len(scene_texts) else ""
+            error = _adapted_scene_row_error(row, scene_text=text, title=title)
+            if error:
+                return f"scene {index + 1} {source}: {error}"
+    # Scene-level: at least one primary across web+yt names the subject game.
+    for index, text in enumerate(scene_texts):
+        subject_game = scene_subject_game_for_scene(text, title)
+        if not subject_game["key"]:
+            continue
+        primaries = []
+        for source in ("web", "yt"):
+            rows = bundle.get(source) or []
+            if index < len(rows) and isinstance(rows[index], dict):
+                primaries.extend(_adapted_row_primaries(rows[index]))
+        game_error = _scene_game_query_error(primaries, text, title)
+        if game_error:
+            return f"scene {index + 1}: {game_error}"
+    # Cross-scene duplicates on flat primaries (same rule as plan rows).
+    flat_rows: List[Dict[str, Any]] = []
+    for index, text in enumerate(scene_texts):
+        web_rows = bundle.get("web") or []
+        yt_rows = bundle.get("yt") or []
+        web_primary = ""
+        yt_primary = ""
+        if index < len(web_rows) and isinstance(web_rows[index], dict):
+            web_primary = str(web_rows[index].get("search_query") or web_rows[index].get("primary_query") or "")
+        if index < len(yt_rows) and isinstance(yt_rows[index], dict):
+            yt_primary = str(yt_rows[index].get("search_query") or yt_rows[index].get("youtube_query") or "")
+        flat_rows.append({"scene_number": index + 1,
+                          "youtube": {"primary": yt_primary},
+                          "web": {"primary": web_primary},
+                          "visual_intent": (web_rows[index].get("visual_intent") if index < len(web_rows) and isinstance(web_rows[index], dict) else "")})
+    plan_errors = validate_scene_query_plan(flat_rows, scene_texts, title)
+    if plan_errors:
+        first = plan_errors[0]
+        return f"scene {first['scene_number']}: {first['error']}"
+    return None
+
+
+def validate_cached_scene_bundle(bundle: Any, scene_texts: List[str], title: Any = "") -> Optional[str]:
+    """Cache-loader gate: first error in a stored bundle, or None if servable."""
+    return validate_adapted_scene_plan(bundle, scene_texts, title)
 
 
 def load_persisted_scene_plan(topic: str, script: str, scene_texts: List[str]) -> Optional[List[Dict]]:
@@ -1162,14 +1903,18 @@ Return one container row for every scene in order."""
                 )
                 positive_terms = _term_list(row.get("retrieval_positive_terms") or fallback_context.get("retrieval_positive_terms"))
                 negative_terms = _term_list(row.get("retrieval_negative_terms") or fallback_context.get("retrieval_negative_terms"))
-                youtube_query_intents = _term_list(row.get("youtube_query_intents"), limit=8)
+                # The LLM may omit intents even though the schema now
+                # requires them; fill from the domain instead of shipping
+                # empty (an empty intents row fails the fresh-path check).
+                youtube_query_intents = _term_list(
+                    row.get("youtube_query_intents") or _default_youtube_intents(domain_category), limit=8)
                 cleaned = {
                     "scene_number": idx + 1,
                     "container_id": container_id,
                     "container_subject": subject if not is_intro and not is_outro else (subject or topic or ""),
                     "subcontainer_subject": re.sub(r"\s+", " ", str(row.get("subcontainer_subject") or "").strip()),
                     "scene_subject": scene_subject or subject or topic or "",
-                    "scene_subject_type": str(row.get("scene_subject_type") or ("topic" if is_intro or is_outro else "person")).strip().lower(),
+                    "scene_subject_type": str(row.get("scene_subject_type") or "").strip().lower(),
                     "container_type": str(row.get("container_type") or row.get("scene_subject_type") or ("topic" if is_intro or is_outro else "entity")).strip().lower(),
                     "domain_anchor": domain_anchor,
                     "domain_category": domain_category,
@@ -1187,6 +1932,17 @@ Return one container row for every scene in order."""
                     "_llm_container": row_is_llm,
                     "_mechanical_container": not row_is_llm,
                 }
+                # Never ship a contradicted or missing subject type: the
+                # old default stamped "person" on studios, places and
+                # game titles. A missing/invalid/wrong value is replaced
+                # with the inferred type (visual type, then subject text,
+                # then neutral "topic") instead of the "person" default.
+                if not cleaned.get("scene_subject_type") or _subject_type_mismatch(cleaned):
+                    cleaned["scene_subject_type"] = _infer_scene_subject_type(
+                        cleaned.get("scene_subject") or cleaned.get("container_subject"),
+                        row.get("visual_subject_type") or "",
+                        scene_text,
+                    )
                 cleaned_rows.append(cleaned)
                 previous_id = container_id
                 if subject and not is_intro and not is_outro:
@@ -1236,10 +1992,19 @@ Return one container row for every scene in order."""
             _global_forbidden_hint = f"\nGLOBAL FORBIDDEN SUBJECTS across all sections: {', '.join(sorted(_all_section_words))}. NEVER include any of these words in queries for scenes from OTHER sections."
 
         try:
-            chunk_size = int(os.environ.get("VIDZEO_BRAIN_SCENE_CHUNK_SIZE", "12") or 12)
+            chunk_size = int(os.environ.get("VIDZEO_BRAIN_SCENE_CHUNK_SIZE", "32") or 32)
         except Exception:
-            chunk_size = 12
-        chunk_size = max(3, min(12, chunk_size))
+            chunk_size = 32
+        # BULK queries: one request carries up to 32 scenes (a whole 2-min
+        # job in a single request) instead of 12-scene slices. The schema
+        # has no scenes-per-request cap; the binding limits are compose
+        # time (~20s/scene measured — 32 scenes ≈ 11 min, inside the
+        # 15-min request wall) and output tokens (~260/scene — 32 scenes
+        # ≈ 8k tokens, inside the 12000 max_tokens cap below). Longer jobs
+        # split into 32-scene chunks that the worker pool answers in
+        # parallel, so wall time stays ~one chunk. A failed chunk falls
+        # back to mechanical rows and the resume re-plans only those.
+        chunk_size = max(3, min(32, chunk_size))
         if len(scene_texts) > chunk_size:
             chunks = [
                 (start, scene_texts[start:start + chunk_size], section_subjects[start:start + chunk_size])
@@ -1378,6 +2143,10 @@ Each scene plan must match the schema exactly."""
             "properties": {
                 "scenes": {
                     "type": "array",
+                    # An empty plan is not a plan: the whole chunk would
+                    # fall back to mechanical rows. minItems lets the
+                    # worker fix an empty answer instead of losing the chunk.
+                    "minItems": 1,
                     "items": SCENE_PLAN_SCHEMA,
                 }
             },
@@ -1409,7 +2178,11 @@ Each scene plan must match the schema exactly."""
                 user_prompt=user,
                 system_prompt=system,
                 temperature=0.2,
-                max_tokens=max(2400, min(7000, 900 + (len(scene_texts) * 550))),
+                # Bulk output budget: ~260 tokens per scene plan, so a
+                # 32-scene chunk needs ~8k tokens; the old 7000 cap would
+                # truncate a full bulk plan (and a truncated plan fails
+                # validation, losing the whole chunk to mechanical rows).
+                max_tokens=max(2400, min(12000, 900 + (len(scene_texts) * 550))),
                 json_mode=True,
                 json_schema=schema,
                 json_schema_name="vidzeo_scene_queries_v3",
@@ -1448,6 +2221,45 @@ Each scene plan must match the schema exactly."""
                         for field in fields[1:]:
                             if not str(queries.get(field) or "").strip():
                                 queries[field] = first_val
+                    # Retrieval contract: a row with empty domain/intents,
+                    # a format-phrase subject, a wrong subject type, or
+                    # queries carrying no entity/viewpoint words fails the
+                    # whole chunk to mechanical re-plan — it is never
+                    # shipped with empty fields. The game check is
+                    # scene-relative: the scene's own narration (not the
+                    # video title) decides which game the queries must name.
+                    contract_error = _directed_scene_row_error(
+                        scene,
+                        scene_text=scene_texts[index - 1] if index - 1 < len(scene_texts) else "",
+                        title=topic,
+                    )
+                    if contract_error:
+                        raise ValueError(
+                            f"OpenRouter returned an invalid scene plan at row {index}: {contract_error}")
+                # Stamp the scene-relative subject game, derived from each
+                # scene's own narration (never the LLM's say-so alone), so
+                # the adapter, the cache, and the relevance gate all see
+                # which game this scene's queries must seek. Stamped only
+                # when a game is actually derived: stamping an empty
+                # "scene_subject_game": "" onto every row would change the
+                # returned rows' shape for scenes with no game at all.
+                for index, scene in enumerate(scenes):
+                    if isinstance(scene, dict):
+                        game = scene_subject_game_for_scene(
+                            scene_texts[index] if index < len(scene_texts) else "", topic)
+                        if game["key"]:
+                            scene["scene_subject_game"] = game["key"]
+                            scene["scene_subject_games"] = game_keys_named_in_text(
+                                scene_texts[index] if index < len(scene_texts) else "")
+                # Plan-level contract: no two scenes share a primary query
+                # and every scene's primaries carry a token distinctive to
+                # its own narration. A duplicate/generic plan fails the
+                # whole chunk, like a bad row.
+                plan_errors = validate_scene_query_plan(scenes, scene_texts, topic)
+                if plan_errors:
+                    first = plan_errors[0]
+                    raise ValueError(
+                        f"OpenRouter returned an invalid scene plan at row {first['scene_number']}: {first['error']}")
                 return scenes
             print(f"   Brain returned {len(scenes) if isinstance(scenes, list) else 0} scenes, expected {len(scene_texts)}")
         except Exception as e:

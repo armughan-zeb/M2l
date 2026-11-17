@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -26,6 +27,14 @@ import requests
 from requests.adapters import HTTPAdapter
 
 
+class HostCircuitOpen(RuntimeError):
+    pass
+
+
+class DownloadSlotTimeout(TimeoutError):
+    pass
+
+
 class DownloadLimiter:
     """One budget across scene threads and their independent asyncio loops."""
 
@@ -35,11 +44,41 @@ class DownloadLimiter:
         self.active = 0
         self.hosts = {}
         self.cooldowns = {}
+        self.failures = {}
         self.lock = threading.Lock()
+
+    def open_circuit(self, host, seconds=60):
+        """Open the host circuit immediately (a 403 is a refusal, not a blip).
+
+        The failure-count path needs 3 failures before it opens; a host that
+        answers 403 has already refused, so waiting for 2 more refusals just
+        burns candidate attempts and slot waits against a dead host. A 403
+        must never be retried either: the same proxy refuses the same URL
+        again, so the only useful response is to stop trying that host and
+        let the scene fall to its next candidate or lane.
+        """
+        with self.lock:
+            self.cooldowns[host] = time.monotonic() + max(1, seconds)
+            self.failures.pop(host, None)
+            LOGGER.warning("Web image host circuit opened for %s after HTTP 403 (%ss)", host, max(1, seconds))
 
     def defer(self, host, seconds=30):
         with self.lock:
-            self.cooldowns[host] = time.monotonic() + seconds
+            self.cooldowns[host] = max(self.cooldowns.get(host, 0), time.monotonic() + seconds)
+
+    def record_outcome(self, host, failed):
+        with self.lock:
+            if not failed:
+                self.failures.pop(host, None)
+                if self.cooldowns.get(host, 0) <= time.monotonic():
+                    self.cooldowns.pop(host, None)
+                return
+            count = self.failures.get(host, 0) + 1
+            self.failures[host] = count
+            if count >= 3 or host in self.cooldowns:
+                self.cooldowns[host] = time.monotonic() + 60
+                self.failures.pop(host, None)
+                LOGGER.warning("Web image host circuit opened for %s (60s)", host)
 
     @asynccontextmanager
     async def slot(self, host, deadline):
@@ -48,8 +87,9 @@ class DownloadLimiter:
             while time.monotonic() < deadline:
                 with self.lock:
                     if self.cooldowns.get(host, 0) > time.monotonic():
-                        raise RuntimeError("host cooling down after HTTP 429")
-                    if self.active < self.total and self.hosts.get(host, 0) < self.per_host:
+                        raise HostCircuitOpen("host circuit open after 403, 429 or timeout")
+                    host_limit = 1 if host in self.cooldowns else self.per_host
+                    if self.active < self.total and self.hosts.get(host, 0) < host_limit:
                         self.active += 1
                         self.hosts[host] = self.hosts.get(host, 0) + 1
                         acquired = True
@@ -57,7 +97,7 @@ class DownloadLimiter:
                     break
                 await asyncio.sleep(0.05)
             if not acquired:
-                raise asyncio.TimeoutError()
+                raise DownloadSlotTimeout("web download capacity wait timed out")
             yield
         finally:
             if acquired:
@@ -94,6 +134,8 @@ from .constants import (
     WATERMARK_SIGNALS,
 )
 from .safety import candidate_is_safe
+
+LOGGER = logging.getLogger(__name__)
 
 DUCKDUCKGO_HOMEPAGE = "https://duckduckgo.com/"
 DUCKDUCKGO_IMAGE_API = "https://duckduckgo.com/i.js"
@@ -200,61 +242,6 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
-def _requests_image_fallback(
-    url: str,
-    path: Path,
-    headers: Optional[Dict[str, str]],
-    timeout_seconds: float,
-    min_size: int,
-    max_bytes: int,
-) -> Tuple[Optional[Path], str]:
-    """Retry a hotlink with the requests transport after an aiohttp 403.
-
-    A few otherwise reliable image hosts (notably Wikimedia's upload CDN)
-    reject aiohttp's TLS/client fingerprint while returning the same URL to a
-    normal browser or requests.  This is a narrow transport fallback, only
-    used for 403/406 responses; it does not weaken relevance or safety gates.
-    """
-    request_headers = dict(SEARCH_HEADERS)
-    if headers:
-        request_headers.update(headers)
-    try:
-        response = requests.get(
-            url,
-            headers=request_headers,
-            timeout=max(2.0, min(20.0, float(timeout_seconds))),
-            stream=True,
-        )
-        if response.status_code != 200:
-            return None, f"HTTP {response.status_code}"
-        content_type = str(response.headers.get("Content-Type") or "").lower()
-        if content_type and "image" not in content_type and "octet" not in content_type:
-            return None, f"not image: {content_type}"
-        declared = response.headers.get("Content-Length")
-        try:
-            if declared and int(declared) > max_bytes:
-                return None, f"too large ({declared}B > {max_bytes}B)"
-        except (TypeError, ValueError):
-            pass
-        chunks: List[bytes] = []
-        total = 0
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > max_bytes:
-                return None, f"too large ({total}B > {max_bytes}B)"
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        if len(data) < min_size:
-            return None, f"too small ({len(data)}B)"
-        path.write_bytes(data)
-        return path, ""
-    except Exception as exc:
-        return None, str(exc)[:80]
-
-
-# ── URL DISCOVERY: Bing (requests — reliable, bypasses bot detection) ──
 def _parse_bing_html(html_text: str, limit: int) -> List[Dict]:
     results = []
     matches = list(_BING_PARSE_PATTERN.finditer(html_text))
@@ -482,8 +469,11 @@ def search_bing(query: str, limit: int = 36) -> List[Dict]:
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     all_results.append(r_item)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Was silently swallowed: a dead Bing lane looked identical to a
+        # query with no results. Pass 2 still runs, but the failure is now
+        # in the log with its error class.
+        LOGGER.warning("bing search pass 1 failed for %r: %s: %s", q[:60], type(exc).__name__, exc)
 
     # Pass 2: editorial site enrichment if we need more results
     if len(all_results) < limit:
@@ -514,9 +504,25 @@ def search_bing(query: str, limit: int = 36) -> List[Dict]:
     return _relevance_gate(all_results[:limit * 2], q)
 
 
+_ddg_down_until: float = 0.0
+
+
 # ── URL DISCOVERY: DuckDuckGo (requests) ────────────────────────────
 def search_ddg(query: str, limit: int = 36) -> List[Dict]:
-    """Search DuckDuckGo synchronously."""
+    """Search DuckDuckGo synchronously.
+
+    Raises RuntimeError when the lane itself fails (homepage unreachable,
+    no vqd token, image API error). The old code returned [] in all those
+    cases, so a bot-blocked DDG was indistinguishable from a query with no
+    results and the resolver never recorded a provider failure. Callers
+    already catch exceptions per source (_discover_hybrid_urls) or per
+    query (search_hybrid), so raising here makes the failure visible
+    without changing the fallback behaviour.
+    """
+    global _ddg_down_until
+    if time.monotonic() < _ddg_down_until:
+        raise RuntimeError("DDG circuit open (cooldown active after bot check/error)")
+
     q = re.sub(r"\s+", " ", (query or "").strip())
     if not q:
         return []
@@ -527,20 +533,22 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
     # Get vqd token
     try:
         r = _request_get_with_retries(session, DUCKDUCKGO_HOMEPAGE, params={"q": q, "kp": "1"}, timeout=10)
-        if r is None:
-            return []
-        token_match = (
-            re.search(r"vqd=['\"]?([0-9A-Za-z\-_]+)['\"]?", r.text)
-            or re.search(r"vqd=([0-9A-Za-z\-_]+)&", r.text)
-        )
-        if not token_match:
-            return []
-        vqd = token_match.group(1)
-    except Exception:
-        return []
+    except Exception as exc:
+        _ddg_down_until = time.monotonic() + 30.0
+        raise RuntimeError(f"DDG homepage unreachable: {type(exc).__name__}: {exc}") from exc
+    if r is None:
+        _ddg_down_until = time.monotonic() + 30.0
+        raise RuntimeError("DDG homepage unreachable after retries")
+    token_match = (
+        re.search(r"vqd=['\"]?([0-9A-Za-z\-_]+)['\"]?", r.text)
+        or re.search(r"vqd=([0-9A-Za-z\-_]+)&", r.text)
+    )
+    if not token_match:
+        _ddg_down_until = time.monotonic() + 30.0
+        raise RuntimeError("DDG vqd token unavailable (bot check or markup change)")
+    vqd = token_match.group(1)
 
     # Get images
-    results = []
     try:
         r = _request_get_with_retries(
             session,
@@ -553,12 +561,19 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
             },
             timeout=10,
         )
-        if r is None:
-            return []
+    except Exception as exc:
+        _ddg_down_until = time.monotonic() + 30.0
+        raise RuntimeError(f"DDG image API failed: {type(exc).__name__}: {exc}") from exc
+    if r is None:
+        _ddg_down_until = time.monotonic() + 30.0
+        raise RuntimeError("DDG image API unreachable after retries")
+    try:
         payload = r.json()
-    except Exception:
-        return []
+    except Exception as exc:
+        _ddg_down_until = time.monotonic() + 30.0
+        raise RuntimeError(f"DDG image API returned unparseable JSON: {type(exc).__name__}: {exc}") from exc
 
+    results = []
     for row in payload.get("results") or []:
         if not isinstance(row, dict):
             continue
@@ -606,13 +621,36 @@ def search_hybrid(
     def _search_one(q: str) -> Tuple[str, List[Dict]]:
         results = []
         seen = set()
-        # Bing + DDG in sequence within one thread (2 HTTP calls max)
-        for engine_results in [search_bing(q, limit_per_query), search_ddg(q, limit_per_query)]:
+        seen_keys = set()
+        # Each engine is isolated: the old code built
+        # [search_bing(...), search_ddg(...)] eagerly, so a DDG failure
+        # raised away Bing's already-fetched results for the query. A dead
+        # engine must cost only its own rows, and the failure is logged
+        # with its error class instead of swallowed.
+        for engine_name, engine_fn in (("bing", search_bing), ("ddg", search_ddg)):
+            if engine_name == "ddg" and time.monotonic() < _ddg_down_until:
+                continue
+            try:
+                engine_results = engine_fn(q, limit_per_query)
+            except Exception as exc:
+                LOGGER.warning(
+                    "hybrid search engine %s failed for %r: %s: %s",
+                    engine_name, q[:60], type(exc).__name__, exc,
+                )
+                continue
             for r in engine_results:
                 uk = r.get("image_url", "")
-                if uk and uk not in seen:
-                    seen.add(uk)
-                    results.append(r)
+                if not uk or uk in seen:
+                    continue
+                # Dedup on (host, path) as well as the exact URL: CDNs serve
+                # the same image under many signed/thumbnail query strings,
+                # and those duplicates used to fill the per-query shortlist.
+                key = _canonical_image_key(uk)
+                if key in seen_keys:
+                    continue
+                seen.add(uk)
+                seen_keys.add(key)
+                results.append(r)
         return q, results[:limit_per_query]
 
     out: Dict[str, List[Dict]] = {}
@@ -622,9 +660,21 @@ def search_hybrid(
             try:
                 q, results = future.result(timeout=30)
                 out[q] = results
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.warning(
+                    "hybrid search failed for %r: %s: %s",
+                    futures[future][:60], type(exc).__name__, exc,
+                )
     return out
+
+
+def _canonical_image_key(url: str) -> Tuple[str, str]:
+    """Host + path dedup key for an image URL (query strings ignored)."""
+    try:
+        parsed = urlparse(url)
+        return (parsed.netloc.lower(), parsed.path.rstrip("/").lower())
+    except Exception:
+        return ("", str(url or ""))
 
 
 # ── IMAGE DOWNLOAD: aiohttp bulk (fast, parallel) ────────────────────
@@ -640,6 +690,8 @@ async def _download_bulk_async(
 ) -> List[Tuple[str, Optional[Path], str]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(max_concurrent)
+    batch_deadline = time.monotonic() + min(90.0, max(0.1, timeout_seconds) * 3)
+    max_attempts = min(2, _net_retries())
 
     # Keep the transport cap aligned with resolver validation.  Enforce it
     # while reading the response so a hostile or accidentally huge publisher
@@ -665,6 +717,7 @@ async def _download_bulk_async(
         headers=dict(SEARCH_HEADERS),
         timeout=timeout,
         connector=connector,
+        trust_env=True,
     ) as session:
 
         async def _dl_one(url: str) -> Tuple[str, Optional[Path], str]:
@@ -682,41 +735,40 @@ async def _download_bulk_async(
                 path = output_dir / f"img_{uh}_{ts}{ext}"
                 last_error = ""
                 retry_statuses = {408, 425, 429, 500, 502, 503, 504}
-                deadline = time.monotonic() + timeout_seconds
-                for attempt in range(_net_retries()):
+                deadline = min(batch_deadline, time.monotonic() + timeout_seconds)
+                host = urlparse(url).netloc.lower()
+                if deadline <= time.monotonic():
+                    return url, None, "web download batch budget exhausted"
+                for attempt in range(max_attempts):
                     try:
-                        async with _DOWNLOAD_LIMITER.slot(urlparse(url).netloc.lower(), deadline), session.get(
+                        async with _DOWNLOAD_LIMITER.slot(host, deadline), session.get(
                             url, headers=(headers_by_url or {}).get(url),
                             timeout=aiohttp.ClientTimeout(total=max(0.01, deadline - time.monotonic())),
                         ) as resp:
                             if resp.status != 200:
                                 last_error = f"HTTP {resp.status}"
                                 if resp.status == 429:
-                                    _DOWNLOAD_LIMITER.defer(urlparse(url).netloc.lower())
+                                    try:
+                                        retry_after = max(1, min(60, int(resp.headers.get("Retry-After", "30"))))
+                                    except ValueError:
+                                        retry_after = 30
+                                    _DOWNLOAD_LIMITER.defer(host, retry_after)
                                     return url, None, last_error
-                                if resp.status in {403, 406}:
-                                    # Some CDNs fingerprint aiohttp and return
-                                    # 403 while accepting the same request via
-                                    # the requests transport. Keep this retry
-                                    # bounded and only invoke it for these
-                                    # hotlink responses.
-                                    fallback_path, fallback_error = await asyncio.to_thread(
-                                        _requests_image_fallback,
-                                        url,
-                                        path,
-                                        (headers_by_url or {}).get(url),
-                                        max(2.0, deadline - time.monotonic()),
-                                        min_size,
-                                        max_bytes,
-                                    )
-                                    if fallback_path:
-                                        return url, fallback_path, ""
-                                    last_error = fallback_error or last_error
+                                if resp.status == 403:
+                                    # Refusal, not a blip: open the circuit on
+                                    # the first 403 so the scene stops burning
+                                    # candidates against a dead host. Do NOT
+                                    # add 403 to retry_statuses below — the
+                                    # same proxy refuses the same URL again.
+                                    _DOWNLOAD_LIMITER.open_circuit(host)
+                                    return url, None, last_error
+                                _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                 if resp.status not in retry_statuses:
                                     return url, None, last_error
                             else:
                                 ct = resp.headers.get("Content-Type", "").lower()
                                 if ct and "image" not in ct and "octet" not in ct:
+                                    _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                     return url, None, f"not image: {ct}"
                                 content_length = resp.headers.get("Content-Length")
                                 try:
@@ -724,6 +776,7 @@ async def _download_bulk_async(
                                 except (TypeError, ValueError):
                                     declared_length = 0
                                 if declared_length > max_bytes:
+                                    _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                     return url, None, f"too large ({declared_length}B > {max_bytes}B)"
 
                                 chunks = []
@@ -734,18 +787,23 @@ async def _download_bulk_async(
                                 async for chunk in resp.content.iter_chunked(64 * 1024):
                                     total_bytes += len(chunk)
                                     if total_bytes > max_bytes:
+                                        _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                         return url, None, f"too large ({total_bytes}B > {max_bytes}B)"
                                     chunks.append(chunk)
+                                _DOWNLOAD_LIMITER.record_outcome(host, failed=False)
                                 data = b"".join(chunks)
                                 if len(data) < min_size:
                                     return url, None, f"too small ({len(data)}B)"
                                 path.write_bytes(data)
                                 return url, path, ""
+                    except (HostCircuitOpen, DownloadSlotTimeout) as exc:
+                        return url, None, str(exc)
                     except asyncio.TimeoutError:
+                        _DOWNLOAD_LIMITER.record_outcome(host, failed=True)
                         last_error = "timeout"
                     except Exception as e:
                         last_error = str(e)[:80]
-                    if attempt < _net_retries() - 1:
+                    if attempt < max_attempts - 1:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break

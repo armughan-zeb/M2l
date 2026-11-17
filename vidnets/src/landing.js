@@ -259,6 +259,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     const state = await window.electronAPI?.getBackendState();
     setBackendState(state);
     appendLog('Landing shell ready.', true);
-    setAuthNote('Google sign-in will open in your default browser.', 'info');
+    setAuthNote('Local engine ready. Opening Vidnets Studio...', 'info');
     setContinueButtonState(state?.phase === 'ready' ? 'idle' : 'disabled');
 });

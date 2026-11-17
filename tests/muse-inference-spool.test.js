@@ -26,6 +26,12 @@ function writeHeartbeat(dir, ageMs = 0) {
   }));
 }
 
+function writePoolHeartbeat(dir, workerId, ageMs = 0) {
+  fs.writeFileSync(path.join(dir, `worker-alive-${workerId}.json`), JSON.stringify({
+    updatedAt: Date.now() - ageMs, worker: 'resident-inference', workerId, pending: 0, answered: 0
+  }));
+}
+
 function runSpool(dir, request, t) {
   const child = spawn(process.execPath, [SPOOL], {
     env: { ...process.env, MUSE_INFERENCE_SPOOL_DIR: dir },
@@ -75,6 +81,57 @@ test('spool delivers a worker answer on stdout', async t => {
   assert.equal(fs.existsSync(requestFile), false, 'spool cleaned up the request file');
 });
 
+test('spool treats a fresh per-worker pool heartbeat as alive (no legacy file)', async t => {
+  const dir = fixture(t);
+  writePoolHeartbeat(dir, 'worker-1');
+  const id = 'e'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id), t);
+  const requestFile = path.join(dir, id + '.request.json');
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.ok(fs.existsSync(requestFile), 'spool wrote the request file');
+  fs.writeFileSync(path.join(dir, id + '.answer.json'), 'pool answer');
+  const result = await done;
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'pool answer');
+});
+
+test('spool exits 3 when only stale pool heartbeats exist', async t => {
+  const dir = fixture(t);
+  writePoolHeartbeat(dir, 'worker-1', 120000);
+  writePoolHeartbeat(dir, 'worker-2', 120000);
+  const id = '1'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id), t);
+  const result = await done;
+  assert.equal(result.code, 3);
+  assert.match(result.stderr, /MUSE_TRANSPORT_UNAVAILABLE/);
+});
+
+test('spool delivers when a worker claimed the request file, and cleans up the claim', async t => {
+  const dir = fixture(t);
+  writeHeartbeat(dir);
+  const id = 'f'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id), t);
+  const requestFile = path.join(dir, id + '.request.json');
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.ok(fs.existsSync(requestFile), 'spool wrote the request file');
+  // A pool worker claims by atomic rename; the spool must keep waiting
+  // for the answer (it already holds the payload from stdin) and remove
+  // the claim file on delivery.
+  const claimFile = path.join(dir, id + '.request.json.claimed-worker-1');
+  fs.renameSync(requestFile, claimFile);
+  fs.writeFileSync(path.join(dir, id + '.answer.json.tmp-test'), 'claimed answer');
+  fs.renameSync(path.join(dir, id + '.answer.json.tmp-test'), path.join(dir, id + '.answer.json'));
+  const result = await done;
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'claimed answer');
+  assert.equal(fs.existsSync(requestFile), false, 'spool cleaned up the request file');
+  assert.equal(fs.existsSync(claimFile), false, 'spool cleaned up the claim file');
+});
+
 test('spool exits 3 with the unavailable marker when the worker heartbeat is stale', async t => {
   const dir = fixture(t);
   writeHeartbeat(dir, 120000); // 2 minutes old — past the 90s limit
@@ -118,4 +175,88 @@ test('spool rejects a request id that is not 32 hex characters', async t => {
   const result = await done;
   assert.equal(result.code, 1);
   assert.match(result.stderr, /no valid 32-hex id/);
+});
+
+// Regression (2026-11-16): a worker that claimed a request and then died
+// stranded it until expiry — no other worker could claim it, even with
+// the pool alive and idle. The spool rescues a dead worker's claim back
+// to the pool; it must never steal a claim from a live worker or rescue
+// a claim that is still young.
+
+test('spool rescues a request from a dead worker claim when another worker is alive', async t => {
+  const dir = fixture(t);
+  writePoolHeartbeat(dir, 'worker-1', 300000); // dead: 5 minutes old
+  writePoolHeartbeat(dir, 'worker-2'); // alive
+  const id = '9'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id), t);
+  const requestFile = path.join(dir, id + '.request.json');
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.ok(fs.existsSync(requestFile), 'spool wrote the request file');
+  // worker-1 claims it, then dies: backdate the claim past the 2-minute grace.
+  const claimFile = path.join(dir, id + '.request.json.claimed-worker-1');
+  fs.renameSync(requestFile, claimFile);
+  const old = new Date(Date.now() - 130000);
+  fs.utimesSync(claimFile, old, old);
+  // The spool must rescue the claim back to the pool instead of waiting
+  // for the request to expire; worker-2 then answers it.
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.ok(fs.existsSync(requestFile), 'spool rescued the dead claim back to the pool');
+  fs.writeFileSync(path.join(dir, id + '.answer.json'), 'rescued answer');
+  const result = await done;
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'rescued answer');
+  assert.match(result.stderr, /rescued request .* from dead worker worker-1/);
+});
+
+test('spool does not rescue a claim from a heartbeating worker', async t => {
+  const dir = fixture(t);
+  writePoolHeartbeat(dir, 'worker-1'); // alive
+  writePoolHeartbeat(dir, 'worker-2'); // alive
+  const id = '8'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id), t);
+  const requestFile = path.join(dir, id + '.request.json');
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const claimFile = path.join(dir, id + '.request.json.claimed-worker-1');
+  fs.renameSync(requestFile, claimFile);
+  const old = new Date(Date.now() - 130000);
+  fs.utimesSync(claimFile, old, old);
+  // Give the rescue checks time to run: the claim must stay put while
+  // worker-1 still heartbeats, even though the claim is old.
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  assert.equal(fs.existsSync(requestFile), false, 'live claim is not rescued');
+  assert.equal(fs.existsSync(claimFile), true);
+  fs.writeFileSync(path.join(dir, id + '.answer.json'), 'slow worker answer');
+  const result = await done;
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'slow worker answer');
+  assert.doesNotMatch(result.stderr, /rescued request/);
+});
+
+test('spool does not rescue a young claim even when its worker is dead', async t => {
+  const dir = fixture(t);
+  writePoolHeartbeat(dir, 'worker-1', 300000); // dead
+  writePoolHeartbeat(dir, 'worker-2'); // alive
+  const id = '7'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id), t);
+  const requestFile = path.join(dir, id + '.request.json');
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const claimFile = path.join(dir, id + '.request.json.claimed-worker-1');
+  fs.renameSync(requestFile, claimFile);
+  // Fresh claim: the worker may still be starting, so no rescue yet.
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  assert.equal(fs.existsSync(requestFile), false, 'young claim is not rescued');
+  assert.equal(fs.existsSync(claimFile), true);
+  fs.writeFileSync(path.join(dir, id + '.answer.json'), 'eventual answer');
+  const result = await done;
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'eventual answer');
+  assert.doesNotMatch(result.stderr, /rescued request/);
 });

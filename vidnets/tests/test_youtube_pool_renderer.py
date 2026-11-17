@@ -12,9 +12,11 @@ from services import youtube_pipeline_v2 as pipeline
 from services.youtube_pool_renderer import resolve_pool_first
 from services.youtube_moment_matcher import YouTubeMoment, heuristic_moment
 from services.youtube_pool_renderer import (
+    _best_probe_moment,
     _creator_cta_text_match,
     _detect_creator_cta_overlay,
     _pool_probe_plan,
+    _prefetch_probe_transcript_moments,
     _probe_pool_candidates,
     _screen_moment_overlays,
     _screen_moment_quality,
@@ -625,6 +627,162 @@ def test_probe_collection_enforces_wall_and_isolates_stalled_worker(tmp_path, mo
         assert audit["fast"]["status"] == "accepted"
     finally:
         release_slow.set()
+
+
+def _probe_first_pools():
+    # One scene, one source, weak metadata (score 50 < trust 70) so the
+    # scene is a vision priority scene, not a metadata-trusted bypass.
+    source = SimpleNamespace(
+        video_id="source-0", url="https://youtube.test/source-0",
+        title="RMS Titanic archival footage", channel="Archive", duration=600,
+        metadata_score=50,
+    )
+    return SimpleNamespace(
+        source_records={"source-0": source},
+        moment_assignments={},
+        assignments=[{"id": "source-0", "duration": 600, "best_timestamp": 20}],
+        rows=[{"scene_text": "Scene 0", "candidate_subject": "RMS Titanic", "title_anchor": "RMS Titanic"}],
+        scene_durations=[4.0],
+    )
+
+
+def test_probe_first_vision_reject_makes_no_full_cut(tmp_path):
+    """F1: a vision-rejected candidate costs only a cheap probe cut, never
+    a full 1080p re-encode."""
+    pools = _probe_first_pools()
+    cuts = []
+    verdict_paths = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append((str(output_path), dict(kwargs)))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    def fake_verdict(path, *args, **kwargs):
+        verdict_paths.append(str(path))
+        return (False, 20.0, True, "not the subject")
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", side_effect=fake_verdict), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 3  # one probe per moment option; each was vetoed
+    for probe_path, probe_kwargs in cuts:
+        assert probe_path.endswith(".probe.mp4")
+        assert probe_kwargs == {
+            "width": 640, "height": 360, "preset": "ultrafast",
+            "crf": 28, "timeout_seconds": 60.0,
+        }
+    # Vision saw the probes, never a full cut.
+    assert len(verdict_paths) == 3
+    assert all(path.endswith(".probe.mp4") for path in verdict_paths)
+    # No full 1080p cut was ever made and the scene has no accepted media.
+    assert not (tmp_path / "cuts" / "scene_001.moment_00.mp4").exists()
+    assert result[0] is None
+
+
+def test_probe_first_vision_accept_cuts_full_1080p_once(tmp_path):
+    """F1: the accepted winner gets exactly one full 1080p cut, after the
+    probe already passed every gate."""
+    pools = _probe_first_pools()
+    cuts = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append((str(output_path), dict(kwargs)))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", return_value=(True, 85.0, True, "visual_pass")), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 2
+    assert cuts[0][0].endswith(".probe.mp4")
+    assert cuts[0][1]["width"] == 640
+    assert cuts[1][0].endswith("scene_001.moment_00.mp4")
+    assert "width" not in cuts[1][1]
+    assert result[0] is not None
+    assert str(result[0]).endswith("scene_001.moment_00.mp4")
+    assert (tmp_path / "cuts" / "scene_001.moment_00.mp4").exists()
+
+
+def test_probe_first_falls_back_to_full_cut_when_probe_fails(tmp_path):
+    """F1: a probe ffmpeg hiccup never loses a scene; the old full-cut
+    path runs instead."""
+    pools = _probe_first_pools()
+    cuts = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append(str(output_path))
+        if ".probe." in str(output_path):
+            return False
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", return_value=(True, 85.0, True, "visual_pass")), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 2
+    assert cuts[0].endswith(".probe.mp4")
+    assert cuts[1].endswith("scene_001.moment_00.mp4")
+    assert result[0] is not None
+
+
+def test_probe_first_can_be_disabled(tmp_path, monkeypatch):
+    """F1: VIDZEO_YT_PROBE_FIRST=0 restores the old cut-first behaviour."""
+    monkeypatch.setenv("VIDZEO_YT_PROBE_FIRST", "0")
+    pools = _probe_first_pools()
+    cuts = []
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        cuts.append(str(output_path))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    visual_context = SimpleNamespace(enabled=True)
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch.object(pipeline, "_visual_verdict_scored", return_value=(True, 85.0, True, "visual_pass")), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=visual_context, output_dir=tmp_path)
+    assert len(cuts) == 1
+    assert cuts[0].endswith("scene_001.moment_00.mp4")
+    assert result[0] is not None
 
 
 def test_pool_renderer_heuristic_fallback_covers_all_scenes_without_transcripts(tmp_path):
@@ -1339,3 +1497,177 @@ def test_pool_renderer_avoids_repeating_exact_same_timestamps_for_pooled_sources
     # The two scenes MUST NOT have the exact same start timestamp!
     assert abs(start_0 - start_1) >= 4.0
 
+
+
+def test_probe_samples_transcript_moment_when_present(tmp_path, monkeypatch):
+    """Transcript + frame selection: a source with a transcript moment is
+    probed AT the moment timestamp; a source without one (or with only a
+    heuristic moment) falls back to deterministic quarter/center sampling."""
+    monkeypatch.setenv("VIDZEO_YT_POOL_PROBE_VISION_CAP", "0")
+    moment = YouTubeMoment(
+        source_id="with-moment", video_id="with-moment",
+        start=123.0, end=129.0,
+        transcript_text="the driver sees whiteout from the cab",
+        match_score=88.0, scene_index=0,
+        match_reason="scene_overlap", heuristic=False,
+    )
+    heuristic_only = heuristic_moment(
+        source_id="heur-source", video_id="heur-source",
+        scene_index=0, start=300.0, duration=4.0,
+    )
+    records = {
+        "with-moment": SimpleNamespace(
+            video_id="with-moment", url="https://youtube.test/with-moment",
+            title="Cab ride in a snowstorm", channel="Rail Archive", duration=600,
+            metadata_score=100, pool_keys=["pool-a"],
+        ),
+        "plain-source": SimpleNamespace(
+            video_id="plain-source", url="https://youtube.test/plain-source",
+            title="Freight train in snow", channel="Rail Archive", duration=600,
+            metadata_score=90, pool_keys=["pool-a"],
+        ),
+        "heur-source": SimpleNamespace(
+            video_id="heur-source", url="https://youtube.test/heur-source",
+            title="Winter railroad", channel="Rail Archive", duration=600,
+            metadata_score=80, pool_keys=["pool-a"],
+        ),
+    }
+    pools = SimpleNamespace(
+        rows=[{}],
+        moment_assignments={0: [moment, heuristic_only]},
+    )
+    downloaded_starts = {}
+
+    def fake_probe(candidate, output_path, start=0.0, *args, **kwargs):
+        downloaded_starts[str(candidate.get("video_id") or "")] = float(start)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"probe" * 1000)
+        return True
+
+    class ProbePipeline:
+        _download_clip = staticmethod(fake_probe)
+
+    with mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        audit = _probe_pool_candidates(
+            ProbePipeline(), pools,
+            {"pool-a": ["with-moment", "plain-source", "heur-source"]},
+            records=records, output_root=tmp_path,
+        )
+
+    # The moment source is probed at the moment, and the downloader really
+    # received that start (not just the audit row).
+    assert audit["with-moment"]["probe_start"] == 123.0
+    assert downloaded_starts["with-moment"] == 123.0
+    assert audit["with-moment"]["probe_window_source"] == "transcript_moment"
+    assert audit["with-moment"]["probe_moment_start"] == 123.0
+    assert audit["with-moment"]["probe_moment_end"] == 129.0
+    assert "cab" in audit["with-moment"]["probe_moment_text"]
+    assert audit["with-moment"]["probe_moment_score"] == 88.0
+    assert audit["with-moment"]["probe_moment_scene"] == 0
+    assert audit["with-moment"]["status"] == "accepted"
+
+    # Sources without a real transcript match fall back to the old sampling.
+    safe_max_start = 600 - 3.0 - 0.25
+    for source_id in ("plain-source", "heur-source"):
+        fraction = ((sum(ord(char) for char in source_id) % 3) + 1) / 4.0
+        expected = round(min(safe_max_start, safe_max_start * fraction), 3)
+        assert audit[source_id]["probe_start"] == expected
+        assert downloaded_starts[source_id] == expected
+        assert audit[source_id]["probe_window_source"] == "quarter_center"
+        assert "probe_moment_start" not in audit[source_id]
+
+
+def test_best_probe_moment_ignores_heuristic_and_zero_score():
+    pools = SimpleNamespace(moment_assignments={
+        0: [
+            heuristic_moment(source_id="vid-a", video_id="vid-a", scene_index=0, start=50.0, duration=4.0),
+            YouTubeMoment(source_id="vid-a", video_id="vid-a", start=10.0, end=14.0,
+                          transcript_text="", match_score=0.0, scene_index=0,
+                          match_reason="weak", heuristic=False),
+        ],
+        1: [
+            YouTubeMoment(source_id="vid-b", video_id="vid-b", start=200.0, end=206.0,
+                          transcript_text="cab view", match_score=40.0, scene_index=1,
+                          match_reason="scene_overlap", heuristic=False),
+            YouTubeMoment(source_id="vid-b", video_id="vid-b", start=90.0, end=96.0,
+                          transcript_text="cab view again", match_score=72.0, scene_index=1,
+                          match_reason="scene_overlap", heuristic=False),
+        ],
+    })
+    assert _best_probe_moment(pools, "vid-a") is None
+    best = _best_probe_moment(pools, "vid-b")
+    assert best is not None and best.start == 90.0 and best.match_score == 72.0
+    assert _best_probe_moment(pools, "missing") is None
+    assert _best_probe_moment(SimpleNamespace(), "vid-b") is None
+
+
+def test_prefetch_probe_transcript_moments_populates_assignments(tmp_path):
+    """The pre-probe fetch hands the probe candidates to the transcript
+    matcher and stores the moments on the pools object before probing."""
+    moment = YouTubeMoment(
+        source_id="with-moment", video_id="with-moment",
+        start=123.0, end=129.0, transcript_text="whiteout from the cab",
+        match_score=88.0, scene_index=0, match_reason="scene_overlap",
+        heuristic=False,
+    )
+    calls = {}
+
+    class PrefetchPipeline:
+        def _prepare_pool_transcript_moments(self, rows, pools, *, scene_durations,
+                                             force, session_jar=None, deadline_seconds=None):
+            calls["pools"] = pools
+            calls["deadline_seconds"] = deadline_seconds
+            calls["force"] = force
+            return (
+                {"with-moment": SimpleNamespace(available=True)},
+                {0: [moment]},
+                {"with-moment": {"video_id": "with-moment"}},
+            )
+
+    pools = SimpleNamespace(
+        rows=[{"scene_subject": "BNSF cab whiteout"}],
+        scene_durations=[4.0],
+        moment_assignments={},
+    )
+    records = {
+        "with-moment": SimpleNamespace(
+            video_id="with-moment", url="https://youtube.test/with-moment",
+            title="Cab ride in a snowstorm", channel="Rail Archive", duration=600,
+            metadata_score=100, pool_keys=["pool-a"],
+        ),
+    }
+    audit = _prefetch_probe_transcript_moments(
+        PrefetchPipeline(), pools, {"pool-a": ["with-moment"]}, records,
+    )
+    assert audit["status"] == "completed"
+    assert audit["available"] == 1
+    assert audit["moments"] == 1
+    # Only the probe candidates were handed to the matcher, and the tight
+    # pre-probe deadline was used instead of the shared 300s wall.
+    assert [c.get("video_id") for c in calls["pools"]["pool-a"]] == ["with-moment"]
+    assert calls["deadline_seconds"] == 60.0
+    assert calls["force"] is True
+    assert pools.moment_assignments == {0: [moment]}
+
+
+def test_prefetch_probe_transcript_moments_never_blocks_probe():
+    """A transcript failure is fail-soft: the probe still runs with empty
+    moments (quarter/center fallback) instead of raising."""
+
+    class FailingPipeline:
+        def _prepare_pool_transcript_moments(self, *args, **kwargs):
+            raise RuntimeError("transcript broker down")
+
+    pools = SimpleNamespace(rows=[{}], scene_durations=[4.0], moment_assignments={})
+    records = {
+        "vid": SimpleNamespace(
+            video_id="vid", url="https://youtube.test/vid", title="t",
+            channel="c", duration=60, metadata_score=1, pool_keys=["pool-a"],
+        ),
+    }
+    audit = _prefetch_probe_transcript_moments(
+        FailingPipeline(), pools, {"pool-a": ["vid"]}, records,
+    )
+    assert audit["status"] == "failed"
+    assert pools.moment_assignments == {}

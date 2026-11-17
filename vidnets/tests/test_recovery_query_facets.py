@@ -74,3 +74,88 @@ def test_camera_directions_cannot_become_locked_scene_subjects():
     assert app._clean_scene_brain_subject('Close-up of Tesla', 'Tesla') == 'Tesla'
     assert app._clean_scene_brain_subject('Split screen showing cars', 'Tesla') == 'Tesla'
     assert app._clean_scene_brain_subject('Tesla Powerwall', 'Tesla') == 'Tesla Powerwall'
+
+
+def test_bnsf_cab_scene_queries_keep_viewpoint_and_drop_negated_lineside():
+    """The BNSF cab-in-whiteout scene: narration says "shown from the cab,
+    not from the lineside". Queries must carry the viewpoint (from the cab)
+    plus the operator and weather term (BNSF, whiteout), and must never
+    carry the negated viewpoint (lineside) as a positive facet."""
+    from server.services.media_query_strategy import enrich_scene_queries
+    title = "A BNSF Whiteout Crossing, Seen From the Driver's Cab"
+    narration = "It is shown from the cab, not from the lineside."
+    req = build_visual_requirement(
+        title=title,
+        script="A BNSF freight train crosses a whiteout at a grade crossing. " + narration,
+        scene_text=narration,
+    )
+    queries = enrich_scene_queries(
+        ["train snow", "freight train snow footage", "BNSF train snow"],
+        req, narration, provider='youtube',
+    )
+    first = queries[0]
+    assert "BNSF" in first
+    assert "whiteout" in first.casefold()
+    assert "from the cab" in first.casefold()
+    assert "train snow" != first
+    assert "lineside" not in " ".join(queries).casefold()
+    assert "not lineside" not in " ".join(queries).casefold()
+
+    web = enrich_scene_queries(["train snow photo"], req, narration, provider='web')
+    assert "from the cab" in web[0].casefold()
+    assert "lineside" not in " ".join(web).casefold()
+
+
+def test_inside_cab_viewpoint_phrase_and_cab_interior_survive():
+    from server.services.media_query_strategy import enrich_scene_queries
+    req = build_visual_requirement(
+        title="BNSF cab ride",
+        script="Inside the cab, the engineer watches the whiteout.",
+        scene_text="Inside the cab, the engineer watches the whiteout.",
+    )
+    queries = enrich_scene_queries(["train snow"], req,
+                                   "Inside the cab, the engineer watches the whiteout.",
+                                   provider='youtube')
+    assert "inside the cab" in queries[0].casefold()
+    assert "whiteout" in queries[0].casefold()
+
+
+def test_gta_vice_city_queries_carry_aerial_and_neon_streets():
+    """GTA VI scene 2: the viewpoint lives in visual_intent ("Aerial and
+    street-level shots of neon-lit Vice City streets"), not just in the
+    narration. Enriched queries must carry "aerial" and "neon streets"
+    alongside the game title."""
+    from server.services.media_query_strategy import enrich_scene_queries
+    narration = ("The game returns to Vice City, now set in the fictional state of Leonida, "
+                 "a sun-soaked reimagining of Florida filled with beaches, swamps, and neon streets.")
+    req = build_visual_requirement(
+        title="Grand Theft Auto VI", script=narration, scene_text=narration,
+        visual_intent="Aerial and street-level shots of neon-lit Vice City streets",
+    )
+    queries = enrich_scene_queries(
+        ["Vice City Grand Theft Auto VI neon streets night footage"],
+        req, narration, provider='youtube',
+    )
+    joined = " ".join(queries).casefold()
+    assert "grand theft auto vi" in joined
+    assert "aerial" in joined
+    assert "neon streets" in joined
+
+
+def test_gta_lucia_queries_carry_prison_gates():
+    """GTA VI scene 4: "prison gates" is stated in the visual intent, not
+    the narration ("walking out of prison"). It must still reach the query."""
+    from server.services.media_query_strategy import enrich_scene_queries
+    narration = ("At the center of the story are Lucia Caminos and Jason Duval, two partners in crime "
+                 "whose story begins with Lucia walking out of prison and reuniting with Jason.")
+    req = build_visual_requirement(
+        title="Grand Theft Auto VI", script=narration, scene_text=narration,
+        visual_intent="Lucia walking out of the prison gates at dawn",
+    )
+    queries = enrich_scene_queries(
+        ["Lucia Caminos and Jason Duval Grand Theft Auto VI characters"],
+        req, narration, provider='youtube',
+    )
+    joined = " ".join(queries).casefold()
+    assert "grand theft auto vi" in joined
+    assert "prison gates" in joined

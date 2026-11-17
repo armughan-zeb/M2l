@@ -2,11 +2,10 @@
 
 Double-click Start Vidnets.cmd to run the original app through bundled Electron.
 No npm install is needed. Python, Node, FFmpeg, Electron, Remotion and its browser
-are included. Lifetime Pro purchase is required for public generation access.
-Private trials are granted only by the administrator. Sign in with your purchase
-account, then configure your provider API keys in Settings.
-Manual generation uses Qwen 3.5 Flash through OpenRouter. For an external agent,
-read AGENT_ACCESS.md and pair once in Settings, then use VIDNETS_AGENT.cmd.
+are included. This Muse worker build runs generation without any account sign-in:
+the backend defaults to sign-in-free local mode and the headless agent service
+boots unpaired. Manual OpenRouter generation still needs a provider API key in
+Settings. For an external agent, read AGENT_ACCESS.md and use VIDNETS_AGENT.cmd.
 The agent service can run with the desktop closed; credentials are never bundled.
 
 The original main.js/preload.js, server Python, src UI, Remotion components,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import copy
 from collections import Counter
@@ -698,13 +699,155 @@ def _verified_still_for_reuse(scene: Mapping[str, Any]) -> tuple[str, dict[str, 
     return None
 
 
-def _repair_graphic_fallback_media(scenes: list[Any], *, fps: int) -> list[int]:
-    """Fill a missing-media beat from a verified, nonadjacent still of the same entity.
+def _scene_requirement(scene: Mapping[str, Any]) -> Mapping[str, Any]:
+    """A scene's visual requirement dict, editorial or v2 shape, else {}."""
+    primary = scene.get("primary_visual") if isinstance(scene.get("primary_visual"), Mapping) else {}
+    asset = primary.get("asset") if isinstance(primary.get("asset"), Mapping) else {}
+    resolution = asset.get("resolution") if isinstance(asset.get("resolution"), Mapping) else {}
+    final_context = resolution.get("final_scene_context") if isinstance(resolution.get("final_scene_context"), Mapping) else {}
+    requirement = final_context.get("visual_requirement") if isinstance(final_context.get("visual_requirement"), Mapping) else {}
+    if isinstance(requirement, Mapping) and requirement:
+        return requirement
+    direct = scene.get("visual_requirement")
+    return direct if isinstance(direct, Mapping) else {}
 
-    Unresolved graphic plates can otherwise become the full-bleed background
-    for perfectly good data/person cues. Reuse is limited to a film-wide
-    canonical-entity match, verified local stills, nonadjacent scenes, and the
-    source scene's declared reuse budget. The director's graphic and narration
+
+def _norm_entity(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+
+def _entities_conflict(target: Mapping[str, Any], donor: Mapping[str, Any]) -> bool:
+    """True when the donor names a different strict entity of the same kind.
+
+    Scene-relative, not title-absolute: a still verified for a GTA V-history
+    scene (entity "Grand Theft Auto V", a game) must never be lent to a
+    GTA VI scene, while a Vice City place still or a Rockstar Games
+    organisation still from the same film may serve as general media.
+    Unknown or differently-typed entities do not conflict.
+    """
+    target_entity = _norm_entity(target.get("canonical_entity"))
+    donor_entity = _norm_entity(donor.get("canonical_entity"))
+    if not target_entity or not donor_entity or target_entity == donor_entity:
+        return False
+    target_type = _norm_entity(target.get("subject_type"))
+    donor_type = _norm_entity(donor.get("subject_type"))
+    return bool(target_type and donor_type and target_type == donor_type)
+
+
+def _displayed_asset_counts(scenes: list[Any]) -> Counter[str]:
+    """How many scenes currently display each asset (once per scene).
+
+    One scene can reference its asset through several keys (``src``,
+    ``path``, ``asset_path``); those are one display, not three.
+    """
+    counts: Counter[str] = Counter()
+    for scene in scenes:
+        if not isinstance(scene, Mapping):
+            continue
+        media = scene.get("media") if isinstance(scene.get("media"), Mapping) else {}
+        paths = [media.get("src"), media.get("path")]
+        for shot in media.get("shots") or []:
+            if isinstance(shot, Mapping):
+                paths.extend((shot.get("path"), shot.get("asset_path")))
+        seen: set[str] = set()
+        for path in paths:
+            path = str(path or "").strip()
+            if not path:
+                continue
+            try:
+                key = str(Path(path).expanduser().resolve()).casefold()
+            except (OSError, ValueError):
+                key = path.casefold()
+            if key not in seen:
+                seen.add(key)
+                counts[key] += 1
+    return counts
+
+
+def _closest_verified_donor(
+    scenes: list[Any],
+    target_index: int,
+    exclude_path: str,
+) -> tuple[str, dict[str, Any], int, str] | None:
+    """Closest verified still from the same job, before any graphic.
+
+    Fallback order (Nov 10 stall policy): (1) closest already-downloaded,
+    vision-checked media for the SAME canonical entity; (2) a general scene
+    from the same job's approved media; (3) graphic last (caller). Donors
+    are non-adjacent, under their reuse cap, and never the defective file
+    itself. A graphic must never be chosen while verified media from the
+    job sits unused for the scene.
+
+    The target must name a canonical entity: without a subject there is
+    nothing to be "closest" to, and borrowing an arbitrary other scene's
+    still would be a guess, not a recovery (entity-less scenes keep the
+    caller's graphic behaviour).
+    """
+    if not (0 <= target_index < len(scenes)):
+        return None
+    target = scenes[target_index] if isinstance(scenes[target_index], Mapping) else {}
+    target_req = _scene_requirement(target)
+    target_entity = _norm_entity(target_req.get("canonical_entity"))
+    if not target_entity:
+        return None
+    counts = _displayed_asset_counts(scenes)
+    ranked: list[tuple[int, int, int, str, dict[str, Any], int, str]] = []
+    for source_index, source_scene in enumerate(scenes):
+        if source_index == target_index or abs(source_index - target_index) <= 1:
+            continue
+        if not isinstance(source_scene, Mapping):
+            continue
+        resolved = _verified_still_for_reuse(source_scene)
+        if not resolved:
+            continue
+        path, shot = resolved
+        if path == exclude_path:
+            continue
+        try:
+            asset_key = str(Path(path).expanduser().resolve()).casefold()
+        except (OSError, ValueError):
+            asset_key = path.casefold()
+        source_req = _scene_requirement(source_scene)
+        source_entity = _norm_entity(source_req.get("canonical_entity"))
+        if _entities_conflict(target_req, source_req):
+            continue
+        reuse_policy = {}
+        primary = source_scene.get("primary_visual") if isinstance(source_scene.get("primary_visual"), Mapping) else {}
+        asset = primary.get("asset") if isinstance(primary.get("asset"), Mapping) else {}
+        resolution = asset.get("resolution") if isinstance(asset.get("resolution"), Mapping) else {}
+        final_context = resolution.get("final_scene_context") if isinstance(resolution.get("final_scene_context"), Mapping) else {}
+        if isinstance(final_context.get("reuse_policy"), Mapping):
+            reuse_policy = final_context["reuse_policy"]
+        max_uses = max(1, int(_number(reuse_policy.get("max_uses"), 2)))
+        if counts.get(asset_key, 0) >= max_uses:
+            continue
+        same_entity = 0 if (target_entity and source_entity and target_entity == source_entity) else 1
+        ranked.append((
+            same_entity,
+            abs(source_index - target_index),
+            counts.get(asset_key, 0),
+            asset_key,
+            shot,
+            source_index,
+            path,
+        ))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    _, _, _, _, shot, source_index, path = ranked[0]
+    kind = "same_entity" if ranked[0][0] == 0 else "general_same_job"
+    return path, shot, source_index, kind
+
+
+def _repair_graphic_fallback_media(scenes: list[Any], *, fps: int) -> list[int]:
+    """Fill a missing-media beat from a verified, nonadjacent still.
+
+    First a still of the same canonical entity; when none exists, a general
+    verified still from the same job (never a graphic while verified media
+    sits unused). Unresolved graphic plates can otherwise become the
+    full-bleed background for perfectly good data/person cues. Reuse is
+    limited to verified local stills, nonadjacent scenes, and the source
+    scene's declared reuse budget. The director's graphic and narration
     remain unchanged.
     """
     use_counts: Counter[str] = Counter()
@@ -794,9 +937,48 @@ def _repair_graphic_fallback_media(scenes: list[Any], *, fps: int) -> list[int]:
             if best is None or score > best[0]:
                 best = (score, source_index, source_scene, path, shot, asset_key)
         if best is None:
+            # No same-entity donor: fall back to a general scene from the
+            # same job's approved media (stall policy step 2) rather than a
+            # graphic. The donor must still be non-adjacent, under its reuse
+            # cap, and must not name a different strict entity of the same
+            # kind (a GTA V frame is never general media for a GTA VI scene).
+            target_req = _scene_requirement(target_scene)
+            for source_index, source_scene, path, shot, asset_key in candidates:
+                if source_index == target_index or abs(source_index - target_index) <= 1:
+                    continue
+                source_req = _scene_requirement(source_scene)
+                if _entities_conflict(target_req, source_req):
+                    continue
+                source_media = source_scene.get("media") if isinstance(source_scene.get("media"), Mapping) else {}
+                source_primary = source_scene.get("primary_visual") if isinstance(source_scene.get("primary_visual"), Mapping) else {}
+                source_asset = source_primary.get("asset") if isinstance(source_primary.get("asset"), Mapping) else {}
+                source_resolution = source_asset.get("resolution") if isinstance(source_asset.get("resolution"), Mapping) else {}
+                source_context = source_resolution.get("final_scene_context") if isinstance(source_resolution, Mapping) else {}
+                reuse_policy = source_context.get("reuse_policy") if isinstance(source_context, Mapping) and isinstance(source_context.get("reuse_policy"), Mapping) else {}
+                max_uses = max(1, int(_number(reuse_policy.get("max_uses"), 2)))
+                if use_counts[asset_key] >= max_uses:
+                    continue
+                source_identity = _media_identity_text(source_scene)
+                source_tokens = set(re.findall(r"[a-z0-9]+", source_identity))
+                source_tokens -= entity_tokens
+                general_score = 5.0 + min(2.0, 0.25 * len(context_tokens & source_tokens))
+                target_role_words = set(re.findall(r"[a-z0-9]+", str(target_scene.get("visual_intent") or "").casefold()))
+                source_role_words = set(re.findall(r"[a-z0-9]+", str(source_scene.get("visual_intent") or "").casefold()))
+                if target_role_words & source_role_words:
+                    general_score += 0.15
+                if best is None or general_score > best[0]:
+                    best = (general_score, source_index, source_scene, path, shot, asset_key)
+        if best is None:
             continue
 
         _, source_index, source_scene, path, source_shot, asset_key = best
+        donor_entity, _ = _visual_requirement_context(source_scene)
+        donor_entity_norm = re.sub(r"[^a-z0-9]+", " ", donor_entity.casefold()).strip()
+        reuse_kind = (
+            "same_entity_nonadjacent_media_recovery"
+            if donor_entity_norm and donor_entity_norm == normalized_entity
+            else "general_same_job_media_recovery"
+        )
         target_media = target_scene.get("media") if isinstance(target_scene.get("media"), Mapping) else {}
         original = {key: target_media.get(key) for key in ("src", "source", "resolution_kind") if target_media.get(key) is not None}
         target_duration = max(1 / max(1, fps), _number(target_scene.get("duration")))
@@ -813,8 +995,8 @@ def _repair_graphic_fallback_media(scenes: list[Any], *, fps: int) -> list[int]:
         replacement_shot.update({
             "path": path, "asset_path": path, "shot_start": 0.0,
             "shot_end": target_duration, "duration": target_duration,
-            "reuse_kind": "same_entity_nonadjacent_media_recovery",
-            "fallback_layer": "same_identity_cross_scene",
+            "reuse_kind": reuse_kind,
+            "fallback_layer": "same_identity_cross_scene" if reuse_kind == "same_entity_nonadjacent_media_recovery" else "general_same_job_media",
         })
         replacement["shots"] = [replacement_shot]
         target_scene["media"] = replacement
@@ -825,11 +1007,11 @@ def _repair_graphic_fallback_media(scenes: list[Any], *, fps: int) -> list[int]:
             target_scene["primary_visual"] = {**dict(primary), "asset": primary_asset}
         target_scene["media_repair"] = {
             "source": "production_grounding_guard",
-            "decision": "reused_verified_same_entity_still",
+            "decision": "reused_verified_same_entity_still" if reuse_kind == "same_entity_nonadjacent_media_recovery" else "reused_verified_general_same_job_still",
             "source_scene_index": source_index,
             "source_asset_fingerprint": source_shot.get("asset_fingerprint") or "",
             "entity": canonical,
-            "reuse_kind": "same_entity_nonadjacent_media_recovery",
+            "reuse_kind": reuse_kind,
             "original_fallback": original,
         }
         use_counts[asset_key] += 1
@@ -1016,6 +1198,315 @@ def audit_production_requirements(manifest: Mapping[str, Any]) -> dict[str, Any]
         errors.append({'code':'unresolved_diagram_overuse','message':'The bounded creative revision did not resolve excessive diagrams. Revise the affected beats before export.'})
     return {"status": "fail" if errors else "pass", "errors": errors, "warnings": warnings,
             "structural_signatures": signatures, "signature_counts": dict(Counter(signatures))}
+
+
+# ---------------------------------------------------------------------------
+# Render resilience: one bad image must never hold the whole render.
+# (Berlin Wall job 55e43a67, scene 2 — a watermarked photo was replaced by a
+# terminal grounded graphic, but the shot kept the photo's verified digest,
+# so the render gate hard-failed the whole job with
+# ``verified_shot_changed_after_review``.)
+#
+# A single-scene media defect is repaired, never a render failure:
+#   1. swap in the next ranked alternate for that scene when one exists;
+#   2. otherwise convert the shot to a clean graphic fallback on the file
+#      that is actually there, re-stamping the verified digest to that
+#      file's real hash so no stale digest survives;
+#   3. count the graphics against a small per-video allowance (default 5).
+#      Beyond the allowance the video still renders, but the audit carries
+#      a ``graphic_allowance_exceeded`` warning.
+# The render still fails when a scene has no usable media at all, when the
+# video has 0 real-media scenes overall (that rule lives in
+# ``media_delivery_gate.validate_documentary_coverage`` and is untouched),
+# and for every non-media defect (bad template, missing map, ...), which
+# this repair never touches. ``audit_production_requirements`` itself stays
+# a pure detector; the repair runs on top of it.
+# ---------------------------------------------------------------------------
+MEDIA_DEFECT_CODES = frozenset({
+    "verified_shot_changed_after_review",
+    "shot_verification_asset_mismatch",
+    "rejected_shot_in_timeline",
+})
+DEFAULT_MAX_GRAPHIC_SCENES = 5
+_REJECTED_SHOT_STATUSES = {"rejected", "failed", "blocked"}
+
+
+def _max_graphic_scenes() -> int:
+    """Per-video graphic allowance (env ``VIDZEO_MAX_GRAPHIC_SCENES``)."""
+    try:
+        value = int(os.environ.get("VIDZEO_MAX_GRAPHIC_SCENES", "") or DEFAULT_MAX_GRAPHIC_SCENES)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_GRAPHIC_SCENES
+    return max(0, value)
+
+
+def _sha256_of(path: str) -> str:
+    try:
+        return _sha256_file(Path(str(path)))
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _scene_alternates(scene: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Ranked alternates retained for a scene, best-first, files that exist."""
+    seen: set[str] = set()
+    alternates: list[dict[str, Any]] = []
+    sources = []
+    primary = scene.get("primary_visual") if isinstance(scene.get("primary_visual"), Mapping) else {}
+    asset = primary.get("asset") if isinstance(primary.get("asset"), Mapping) else {}
+    sources.append(asset.get("alternates"))
+    media = scene.get("media") if isinstance(scene.get("media"), Mapping) else {}
+    sources.append(media.get("alternates"))
+    for source in sources:
+        if not isinstance(source, list):
+            continue
+        for alternate in source:
+            if not isinstance(alternate, Mapping):
+                continue
+            path = str(
+                alternate.get("path")
+                or alternate.get("asset_path")
+                or alternate.get("selected_path")
+                or alternate.get("local_path")
+                or ""
+            ).strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            if Path(path).is_file():
+                alternates.append(dict(alternate))
+    return alternates
+
+
+def _retarget_shot(shot: dict[str, Any], new_path: str, new_sha: str, *, graphic: bool) -> None:
+    """Point one shot at ``new_path`` and stamp its digests to ``new_sha``."""
+    shot["path"] = new_path
+    shot["asset_path"] = new_path
+    shot["verified_asset_sha256"] = new_sha
+    shot["asset_sha256"] = new_sha
+    shot["asset_fingerprint"] = new_sha
+    decision = shot.get("visual_decision")
+    if not isinstance(decision, Mapping):
+        decision = {}
+        shot["visual_decision"] = decision
+    decision = dict(decision)
+    decision["verified_asset_sha256"] = new_sha
+    shot["visual_decision"] = decision
+    if graphic:
+        shot["verification"] = "grounded_graphic_fallback"
+        shot["verification_status"] = "graphic_fallback"
+        shot["media_type"] = "graphic"
+        shot["fallback_layer"] = "degraded:graphic_fallback"
+        decision["verification_status"] = "graphic_fallback"
+        decision["accepted"] = False
+    else:
+        shot["verification"] = "verified_reuse"
+        shot["verification_status"] = "verified_reuse"
+        shot.pop("fallback_layer", None)
+        decision["verification_status"] = "verified_reuse"
+        decision["accepted"] = True
+        decision["visual_checked"] = True
+
+
+def _retarget_scene_paths(scene: dict[str, Any], timeline: Mapping[str, Any] | None, old_path: str, new_path: str) -> None:
+    """Keep every copy of a scene's asset path consistent after a swap."""
+    media = scene.get("media") if isinstance(scene.get("media"), Mapping) else {}
+    for key in ("src", "path"):
+        if str(media.get(key) or "") == old_path:
+            media[key] = new_path
+    primary = scene.get("primary_visual") if isinstance(scene.get("primary_visual"), Mapping) else {}
+    asset = primary.get("asset") if isinstance(primary.get("asset"), Mapping) else {}
+    for key in ("src", "path"):
+        if str(asset.get(key) or "") == old_path:
+            asset[key] = new_path
+    tracks = (timeline or {}).get("tracks") if isinstance(timeline, Mapping) else None
+    media_track = tracks.get("media") if isinstance(tracks, Mapping) else None
+    if isinstance(media_track, list):
+        for entry in media_track:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("asset") or "") == old_path:
+                entry["asset"] = new_path
+
+
+def _defective_shots(scene: Mapping[str, Any], error: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Shots of ``scene`` that the audit ``error`` is about."""
+    media = scene.get("media") if isinstance(scene.get("media"), Mapping) else {}
+    shots = [shot for shot in (media.get("shots") or []) if isinstance(shot, dict)]
+    code = str(error.get("code") or "")
+    error_path = str(error.get("path") or "")
+    if error_path:
+        return [shot for shot in shots if str(shot.get("path") or shot.get("asset_path") or "") == error_path]
+    if code == "rejected_shot_in_timeline":
+        return [shot for shot in shots if str(shot.get("verification_status") or "").lower() in _REJECTED_SHOT_STATUSES]
+    if code == "shot_verification_asset_mismatch":
+        return [
+            shot for shot in shots
+            if (shot.get("verified_asset_sha256") or shot.get("asset_sha256"))
+            and (shot.get("visual_decision") or {}).get("verified_asset_sha256")
+            and (shot.get("verified_asset_sha256") or shot.get("asset_sha256")) != (shot.get("visual_decision") or {}).get("verified_asset_sha256")
+        ]
+    return shots
+
+
+def repair_media_defects(manifest: dict[str, Any], *, max_graphic_scenes: int | None = None) -> dict[str, Any]:
+    """Repair single-scene media defects in place; return the final audit.
+
+    Returns a dict with ``audit`` (the re-run audit after repair),
+    ``substitutions`` (one record per repaired shot), ``graphic_scenes``,
+    ``max_graphic_scenes``, ``allowance_exceeded`` and
+    ``repaired_scene_indices``. Non-media audit errors are left untouched.
+    """
+    if max_graphic_scenes is None:
+        max_graphic_scenes = _max_graphic_scenes()
+    audit = audit_production_requirements(manifest)
+    scenes = manifest.get("scenes") or []
+    timeline = manifest.get("editing_timeline") if isinstance(manifest.get("editing_timeline"), Mapping) else None
+    substitutions: list[dict[str, Any]] = []
+    repaired: set[int] = set()
+    graphic_shas: dict[str, int] = {}
+    graphic_repeats: list[dict[str, Any]] = []
+    defective: dict[int, list[dict[str, Any]]] = {}
+    for error in audit.get("errors") or []:
+        if not isinstance(error, Mapping):
+            continue
+        if str(error.get("code") or "") not in MEDIA_DEFECT_CODES:
+            continue
+        index = error.get("scene_index")
+        if isinstance(index, int) and 0 <= index < len(scenes):
+            defective.setdefault(index, []).append(dict(error))
+    for index in sorted(defective):
+        scene = scenes[index]
+        if not isinstance(scene, dict):
+            continue
+        alternates = _scene_alternates(scene)
+        for error in defective[index]:
+            for shot in _defective_shots(scene, error):
+                old_path = str(shot.get("path") or shot.get("asset_path") or "")
+                if not old_path or not Path(old_path).is_file():
+                    # No usable media on disk for this shot; leave the error
+                    # in place so the render still fails rather than shipping
+                    # a scene with nothing in it.
+                    continue
+                record: dict[str, Any] = {
+                    "scene_index": index,
+                    "code": str(error.get("code") or ""),
+                    "from": old_path,
+                }
+                alternate = alternates.pop(0) if alternates else None
+                if alternate is not None:
+                    new_path = str(
+                        alternate.get("path")
+                        or alternate.get("asset_path")
+                        or alternate.get("selected_path")
+                        or alternate.get("local_path")
+                        or ""
+                    )
+                    new_sha = _sha256_of(new_path)
+                    if not new_sha:
+                        alternate = None
+                    else:
+                        decision = alternate.get("visual_decision")
+                        if isinstance(decision, Mapping):
+                            shot["visual_decision"] = dict(decision)
+                        _retarget_shot(shot, new_path, new_sha, graphic=False)
+                        _retarget_scene_paths(scene, timeline, old_path, new_path)
+                        record.update({"to": "alternate", "path": new_path})
+                        substitutions.append(record)
+                        repaired.add(index)
+                        continue
+                # No alternate left: prefer the closest already-verified
+                # media from the same job over a graphic (stall policy:
+                # same entity first, then a general scene from the job's
+                # approved media). A graphic is the last resort, never the
+                # default while verified media sits unused for this scene.
+                donor = _closest_verified_donor(scenes, index, old_path)
+                if donor is not None:
+                    donor_path, donor_shot, donor_index, donor_kind = donor
+                    donor_sha = _sha256_of(donor_path)
+                    if donor_sha:
+                        decision = donor_shot.get("visual_decision")
+                        if isinstance(decision, Mapping):
+                            shot["visual_decision"] = dict(decision)
+                        _retarget_shot(shot, donor_path, donor_sha, graphic=False)
+                        _retarget_scene_paths(scene, timeline, old_path, donor_path)
+                        record.update({
+                            "to": "closest_verified_media",
+                            "path": donor_path,
+                            "donor_scene_index": donor_index,
+                            "reuse_kind": donor_kind,
+                        })
+                        substitutions.append(record)
+                        repaired.add(index)
+                        continue
+                # No alternate left: convert the shot to a clean graphic on
+                # the file that is actually there, re-stamping the verified
+                # digest to that file's real hash so the stale digest from
+                # the rejected photo cannot fail the gate again.
+                file_sha = _sha256_of(old_path)
+                if not file_sha:
+                    continue
+                repeat_of = graphic_shas.get(file_sha)
+                graphic_shas.setdefault(file_sha, index)
+                _retarget_shot(shot, old_path, file_sha, graphic=True)
+                media = scene.get("media") if isinstance(scene.get("media"), Mapping) else {}
+                media["resolution_kind"] = "grounded_graphic_fallback"
+                record.update({"to": "graphic", "path": old_path})
+                if repeat_of is not None:
+                    # Never silently repeat a graphic across scenes: the
+                    # repeat is recorded on the substitution and surfaced
+                    # as an audit warning below.
+                    record["graphic_distinct"] = False
+                    record["graphic_repeat_of_scene"] = repeat_of
+                    graphic_repeats.append({
+                        "scene_index": index,
+                        "repeat_of_scene": repeat_of,
+                        "asset_sha256": file_sha,
+                        "path": old_path,
+                    })
+                substitutions.append(record)
+                repaired.add(index)
+    manifest["media_substitutions"] = substitutions
+    audit = audit_production_requirements(manifest)
+    graphic_scenes = sum(
+        1 for scene in scenes
+        if isinstance(scene, Mapping) and _scene_has_graphic_fallback_media(scene)
+    )
+    allowance_exceeded = graphic_scenes > max_graphic_scenes
+    manifest["graphic_allowance"] = {
+        "graphic_scenes": graphic_scenes,
+        "max_graphic_scenes": max_graphic_scenes,
+        "exceeded": allowance_exceeded,
+    }
+    if allowance_exceeded:
+        audit.setdefault("warnings", []).append({
+            "code": "graphic_allowance_exceeded",
+            "graphic_scenes": graphic_scenes,
+            "max_graphic_scenes": max_graphic_scenes,
+            "message": (
+                f"{graphic_scenes} scenes fell back to graphics (allowance "
+                f"{max_graphic_scenes}); the video still renders, but the "
+                "real-media yield is below the target."
+            ),
+        })
+    if graphic_repeats:
+        audit.setdefault("warnings", []).append({
+            "code": "graphic_repeat",
+            "repeats": graphic_repeats,
+            "message": (
+                f"{len(graphic_repeats)} scene(s) reuse a graphic already "
+                "shown by another scene; each repeat is recorded on its "
+                "substitution (graphic_repeat_of_scene)."
+            ),
+        })
+    return {
+        "audit": audit,
+        "substitutions": substitutions,
+        "graphic_scenes": graphic_scenes,
+        "max_graphic_scenes": max_graphic_scenes,
+        "allowance_exceeded": allowance_exceeded,
+        "repaired_scene_indices": sorted(repaired),
+    }
 
 
 def compile_production_timeline(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1335,7 +1826,16 @@ def compile_production_timeline(manifest: dict[str, Any]) -> dict[str, Any]:
     tracks["music"] = list(audio.get("music") or []) if isinstance(audio.get("music"), list) else ([audio["music"]] if audio.get("music") else [])
     manifest["editing_timeline"] = {"version": 1, "clock": "film_global_frames", "fps": fps, "tracks": tracks}
     manifest['review_frames'] = [round(t * fps) for t in review_sample_times(manifest, _number(manifest.get('duration'), sum(_number(scene.get('duration')) for scene in manifest.get('scenes') or [])))]
-    manifest["production_audit"] = audit_production_requirements(manifest)
+    # One bad image must never hold the whole render: repair single-scene
+    # media defects (alternate swap, then clean graphic re-stamp) before the
+    # audit is stored, so the render gate only ever sees what is left.
+    # The repair must never break compilation; on any failure fall back to
+    # the raw audit (fail-closed, as before).
+    try:
+        manifest["production_audit"] = repair_media_defects(manifest)["audit"]
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        manifest.setdefault("media_substitutions_error", f"{type(exc).__name__}: {exc}")
+        manifest["production_audit"] = audit_production_requirements(manifest)
     try:
         from .manager import manager_review
         manifest["quality_control"] = manager_review(manifest)

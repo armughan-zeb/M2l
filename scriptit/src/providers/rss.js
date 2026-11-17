@@ -51,8 +51,10 @@ function feedsForNiche(niche) {
   return STATIC_FEEDS.filter((feed) => wanted.includes(feed.category)).slice(0, 5);
 }
 
+const { runBatches } = require('../utils/concurrency');
+
 const parser = new Parser({
-  timeout: 8000,
+  timeout: 20000,
   customFields: { item: ['media:content', 'description', 'source'] },
 });
 
@@ -102,27 +104,48 @@ function scoreItem(item, queryTokens) {
   return score;
 }
 
-async function fetchFeed(feed, timeoutMs = 8000) {
+async function fetchFeed(feed, timeoutMs = 20000) {
+  // The timeout was previously ignored: parseURL always used the
+  // module-level parser's fixed 8000ms. Build a parser per call so the
+  // caller's budget is real — a feed that answers slowly through the
+  // proxy gets the time it was given instead of a fixed cut-off.
+  const feedParser = timeoutMs === 20000 ? parser : new Parser({
+    timeout: timeoutMs,
+    customFields: { item: ['media:content', 'description', 'source'] },
+  });
   try {
-    const out = await parser.parseURL(feed.url);
+    const out = await feedParser.parseURL(feed.url);
     return { feed, items: (out.items || []).slice(0, 25) };
   } catch (err) {
     return { feed, items: [], error: err.message };
   }
 }
 
-async function searchRss(query, { limit = 16, timeoutMs = 8000, niche = 'general' } = {}) {
+async function searchRss(query, { limit = 16, timeoutMs = 20000, niche = 'general' } = {}) {
   const qTokens = tokenize(query);
   const feedsToTry = [
     ...topicFeeds(query),
     ...feedsForNiche(niche),
   ];
 
-  const settled = await Promise.allSettled(feedsToTry.map((f) => fetchFeed(f, timeoutMs)));
+  // The old code fired all 11 feeds at once through the egress proxy,
+  // which serializes concurrent connections: under load every feed's
+  // proxy tunnel timed out at 5000ms and the whole lane died (Cooper
+  // run, 2026-11-09). Fetch in batches of 3 — sequential-ish requests
+  // answer in ~1s, so the lane survives proxy congestion.
+  const settled = await runBatches(feedsToTry, 3, async (feed) => {
+    try {
+      return { status: 'fulfilled', value: await fetchFeed(feed, timeoutMs) };
+    } catch (err) {
+      return { status: 'rejected', reason: err };
+    }
+  });
   const all = [];
   const seenUrls = new Set();
+  const feedErrors = [];
   for (const r of settled) {
-    if (r.status !== 'fulfilled') continue;
+    if (r.status !== 'fulfilled') { feedErrors.push(String(r.reason?.message || r.reason || 'feed failed')); continue; }
+    if (r.value.error) feedErrors.push(`${r.value.feed.name}: ${r.value.error}`);
     const { items } = r.value;
     for (const it of items) {
       const url = it.link || it.guid || '';
@@ -152,7 +175,14 @@ async function searchRss(query, { limit = 16, timeoutMs = 8000, niche = 'general
     if (a.isDated !== b.isDated) return a.isDated ? -1 : 1;
     return new Date(b.date || 0) - new Date(a.date || 0);
   });
+  // Partial failure is normal (some feeds always fail) and stays silent.
+  // Total failure is not: every feed erroring means the RSS lane is dead,
+  // and returning [] would hide that from the research log. A legitimately
+  // empty result (feeds answered, nothing matched) still returns [].
+  if (all.length === 0 && feedErrors.length > 0 && feedErrors.length >= feedsToTry.length) {
+    throw new Error(`RSS search failed: all ${feedsToTry.length} feeds errored (${[...new Set(feedErrors)].slice(0, 3).join('; ')})`);
+  }
   return all.slice(0, limit);
 }
 
-module.exports = { searchRss, STATIC_FEEDS, topicFeeds, feedsForNiche };
+module.exports = { searchRss, fetchFeed, STATIC_FEEDS, topicFeeds, feedsForNiche };

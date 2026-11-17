@@ -287,7 +287,7 @@ async function main() {
     log('Refusing to present a failed draft as a finished script. Returning it with publishable=false so the worker can decide.');
     return finish({ scriptText, meta: { ...meta, publishable: false } });
   }
-  log(`done: ${meta.quality?.words || scriptText.split(/\s+/).length} words, quality score ${meta.quality?.score ?? 'n/a'}, hook=${meta.quality?.hook === true}`);
+  log(`done: ${meta.quality?.words || scriptText.split(/\s+/).length} words, quality score ${meta.quality?.score ?? 'n/a'}, hook=${meta.quality?.hook === true}${meta.ungrounded ? ' — UNGROUNDED (P4): no verified research; verify facts before production' : ''}`);
   finish({ scriptText, meta });
 }
 

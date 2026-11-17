@@ -510,9 +510,16 @@ def test_verified_source_allows_only_hash_bound_h264_render_transcode(tmp_path):
 
     render.write_bytes(b'changed after the transcode record')
     compile_production_timeline(manifest)
-    assert manifest['production_audit']['status'] == 'fail'
-    assert any(error['code'] == 'verified_shot_changed_after_review'
-               for error in manifest['production_audit']['errors'])
+    # Berlin Wall (job 55e43a67, scene 2) changed this: a single scene whose
+    # verified bytes no longer match the file must not hold the whole render.
+    # The shot is repaired to a recorded graphic fallback and the render
+    # continues; the substitution is visible in media_substitutions, never
+    # silent.
+    assert manifest['production_audit']['status'] == 'pass'
+    assert manifest['media_substitutions']
+    assert manifest['media_substitutions'][0]['to'] == 'graphic'
+    assert manifest['graphic_allowance']['graphic_scenes'] == 1
+    assert manifest['production_audit']['errors'] == []
 
 
 def test_missing_data_manager_fallback_has_no_narration_card():
@@ -780,7 +787,7 @@ def test_missing_or_empty_frame_review_cannot_pass(tmp_path):
     assert not long_dip
 
 
-def test_final_timeline_refuses_changed_verified_asset_bytes(tmp_path):
+def test_final_timeline_repairs_changed_verified_asset_bytes(tmp_path):
     import hashlib
     path = tmp_path/'image.jpg'
     path.write_bytes(b'approved image')
@@ -789,7 +796,14 @@ def test_final_timeline_refuses_changed_verified_asset_bytes(tmp_path):
         {'path':str(path),'visual_decision':{'verified_asset_sha256':digest},'verified_asset_sha256':digest,'verification_scope':'actual_asset'}]}}]}
     assert compile_production_timeline(manifest)['production_audit']['status'] == 'pass'
     path.write_bytes(b'replaced image')
-    assert compile_production_timeline(manifest)['production_audit']['status'] == 'fail'
+    # Berlin Wall (job 55e43a67, scene 2): a single scene whose verified
+    # bytes changed must not hold the whole render. The shot is repaired to
+    # a recorded graphic fallback and the audit passes.
+    manifest = compile_production_timeline(manifest)
+    assert manifest['production_audit']['status'] == 'pass'
+    assert manifest['media_substitutions']
+    assert manifest['media_substitutions'][0]['to'] == 'graphic'
+    assert manifest['production_audit']['errors'] == []
 
 
 def test_vision_preserves_source_presentation_classification():

@@ -226,6 +226,17 @@ def build_sources(
                     metadata_score=float(candidate.get("v2_score") or candidate.get("score") or 0.0),
                 )
                 sources[sid] = existing
+            else:
+                # The same source can appear in several pools with different
+                # best-fit scores (one per pool). Keep the max: a source
+                # that scored well in any pool must not be hidden behind a
+                # lower first-pool score at the shortlist gate.
+                try:
+                    pool_score = float(candidate.get("v2_score") or candidate.get("score") or 0.0)
+                except (TypeError, ValueError):
+                    pool_score = 0.0
+                if pool_score > existing.metadata_score:
+                    existing.metadata_score = pool_score
             if pool_key not in existing.pool_keys:
                 existing.pool_keys.append(str(pool_key))
     return sources
