@@ -2174,18 +2174,30 @@ def _get_authenticated_youtube_session(
     if not enabled:
         return None
     # Configured pool: VIDZEO_YT_COOKIE_FILES list + cookies directory,
-    # shared per process so rotation and per-account health survive
-    # across searches and downloads. next_healthy() round-robins across
-    # verified accounts and skips signed-out / throttled ones; zero
-    # healthy accounts falls back to public access below.
+    # plus the hardcoded repo-root cookies.json fallback, shared per
+    # process so rotation and per-account health survive across
+    # searches and downloads. next_attachable() returns the best
+    # loadable jar even when the account's last probe reported
+    # signed_out: the operator's cookies are attached best-effort
+    # instead of going fully anonymous. Only load_error / throttled
+    # accounts fall back to public access below.
     from services.youtube_session import get_configured_pool
     pool = get_configured_pool()
     if pool.paths:
-        index, jar = pool.next_healthy()
+        index, jar = pool.next_attachable()
         adapted = _adapt_youtube_cookie_jar(jar)
         if adapted is not None:
             adapted._vidzeo_session_pool = pool
             adapted._vidzeo_session_index = index
+            try:
+                snap = pool.health_snapshot()
+                status = str(snap[index].get("status") or "") if 0 <= index < len(snap) else ""
+            except Exception:
+                status = ""
+            if status and status != "verified":
+                print(f"   [yt-v2] YouTube cookies attached best-effort (account {index + 1} reports {status}); YouTube may still throttle", flush=True)
+            else:
+                print(f"   [yt-v2] authenticated YouTube session enabled (account {index + 1})", flush=True)
             return adapted
         print("   [yt-v2] configured YouTube accounts unavailable; using public search", flush=True)
         if str(os.environ.get("VIDZEO_YT_REQUIRE_SESSION") or "").lower() in {"1", "true", "yes", "on"}:
@@ -2288,6 +2300,25 @@ def _install_youtube_session(ydl: Any, session_jar: Any) -> None:
         print(f"   [yt-v2] could not attach authenticated session ({type(exc).__name__})")
 
 
+def _persist_youtube_session_cookies(used_jar: Any, session_jar: Any = None,
+                                     pool: Any = None, index: Any = None) -> None:
+    """Best-effort cookie write-back after a jar was used against YouTube.
+
+    YouTube rotates session tokens via Set-Cookie; the rotated values live
+    only in the jar yt-dlp mutated, so write them back to the pool file the
+    jar came from or the next process start loads dead tokens. ``used_jar``
+    is the jar yt-dlp actually used (``ydl.cookiejar`` after the request);
+    ``session_jar`` is the accessor jar that still carries the pool/index
+    attributes (clones made for yt-dlp lose them). Never raises, never
+    logs values; a skipped write-back only costs the next rotation.
+    """
+    try:
+        from services.youtube_cookie_persistence import persist_session_jar
+        persist_session_jar(used_jar, session_jar=session_jar, pool=pool, index=index)
+    except Exception as exc:
+        print(f"   [yt-v2] cookie write-back skipped ({type(exc).__name__})", flush=True)
+
+
 def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation, output_dir, raw_prefix):
     """Retry a sign-in requirement with one other verified account."""
     def download(jar):
@@ -2302,10 +2333,17 @@ def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation,
         })
         with yt_dlp.YoutubeDL(attempt_opts) as ydl:
             _install_youtube_session(ydl, jar)
+            # The jar yt-dlp actually used: _install_youtube_session clones
+            # the pool jar, and yt-dlp mutates that clone in place with any
+            # rotated Set-Cookie values. Read it from __dict__ so the
+            # cached_property is never triggered for an anonymous download.
+            installed = ydl.__dict__.get("cookiejar")
             ydl.download([url])
+        return installed if installed is not None else jar
 
     try:
-        download(session_jar)
+        used_jar = download(session_jar)
+        _persist_youtube_session_cookies(used_jar, session_jar)
     except Exception as exc:
         pool = getattr(session_jar, "_vidzeo_session_pool", None)
         detail = str(exc).casefold()
@@ -2339,7 +2377,8 @@ def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation,
         for stale in output_dir.glob(raw_prefix + "*"):
             stale.unlink(missing_ok=True)
         print(f"   [yt-session] retrying sign-in-required footage with verified account {index + 1}", flush=True)
-        download(backup)
+        used_backup = download(backup)
+        _persist_youtube_session_cookies(used_backup, pool=pool, index=index)
 
 
 def _youtube_player_clients(session_jar: Any = None) -> List[str]:
@@ -2500,6 +2539,9 @@ def _search_youtube_uncached(
         with yt_dlp.YoutubeDL(opts) as ydl:
             _install_youtube_session(ydl, session_jar)
             data = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
+            # Search is the highest-volume YouTube use: persist any tokens
+            # YouTube rotated on this request before the jar is discarded.
+            _persist_youtube_session_cookies(ydl.__dict__.get("cookiejar"), session_jar)
         entries = []
         for item in (data or {}).get("entries") or []:
             if not item:
@@ -6073,6 +6115,52 @@ def _assign_candidates(
     return assignments
 
 
+_CONTENT_REJECTION_STATUSES = {
+    'motion_or_quality_rejected', 'overlay_or_talking_head_rejected',
+    'contact_vision_rejected',
+}
+
+
+def _same_video_alternate_allowed(attempt_rows, vid, option_count) -> bool:
+    """Whether a failed cut may be retried at another timestamp of the same video.
+
+    A same-video alternate is only useful when the failure was timestamp-local
+    (e.g. an intro talking head or a mid-video blank frame). It is denied when
+    a fresh master exists (``option_count > 1``) and the failure is one of:
+
+    * a static/slideshow master (the whole video is a still);
+    * a video-global rejection (burned-in captions / watermarks fail at every
+      timestamp of the same master);
+    * a second content failure on the same video in this scene (the master is
+      wrong for the scene, not the timestamp).
+
+    When no fresh master exists the alternate is still allowed: it is the
+    scene's only remaining chance.
+    """
+    if not attempt_rows:
+        return False
+    last = attempt_rows[-1] if isinstance(attempt_rows[-1], dict) else {}
+    if str(last.get('status') or '') not in _CONTENT_REJECTION_STATUSES:
+        return False
+    if option_count <= 1:
+        return True
+    reason = str(last.get('rejection_reason') or '').split(':')[0]
+    if reason in {
+        'static_image_or_pan', 'still_or_slideshow', 'still_or_slideshow_frame',
+        'static_frame_hold',
+    }:
+        return False
+    if reason in {'caption_overlay_rejected', 'watermark_detected', 'watermark'}:
+        return False
+    prior_same_video_failures = sum(
+        1 for row in attempt_rows[:-1]
+        if isinstance(row, dict)
+        and str(row.get('video_id') or row.get('candidate_id') or '') == vid
+        and str(row.get('status') or '') in _CONTENT_REJECTION_STATUSES
+    )
+    return prior_same_video_failures < 1
+
+
 def get_youtube_clips(
     script: str,
     title: str,
@@ -7049,19 +7137,9 @@ def get_youtube_clips(
                 # If cut 1 was rejected (e.g. intro talking head or text overlay) and the video
                 # is long enough, try an alternate clean mid-video B-roll timestamp from the same video.
                 vid_duration = float(option.get("duration") or 0.0)
-                retryable_cut = bool(attempt_audit[idx] and attempt_audit[idx][-1].get('status') in {
-                    'motion_or_quality_rejected', 'overlay_or_talking_head_rejected',
-                    'contact_vision_rejected',
-                })
-                if (retryable_cut and len(options) > 1
-                        and attempt_audit[idx][-1].get('rejection_reason') in {
-                            'static_image_or_pan', 'still_or_slideshow', 'still_or_slideshow_frame',
-                            'static_frame_hold',
-                        }):
-                    # Explore a fresh master before spending another transfer
-                    # on a static guide/slideshow. Intro overlays still get
-                    # their useful same-source mid-video recovery below.
-                    retryable_cut = False
+                retryable_cut = _same_video_alternate_allowed(
+                    attempt_audit[idx], vid, len(options)
+                )
                 time_for_cut = hard_deadline is None or hard_deadline - time.monotonic() > 35
                 # The fair scheduler deliberately sets attempt_budget=1.
                 # Using that budget as the condition made same-source clean

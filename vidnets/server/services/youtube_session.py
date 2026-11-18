@@ -404,13 +404,59 @@ def _persist(jar: http.cookiejar.CookieJar, meta: Dict[str, Any]) -> bool:
         }
         target = _secure_store_path()
         target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Owner-only directory: the snapshot holds live sign-in cookies.
+            os.chmod(target.parent, 0o700)
+        except OSError:
+            pass
         temp = target.with_suffix(".tmp")
         temp.write_text(json.dumps(container, separators=(",", ":")), encoding="utf-8")
+        try:
+            # Owner-only file, set before the atomic rename so no
+            # world-readable window ever exists.
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
         os.replace(temp, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
         return True
     except Exception as exc:
         print(f"   [yt-session] encrypted persistence unavailable: {type(exc).__name__}")
         return False
+
+
+def refresh_encrypted_snapshot(
+    jar: http.cookiejar.CookieJar, meta: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Write the live jar to the encrypted on-disk snapshot.
+
+    Called by the cookie write-back path whenever cookies are written
+    back or replaced (e.g. after YouTube rotates a token), so the
+    snapshot stays current without a fresh browser export.  The
+    snapshot is the durable store: it survives server restarts and
+    VM reboots, and ``_load_persisted()`` restores it on next start.
+
+    Refuses an empty or unauthenticated jar instead of overwriting a
+    good snapshot with junk.  Only cookie names/counts are ever
+    logged, never values.  Returns True when the snapshot was written.
+    """
+    try:
+        filtered = _filtered_jar(jar) if jar is not None else http.cookiejar.CookieJar()
+    except Exception:
+        return False
+    if not _jar_is_authenticated(filtered):
+        return False
+    snapshot_meta = {
+        "source": "cookie-write-back",
+        "verified_authenticated": False,
+        "verification": "",
+    }
+    if meta:
+        snapshot_meta.update({k: v for k, v in meta.items() if k != "cookies"})
+    return _persist(filtered, snapshot_meta)
 
 
 def _load_persisted() -> Tuple[Optional[http.cookiejar.CookieJar], Dict[str, Any]]:
@@ -809,6 +855,26 @@ def _cookie_pool_retry_delay_seconds(status: str) -> float:
         return default
 
 
+def _default_cookie_file_paths() -> List[Path]:
+    """Hardcoded fallback: the operator-shared cookies at the repo root.
+
+    The cookies the operator shares live at ``<repo>/cookies.json``.
+    They must be picked up even when no ``VIDZEO_YT_COOKIE_FILES`` env
+    var is set (fresh machine, lost .env line): the pipeline should
+    use the shared cookies with zero configuration.
+    """
+    try:
+        candidate = Path(__file__).resolve().parents[3] / "cookies.json"
+    except (IndexError, RuntimeError):
+        return []
+    try:
+        if candidate.is_file():
+            return [candidate]
+    except OSError:
+        pass
+    return []
+
+
 class ConfiguredYouTubeSessions:
     """Verify operator-supplied accounts on demand, separately from browser login.
 
@@ -823,6 +889,10 @@ class ConfiguredYouTubeSessions:
 
     def __init__(self, setting: str = "", *, cookie_dir: Any = None):
         paths = _parse_cookie_file_setting(setting)
+        if not paths:
+            # Hardcoded default: the operator-shared cookies at the repo
+            # root. No env var, no config file needed to use them.
+            paths = _default_cookie_file_paths()
         for candidate in _discover_cookie_dir_paths(cookie_dir):
             if str(candidate) not in {str(path) for path in paths}:
                 paths.append(candidate)
@@ -830,7 +900,60 @@ class ConfiguredYouTubeSessions:
         self._lock = RLock()
         self._checked: Dict[int, Optional[http.cookiejar.CookieJar]] = {}
         self._health: Dict[int, Dict[str, Any]] = {}
+        # Per-file content signatures (mtime_ns, size), keyed by path
+        # string. The pool rebuild key is the file LIST only, so a cookie
+        # file overwritten in place would otherwise sit behind a stale
+        # health verdict until the verify TTL expired. A signature
+        # change means the operator dropped a fresh export: the account
+        # is reset to unknown so the next call re-probes it. os.stat
+        # only -- no file reads on the hot path.
+        self._signatures: Dict[str, Optional[Tuple[int, int]]] = {
+            str(path): self._file_signature(path) for path in self.paths
+        }
         self._cursor = 0
+
+    @staticmethod
+    def _file_signature(path: Any) -> Optional[Tuple[int, int]]:
+        """Cheap content fingerprint: (mtime_ns, size), or None if unreadable."""
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _note_file_change(self, index: int) -> bool:
+        """Notice an in-place overwrite of one account's cookie file.
+
+        Returns True when the file's signature changed and the health
+        entry was reset to unknown (a re-verify is now due). A throttled
+        account keeps its cooldown: only the recorded signature is
+        updated, and the fresh content is probed once the cooldown
+        expires. A file that vanished is left alone -- the load path
+        surfaces that as load_error on the next probe.
+        """
+        path = self.paths[index]
+        key = str(path)
+        signature = self._file_signature(path)
+        previous = self._signatures.get(key)
+        if signature is None or previous is None:
+            self._signatures[key] = signature
+            return False
+        if signature == previous:
+            return False
+        self._signatures[key] = signature
+        entry = self._health_entry(index)
+        if str(entry.get("status") or "unknown") == "throttled":
+            return False
+        entry.update({
+            "status": "unknown",
+            "reason": "cookie-file-changed",
+            "cookie_count": 0,
+            "auth_cookie_count": 0,
+            "last_checked": 0.0,
+            "verified_at": 0.0,
+        })
+        self._checked[index] = None
+        return True
 
     # -- health ---------------------------------------------------------
     def _health_entry(self, index: int) -> Dict[str, Any]:
@@ -887,7 +1010,13 @@ class ConfiguredYouTubeSessions:
                 self._checked[index] = None
 
     def refresh(self) -> None:
-        """Rescan the cookies directory; new files join the pool, removed ones leave."""
+        """Rescan the cookies directory; new files join the pool, removed ones leave.
+
+        Also re-stat every tracked file: a cookie file overwritten in
+        place (same path, fresh export) resets that account to unknown
+        so the next call re-probes it instead of serving the stale
+        verdict from the old file.
+        """
         with self._lock:
             current = list(self.paths)
             discovered = _discover_cookie_dir_paths()
@@ -905,11 +1034,17 @@ class ConfiguredYouTubeSessions:
                     index: entry for index, entry in self._health.items()
                     if index < len(self.paths)
                 }
+            for index in range(len(self.paths)):
+                self._note_file_change(index)
 
     # -- verification ---------------------------------------------------
     def _check_account(self, index: int) -> Optional[http.cookiejar.CookieJar]:
         """Load + verify one account file; cache the verdict, not the probe."""
         now = time.time()
+        # A file overwritten since the last check resets the health
+        # entry to unknown first, so the TTL guards below cannot serve
+        # a stale verdict from the old export.
+        self._note_file_change(index)
         entry = self._health_entry(index)
         status = str(entry.get("status") or "unknown")
         if status == "verified" and self._checked.get(index) is not None:
@@ -1006,6 +1141,56 @@ class ConfiguredYouTubeSessions:
                     return index, _clone_jar(jar)
             return -1, None
 
+    def _load_attachable_jar(self, index: int) -> Optional[http.cookiejar.CookieJar]:
+        """Load one account's jar for best-effort attachment, no YouTube probe.
+
+        Returns the jar when the file loads and carries auth cookies,
+        even when the last verify probe reported signed_out: the probe's
+        LOGGED_IN verdict can lag a session that still carries identity,
+        and a signed-out jar is strictly better than fully anonymous
+        access.  Skips throttled accounts (cooling down) and unreadable
+        files.  No network call here, so the signed-out probe is not
+        repeated and the search wall is not burned.
+        """
+        entry = self._health_entry(index)
+        status = str(entry.get("status") or "unknown")
+        if status in {"throttled", "load_error"}:
+            return None
+        try:
+            jar = _filtered_jar(
+                cookie for cookie in _load_explicit_cookie_file(self.paths[index])
+                if cookie.domain.lstrip(".").lower() == "youtube.com"
+                or cookie.domain.lower().endswith(".youtube.com")
+            )
+        except (OSError, ValueError, http.cookiejar.LoadError):
+            return None
+        if not _jar_is_authenticated(jar):
+            return None
+        return jar
+
+    def next_attachable(self) -> Tuple[int, Optional[http.cookiejar.CookieJar]]:
+        """Best-effort jar for attachment: verified first, then any loadable account.
+
+        The pipeline attaches this jar to every YouTube search and
+        download instead of going fully anonymous.  A signed-out or
+        unverified account still carries the operator's cookies; only
+        load_error (unparseable file) and throttled (cooling down)
+        accounts are skipped.  The caller must not claim the session is
+        verified: health_snapshot() stays the source of truth for that.
+        """
+        with self._lock:
+            index, jar = self.next_healthy()
+            if jar is not None:
+                return index, jar
+            total = len(self.paths)
+            for step in range(total):
+                index = (self._cursor + step) % total
+                jar = self._load_attachable_jar(index)
+                if jar is not None:
+                    self._cursor = (index + 1) % total
+                    return index, _clone_jar(jar)
+            return -1, None
+
 
 _CONFIGURED_POOL: Optional[ConfiguredYouTubeSessions] = None
 _CONFIGURED_POOL_KEY: Optional[Tuple[str, Tuple[str, ...]]] = None
@@ -1016,9 +1201,12 @@ def get_configured_pool(setting: Any = None) -> ConfiguredYouTubeSessions:
 
     The pool is rebuilt when the configured file list or the cookies
     directory listing changes, so a newly dropped file is picked up by
-    the next job without a server restart.  Health is kept on the
-    shared instance: an account marked throttled mid-job stays
-    skipped for the rest of its cooldown.
+    the next job without a server restart.  A file overwritten in
+    place is noticed too: refresh() re-stats every tracked file and
+    resets a changed account to unknown, so the next call re-probes
+    it instead of serving the stale verdict from the old export.
+    Health is kept on the shared instance: an account marked throttled
+    mid-job stays skipped for the rest of its cooldown.
     """
     global _CONFIGURED_POOL, _CONFIGURED_POOL_KEY
     with _LOCK:
@@ -1706,6 +1894,18 @@ def ensure_verified_session(
 
 def session_status() -> Dict[str, Any]:
     """Return redacted session diagnostics suitable for the local UI."""
+    # Multi-account cookie pool health (redacted: file names and counts only,
+    # never values). Surfaced here so a stale pool is visible instead of
+    # silently falling back to anonymous public search and burning a run.
+    try:
+        pool_health = get_configured_pool().health_snapshot()
+    except Exception:
+        pool_health = []
+    pool_healthy = sum(1 for item in pool_health if str(item.get("status") or "") == "verified")
+    pool_known_bad = any(
+        str(item.get("status") or "") in {"signed_out", "throttled", "load_error"}
+        for item in pool_health
+    )
     with _LOCK:
         preferred = _preferred_browser()
         meta = dict(_SESSION_META)
@@ -1769,6 +1969,13 @@ def session_status() -> Dict[str, Any]:
                 f"Authenticated {selected_browser.title()} session verified by YouTube"
                 + (f" ({meta.get('channel_title') or meta.get('username') or _CURRENT_CHANNEL_TITLE})" if (meta.get("channel_title") or meta.get("username") or _CURRENT_CHANNEL_TITLE) else "")
                 if ready else meta.get("reason") or "Sign in to YouTube in a supported browser"
+            ),
+            "pool": pool_health,
+            "pool_healthy_accounts": pool_healthy,
+            "pool_message": (
+                "YouTube cookie pool: no healthy account — downloads run anonymous; re-export fresh cookies for signed-in access"
+                if pool_health and pool_healthy == 0 and pool_known_bad
+                else ""
             ),
         }
 

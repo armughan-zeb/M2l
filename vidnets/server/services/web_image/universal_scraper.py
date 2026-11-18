@@ -15,6 +15,7 @@ resolver's responsibility.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import json
 import subprocess
@@ -226,12 +227,52 @@ def _universal_host_slot(host: str) -> Dict[str, object]:
         return state
 
 
+# ── Proxy bypass for the web retry (Nov 18, Moon 20s test) ───────────────
+# The egress proxy is runtime-managed (https_proxy=http://hatch-egress-proxy:3128,
+# re-injected on every shell/restart) and cannot be removed system-wide.
+# When a web search fails through the proxy (read timeouts, bot-gates), the
+# retry goes DIRECT: direct egress works and is fast (Bing 200 in ~1.5s,
+# Yandex 200 in ~1.3s, DuckDuckGo 200 in ~1.2s, verified live Nov 18).
+# The bypass is per-request, not global: a thread-local flag that
+# _throttled_get honours by passing proxies={http: None, https: None} to
+# the requests call, so only the retrying thread's requests go direct and
+# concurrent scene workers are unaffected. Thread-local, so no cross-thread
+# leak; the flag is always restored by the context manager.
+_WEB_BYPASS_PROXY = threading.local()
+
+
+def _web_bypass_proxy_enabled() -> bool:
+    return bool(getattr(_WEB_BYPASS_PROXY, "enabled", False))
+
+
+@contextlib.contextmanager
+def web_bypass_proxy():
+    """Run the enclosed web requests DIRECT, bypassing the egress proxy.
+
+    Use only for a bounded retry after a proxied request failed. The
+    requests calls inside the context pass proxies={http: None, https: None},
+    which overrides the env proxy vars for that single request. The isolated
+    native client (primp) does not accept a proxies override and is retried
+    without it; the engine's plain-requests fallback then honours the bypass.
+    """
+    prev = getattr(_WEB_BYPASS_PROXY, "enabled", False)
+    _WEB_BYPASS_PROXY.enabled = True
+    try:
+        yield
+    finally:
+        _WEB_BYPASS_PROXY.enabled = prev
+
+
 def _throttled_get(client, url: str, *, headers, timeout):
     """GET through the per-host throttle, with bounded 429 backoff retries.
 
     ``client`` is any object with ``.get(url, headers=..., timeout=...)``
     (the isolated native client, a requests.Session, or the requests
     module). Returns the response-like object (status_code + text/json).
+    When the enclosing retry runs direct (``web_bypass_proxy`` context),
+    the call passes ``proxies={http: None, https: None}`` so this single
+    requests call skips the env proxy vars; clients that do not accept a
+    proxies override are retried without it.
     Only 429 is retried with exponential backoff. A 403 is returned
     immediately so the manager can retire that engine for this run rather
     than repeat a refusal for every scene. Other non-200 responses are
@@ -286,7 +327,22 @@ def _throttled_get(client, url: str, *, headers, timeout):
             )
         try:
             request_timeout = max(0.5, min(float(timeout or 15), _remaining()))
-            response = client.get(url, headers=headers, timeout=request_timeout)
+            # Proxy bypass (Nov 18 retry): when the enclosing retry runs
+            # direct, pass proxies={http: None, https: None} so this single
+            # requests call skips the env proxy vars. Clients that do not
+            # accept a proxies override (the isolated native client) raise
+            # TypeError immediately; retry them without it — the engine's
+            # plain-requests fallback then honours the bypass.
+            if _web_bypass_proxy_enabled():
+                try:
+                    response = client.get(
+                        url, headers=headers, timeout=request_timeout,
+                        proxies={"http": None, "https": None},
+                    )
+                except TypeError:
+                    response = client.get(url, headers=headers, timeout=request_timeout)
+            else:
+                response = client.get(url, headers=headers, timeout=request_timeout)
         finally:
             semaphore.release()
         status = int(getattr(response, "status_code", 0) or 0)

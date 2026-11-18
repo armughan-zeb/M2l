@@ -1150,6 +1150,30 @@ def api_status():
         whisper_status = whisper_runtime_status()
     except Exception as exc:
         whisper_status = {"available": False, "loaded": False, "error": str(exc)}
+    try:
+        from services import youtube_session as _yt_session
+        _yt_status = _yt_session.session_status()
+        youtube_session_status = {
+            "ready": bool(_yt_status.get("ready")),
+            "verified_authenticated": bool(_yt_status.get("verified_authenticated")),
+            "pool": _yt_status.get("pool") or [],
+            "pool_healthy_accounts": int(_yt_status.get("pool_healthy_accounts") or 0),
+            "pool_message": str(_yt_status.get("pool_message") or ""),
+        }
+    except Exception as exc:
+        youtube_session_status = {"ready": False, "verified_authenticated": False, "pool": [], "pool_healthy_accounts": 0, "pool_message": "", "error": str(exc)}
+    # YouTube session watchdog: merge the last periodic re-verification
+    # (state file, no probe here) so a pool that flipped to signed_out
+    # shows up here before the next job probes it. session_status()
+    # above only reports the pool's last probed state — "unknown" until
+    # a job first checks — so without this the field stays silent about
+    # a revoked session.
+    try:
+        from services import youtube_session_watchdog as _yt_watchdog
+
+        youtube_session_status = _yt_watchdog.attach_to_status(youtube_session_status)
+    except Exception:
+        pass
 
     return jsonify({
         "ready": True,
@@ -1159,6 +1183,7 @@ def api_status():
         "tts": True,
         "whisper": bool(whisper_status.get("available")),
         "whisper_runtime": whisper_status,
+        "youtube_session": youtube_session_status,
         "ffmpeg": _ffmpeg_ready,
         "ui_dir": str(app.static_folder),
         "auth": auth_config,

@@ -91,6 +91,26 @@ class YouTubeSessionTests(unittest.TestCase):
         self.assertNotIn("secret-value", json.dumps(container))
         self.assertEqual(container["protected"], "windows-dpapi-current-user")
 
+    def test_session_status_surfaces_cookie_pool_health(self):
+        # The multi-account pool used to be invisible: a stale pool silently
+        # fell back to anonymous public search. session_status() must carry
+        # the redacted per-account health so /api/status can show it.
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"VIDZEO_SECURE_DATA_DIR": temp_dir, "VIDZEO_YT_COOKIE_FILES": "", "VIDZEO_YT_COOKIE_DIR": temp_dir},
+            clear=False,
+        ):
+            session.reset_configured_pool()
+            status = session.session_status()
+        self.assertIn("pool", status)
+        self.assertIsInstance(status["pool"], list)
+        self.assertIn("pool_healthy_accounts", status)
+        self.assertIsInstance(status["pool_healthy_accounts"], int)
+        self.assertGreaterEqual(status["pool_healthy_accounts"], 0)
+        self.assertIn("pool_message", status)
+        self.assertIsInstance(status["pool_message"], str)
+        self.assertNotIn("secret-value", json.dumps(status))
+
     def test_persisted_session_restores_without_reopening_browser_database(self):
         profile = session.BrowserProfile("firefox", "profile-path", "default", time.time())
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(

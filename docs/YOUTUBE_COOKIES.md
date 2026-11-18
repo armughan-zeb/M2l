@@ -141,3 +141,94 @@ VIDZEO_RENDER_GATE=off .venv/bin/python -m pytest \
   not a wiring gap (`_search_container_pools`).
 - **Zero healthy accounts**: public access, by design (see §3).
 - Web-image search and stock sources never use YouTube cookies.
+
+## 6. Keeping the session alive (permanence)
+
+The Nov 17 session died the same afternoon it was exported: valid
+at noon, revoked by YouTube server-side by the afternoon. Nothing
+in code can stop YouTube revoking a session. What the pipeline
+does instead is make a good session last as long as possible,
+notice death fast, and make re-export a 30-second file drop.
+
+### 6.1 Export so the session lasts
+
+1. Export from a **dedicated browser profile** that you do not
+   keep browsing YouTube in afterwards. Every further YouTube
+   visit on the PC can rotate the session token, and the rotation
+   kills the exported copy — that is the most likely reason the
+   Nov 17 export died within hours.
+2. **Use the export promptly.** Drop it in (§6.2) as soon as it is
+   exported; an export sitting on the PC for days is already old.
+3. Do not export, then keep using YouTube on the PC in the same
+   profile and re-export later expecting the first copy to still
+   work — the first copy is already dead by then.
+
+### 6.2 Where fresh cookies go (no restart)
+
+- Drop the file into `<repo>/cookies.d/` (e.g.
+  `cookies.d/youtube.json`), or replace `<repo>/cookies.json`
+  in place, or set `VIDZEO_YT_COOKIE_DIR` / `VIDZEO_YT_COOKIE_FILES`.
+- The pool picks a new file up on the next job, no restart.
+  A file **overwritten in place** is also noticed: the pool
+  re-stats every tracked file on refresh and resets a changed
+  account to `unknown`, so the next call re-probes it instead of
+  serving the stale verdict from the old export
+  (`ConfiguredYouTubeSessions._note_file_change`, verified by
+  `tests/test_youtube_pool_reload.py`, 5 passed).
+- `chmod 600` the file, as in §2.
+
+### 6.3 What the pipeline does to keep the session alive
+
+- **Encrypted snapshot (durable store).** The live jar is kept in
+  an OS-protected snapshot at
+  `~/.local/share/vidnets/secure/youtube-session.dpapi` on this VM
+  (Windows: the DPAPI path under `%APPDATA%` — see
+  `_secure_store_candidates()` in `youtube_session.py`). On Linux
+  it is encrypted with a machine-bound key (PBKDF2 over machine-id
+  + a per-machine secret file), stored as a JSON container, file
+  `0600`, directory `0700`. It survives server restarts and VM
+  reboots, and `_load_persisted()` restores it on start. A
+  corrupted snapshot fails closed: it is skipped, never crashes
+  the server.
+- **Write-back of rotated tokens.** The entry point is
+  `refresh_encrypted_snapshot(jar) -> bool` in
+  `vidnets/server/services/youtube_session.py`: it filters the jar
+  to live YouTube/Google cookies, refuses an empty or
+  unauthenticated jar (so a good snapshot is never overwritten
+  with junk), and writes the encrypted snapshot with `0600`/`0700`
+  perms. It is the one-line call the write-back path uses whenever
+  cookies are written back or replaced.
+  ⚠️ **Not yet wired (Nov 17):** the function exists and is
+  unit-tested (`tests/test_youtube_snapshot.py`, 7 passed), but
+  no caller invokes it yet — the write-back module that calls it
+  after a token rotation is still being built. Until that lands,
+  the snapshot is only written by the browser-import path
+  (`_verify_and_install`), which is why no snapshot file exists
+  on this VM right now even though the operator's `cookies.json`
+  is installed: the configured-pool path has never persisted one.
+- **Re-verify on file change.** See §6.2 — a replaced file is
+  re-probed, not trusted on the old verdict.
+- **Alert on death.** A watchdog (`services/youtube_session_watchdog.py`)
+  re-verifies the pool on a slow tick (default once per pool
+  verify TTL, 1800s) and, when an account flips to `signed_out`,
+  logs one redacted line and surfaces a `needs_reexport` signal
+  in `/api/status` (`youtube_session.watchdog`), so the operator
+  is told to re-export **before** the next job fails, not after.
+  It never runs during an active render. Verified by
+  `tests/test_youtube_session_watchdog.py` — 7 passed, 1 failing
+  (`test_api_status_youtube_session_reflects_pool_state`:
+  `needs_reexport` came back `False` in the test; the watchdog
+  module itself passes its unit checks — the status-merge case
+  is still being fixed).
+
+### 6.4 The honest limit
+
+YouTube can still revoke a session server-side at any time — for
+example because the cookies were issued to the operator's PC
+browser and are used from this VM (different machine, different
+IP), which YouTube can treat as a hijacked session. No code
+prevents that. The design above makes a session last as long as
+possible, detects death within one watchdog interval, and makes
+recovery a 30-second drop of a fresh export (§6.1–6.2). If the
+pool reports `signed_out`, only a fresh export restores signed-in
+access — restarting the server or re-running the job will not.

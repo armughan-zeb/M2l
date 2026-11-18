@@ -3398,21 +3398,16 @@ def _verification_result(
     cand_has_media = bool(cand_path and Path(cand_path).is_file() and Path(cand_path).stat().st_size > 0)
     cand_overlay_clean = candidate.get("overlay_clean") is not False
     if strict and vision_unavailable and not semantic_veto:
-        from .job_context import current_job
-        is_agent_job = str(current_job().get("llm_provider") or "").lower() == "external_agent"
-        no_conflict = not bool(result.get("entity_conflict") or result.get("fatal_mismatch") or candidate.get("entity_conflict") or candidate.get("fatal_mismatch"))
-        # If media exists, is clean, and has no semantic veto, admit as deterministic_degraded rather than losing real media
-        if cand_has_media and cand_overlay_clean and no_conflict and (is_agent_job or web_fail_open or web_query_anchor_pending or _is_moving_youtube_source(candidate)):
-            result.update({
-                "accepted": True,
-                "status": "deterministic_degraded",
-                "verification_status": "deterministic_degraded",
-                "reason": "vision_unavailable_retained_clean_download",
-            })
-            return True, "deterministic_degraded", max(score, 65.0), result
-        # A strict identity scene cannot be accepted from metadata, a timeout,
-        # or a deterministic provider stamp. The caller will try another
-        # finalist and eventually use the grounded graphic fallback.
+        # A strict identity scene is NEVER admitted from a clean-but-unverified
+        # clip: "clean" (no overlay, no conflict) does not prove the footage
+        # is the right footage, and the final contract correctly refuses a
+        # deterministic_degraded YouTube row for a strict scene
+        # (visual_verification_pending). Admitting it here used to present a
+        # downloaded clip that the contract then killed (GTA VI run2 scene 1:
+        # cached GTA 6 trailer, zero vision verdicts, died as
+        # visual_verification_pending) instead of letting the scene fall
+        # through to the web lane / next candidate. Fail here, honestly, so
+        # the scene can still be resolved by a verified source.
         result.update({
             "accepted": False,
             "status": "vision_unavailable",

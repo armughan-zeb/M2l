@@ -1387,6 +1387,20 @@ class JobDebugger:
             taken.extend(self._drive_recovery(now))
         except Exception as exc:  # a driver sweep must never kill the server
             self._log(f"driver sweep failed: {exc}")
+        # YouTube session watchdog: re-verify the cookie pool on this same
+        # 120s tick (the watchdog itself TTL-gates to ~one probe per
+        # account per verify TTL, and skips active renders). A flipped
+        # account is logged + recorded in the watchdog state file, which
+        # /api/status surfaces — so a revoked session is flagged BEFORE
+        # the next job's YouTube lane fails on it. Best-effort: never
+        # let the watchdog break the tick.
+        try:
+            from services.youtube_session_watchdog import check as _yt_session_check
+
+            for alert in _yt_session_check(now=now).get("alerts") or []:
+                taken.append({"kind": "youtube_session_alert", **alert})
+        except Exception as exc:  # a watchdog failure must never kill the tick
+            self._log(f"youtube session watchdog failed: {exc}")
         with self._lock:
             save_state(self.state, self.state_path)
         return taken

@@ -476,7 +476,7 @@ from services.sources import OpenverseSource, DuckDuckGoSource, RedditSource, Wi
 from services.sources.google_images_source import GoogleImagesSource
 from services.sources.yandex_source import YandexSource
 from .source_broker import web_image_source_catalog, web_image_fallback_layers
-from .universal_scraper import UniversalScraperManager, UniversalSearchResponse, universal_result_to_candidate
+from .universal_scraper import UniversalScraperManager, UniversalSearchResponse, universal_result_to_candidate, web_bypass_proxy
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 # PIL exposes this as a process-global switch and the vision client enables it
@@ -1624,8 +1624,58 @@ def _discover_api_urls(source_name: str, query: str) -> List[Dict]:
 
 
 
+def _universal_retry_max_attempts() -> int:
+    """Total universal-search attempts per query (Nov 18 retry).
+
+    Default 2: attempt 1 via the egress proxy, attempt 2 direct (proxy
+    bypass). Clamped to 1–3 so a wedged proxy cannot turn a query into an
+    unbounded loop; the delivery budget and the per-attempt engine timeout
+    bound the rest.
+    """
+    try:
+        return max(1, min(3, int(os.environ.get("VIDZEO_WEB_UNIVERSAL_RETRY_ATTEMPTS", "2") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _universal_retry_backoff_seconds() -> float:
+    """Pause between universal-search attempts (Nov 18 retry)."""
+    try:
+        return max(0.0, min(30.0, float(os.environ.get("VIDZEO_WEB_UNIVERSAL_RETRY_BACKOFF_SECONDS", "3") or 3)))
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def _universal_result_is_transient_failure(response: object) -> bool:
+    """True when every engine errored, so a retry may succeed.
+
+    A genuine no-results is engines answering (success) with zero rows —
+    that is never retried. A transient failure is all engines failing
+    (timeout, connection error, bot-gate): the query never got an answer,
+    so retrying the same query (direct, on the second attempt) is the
+    correct recovery instead of failing the scene.
+    """
+    stats = list(getattr(response, "stats", []) or [])
+    if not stats:
+        return False
+    return all(not getattr(stat, "success", False) for stat in stats)
+
+
 def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> List[Dict]:
-    """Run the copied four-engine scraper and map rows into resolver records."""
+    """Run the copied four-engine scraper and map rows into resolver records.
+
+    Bounded retry (Nov 18, Moon 20s test): when every engine fails
+    transiently (timeout / connection error / bot-gate) and the batch comes
+    back with zero rows, the scene used to die with 0 candidates even
+    though a retry would succeed. The same query is retried once (2
+    attempts total): attempt 1 via the egress proxy, attempt 2 direct
+    (proxy bypass — the proxy is runtime-managed and cannot be removed
+    system-wide, so the bypass is per-request). A genuine no-results
+    (at least one engine answered) is never retried. Bounded: at most 2
+    attempts, a short backoff between them, and each attempt keeps its own
+    engine timeout, so a dead proxy cannot hang a job; the delivery
+    budget and the liveness watchdog remain the outer bounds.
+    """
     global _UNIVERSAL_LAST_AUDIT
     default_engine_timeout = 30.0 if wait_until_complete else 8.0
     try:
@@ -1637,69 +1687,108 @@ def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> L
         )))
     except (TypeError, ValueError):
         engine_ids, limit, timeout = None, 20, default_engine_timeout
-    response = _UNIVERSAL_SCRAPER.search(
-        query,
-        engine_ids=engine_ids,
-        limit_per_engine=limit,
-        timeout_seconds=timeout,
-        wait_until_complete=bool(wait_until_complete),
-    )
-    # Wright (Nov 16): candidates arrived a minute after the stage gave
-    # up and were lost.  When a batch comes back empty — or any engine
-    # timed out — re-check the late spool before reporting zero: engines
-    # still running past their deadline may have landed meanwhile, and
-    # the spool holds rows from earlier batches for this exact query.
-    # This is a bounded wait, not another crawl.
-    timed_out = any(
-        (not stat.success) and "timeout" in str(stat.error or "").lower()
-        for stat in response.stats
-    )
-    if response.total == 0 or timed_out:
-        default_late_wait = 120.0 if wait_until_complete else 5.0
-        try:
-            # Late wait raised 5s → 120s (GTA fix, Nov 16): the old 5s was
-            # far short of the ~22s gap between the wave abandoning a batch
-            # and its engines landing, so every late row was orphaned. 120s
-            # covers the gap with headroom; the scene-level pre-broadened
-            # harvest is the second chance for rows that arrive later still.
-            late_wait = max(
-                0.0,
-                min(
-                    300.0,
-                    float(
-                        os.environ.get("VIDZEO_UNIVERSAL_LATE_WAIT_SECONDS") or default_late_wait
-                    ),
-                ),
+    max_attempts = _universal_retry_max_attempts()
+    backoff = _universal_retry_backoff_seconds()
+    response = None
+    rows: List[Dict] = []
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            # Transient failure on the previous attempt: short backoff, then
+            # retry direct (proxy bypass). The proxy is the failure point
+            # when it times out; direct egress is the working fallback.
+            if backoff > 0:
+                time.sleep(backoff)
+            _web_log(
+                f"universal scraper retry {attempt + 1}/{max_attempts} "
+                f"for '{str(query)[:48]}' (direct, proxy bypass)"
             )
-        except (TypeError, ValueError):
-            late_wait = default_late_wait
-        if response.total and not wait_until_complete:
-            # Healthy engines already supplied usable leads. Harvest
-            # available late rows now and let recovery query again for gaps.
-            late_wait = 0.0
-        late_rows = _UNIVERSAL_SCRAPER.collect_late_results(
-            query, wait_seconds=late_wait
+        search_kwargs = {
+            "engine_ids": engine_ids,
+            "limit_per_engine": limit,
+            "timeout_seconds": timeout,
+            "wait_until_complete": bool(wait_until_complete),
+        }
+        if attempt == 0:
+            response = _UNIVERSAL_SCRAPER.search(query, **search_kwargs)
+        else:
+            with web_bypass_proxy():
+                response = _UNIVERSAL_SCRAPER.search(query, **search_kwargs)
+        # Wright (Nov 16): candidates arrived a minute after the stage gave
+        # up and were lost.  When a batch comes back empty — or any engine
+        # timed out — re-check the late spool before reporting zero: engines
+        # still running past their deadline may have landed meanwhile, and
+        # the spool holds rows from earlier batches for this exact query.
+        # This is a bounded wait, not another crawl.
+        timed_out = any(
+            (not stat.success) and "timeout" in str(stat.error or "").lower()
+            for stat in response.stats
         )
-        if late_rows:
-            seen_urls = {
-                str(item.image_url or "").strip().casefold()
-                for item in response.results
-            }
-            extra = [
-                item for item in late_rows
-                if str(item.image_url or "").strip().casefold() not in seen_urls
-            ]
-            if extra:
-                response = UniversalSearchResponse(
-                    response.query,
-                    response.total + len(extra),
-                    list(response.results) + extra,
-                    list(response.stats),
+        if response.total == 0 or timed_out:
+            default_late_wait = 120.0 if wait_until_complete else 5.0
+            try:
+                # Late wait raised 5s → 120s (GTA fix, Nov 16): the old 5s was
+                # far short of the ~22s gap between the wave abandoning a batch
+                # and its engines landing, so every late row was orphaned. 120s
+                # covers the gap with headroom; the scene-level pre-broadened
+                # harvest is the second chance for rows that arrive later still.
+                late_wait = max(
+                    0.0,
+                    min(
+                        300.0,
+                        float(
+                            os.environ.get("VIDZEO_UNIVERSAL_LATE_WAIT_SECONDS") or default_late_wait
+                        ),
+                    ),
                 )
+            except (TypeError, ValueError):
+                late_wait = default_late_wait
+            if response.total and not wait_until_complete:
+                # Healthy engines already supplied usable leads. Harvest
+                # available late rows now and let recovery query again for gaps.
+                late_wait = 0.0
+            late_rows = _UNIVERSAL_SCRAPER.collect_late_results(
+                query, wait_seconds=late_wait
+            )
+            if late_rows:
+                seen_urls = {
+                    str(item.image_url or "").strip().casefold()
+                    for item in response.results
+                }
+                extra = [
+                    item for item in late_rows
+                    if str(item.image_url or "").strip().casefold() not in seen_urls
+                ]
+                if extra:
+                    response = UniversalSearchResponse(
+                        response.query,
+                        response.total + len(extra),
+                        list(response.results) + extra,
+                        list(response.stats),
+                    )
+        rows = []
+        for item in response.results:
+            candidate = universal_result_to_candidate(item, query=query)
+            safe, _reason = candidate_is_safe(candidate)
+            if safe:
+                rows.append(candidate)
+        if rows:
+            break
+        # No rows: retry only on a transient (all-engines-failed) failure.
+        # A genuine no-results (an engine answered with zero rows) is not
+        # retried — the query was answered, and repeating it would burn the
+        # same wall for the same empty answer.
+        if not _universal_result_is_transient_failure(response):
+            break
+        if attempt + 1 >= max_attempts:
+            break
+        _web_log(
+            f"universal scraper: all engines failed transiently for "
+            f"'{str(query)[:48]}'; retrying direct (attempt {attempt + 2}/{max_attempts})"
+        )
     with _UNIVERSAL_AUDIT_LOCK:
         _UNIVERSAL_LAST_AUDIT = {
-            "query": response.query,
-            "total": response.total,
+            "query": response.query if response is not None else query,
+            "total": response.total if response is not None else 0,
             "engines": [
                 {
                     "engine": stat.engine,
@@ -1708,24 +1797,18 @@ def _discover_universal_urls(query: str, wait_until_complete: bool = False) -> L
                     "success": stat.success,
                     "error": stat.error,
                 }
-                for stat in response.stats
+                for stat in (response.stats if response is not None else [])
             ],
         }
-    rows: List[Dict] = []
-    for item in response.results:
-        candidate = universal_result_to_candidate(item, query=query)
-        safe, _reason = candidate_is_safe(candidate)
-        if safe:
-            rows.append(candidate)
     if rows:
         _report_provider_success("universal_scraper")
-    elif response.total == 0 and response.stats and all(not stat.success for stat in response.stats):
+    elif response is not None and response.total == 0 and response.stats and all(not stat.success for stat in response.stats):
         _report_provider_failure(
             "universal_scraper",
             RuntimeError("all universal engines failed with errors"),
         )
     _web_log(
-        f"universal scraper mapped {len(rows)}/{response.total} candidate(s) "
+        f"universal scraper mapped {len(rows)}/{response.total if response is not None else 0} candidate(s) "
         f"for '{str(query)[:48]}'"
     )
     return rows

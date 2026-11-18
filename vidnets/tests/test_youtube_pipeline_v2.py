@@ -1908,5 +1908,53 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         ))
 
 
+    def test_same_video_alternate_blocked_for_caption_overlay(self):
+        # GTA VI run2 scene 6: two transfers burned on one captioned video.
+        rows = [
+            {"video_id": "FJudvYLUdD8", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "caption_overlay_rejected"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "FJudvYLUdD8", 3))
+
+    def test_same_video_alternate_blocked_on_second_content_failure(self):
+        # GTA VI run2 scene 5: one video failed twice (58s + 56s).
+        rows = [
+            {"video_id": "F4yOVIKCZpw", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "outro_endcard_rejected:high_black_outro_slate_ratio_0.79"},
+            {"video_id": "F4yOVIKCZpw", "status": "motion_or_quality_rejected",
+             "rejection_reason": "blank_or_low_information_frame"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "F4yOVIKCZpw", 3))
+
+    def test_same_video_alternate_allowed_for_first_timestamp_local_failure(self):
+        # An outro endcard is timestamp-local: a mid-video cut escapes it.
+        rows = [
+            {"video_id": "F4yOVIKCZpw", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "outro_endcard_rejected:high_black_outro_slate_ratio_0.79"},
+        ]
+        self.assertTrue(ytv2._same_video_alternate_allowed(rows, "F4yOVIKCZpw", 3))
+
+    def test_same_video_alternate_allowed_when_no_fresh_master_exists(self):
+        rows = [
+            {"video_id": "FJudvYLUdD8", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "caption_overlay_rejected"},
+        ]
+        self.assertTrue(ytv2._same_video_alternate_allowed(rows, "FJudvYLUdD8", 1))
+
+    def test_same_video_alternate_blocked_for_static_master(self):
+        rows = [
+            {"video_id": "abc123", "status": "motion_or_quality_rejected",
+             "rejection_reason": "still_or_slideshow"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "abc123", 3))
+
+    def test_same_video_alternate_blocked_for_non_content_failure(self):
+        rows = [
+            {"video_id": "abc123", "status": "download_failed",
+             "rejection_reason": "transport_error"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "abc123", 3))
+
+
 if __name__ == "__main__":
     unittest.main()
