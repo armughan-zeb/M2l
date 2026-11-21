@@ -308,6 +308,7 @@ def check(
                 "file": str(item.get("file") or ""),
                 "status": str(item.get("status") or ""),
                 "reason": str(item.get("reason") or "")[:120],
+                "transient": bool(item.get("transient")),
             }
             for item in snapshot
         ],

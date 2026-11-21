@@ -140,6 +140,7 @@ def test_late_fatal_reject_after_accept_is_recorded(tmp_path, monkeypatch):
     assert record["candidate_id"] == "youtube:F4yOVIKCZpw"
     assert record["video_id"] == "F4yOVIKCZpw"
     assert record["requirement_hash"] == REQUIREMENT_HASH
+    assert record["job_id"] == "4f61cc9e"  # the request row's job: the veto is job-scoped
     assert record["scene_index"] is None  # real rows carry no scene field
     assert record["verdict"] == REAL_REJECT
     assert record["winner"] == REAL_ACCEPT
@@ -251,10 +252,14 @@ def test_fatal_content_keys_scene_and_hash_rules():
     assert (2, "abc123") in keys  # asset hash when no video id
     assert ("requirement_hash", REQUIREMENT_HASH, "F4yOVIKCZpw") in keys
     assert (None, "NoHashVid") in keys
+    # Per-scene scoping (run 9): a hash-less, scene-less record cannot be
+    # attributed to any scene, so it contributes nothing when a scene is
+    # queried — the old (None, identifier) key, which matched every
+    # scene, is gone. The scene-less hash record still contributes its
+    # hash key (matched at lookup by the queried scene's hash).
     assert fatal_content_keys(records, scene_index=1) == {
         (1, "F4yOVIKCZpw"),
         ("requirement_hash", REQUIREMENT_HASH, "F4yOVIKCZpw"),
-        (None, "NoHashVid"),
     }
     # A matching requirement hash turns the scene-less record into a
     # scene key for the queried scene; a non-match contributes nothing.

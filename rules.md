@@ -76,7 +76,11 @@ server while a job is running.
 Daemon: `nohup ./start-daemon.sh >> daemon.log 2>&1 &` (detached —
 foreground runs die with the shell). Vidnets server: `VIDNETS_AGENT.sh
 start` (reuses a live server; a real restart needs SIGTERM first).
-Never `kill -9` a running render. Verify both come back healthy after
+Never `kill -9` a running render. Exception (proven Nov 21, 2026,
+test 20): SIGTERM may NOT stop a render node — the node stayed alive
+and respawned Chrome, so a user-ordered stop required `kill -9` on the
+render node + its Chrome parent. Use `kill -9` only on a user-ordered
+stop, never casually. Verify both come back healthy after
 any restart (doctor + `:5010` status + daemon connected).
 
 ## 9. Secrets only via secure entry, never in the repo

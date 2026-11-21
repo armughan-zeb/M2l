@@ -69,7 +69,14 @@ const UNAVAILABLE = 'MUSE_TRANSPORT_UNAVAILABLE';
 const HEARTBEAT_MAX_AGE_MS = 90000;
 // A claim must be this old before it can be rescued: the claiming worker
 // needs time to start, write its first heartbeat, and begin composing.
-const CLAIM_RESCUE_GRACE_MS = 120000;
+// 300s, not 120s: measured composition runs 95-429s per request (job
+// 89b01295), and a worker composing a 32-scene plan cannot heartbeat
+// mid-turn, so its heartbeat goes stale while it is still working. At
+// 120s the spool "rescued" a live worker's claim and discarded ~160s of
+// its work (a3dd64dd, 2026-11-18). A genuinely dead worker's claim now
+// waits up to 5 min — the request itself has a 15-min wall, and the
+// supervisor's dead-worker replacement covers the worker.
+const CLAIM_RESCUE_GRACE_MS = 300000;
 const CLAIM_RESCUE_CHECK_MS = 2000;
 const POLL_MS = 250;
 const REQUEST_ID = /^[0-9a-f]{32}$/;

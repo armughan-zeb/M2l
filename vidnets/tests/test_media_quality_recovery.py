@@ -453,3 +453,89 @@ def test_preview_review_timeout_falls_back_only_when_non_strict():
     }
     with pytest.raises(TimeoutError, match='preview timed out'):
         _preview_review_fallback('preview timed out', strict=True)
+
+
+def _p8_recovery_harness(tmp_path, monkeypatch, batch_scenes):
+    """Fake the LLM + web branch + verifier for _recover_perceptual_media_candidates.
+
+    batch_scenes: set of scene indices the batched prefetch answers for.
+    Returns (chat_calls, report)."""
+    import json
+    import app
+    import services.openrouter_llm as openrouter
+    import services.pipeline_v2_media_adapter as media_adapter
+
+    chat_calls = []
+    texts = ['beat zero', 'beat one', 'beat two']
+    fresh = {
+        text: _asset(tmp_path / f'fresh-{index}.png', tone)
+        for index, (text, tone) in enumerate(zip(
+            texts, [(230, 90, 40), (40, 200, 90), (90, 60, 220)]))
+    }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def chat(self, **kwargs):
+            chat_calls.append(kwargs)
+            prompt = json.loads(kwargs['user_prompt'])
+            if 'scenes' in prompt:
+                return {'scenes': [
+                    {'scene_index': entry['scene_index'], 'subject': 'topic',
+                     'queries': [f"distinct view {entry['scene_index']}"]}
+                    for entry in prompt['scenes']
+                    if entry['scene_index'] in batch_scenes
+                ]}
+            return {'subject': 'topic', 'queries': ['single fallback view']}
+
+    def fake_verify(scene, candidate):
+        return {'accepted': True, 'visual_checked': True,
+                'verified_asset_sha256': 'fake-digest',
+                'verification_status': 'verified'}
+
+    def fake_web_branch(scene_texts, durations, cfg, title, script, prebuilt_queries=None):
+        # One distinct real file per scene text, so pixel sampling accepts.
+        return {'web_result': {'image_paths': [fresh[scene_texts[0]]],
+                               'image_metadata': [{}]}}
+
+    monkeypatch.setattr(openrouter, 'OpenRouterLLM', FakeClient)
+    monkeypatch.setattr(media_adapter, 'build_qwen_verifier',
+                        lambda *args, **kwargs: (fake_verify, None))
+    monkeypatch.setattr(app, '_run_web_media_branch', fake_web_branch)
+    report = app._recover_perceptual_media_candidates(
+        [{}, {}, {}], texts, [2, 2, 2],
+        {'perceptual_repetition_audit': {'unresolved_repeats': [
+            {'scene_index': 0}, {'scene_index': 1}, {'scene_index': 2}]}},
+        {'openrouter_api_key': 'test-key'}, 'topic', 'full script')
+    return chat_calls, report
+
+
+def test_repeat_recovery_batches_fresh_queries_into_one_request(tmp_path, monkeypatch):
+    # P8 (fewer-requests): three repeated scenes file ONE batched fresh-query
+    # call instead of three single vidnets_response calls.
+    import json
+
+    chat_calls, report = _p8_recovery_harness(tmp_path, monkeypatch, {0, 1, 2})
+    assert len(chat_calls) == 1, "one batched call, no singles, no attempt-1 retries"
+    batch = json.loads(chat_calls[0]['user_prompt'])
+    assert [entry['scene_index'] for entry in batch['scenes']] == [0, 1, 2]
+    assert all('owned_scene' in entry for entry in batch['scenes'])
+    assert 'owned_scene' not in batch, "no single-scene payload in the batch"
+    assert sorted(report['new_verified_candidate_scene_indices']) == [0, 1, 2]
+
+
+def test_repeat_recovery_falls_back_to_single_calls_on_partial_batch(tmp_path, monkeypatch):
+    # P8: when the batch answers only scene 0, scenes 1 and 2 fall back to
+    # their single-scene calls (1 batch + 2 singles).
+    import json
+
+    chat_calls, report = _p8_recovery_harness(tmp_path, monkeypatch, {0})
+    assert len(chat_calls) == 3, chat_calls
+    batched = [call for call in chat_calls if 'scenes' in json.loads(call['user_prompt'])]
+    singles = [call for call in chat_calls if 'owned_scene' in json.loads(call['user_prompt'])]
+    assert len(batched) == 1
+    assert len(singles) == 2
+    assert sorted(json.loads(call['user_prompt'])['owned_scene'] for call in singles) == [
+        'beat one', 'beat two']
+    assert sorted(report['new_verified_candidate_scene_indices']) == [0, 1, 2]

@@ -150,9 +150,18 @@ def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, 
         render_resolution=(960, 540), youtube_runner=runner, web_runner=lambda *a, **k: {},
         stock_runner=lambda *a, **k: {}, snapshotter=lambda paths, **k: list(paths),
         neutral_asset_factory=lambda *a, **k: None, report_progress=lambda *a: None)
-    assert len(calls) == 2
-    assert calls[1]["youtube_excluded_video_ids"] == ["rejected-master"]
-    assert calls[1]["_run_temp_dir"].endswith("youtube_content_recovery")
+    assert calls, "the YouTube lane never ran"
+    # The Track B general-pool build also calls the runner (broad topic
+    # queries, in parallel with the primary lane); it is not part of the
+    # primary/recovery flow this test counts, so filter it out by its
+    # marker. The pool call may land before or after the assertions run
+    # (background thread), so the count must not depend on its timing.
+    primary_calls = [
+        call for call in calls if not call.get("_youtube_general_pool_build")
+    ]
+    assert len(primary_calls) == 2
+    assert primary_calls[1]["youtube_excluded_video_ids"] == ["rejected-master"]
+    assert primary_calls[1]["_run_temp_dir"].endswith("youtube_content_recovery")
 
 
 def test_youtube_only_retries_missing_primary_and_keeps_ready_clip():

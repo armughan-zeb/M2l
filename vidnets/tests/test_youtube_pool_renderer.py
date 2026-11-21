@@ -1671,3 +1671,137 @@ def test_prefetch_probe_transcript_moments_never_blocks_probe():
     )
     assert audit["status"] == "failed"
     assert pools.moment_assignments == {}
+
+
+# ---------------------------------------------------------------------------
+# Pool-first per-scene game check: the shared shortlist is global (a
+# source's metadata_score is its BEST scene fit), so a GTA V clip that
+# fits a GTA V-narrating scene enters the shortlist and token-overlap
+# affinity ranks it first for GTA VI scenes (vice/city/gameplay tokens)
+# with no per-scene game check before cutting. With no visual context
+# the cut gate accepts on deterministic checks alone, so the plan loop
+# itself must apply the scene-relative game gate per (scene, source).
+# ---------------------------------------------------------------------------
+
+def _game_gate_pools():
+    """Two sources, three scenes. The GTA V source has the higher
+    shortlist rank (its transcript moment matches scene 0) and the
+    higher affinity for the GTA VI scenes — exactly the shape that
+    ships a wrong-game clip without a per-scene check."""
+    gta_vi = SimpleNamespace(
+        video_id="gta-vi-src", url="https://youtube.test/gta-vi-src",
+        title="Grand Theft Auto VI Trailer 2", channel="Rockstar Games",
+        duration=166, metadata_score=200, pool_keys=["__global__"],
+    )
+    gta_v = SimpleNamespace(
+        video_id="gta-v-src", url="https://youtube.test/gta-v-src",
+        title="GTA V Vice City gameplay", channel="GTAVideos",
+        duration=600, metadata_score=150, pool_keys=["__global__"],
+    )
+    rows = [
+        {"scene_text": "Lucia walks out of prison in Vice City and reunites with Jason as the sun sets over Leonida.",
+         "candidate_subject": "Grand Theft Auto VI", "section_subject": "Grand Theft Auto VI",
+         "title_anchor": "Grand Theft Auto VI"},
+        {"scene_text": "Grand Theft Auto Five sold more than two hundred million copies and defined open world games.",
+         "candidate_subject": "Grand Theft Auto V", "section_subject": "Grand Theft Auto V",
+         "title_anchor": "Grand Theft Auto V"},
+        {"scene_text": "The trailers show the Leonida Keys and the neon of Vice City itself.",
+         "candidate_subject": "Grand Theft Auto VI", "section_subject": "Grand Theft Auto VI",
+         "title_anchor": "Grand Theft Auto VI"},
+    ]
+    return SimpleNamespace(
+        source_records={"gta-vi-src": gta_vi, "gta-v-src": gta_v},
+        # The wrong-game source holds the transcript moment for scene 0:
+        # transcript matching is game-blind, so the plan loop must not be.
+        moment_assignments={
+            0: [heuristic_moment(source_id="gta-v-src", video_id="gta-v-src", scene_index=0, start=100.0, duration=4.0)],
+            1: [heuristic_moment(source_id="gta-v-src", video_id="gta-v-src", scene_index=1, start=50.0, duration=4.0)],
+        },
+        assignments=[
+            {"id": "gta-vi-src", "duration": 166, "best_timestamp": 20},
+            {"id": "gta-v-src", "duration": 600, "best_timestamp": 50},
+            {"id": "gta-vi-src", "duration": 166, "best_timestamp": 20},
+        ],
+        rows=rows,
+        scene_durations=[4.0, 4.0, 4.0],
+    )
+
+
+def _run_pool_first_no_vision(pools, tmp_path):
+    """Run resolve_pool_first the way production does (no visual
+    context: vision lives in the coordinator), stubbing transport and
+    the deterministic gates. Returns (result, cut_source_by_scene)."""
+    cut_sources = {}
+
+    def fake_source(candidate, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"source")
+        return True
+
+    def fake_cut(source_path, output_path, start, duration, **kwargs):
+        source_path = str(source_path)
+        cut_sources[str(output_path)] = Path(source_path).stem
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"cut")
+        return True
+
+    with mock.patch.object(pipeline, "_download_source_once", side_effect=fake_source), \
+         mock.patch.object(pipeline, "_cut_local_segment", side_effect=fake_cut), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_quality", return_value={"checked": True, "reject": False}), \
+         mock.patch("services.youtube_pool_renderer._screen_moment_overlays", return_value={"checked": True, "clean": True, "reject": False, "overlay_types": []}):
+        result = resolve_pool_first(pipeline, pools, visual_context=None, output_dir=tmp_path)
+    by_scene = {}
+    for output_path, stem in cut_sources.items():
+        # Full 1080p cuts are scene_XXX.moment_YY.mp4; probes are .probe.mp4.
+        if ".probe." in output_path or not output_path.endswith(".mp4"):
+            continue
+        scene_no = int(Path(output_path).stem.split(".")[0].split("_")[1])
+        # source files are <source_id>.source.mp4
+        by_scene[scene_no] = stem.replace(".source", "")
+    return list(result or []), by_scene
+
+
+def test_pool_first_applies_per_scene_game_check(tmp_path):
+    """A GTA V source shortlisted on its best-scene fit must not be cut
+    for GTA VI scenes — even though it holds scene 0's transcript moment
+    and out-ranks the VI trailer on affinity — while it stays usable for
+    the GTA V scene it is right for."""
+    pools = _game_gate_pools()
+    result, by_scene = _run_pool_first_no_vision(pools, tmp_path)
+    assert len(result) == 3
+    assert result[0] is not None
+    assert by_scene.get(1) == "gta-vi-src", f"scene 0 cut from {by_scene.get(1)}"
+    assert result[1] is not None
+    assert by_scene.get(2) == "gta-v-src", f"scene 1 cut from {by_scene.get(2)}"
+    assert result[2] is not None
+    assert by_scene.get(3) == "gta-vi-src", f"scene 2 cut from {by_scene.get(3)}"
+
+
+def test_pool_first_sparse_fallback_skips_wrong_game_source(tmp_path):
+    """When every admitted source is wrong-game for a scene, the sparse
+    coverage fallback leaves the scene unplanned (the coordinator's
+    web/stock lanes fill it) instead of cutting the forbidden clip."""
+    gta_v = SimpleNamespace(
+        video_id="gta-v-src", url="https://youtube.test/gta-v-src",
+        title="GTA V Vice City gameplay", channel="GTAVideos",
+        duration=600, metadata_score=150, pool_keys=["__global__"],
+    )
+    rows = [
+        {"scene_text": "Lucia walks out of prison in Vice City and reunites with Jason.",
+         "candidate_subject": "Grand Theft Auto VI", "section_subject": "Grand Theft Auto VI",
+         "title_anchor": "Grand Theft Auto VI"},
+        {"scene_text": "The trailers show the Leonida Keys and the neon of Vice City itself.",
+         "candidate_subject": "Grand Theft Auto VI", "section_subject": "Grand Theft Auto VI",
+         "title_anchor": "Grand Theft Auto VI"},
+    ]
+    pools = SimpleNamespace(
+        source_records={"gta-v-src": gta_v},
+        moment_assignments={},
+        assignments=[None, None],
+        rows=rows,
+        scene_durations=[4.0, 4.0],
+    )
+    result, by_scene = _run_pool_first_no_vision(pools, tmp_path)
+    assert len(result) == 2
+    assert result[0] is None and result[1] is None
+    assert by_scene == {}

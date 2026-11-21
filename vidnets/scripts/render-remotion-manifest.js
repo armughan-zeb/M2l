@@ -378,6 +378,29 @@ function startLocalAssetServer() {
   });
 }
 
+// Pre-scaled 1080p variants created by advance preparation live next to the
+// original as `<stem>.scaled-1080p.<ext>`. Prefer them at compose time: a
+// 1080p source needs no downscale in Chromium, which is the render's hot
+// path on this VM. Strict no-op when no variant exists — the original is
+// used untouched. Images and video only; audio/fonts are never swapped.
+const SCALED_1080P_MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v']);
+
+function scaled1080pPathFor(filePath) {
+  const ext = path.extname(filePath);
+  if (!SCALED_1080P_MEDIA_EXTENSIONS.has(ext.toLowerCase())) return filePath;
+  return path.join(path.dirname(filePath), `${path.basename(filePath, ext)}.scaled-1080p${ext}`);
+}
+
+function preferScaled1080p(filePath) {
+  if (typeof filePath !== 'string' || !filePath) return filePath;
+  const scaled = scaled1080pPathFor(filePath);
+  if (scaled === filePath) return filePath;
+  try {
+    if (fs.existsSync(scaled) && fs.statSync(scaled).isFile()) return scaled;
+  } catch (_) {}
+  return filePath;
+}
+
 function asLocalUrl(value, baseUrl) {
   if (typeof value !== 'string') return value;
   let raw = value.trim();
@@ -420,7 +443,9 @@ function asLocalUrl(value, baseUrl) {
     try {
       const resolved = path.resolve(candidate);
       if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
-        const normalized = resolved.replace(/\\/g, '/');
+        // Prefer a pre-scaled 1080p sibling when advance preparation made
+        // one; otherwise the original resolves exactly as before.
+        const normalized = preferScaled1080p(resolved).replace(/\\/g, '/');
         // Strip a POSIX leading slash: `${baseUrl}//home/...` would parse
         // as a protocol-relative URL (host "home") instead of a path.
         return `${baseUrl}/${encodeURI(normalized.replace(/^\/+/, ''))}`;
@@ -501,6 +526,108 @@ function compositionSources() {
   };
   roots.forEach(visit);
   return [...new Set(files)].filter((file) => fs.existsSync(file)).sort();
+}
+
+// Static-import scan of the composition entry's local import graph. The
+// directory walk above misses files the composition imports from OUTSIDE
+// those roots — DocumentaryComposition.jsx imports ../production-timeline
+// (vidnets/src/production-timeline.js) — so a change to such a file would
+// leave the bundle key unchanged and serve a stale bundle. The bundle key
+// therefore covers the union of the directory walk and this graph. Only
+// relative specifiers are followed; package imports are pinned by
+// package.json, which is already hashed.
+const LOCAL_IMPORT_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.json', '.css'];
+const IMPORT_SPECIFIER_RE = /(?:import\s+(?:[^'"]*?\s+from\s+)?|export\s+(?:[^'"]*?\s+from\s+)?|require\s*\(\s*|import\s*\(\s*)['"](\.[^'"]+)['"]/g;
+
+function resolveLocalImport(importerPath, specifier) {
+  const base = path.resolve(path.dirname(importerPath), specifier);
+  const candidates = [base];
+  for (const ext of LOCAL_IMPORT_EXTENSIONS) candidates.push(base + ext);
+  for (const ext of LOCAL_IMPORT_EXTENSIONS) candidates.push(path.join(base, `index${ext}`));
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function resolveCompositionImportGraph(entryPath, rootDir = root) {
+  const checkout = path.resolve(rootDir);
+  const seen = new Set();
+  const queue = [path.resolve(entryPath)];
+  const files = [];
+  while (queue.length) {
+    const current = queue.shift();
+    if (seen.has(current)) continue;
+    seen.add(current);
+    let text;
+    try {
+      if (!fs.existsSync(current) || !fs.statSync(current).isFile()) continue;
+      text = fs.readFileSync(current, 'utf8');
+    } catch (_) { continue; }
+    files.push(current);
+    IMPORT_SPECIFIER_RE.lastIndex = 0;
+    let match;
+    while ((match = IMPORT_SPECIFIER_RE.exec(text)) !== null) {
+      const resolved = resolveLocalImport(current, match[1]);
+      // A local import that escapes the checkout cannot be part of this
+      // bundle; anything inside it is hashed even if the directory walk
+      // never visits it.
+      if (resolved && resolved.startsWith(checkout + path.sep) && !seen.has(resolved)) {
+        queue.push(resolved);
+      }
+    }
+  }
+  return files.sort();
+}
+
+function remotionVersion() {
+  try {
+    return String(require('@remotion/bundler/package.json').version || 'unknown');
+  } catch (_) {}
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    return String(deps['@remotion/bundler'] || deps.remotion || 'unknown');
+  } catch (_) {}
+  return 'unknown';
+}
+
+// A cached bundle carries a manifest proving it was built from exactly
+// these sources with this Remotion version. Reuse requires the manifest:
+// a cache written before manifests existed, or under a different Remotion,
+// rebuilds once instead of risking a stale or incompatible bundle.
+const BUNDLE_MANIFEST_FILENAME = 'bundle-manifest.json';
+const BUNDLE_MANIFEST_VERSION = 1;
+
+function writeBundleManifest(cachedBundlePath, bundleHash) {
+  const manifest = {
+    version: BUNDLE_MANIFEST_VERSION,
+    hash: bundleHash,
+    remotionVersion: remotionVersion(),
+    createdAt: new Date().toISOString(),
+  };
+  fs.mkdirSync(cachedBundlePath, { recursive: true });
+  fs.writeFileSync(path.join(cachedBundlePath, BUNDLE_MANIFEST_FILENAME), JSON.stringify(manifest, null, 2), 'utf8');
+  return manifest;
+}
+
+function readBundleManifest(cachedBundlePath) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(cachedBundlePath, BUNDLE_MANIFEST_FILENAME), 'utf8'));
+    if (raw && raw.version === BUNDLE_MANIFEST_VERSION && typeof raw.hash === 'string') return raw;
+  } catch (_) {}
+  return null;
+}
+
+function cachedBundleIsUsable(cachedBundlePath, bundleHash) {
+  if (!fs.existsSync(path.join(cachedBundlePath, 'index.html'))) return false;
+  const manifest = readBundleManifest(cachedBundlePath);
+  if (!manifest) return false;
+  if (manifest.hash !== bundleHash) return false;
+  if (manifest.remotionVersion !== remotionVersion()) return false;
+  return true;
 }
 
 // The renderer needs documentary fonts, sound effects, and any saved Remotion
@@ -798,9 +925,16 @@ function writeAssetDigestCache(cachePath, files) {
   }
 }
 
-function promoteBundleToCache(serveUrl, cachedBundlePath) {
+function promoteBundleToCache(serveUrl, cachedBundlePath, bundleHash) {
   fs.mkdirSync(path.dirname(cachedBundlePath), { recursive: true });
-  if (fs.existsSync(path.join(cachedBundlePath, 'index.html'))) return cachedBundlePath;
+  if (fs.existsSync(path.join(cachedBundlePath, 'index.html'))) {
+    // A concurrent render installed this bundle first; make sure it carries
+    // a manifest for this hash so the next render can reuse it. Never fatal.
+    try {
+      if (!cachedBundleIsUsable(cachedBundlePath, bundleHash)) writeBundleManifest(cachedBundlePath, bundleHash);
+    } catch (_) {}
+    return cachedBundlePath;
+  }
   if (fs.existsSync(cachedBundlePath)) fs.rmSync(cachedBundlePath, { recursive: true, force: true });
 
   const stagedCachePath = `${cachedBundlePath}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
@@ -823,9 +957,20 @@ function promoteBundleToCache(serveUrl, cachedBundlePath) {
   } catch (error) {
     fs.rmSync(stagedCachePath, { recursive: true, force: true });
     if (error.code === 'EEXIST' && fs.existsSync(path.join(cachedBundlePath, 'index.html'))) {
+      try {
+        if (!cachedBundleIsUsable(cachedBundlePath, bundleHash)) writeBundleManifest(cachedBundlePath, bundleHash);
+      } catch (_) {}
       return cachedBundlePath;
     }
     throw error;
+  }
+  // Stamp the manifest proving this bundle matches these sources; a
+  // manifest write failure must never block the render — the next render
+  // simply rebuilds instead of reusing.
+  try {
+    writeBundleManifest(cachedBundlePath, bundleHash);
+  } catch (error) {
+    console.warn(`[Remotion] Bundle manifest could not be saved: ${error.message}`);
   }
   return cachedBundlePath;
 }
@@ -966,6 +1111,13 @@ async function renderManifest() {
       hasher.update(path.relative(root, sourcePath).replace(/\\/g, '/'));
       hasher.update(fs.readFileSync(sourcePath));
     }
+    // Files the entry imports from outside the walked roots
+    // (../production-timeline): without them a source change would leave
+    // the key unchanged and serve a stale bundle.
+    for (const sourcePath of resolveCompositionImportGraph(entryPath)) {
+      hasher.update(path.relative(root, sourcePath).replace(/\\/g, '/'));
+      hasher.update(fs.readFileSync(sourcePath));
+    }
     const assetDigestCache = loadAssetDigestCache(assetDigestCachePath);
     let assetHashCacheHits = 0;
     for (const asset of publicAssets) {
@@ -993,8 +1145,8 @@ async function renderManifest() {
     console.log(`[Remotion] Verified ${publicAssets.length} bundled assets with SHA-256 in ${((Date.now() - hashStartedAt) / 1000).toFixed(2)}s (${assetHashCacheHits} cached).`);
 
     let serveUrl;
-    if (fs.existsSync(cachedBundlePath) && fs.existsSync(path.join(cachedBundlePath, 'index.html'))) {
-      console.log(`[Remotion] Reusing cached bundle: ${bundleHash}`);
+    if (cachedBundleIsUsable(cachedBundlePath, bundleHash)) {
+      console.log(`[Remotion] Reusing cached bundle: ${bundleHash} (manifest-verified)`);
       reportStage('bundling composition', 100, 'cached');
       serveUrl = cachedBundlePath;
       const cachedPublic = path.join(cachedBundlePath, 'public');
@@ -1025,7 +1177,7 @@ async function renderManifest() {
         onDirectoryCreated: (dir) => { bundleDir = dir; },
         webpackOverride: (config) => config,
       });
-      serveUrl = promoteBundleToCache(serveUrl, cachedBundlePath);
+      serveUrl = promoteBundleToCache(serveUrl, cachedBundlePath, bundleHash);
     }
 
     // Measure actual font-loaded text in every production preview, not only
@@ -1169,7 +1321,7 @@ async function renderManifest() {
       x264Preset: selectedX264Preset,
       crf: selectedCrf,
       imageFormat: 'jpeg',
-      logLevel: 'verbose',
+      logLevel: 'error',
       outputLocation: stagedOutput,
       inputProps,
       audioCodec: 'aac',
@@ -1399,4 +1551,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startLocalAssetServer, parseAssetRange, renderBrowserSession, renderSectionHasher, adaptiveConcurrency, waitForRenderMemory, stageRendererPublicAssets, ensureFfmpegOutputDirectory, pruneGeneratedBundleFiles, acquireRenderLease, asLocalUrl, normalizeManifest, finalizeMp4Audio };
+module.exports = { startLocalAssetServer, parseAssetRange, renderBrowserSession, renderSectionHasher, adaptiveConcurrency, waitForRenderMemory, stageRendererPublicAssets, ensureFfmpegOutputDirectory, pruneGeneratedBundleFiles, acquireRenderLease, asLocalUrl, normalizeManifest, finalizeMp4Audio, resolveCompositionImportGraph, remotionVersion, readBundleManifest, writeBundleManifest, cachedBundleIsUsable, scaled1080pPathFor, preferScaled1080p };

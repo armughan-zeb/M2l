@@ -19,9 +19,12 @@ import requests
 from .job_context import current_job, check_job_active, remaining_seconds
 from .pipeline_activity import record_activity
 from .verdict_conflicts import (
+    build_coherence_context,
     build_late_fatal_record,
     is_fatal_reject,
     record_late_fatal_reject,
+    request_context_text,
+    verdict_reason_coherence_issue,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,18 +139,81 @@ _last_prune_monotonic = 0.0
 _prune_lock = threading.Lock()
 
 
+def _fingerprint_image_part(part):
+    """Canonical form of one message part for fingerprinting.
+
+    A vision payload is filed with inline data-URI images but STORED with
+    ``local_image`` parts pointing at per-request files, so the raw
+    messages never matched a stored twin (and the answer cache never hit
+    for vision). Normalizing both forms to the image bytes' hash makes a
+    filed payload and its stored twin fingerprint identically. A part
+    whose bytes cannot be read falls back to its path/URI text — today's
+    behavior — so fingerprinting never breaks a filing.
+    """
+    if not isinstance(part, dict):
+        return part
+    part_type = part.get('type')
+    if part_type == 'image_url':
+        source = part.get('image_url', {})
+        url = source.get('url', '') if isinstance(source, dict) else str(source)
+        if isinstance(url, str) and url.startswith('data:image/') and ';base64,' in url:
+            try:
+                data = base64.b64decode(url.split(';base64,', 1)[1], validate=True)
+                return {'type': 'image', 'image_sha256': hashlib.sha256(data).hexdigest(),
+                        'detail': source.get('detail', 'auto') if isinstance(source, dict) else 'auto'}
+            except Exception:
+                pass
+        return {'type': 'image_url', 'image_url': url,
+                'detail': source.get('detail', 'auto') if isinstance(source, dict) else 'auto'}
+    if part_type == 'local_image':
+        image_path = str(part.get('path') or '')
+        try:
+            data = open(image_path, 'rb').read()
+            return {'type': 'image', 'image_sha256': hashlib.sha256(data).hexdigest(),
+                    'detail': part.get('detail', 'auto')}
+        except Exception:
+            return {'type': 'local_image', 'path': image_path,
+                    'detail': part.get('detail', 'auto')}
+    return part
+
+
+def _fingerprint_messages(messages):
+    """Messages with image parts normalized to content hashes.
+
+    Text parts pass through unchanged. Image parts become their canonical
+    form (see _fingerprint_image_part), so the filed and stored shapes of
+    the same vision payload fingerprint identically.
+    """
+    normalized = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            normalized.append(message)
+            continue
+        copied = dict(message)
+        if isinstance(message.get('content'), list):
+            copied['content'] = [
+                _fingerprint_image_part(part)
+                if isinstance(part, dict) and part.get('type') in ('image_url', 'local_image')
+                else part
+                for part in message['content']
+            ]
+        normalized.append(copied)
+    return normalized
+
+
 def payload_fingerprint(row):
     """Stable identity of what an answer must contain.
 
     Covers everything the answer depends on — job, operation, kind,
     messages, response format — and nothing that changes on re-issue
-    (id, created/expires times).
+    (id, created/expires times). Image parts are normalized to content
+    hashes, so a filed payload matches its stored twin.
     """
     canonical = {
         'job_id': row.get('job_id', ''),
         'operation': row.get('operation', ''),
         'kind': row.get('kind', ''),
-        'messages': row.get('messages', []),
+        'messages': _fingerprint_messages(row.get('messages', [])),
         'response_format': row.get('response_format', {}),
     }
     blob = json.dumps(canonical, sort_keys=True, ensure_ascii=False, default=str)
@@ -312,6 +378,23 @@ def _record_late_fatal_reject(request_id, row, path, content):
             return
         if not is_fatal_reject(verdict):
             return
+        # Reasoning-coherence gate (run 9): a fatal verdict whose
+        # reasoning is cross-contaminated (e.g. "the yacht from the
+        # earlier clip review") is NOT filed — the late answer is still
+        # refused as before, but no ledger entry is created, so a later
+        # attempt re-reads the candidate live instead of vetoing it on
+        # contaminated reasoning.
+        try:
+            context = build_coherence_context(
+                extra_text=request_context_text(row))
+            issue = verdict_reason_coherence_issue(verdict, context)
+        except Exception:
+            issue = None
+        if issue is not None:
+            logger.info(
+                'verdict-conflict ledger filing skipped for %s: incoherent '
+                'reasoning (%s)', request_id, issue)
+            return
         winner = None
         reply_path = path.with_name('response.json')
         if reply_path.exists():
@@ -428,10 +511,11 @@ def find_pending_twin(*, owner, job_id, operation, kind, messages, response_form
 
     The fingerprint is computed on the payload as filed (before local-image
     copies): the copy rewrites data-URI images to per-request file paths,
-    which would make two identical vision filings look different. For text
-    payloads (direction, queries, beats) the filed and stored messages are
-    identical, so twins match. A vision payload with inline images never
-    matches a twin and falls back to minting, as today.
+    which would make two identical vision filings look different. The
+    fingerprint normalizes image parts to content hashes, so a filed
+    vision payload matches its stored twin exactly as text payloads do.
+    For text payloads (direction, queries, beats) the filed and stored
+    messages are identical, so twins match.
 
     Old dirs are skipped by mtime without parsing: a request file untouched
     for longer than the longest possible wall cannot still be pending, so
@@ -544,32 +628,6 @@ def _wait_for_bridge_response(request_id, reply_path, deadline, *, operation='',
                 pass
         time.sleep(min(.1, max(.001, deadline - time.monotonic())))
     return None
-    result = []
-    count = 0
-    for message in messages:
-        copied = dict(message)
-        if isinstance(message.get('content'), list):
-            content = []
-            for part in message['content']:
-                copied_part = dict(part)
-                if part.get('type') == 'image_url':
-                    source = part.get('image_url', {})
-                    url = source.get('url', '') if isinstance(source, dict) else str(source)
-                    if url.startswith('data:image/') and ';base64,' in url:
-                        prefix, encoded = url.split(';base64,', 1)
-                        data = base64.b64decode(encoded, validate=True)
-                        if len(data) > 5 * 1024 * 1024:
-                            raise ValueError('Agent image exceeds the 5 MB limit.')
-                        extension = '.png' if prefix == 'data:image/png' else '.jpg'
-                        count += 1
-                        image_path = directory / f'frame-{count}{extension}'
-                        image_path.write_bytes(data)
-                        copied_part = {'type': 'local_image', 'path': str(image_path.resolve()),
-                                       'detail': source.get('detail', 'auto') if isinstance(source, dict) else 'auto'}
-                content.append(copied_part)
-            copied['content'] = content
-        result.append(copied)
-    return result
 
 
 def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
@@ -618,13 +676,24 @@ def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
     # Pending-twin dedupe: a resume/refile of the same payload waits on the
     # twin already pending instead of minting a duplicate the operator must
     # answer twice. The twin is not ours to expire: if it expires
-    # unanswered while our wall remains, file a fresh request below.
-    with _mint_lock:
-        twin_id = find_pending_twin(
-            owner=owner, job_id=context.get('job_id', ''), operation=operation,
-            kind=kind, messages=messages, response_format=response_format,
-        )
-    if twin_id is not None:
+    # unanswered while our wall remains, re-scan for a replacement twin
+    # (another waiter may have minted one) or file a fresh request below.
+    # The twin scan AND the mint happen under one _mint_lock hold, so
+    # several waiters queued on one expired twin cannot each mint a fresh
+    # request when it expires. At most two expired twins are joined; after
+    # that a fresh request is minted even if a twin is still pending.
+    request_id = reply_path = path = None
+    for _twin_join in range(3):
+        with _mint_lock:
+            twin_id = find_pending_twin(
+                owner=owner, job_id=context.get('job_id', ''), operation=operation,
+                kind=kind, messages=messages, response_format=response_format,
+            )
+            if twin_id is None or _twin_join >= 2:
+                request_id, reply_path, path = _mint_fresh_request()
+                twin_id = None
+        if twin_id is None:
+            break
         twin_path = _request_path(twin_id)
         twin_reply_path = twin_path.with_name('response.json')
         try:
@@ -646,8 +715,6 @@ def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
             return response
         if time.monotonic() >= deadline:
             raise AgentBridgeError(f'Muse request {twin_id} ({operation or kind}) expired after {wall:.1f}s.')
-    with _mint_lock:
-        request_id, reply_path, path = _mint_fresh_request()
     # Preparation-stall detector (queue_manager heartbeat) only sees lane
     # activity from web/vision/youtube. A bridge wait is bounded by the
     # request deadline (floor 3600s) but shows no display progress, so an

@@ -53,6 +53,10 @@ def main() -> int:
         result = get_youtube_clips(
             script=str(payload.get("script") or ""),
             title=str(payload.get("title") or ""),
+            # Full job title for the prep-manifest injection lookup; the
+            # search title may be just the topic anchor (run 3: anchor
+            # injected 0; full title injected 9).
+            prep_manifest_title=str(payload.get("prep_manifest_title") or "") or None,
             num_scenes=len(scene_texts),
             scene_durations=list(payload.get("scene_durations") or []),
             scene_timing_windows=list(payload.get("scene_timing_windows") or []),

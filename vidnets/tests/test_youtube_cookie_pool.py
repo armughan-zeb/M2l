@@ -95,11 +95,14 @@ def test_pool_discovers_cookie_directory(tmp_path):
     _write_netscape(cookie_dir / "acct1.txt")
     _write_json(cookie_dir / "acct2.json")
     (cookie_dir / "notes.md").write_text("not a cookie file", encoding="utf-8")
+    # The empty FILES setting falls back to the hardcoded repo-root
+    # cookies.json; isolate this test from the operator's real file so
+    # the pool under test holds exactly the directory's accounts.
     with mock.patch.dict(
         os.environ,
         {"VIDZEO_YT_COOKIE_FILES": "", "VIDZEO_YT_COOKIE_DIR": str(cookie_dir)},
         clear=False,
-    ):
+    ), mock.patch.object(session, "_default_cookie_file_paths", return_value=[]):
         pool = session.ConfiguredYouTubeSessions("")
     assert [p.name for p in pool.paths] == ["acct1.txt", "acct2.json"]
 
@@ -195,7 +198,12 @@ def test_shared_pool_rebuilds_when_files_change(tmp_path):
         "VIDZEO_YT_COOKIE_DIR": str(cookie_dir),
     }
     try:
-        with mock.patch.dict(os.environ, env, clear=False):
+        # Isolate from the operator's real repo-root cookies.json: the
+        # empty FILES setting would otherwise pull it into the shared
+        # pool alongside the directory's accounts.
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            session, "_default_cookie_file_paths", return_value=[]
+        ):
             session.reset_configured_pool()
             first = session.get_configured_pool()
             assert len(first.paths) == 1
@@ -226,6 +234,121 @@ def test_ensure_session_tries_configured_pool_files_first(tmp_path):
     ):
         jar, _generation = session.ensure_session()
     assert session._jar_is_authenticated(jar)
+
+
+def _verify_timeout(jar, explicit_sign_in_only=False):
+    return None, "youtube-probe-ReadTimeout"
+
+
+def test_pool_retries_transient_probe_timeout_once_then_verifies(tmp_path, monkeypatch):
+    """Run 7 flap: the small worker's probe hit youtube-probe-ReadTimeout
+    while the main worker verified the same account — a transport
+    timeout, not a dead session. One retry must recover it instead of
+    parking the account as unverified for the whole retry window."""
+    monkeypatch.setenv("VIDZEO_YT_PROBE_RETRY_DELAY_SECONDS", "0")
+    good = _write_netscape(tmp_path / "good.txt")
+    calls = {"n": 0}
+
+    def flaky(jar, explicit_sign_in_only=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, "youtube-probe-ReadTimeout"
+        return True, "youtube-confirmed"
+
+    with _pool_env(tmp_path), mock.patch.object(
+        session, "_verify_youtube_session", side_effect=flaky
+    ):
+        pool = session.ConfiguredYouTubeSessions(str(good))
+        index, jar = pool.next_healthy()
+    assert index == 0
+    assert jar is not None
+    assert calls["n"] == 2
+    assert pool.health_snapshot()[0]["status"] == "verified"
+    assert pool.health_snapshot()[0]["transient"] is False
+
+
+def test_pool_persistent_timeout_stays_unverified_transient_but_attachable(tmp_path, monkeypatch):
+    """A probe that keeps timing out stays unverified — but flagged
+    transient (a probe problem, not a dead session), and the YT lane
+    must still work on best-effort cookies, as run 7's small worker
+    did (3/3 despite UNVERIFIED)."""
+    monkeypatch.setenv("VIDZEO_YT_PROBE_RETRY_DELAY_SECONDS", "0")
+    good = _write_netscape(tmp_path / "good.txt")
+    with _pool_env(tmp_path), mock.patch.object(
+        session, "_verify_youtube_session", side_effect=_verify_timeout
+    ):
+        pool = session.ConfiguredYouTubeSessions(str(good))
+        assert pool.next_healthy() == (-1, None)
+        snapshot = pool.health_snapshot()[0]
+        assert snapshot["status"] == "unverified"
+        assert snapshot["reason"] == "youtube-probe-ReadTimeout"
+        assert snapshot["transient"] is True
+        index, jar = pool.next_attachable()
+        assert index == 0
+        assert jar is not None
+
+
+def test_pool_definite_signout_is_not_retried(tmp_path, monkeypatch):
+    """A definite signed-out verdict is terminal: retrying it only
+    burns the search wall. Only transport timeouts retry."""
+    monkeypatch.setenv("VIDZEO_YT_PROBE_RETRY_DELAY_SECONDS", "0")
+    stale = _write_netscape(tmp_path / "stale.txt")
+    with _pool_env(tmp_path), mock.patch.object(
+        session, "_verify_youtube_session", side_effect=_verify_false
+    ) as verify:
+        pool = session.ConfiguredYouTubeSessions(str(stale))
+        assert pool.next_verified() == (-1, None)
+        assert pool.health_snapshot()[0]["status"] == "signed_out"
+        assert pool.health_snapshot()[0]["transient"] is False
+        assert verify.call_count == 1
+
+
+def test_transient_unverified_reprobes_sooner_than_inconclusive(monkeypatch):
+    """A transient timeout re-probes after 30 s, not the 120 s an
+    inconclusive verdict waits — one slow handshake must not keep a
+    good account out of the verified pool for two minutes."""
+    monkeypatch.delenv("VIDZEO_YT_POOL_TRANSIENT_RETRY_SECONDS", raising=False)
+    monkeypatch.delenv("VIDZEO_YT_POOL_UNVERIFIED_RETRY_SECONDS", raising=False)
+    assert session._cookie_pool_retry_delay_seconds("unverified", transient=True) == 30.0
+    assert session._cookie_pool_retry_delay_seconds("unverified") == 120.0
+    assert session._cookie_pool_retry_delay_seconds("unverified", transient=False) == 120.0
+
+
+def test_probe_timeout_defaults_cover_slow_tls_handshake(monkeypatch):
+    """Nov 19 live measurement: the feed-page probe took 4.0-6.7 s
+    (TLS handshake alone 3.34 s), so the old (2 s, 5 s) budget timed
+    out 5/5 while the session verified fine at (5 s, 15 s). The
+    defaults must cover the measured handshake + TTFB; env overrides
+    still win for operators who want it tighter."""
+    import requests
+
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        url = "https://www.youtube.com/feed/you"
+        text = '{"LOGGED_IN":true}'
+
+    def fake_get(url, **kwargs):
+        seen.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.delenv("VIDZEO_YT_AUTH_CONNECT_TIMEOUT", raising=False)
+    monkeypatch.delenv("VIDZEO_YT_AUTH_READ_TIMEOUT", raising=False)
+    monkeypatch.setattr(requests, "get", fake_get)
+    jar = http.cookiejar.CookieJar()
+    jar.set_cookie(_cookie("SAPISID"))
+    jar.set_cookie(_cookie("LOGIN_INFO"))
+    verified, reason = session._verify_youtube_session(jar, explicit_sign_in_only=True)
+    assert verified is True
+    assert reason == "youtube-confirmed"
+    assert seen["timeout"] == (8.0, 15.0)
+
+    monkeypatch.setenv("VIDZEO_YT_AUTH_CONNECT_TIMEOUT", "2")
+    monkeypatch.setenv("VIDZEO_YT_AUTH_READ_TIMEOUT", "5")
+    verified, _reason = session._verify_youtube_session(jar, explicit_sign_in_only=True)
+    assert verified is True
+    assert seen["timeout"] == (2.0, 5.0)
 
 
 def test_write_netscape_never_downgrades_existing_file(tmp_path):

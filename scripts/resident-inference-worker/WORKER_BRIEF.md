@@ -50,16 +50,65 @@ query plans expired while still queued behind it).
 1. Every 3 seconds, list `<spool>/*.request.json` (unclaimed requests
    only — files ending `.claimed-<workerId>` are someone's work, not
    yours). Ignore any file whose request `expires_at` is already past —
-   it is dead; delete it. If you see a `.claimed-*` file whose request
+   it is dead; delete it. Note: `expires_at` is a float (epoch seconds
+   with decimals, e.g. `1795179793.2697794`) — a bash integer test like
+   `[ "$exp" -lt "$now" ]` errors with "integer expression expected" on
+   every iteration and the cleanup silently never runs (worker-4,
+   2026-11-20). Compare in Python, or truncate to an integer first
+   (`exp=${exp%.*}`) before the bash test. If you see a `.claimed-*` file whose request
    `expires_at` is past, delete that claim file too — its worker is done
-   with it and the request is dead either way.
+   with it and the request is dead either way. Poll on ONE loop only:
+   run a single poll loop at a time and never start a second poll/claim
+   exec while one is still running — two concurrent claim loops race
+   each other and double-claim (on 2026-11-18 a worker held 4 beats
+   claims at once and, in a later burst, claimed a second request 1
+   second before its first was answered, because two claim loops ran
+   at once). The loop never ends while you live: if it finishes, start
+   the next one immediately, back-to-back with no gap — a worker whose
+   poll loop has ended and is waiting for its next turn is a worker
+   that is not claiming. On every poll iteration, also read
+   `<spool>/supervisor-actions.json` and look for an entry with
+   `status` `pending`, `workerId` equal to yours, and `action` one of
+   `rotate`, `stop_graceful`, `stop_idle`, `replace_stuck` — that is the
+   supervisor telling you to stop, in writing, and it is how a stop
+   reaches you when the supervisor agent itself is dead (on 2026-11-20
+   a queued rotate sat ~105 min because no worker checked this file).
+   Read the file only: never claim, edit, or mark the entry done — the
+   loop and the supervisor own the queue. If you find one, stop as in
+   step 4.
 2. Pick the unexpired, unclaimed request with the earliest `expires_at`
    and CLAIM it first: atomically rename
    `<id>.request.json` to `<id>.request.json.claimed-<workerId>`
    (a plain rename on the same filesystem — atomic, so two workers can
    never claim the same request; if the rename fails because the file is
-   gone, another worker claimed it first — move on). Answer ONLY what
-   you claimed. Do not start a second answer while one is in progress.
+   gone, another worker claimed it first — move on). The rename IS the
+   claim: do not check-then-claim in separate steps (a `ls` for your own
+   claim file followed by a rename in a later command races with your
+   own other exec session and with other workers). Claim with the single
+   rename command, and treat its exit status as the verdict — success
+   means you hold it, failure means you do not. After a successful
+   rename, and BEFORE composing, append the CLAIMED line to
+   `<spool>/worker.log` in the same command:
+   `2026-11-15 08:00:00 UTC [worker-1] CLAIMED <id>`. The shared log
+   is the pool's only claim visibility: a claim that is never logged
+   there is invisible to the supervisor and to claim rescue (on
+   2026-11-18 worker-2 logged its last CLAIMED line at 02:05:36 UTC
+   and then answered 43 requests with no claim line at all — its holds
+   were invisible for an hour). Never log CLAIMED for a rename that
+   failed: a logged claim you do not hold is worse than no log (on
+   2026-11-18 worker-2 logged CLAIMED for a request worker-1 then
+   claimed and answered). Answer ONLY what you claimed. Never compose
+   an answer for a request you do not currently hold as
+   `<id>.request.json.claimed-<workerId>`: if you released a claim, it
+   is not yours any more, even if you already read it (on 2026-11-18
+   worker-2 released 3 beats claims at 02:12:45 and then answered one
+   of the released requests at 02:17:03 anyway). Hold at most ONE claim at a time: never claim a second
+   request while you still hold an unanswered claim — a held claim blocks
+   every other worker from that request while you work on something else
+   (on 2026-11-18 a worker held one beats request for 11 minutes while
+   answering four others, and the held request was the tail of the whole
+   job). Claim only when you hold no claim; answer the claim you hold
+   before claiming another. Do not start a second answer while one is in progress.
    Keep an in-memory set of request ids you have already answered and
    never answer the same request twice.
 3. Every 10 seconds (even while composing), rewrite
@@ -72,11 +121,23 @@ query plans expired while still queued behind it).
    pool for another worker. A worker that answers but stops heartbeating
    is a dead worker. Never let composing, a slow read, or a long turn
    stop the heartbeat — write it on a timer that keeps running while
-   you work.
+   you work. Write it YOURSELF, from your own exec loop: never hand it
+   to a detached shell script that outlives your session. A heartbeat
+   file that keeps updating after your agent is gone makes a dead
+   worker look alive — the supervisor will adopt it, count it toward
+   the pool, and never replace it (on 2026-11-18 worker-3's agent
+   produced no exec activity and no answer for 30+ minutes, including
+   a full 8-request burst it took zero of, while a detached loop kept
+   its heartbeat fresh and its `answered` count frozen at 26). If a
+   detached heartbeat loop already exists for your workerId when you
+   start, stop it first and take over heartbeat writing yourself.
 4. Never exit on an error. Log it, write `<id>.error.json` for that request,
    delete your claim file, and keep polling. Only stop when the parent
-   (your supervisor) tells you to; on stop, finish the current answer,
-   delete your claim file if the answer was not delivered, then exit.
+   (your supervisor) tells you to — directly, or by a pending action
+   addressed to you in `supervisor-actions.json` (step 1); on stop,
+   finish the current answer, log `STOPPED` with the action's `id` to
+   `<spool>/worker.log`, delete your claim file if the answer was not
+   delivered, then exit.
 
 ## How to answer
 

@@ -697,6 +697,16 @@ def _verify_youtube_session(
     try:
         import requests
 
+        # Probe budget (Nov 19 live measurement, same cookies, same
+        # URL): the feed page took 4.0-6.7 s end to end — the TLS
+        # handshake alone measured 3.34 s — while the old (2 s, 5 s)
+        # budget timed out 5/5 at ~2.0 s and the session verified fine
+        # at (5 s, 15 s). A 2 s connect timeout therefore flapped a
+        # healthy account to unverified (run 6 + run 7: main worker
+        # verified, small worker ReadTimeout, same account). Connect
+        # 8 s / read 15 s keeps the probe bounded while covering the
+        # measured handshake + TTFB with headroom. Env overrides stay
+        # available for operators who want it tighter.
         response = requests.get(
             "https://www.youtube.com/feed/you?persist_app=1&app=desktop",
             cookies=jar,
@@ -708,8 +718,8 @@ def _verify_youtube_session(
                 "Accept-Language": "en-US,en;q=0.9",
             },
             timeout=(
-                max(0.5, float(os.environ.get("VIDZEO_YT_AUTH_CONNECT_TIMEOUT", "2") or 2)),
-                max(1.0, float(os.environ.get("VIDZEO_YT_AUTH_READ_TIMEOUT", "5") or 5)),
+                max(0.5, float(os.environ.get("VIDZEO_YT_AUTH_CONNECT_TIMEOUT", "8") or 8)),
+                max(1.0, float(os.environ.get("VIDZEO_YT_AUTH_READ_TIMEOUT", "15") or 15)),
             ),
             allow_redirects=True,
         )
@@ -834,6 +844,33 @@ def _discover_cookie_dir_paths(cookie_dir: Any = None) -> List[Path]:
     return found
 
 
+def _is_transient_probe_reason(reason: str) -> bool:
+    """True when a probe failure was a transport timeout, not a verdict.
+
+    A ReadTimeout/ConnectTimeout means YouTube never answered, so the
+    session itself is unjudged: the account may still be signed in
+    (run 7: the small worker's probe timed out yet its downloads
+    completed 3/3 on the same cookies). Only timeouts count as
+    transient; a definite signed-out answer, an HTTP error, or an
+    inconclusive page never does.
+    """
+    reason = str(reason or "").lower()
+    return reason.startswith("youtube-probe-") and "timeout" in reason
+
+
+def _probe_retry_delay_seconds() -> float:
+    try:
+        return max(
+            0.0,
+            min(
+                10.0,
+                float(os.environ.get("VIDZEO_YT_PROBE_RETRY_DELAY_SECONDS", "2") or 2),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 2.0
+
+
 def _cookie_pool_verify_ttl_seconds() -> float:
     try:
         return max(0.0, float(os.environ.get("VIDZEO_YT_POOL_VERIFY_TTL_SECONDS", "1800") or 1800))
@@ -841,7 +878,19 @@ def _cookie_pool_verify_ttl_seconds() -> float:
         return 1800.0
 
 
-def _cookie_pool_retry_delay_seconds(status: str) -> float:
+def _cookie_pool_retry_delay_seconds(status: str, *, transient: bool = False) -> float:
+    # A transient probe timeout is a network blip, not a session
+    # verdict: re-probe it sooner (30 s) than a genuinely inconclusive
+    # verdict (120 s), so one slow handshake does not keep a good
+    # account out of the verified pool for two minutes.
+    if status == "unverified" and transient:
+        try:
+            return max(
+                0.0,
+                float(os.environ.get("VIDZEO_YT_POOL_TRANSIENT_RETRY_SECONDS", "30") or 30),
+            )
+        except (TypeError, ValueError):
+            return 30.0
     env_name = {
         "throttled": "VIDZEO_YT_POOL_THROTTLE_COOLDOWN_SECONDS",
         "unverified": "VIDZEO_YT_POOL_UNVERIFIED_RETRY_SECONDS",
@@ -949,6 +998,7 @@ class ConfiguredYouTubeSessions:
             "reason": "cookie-file-changed",
             "cookie_count": 0,
             "auth_cookie_count": 0,
+            "transient": False,
             "last_checked": 0.0,
             "verified_at": 0.0,
         })
@@ -965,6 +1015,7 @@ class ConfiguredYouTubeSessions:
                 "cookie_count": 0,
                 "auth_cookie_count": 0,
                 "failures": 0,
+                "transient": False,
                 "last_checked": 0.0,
                 "verified_at": 0.0,
             }
@@ -982,6 +1033,7 @@ class ConfiguredYouTubeSessions:
                     "file": path.name,
                     "status": str(entry.get("status") or "unknown"),
                     "reason": str(entry.get("reason") or "")[:120],
+                    "transient": bool(entry.get("transient")),
                     "cookie_count": int(entry.get("cookie_count") or 0),
                     "auth_cookie_count": int(entry.get("auth_cookie_count") or 0),
                     "failures": int(entry.get("failures") or 0),
@@ -1051,7 +1103,9 @@ class ConfiguredYouTubeSessions:
             if now - float(entry.get("verified_at") or 0) < _cookie_pool_verify_ttl_seconds():
                 return self._checked[index]
         if status in {"throttled", "unverified", "signed_out", "load_error"}:
-            if now - float(entry.get("last_checked") or 0) < _cookie_pool_retry_delay_seconds(status):
+            if now - float(entry.get("last_checked") or 0) < _cookie_pool_retry_delay_seconds(
+                status, transient=bool(entry.get("transient"))
+            ):
                 return None
             if status == "signed_out":
                 # A signed-out export stays signed-out until the operator
@@ -1090,9 +1144,22 @@ class ConfiguredYouTubeSessions:
             print(f"   [yt-session] configured account {index + 1}: signed_out (no-auth-cookies)", flush=True)
             return None
         verified, reason = _verify_youtube_session(jar, explicit_sign_in_only=True)
+        if verified is None and _is_transient_probe_reason(reason):
+            # One retry after a short pause: the probe runs while the
+            # worker is busy, and a single slow TLS handshake / TTFB
+            # spike must not poison a good account for the whole
+            # unverified retry window (run 7: main worker verified,
+            # small worker ReadTimeout, same cookies, same account).
+            # Only transport timeouts retry — a definite signed-out
+            # answer or an inconclusive page never does.
+            print(f"   [yt-session] configured account {index + 1}: probe timed out ({reason}); retrying once", flush=True)
+            delay = _probe_retry_delay_seconds()
+            if delay:
+                time.sleep(delay)
+            verified, reason = _verify_youtube_session(jar, explicit_sign_in_only=True)
         entry["last_checked"] = now
         if verified is True:
-            entry.update({"status": "verified", "reason": "youtube-confirmed", "verified_at": now})
+            entry.update({"status": "verified", "reason": "youtube-confirmed", "transient": False, "verified_at": now})
             self._checked[index] = jar
             print(f"   [yt-session] configured account {index + 1}: verified", flush=True)
             return jar
@@ -1100,6 +1167,7 @@ class ConfiguredYouTubeSessions:
             entry.update({
                 "status": "signed_out",
                 "reason": str(reason or "youtube-reported-signed-out")[:120],
+                "transient": False,
                 "failures": int(entry.get("failures") or 0) + 1,
             })
             self._checked[index] = None
@@ -1108,6 +1176,12 @@ class ConfiguredYouTubeSessions:
         entry.update({
             "status": "unverified",
             "reason": str(reason or "youtube-probe-inconclusive")[:120],
+            # Transient timeouts stay visible as unverified (the YT
+            # lane falls back to best-effort cookies and the worker log
+            # says so), but the flag tells /api/status and the
+            # watchdog that this is a probe problem, not a dead
+            # session — it must never raise a re-export alert.
+            "transient": _is_transient_probe_reason(reason),
         })
         self._checked[index] = None
         print(f"   [yt-session] configured account {index + 1}: unverified ({entry['reason']})", flush=True)

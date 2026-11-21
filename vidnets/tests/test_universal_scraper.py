@@ -1,7 +1,6 @@
 import time
 import json
 import subprocess
-from types import SimpleNamespace
 
 from services.web_image.universal_scraper import (
     UniversalImageResult,
@@ -53,24 +52,23 @@ def test_native_image_search_preserves_metadata_and_pagination(monkeypatch):
     assert captured[0]['kind'] == 'images' and captured[0]['limit'] == 2
 
 
-def test_native_tls_bing_yandex_live_in_child_processes(monkeypatch):
+def test_engines_use_plain_requests_sessions_not_subprocess(monkeypatch):
+    """Regression (Nov 18 web-resilience): primp is DNS-dead from this
+    VM, so the isolated native client is removed — HTTP engines use a
+    plain requests.Session directly and must never spawn a subprocess
+    (or initialize native TLS) for an engine call. The fallback
+    dimension is now the ROUTE (proxy vs direct), not the transport."""
+    import requests
+
     from services.web_image import universal_scraper as scraper
-    captured = []
-    class Process:
-        def __init__(self, *args, **kwargs):
-            pass
-        def communicate(self, request=None, **kwargs):
-            if request:
-                captured.append(json.loads(request))
-            return ('{"status_code":200,"text":"search markup"}', '')
-        def poll(self):
-            return 0
-    monkeypatch.setattr(scraper, 'primp', SimpleNamespace(Client=lambda: (_ for _ in ()).throw(AssertionError('Native TLS initialized in API'))))
-    monkeypatch.setattr(scraper.subprocess, 'Popen', Process)
-    for engine, url in ((scraper.BingEngine(), 'https://www.bing.com/images/async'), (scraper.YandexEngine(), 'https://yandex.com/images/search')):
-        response = engine._get_client().get(url, headers={}, timeout=6)
-        assert response.status_code == 200
-    assert len(captured) == 2 and all(row['kind'] == 'http' for row in captured)
+
+    monkeypatch.setattr(
+        scraper.subprocess, "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("subprocess spawned for HTTP engine call")),
+    )
+    for engine in (scraper.BingEngine(), scraper.YandexEngine()):
+        assert isinstance(engine._get_client(), requests.Session)
 
 
 class _FakeEngine:
@@ -125,11 +123,51 @@ def test_manager_keeps_partial_success_when_one_engine_fails():
     assert "unavailable" in response.stats[1].error
 
 
+def test_no_duckduckgo_in_live_web_engine_set():
+    """DuckDuckGo was removed Nov 19, 2026 (bot-gates this egress).
+
+    No live lane may query it: not the universal scraper's default set or
+    its engine registry, not the broker priority/catalog/fallback layers,
+    and not the resolver's fast sources, tier-one wave, or enabled set.
+    The DuckDuckGoEngine class and search_ddg stay defined for direct
+    callers, but nothing in the live path dispatches them.
+    """
+    from services.web_image.source_broker import (
+        WEB_ENGINE_PRIORITY,
+        web_image_fallback_layers,
+        web_image_source_catalog,
+    )
+    from services.web_image.resolver import (
+        _FAST_SOURCES,
+        _TIER_ONE_SOURCES,
+        _enabled_fast_sources,
+    )
+
+    manager = UniversalScraperManager(max_workers=2, engine_timeout_seconds=2)
+    assert "duckduckgo" not in UniversalScraperManager.DEFAULT_ENGINES
+    assert "duckduckgo" not in manager._engines
+    assert "duckduckgo" not in WEB_ENGINE_PRIORITY
+    catalog_names = [row["name"] for row in web_image_source_catalog()]
+    assert not any("ddg" in name or "duck" in name for name in catalog_names)
+    layer_providers = [
+        provider
+        for layer in web_image_fallback_layers()
+        for provider in layer["providers"]
+    ]
+    assert not any("ddg" in name or "duck" in name for name in layer_providers)
+    fast_names = [name for name, _kind in _FAST_SOURCES]
+    assert not any("ddg" in name or "duck" in name for name in fast_names)
+    assert not any("ddg" in name or "duck" in name for name in _TIER_ONE_SOURCES)
+    enabled_names = [name for name, _kind in _enabled_fast_sources()]
+    assert not any("ddg" in name or "duck" in name for name in enabled_names)
+
+
 def test_default_engine_order_is_yandex_first():
-    # Yandex bot-walls least, so it is always first; Bing, Flickr and
-    # DuckDuckGo are fallbacks in that order (WEB_ENGINE_PRIORITY).
+    # Yandex bot-walls least, so it is always first; Bing and Flickr are
+    # fallbacks in that order (WEB_ENGINE_PRIORITY). DuckDuckGo was removed
+    # Nov 19, 2026 — it bot-gates this egress.
     assert UniversalScraperManager.DEFAULT_ENGINES == (
-        "yandex", "bing", "flickr", "duckduckgo",
+        "yandex", "bing", "flickr",
     )
     assert UniversalScraperManager.DEFAULT_ENGINES[0] == "yandex"
 
@@ -533,13 +571,30 @@ def test_throttled_get_caps_eight_way_stampede_to_per_host_limit(monkeypatch):
     assert client.peak <= 2, f"per-host concurrency cap exceeded: peak={client.peak}"
 
 
-def test_isolated_client_rejects_list_payload_as_transport_error(monkeypatch):
-    """Regression (Nov 16 verification): the search worker writes '[]' for
-    ANY failure, and _IsolatedNativeClient.get indexed it as data['text'] —
-    a bare TypeError. That TypeError used to be masked by the engines'
-    plain-requests fallback; with the fallback removed it zeroed the whole
-    engine live (primp DNS dead, plain requests fine). A non-dict payload
-    must raise a clean RuntimeError so the caller can fall back."""
+def test_search_worker_reports_errors_as_json_not_bare_list():
+    """Regression (Nov 18 web-resilience): the search worker wrote '[]'
+    for ANY failure, hiding every error from the engines (a DNS error
+    looked identical to "no results"). It now reports
+    {"error": "..."} on stdout instead."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    worker = Path(__file__).resolve().parents[1] / "server" / "services" / "research_search_worker.py"
+    payload = json.dumps({"kind": "http", "url": "https://example.test/feed",
+                          "headers": {}, "timeout": 5})
+    proc = subprocess.run(
+        [sys.executable, "-B", str(worker)], input=payload,
+        capture_output=True, text=True, timeout=30,
+    )
+    data = json.loads(proc.stdout)
+    assert isinstance(data, dict) and "error" in data
+    assert data["error"]
+
+
+def test_duckduckgo_engine_handles_worker_error_payload(monkeypatch):
+    """The DuckDuckGo engine treats a worker {"error": ...} payload as
+    an empty result (logged) instead of crashing on a non-list payload."""
     from services.web_image import universal_scraper as scraper
 
     class Process:
@@ -547,31 +602,23 @@ def test_isolated_client_rejects_list_payload_as_transport_error(monkeypatch):
             pass
 
         def communicate(self, *args, **kwargs):
-            return ("[]", "")
+            return (json.dumps({"error": "DNSError: error resolving DNS"}), "")
 
         def poll(self):
             return 0
 
     monkeypatch.setattr(scraper.subprocess, "Popen", Process)
-    client = scraper._IsolatedNativeClient()
-    try:
-        client.get("https://yandex.com/images/search?text=x", headers={}, timeout=15)
-    except RuntimeError as exc:
-        assert "unexpected payload" in str(exc)
-    else:
-        raise AssertionError("expected RuntimeError for a list worker payload")
+    assert scraper.DuckDuckGoEngine()._search_once("NFL", 1, 0, True) == []
 
 
-def test_engine_falls_back_to_plain_requests_when_isolated_client_fails(monkeypatch):
-    """Regression (Nov 16 verification): with the isolated transport dead
-    (primp DNS failure), an engine must still return rows via the bounded
-    plain-requests fallback — not zero rows. The fallback stays bounded
-    because queue time counts inside each 15s budget."""
+def test_engine_falls_back_to_direct_route_when_proxy_fails(monkeypatch):
+    """Regression (Nov 18 web-resilience): the old primp-first +
+    plain-requests fallback is replaced by per-engine ROUTE fallback —
+    proxy first, direct on a transport error. A proxied ReadTimeout must
+    still yield rows via the direct route, not zero rows."""
+    import requests as requests_mod
+
     from services.web_image import universal_scraper as scraper
-
-    class DeadClient:
-        def get(self, url, headers=None, timeout=None):
-            raise RuntimeError("search worker returned an unexpected payload")
 
     feed = {"items": [{"media": {"m": "https://example.test/gta-vi_m.jpg"},
                        "title": "GTA VI key art", "link": "https://example.test/page",
@@ -583,9 +630,13 @@ def test_engine_falls_back_to_plain_requests_when_isolated_client_fails(monkeypa
         def json(self):
             return dict(feed)
 
-    monkeypatch.setattr(scraper.FlickrEngine, "_get_client", lambda self: DeadClient())
-    monkeypatch.setattr(scraper.requests, "get",
-                        lambda url, headers=None, timeout=None: FakeResp())
+    class RouteClient:
+        def get(self, url, headers=None, timeout=None, **kwargs):
+            if kwargs.get("proxies") is None:
+                raise requests_mod.exceptions.ReadTimeout("proxied route timed out")
+            return FakeResp()
+
+    monkeypatch.setattr(scraper.FlickrEngine, "_get_client", lambda self: RouteClient())
     rows = scraper.FlickrEngine().search("Grand Theft Auto VI key art", 5, 1, True)
     assert len(rows) == 1
     assert rows[0].image_url == "https://example.test/gta-vi_b.jpg"

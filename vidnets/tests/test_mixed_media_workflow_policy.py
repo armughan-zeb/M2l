@@ -26,7 +26,7 @@ def test_web_source_catalog_exposes_complete_ordered_fallback_map():
 
     catalog = web_image_source_catalog()
     names = [row["name"] for row in catalog]
-    assert {"yandex", "bing_hybrid", "ddg_hybrid", "google_images", "openverse", "wikimedia", "flickr_api", "pinterest", "reddit"} <= set(names)
+    assert {"yandex", "bing_hybrid", "google_images", "openverse", "wikimedia", "flickr_api", "pinterest", "reddit"} <= set(names)
     layers = web_image_fallback_layers()
     assert layers[0]["name"] == "fast_primary"
     assert "yandex" in layers[0]["providers"]

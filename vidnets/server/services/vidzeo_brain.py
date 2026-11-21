@@ -1089,6 +1089,17 @@ def _visual_intent_action_words(visual_intent: str, entity_words: set) -> set:
                 and word not in {"context", "shows", "show", "depicts", "features",
                                  "featuring", "shot", "shots", "view", "scene"}):
             words.add(word)
+    # Narrative glue ("known", "called", "reported") is not a shot word:
+    # the YouTube normalizer strips it from every query, so demanding it
+    # in the primary makes the shape check unpassable on the yt lane
+    # (Panama scene 9: visual intent "known beyond", yt primary can never
+    # contain "known"). Drop such words so the viewpoint half is skipped
+    # when nothing usable remains, as the docstring prescribes.
+    try:
+        from .youtube_query_normalizer import _NARRATIVE_NOISE
+        words = {item for item in words if item not in _NARRATIVE_NOISE}
+    except Exception:
+        pass
     return words
 
 
@@ -1438,6 +1449,69 @@ def validate_adapted_scene_plan(bundle: Dict[str, Any], scene_texts: List[str],
         first = plan_errors[0]
         return f"scene {first['scene_number']}: {first['error']}"
     return None
+
+
+def adapted_scene_plan_errors(bundle: Dict[str, Any], scene_texts: List[str],
+                               title: Any = "") -> Dict[int, str]:
+    """Per-scene retrieval-contract errors in a flat adapted bundle.
+
+    Same three checks as ``validate_adapted_scene_plan`` (per-row contract,
+    scene-level subject game, cross-scene duplicate / non-distinctive
+    primaries), but collected per 0-based scene index instead of stopping
+    at the first error, so the mechanical-first path can file an LLM
+    repair request for exactly the failing scenes and serve the rest
+    mechanically. Empty dict = the whole bundle is servable as-is.
+    """
+    errors: Dict[int, str] = {}
+    if not isinstance(bundle, dict):
+        return {idx: "not a query bundle" for idx in range(len(scene_texts or []))}
+    scene_texts = list(scene_texts or [])
+    for source in ("web", "yt", "stock"):
+        rows = bundle.get(source)
+        if not isinstance(rows, list):
+            for index in range(len(scene_texts)):
+                errors.setdefault(index, f"missing {source} rows")
+            continue
+        for index, row in enumerate(rows):
+            if index in errors:
+                continue
+            text = scene_texts[index] if index < len(scene_texts) else ""
+            error = _adapted_scene_row_error(row, scene_text=text, title=title)
+            if error:
+                errors[index] = f"{source}: {error}"
+    for index, text in enumerate(scene_texts):
+        if index in errors:
+            continue
+        subject_game = scene_subject_game_for_scene(text, title)
+        if not subject_game["key"]:
+            continue
+        primaries = []
+        for source in ("web", "yt"):
+            rows = bundle.get(source) or []
+            if index < len(rows) and isinstance(rows[index], dict):
+                primaries.extend(_adapted_row_primaries(rows[index]))
+        game_error = _scene_game_query_error(primaries, text, title)
+        if game_error:
+            errors[index] = game_error
+    flat_rows: List[Dict[str, Any]] = []
+    for index, text in enumerate(scene_texts):
+        web_rows = bundle.get("web") or []
+        yt_rows = bundle.get("yt") or []
+        web_primary = ""
+        yt_primary = ""
+        if index < len(web_rows) and isinstance(web_rows[index], dict):
+            web_primary = str(web_rows[index].get("search_query") or web_rows[index].get("primary_query") or "")
+        if index < len(yt_rows) and isinstance(yt_rows[index], dict):
+            yt_primary = str(yt_rows[index].get("search_query") or yt_rows[index].get("youtube_query") or "")
+        flat_rows.append({"scene_number": index + 1,
+                          "youtube": {"primary": yt_primary},
+                          "web": {"primary": web_primary},
+                          "visual_intent": (web_rows[index].get("visual_intent") if index < len(web_rows) and isinstance(web_rows[index], dict) else "")})
+    for plan_error in validate_scene_query_plan(flat_rows, scene_texts, title):
+        index = int(plan_error.get("scene_number") or 0) - 1
+        if 0 <= index < len(scene_texts):
+            errors.setdefault(index, str(plan_error.get("error") or "plan-level error"))
+    return errors
 
 
 def validate_cached_scene_bundle(bundle: Any, scene_texts: List[str], title: Any = "") -> Optional[str]:
@@ -2198,44 +2272,71 @@ Each scene plan must match the schema exactly."""
                     "web": ("primary", "supporting", "fallback"),
                     "stock": ("primary_query", "alt_query", "fallback_query"),
                 }
+                # One bad row must not lose the whole chunk: the Panama
+                # repair answer failed on row 1 alone ("scene_subject_type
+                # does not match the subject") and the other 12 directed
+                # rows were discarded with it, so the repair merged 0/13.
+                # Salvage per row instead — the multi-chunk path already
+                # does this for timed-out chunks
+                # ('incomplete_or_timed_out_chunk'). A row that fails the
+                # contract is replaced by the mechanical fallback for its
+                # scene; only an all-invalid chunk still fails outright
+                # (the caller then tries the next provider or falls back
+                # to mechanical rows, as before).
+                invalid_rows: Dict[int, str] = {}
                 for index, scene in enumerate(scenes, start=1):
-                    if not isinstance(scene, dict) or scene.get("scene_number") != index:
-                        raise ValueError(f"OpenRouter returned an invalid scene number at row {index}")
-                    if any(not str(scene.get(field) or "").strip() for field in (
-                        "container_subject", "scene_subject", "visual_intent"
-                    )):
-                        raise ValueError(f"OpenRouter returned an empty subject or visual intent at row {index}")
-                    for source, fields in query_fields.items():
-                        queries = scene.get(source)
-                        if not isinstance(queries, dict):
-                            queries = {}
-                            scene[source] = queries
-                        first_field = fields[0]
-                        first_val = str(queries.get(first_field) or "").strip()
-                        if not first_val:
-                            first_val = next((str(queries.get(field) or '').strip() for field in fields
-                                              if str(queries.get(field) or '').strip()), '')
+                    try:
+                        if not isinstance(scene, dict) or scene.get("scene_number") != index:
+                            raise ValueError(f"OpenRouter returned an invalid scene number at row {index}")
+                        if any(not str(scene.get(field) or "").strip() for field in (
+                            "container_subject", "scene_subject", "visual_intent"
+                        )):
+                            raise ValueError(f"OpenRouter returned an empty subject or visual intent at row {index}")
+                        for source, fields in query_fields.items():
+                            queries = scene.get(source)
+                            if not isinstance(queries, dict):
+                                queries = {}
+                                scene[source] = queries
+                            first_field = fields[0]
+                            first_val = str(queries.get(first_field) or "").strip()
                             if not first_val:
-                                raise ValueError(f'OpenRouter returned no usable {source} queries at row {index}')
-                            queries[first_field] = first_val
-                        for field in fields[1:]:
-                            if not str(queries.get(field) or "").strip():
-                                queries[field] = first_val
-                    # Retrieval contract: a row with empty domain/intents,
-                    # a format-phrase subject, a wrong subject type, or
-                    # queries carrying no entity/viewpoint words fails the
-                    # whole chunk to mechanical re-plan — it is never
-                    # shipped with empty fields. The game check is
-                    # scene-relative: the scene's own narration (not the
-                    # video title) decides which game the queries must name.
-                    contract_error = _directed_scene_row_error(
-                        scene,
-                        scene_text=scene_texts[index - 1] if index - 1 < len(scene_texts) else "",
-                        title=topic,
-                    )
-                    if contract_error:
-                        raise ValueError(
-                            f"OpenRouter returned an invalid scene plan at row {index}: {contract_error}")
+                                first_val = next((str(queries.get(field) or '').strip() for field in fields
+                                                  if str(queries.get(field) or '').strip()), '')
+                                if not first_val:
+                                    raise ValueError(f'OpenRouter returned no usable {source} queries at row {index}')
+                                queries[first_field] = first_val
+                            for field in fields[1:]:
+                                if not str(queries.get(field) or "").strip():
+                                    queries[field] = first_val
+                        # Retrieval contract: a row with empty domain/intents,
+                        # a format-phrase subject, a wrong subject type, or
+                        # queries carrying no entity/viewpoint words is never
+                        # shipped with empty fields. The game check is
+                        # scene-relative: the scene's own narration (not the
+                        # video title) decides which game the queries must name.
+                        contract_error = _directed_scene_row_error(
+                            scene,
+                            scene_text=scene_texts[index - 1] if index - 1 < len(scene_texts) else "",
+                            title=topic,
+                        )
+                        if contract_error:
+                            raise ValueError(
+                                f"OpenRouter returned an invalid scene plan at row {index}: {contract_error}")
+                    except ValueError as exc:
+                        invalid_rows[index - 1] = str(exc)
+                        scenes[index - 1] = None
+                if invalid_rows:
+                    if len(invalid_rows) == len(scenes):
+                        raise ValueError(next(iter(invalid_rows.values())))
+                    for offset, message in invalid_rows.items():
+                        subject = section_subjects[offset] if offset < len(section_subjects) else ""
+                        fallback = _mechanical_scene_plan(
+                            scene_texts[offset], offset + 1, subject, topic)
+                        fallback["_query_fallback"] = "invalid_llm_row"
+                        scenes[offset] = fallback
+                        print(
+                            f"   Brain scene planning: row {offset + 1} invalid "
+                            f"({message}); kept mechanical fallback, salvaging the rest")
                 # Stamp the scene-relative subject game, derived from each
                 # scene's own narration (never the LLM's say-so alone), so
                 # the adapter, the cache, and the relevance gate all see

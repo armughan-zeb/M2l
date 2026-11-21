@@ -182,9 +182,21 @@ class PlanningBudgetTests(unittest.TestCase):
 
     def test_source_query_stage_preserves_completed_rows_and_fills_only_gaps(self):
         scenes = self._long_scenes(3)
+        # Mechanical-first: an LLM row only survives the merge when it
+        # passes the real contract validators, so the completed row carries
+        # real contract fields (and the scene's distinctive token "1").
         completed = {
             "scene_number": 1,
-            "search_query": "LLM completed row",
+            "section_subject": "RMS Titanic",
+            "container_subject": "RMS Titanic",
+            "scene_subject": "RMS Titanic",
+            "scene_subject_type": "topic",
+            "domain_category": "disaster",
+            "retrieval_positive_terms": ["RMS Titanic", "ship", "passengers"],
+            "retrieval_negative_terms": [],
+            "youtube_query_intents": ["archival footage", "documentary footage"],
+            "visual_intent": "RMS Titanic ship passengers voyage",
+            "search_query": "RMS Titanic scene 1 ship passengers voyage photo",
             "_llm": True,
         }
         with mock.patch.object(
@@ -244,25 +256,57 @@ class PlanningBudgetTests(unittest.TestCase):
 def test_agent_query_planner_waits_for_the_agent_answer_despite_spent_budget():
     """The source-query planner answers through the polling inbox in agent
     jobs. A spent delivery budget used to shrink its wall to ~0s, so the job
-    fell back to mechanical queries that find nothing ("In February…")."""
+    fell back to mechanical queries that find nothing ("In February…").
+
+    Mechanical-first: both scenes request a diagram/timeline, so they
+    stay on inference by design and the repair path still files the agent
+    request for exactly those scenes and waits for its answer despite the
+    spent budget; the repaired rows carry real contract fields so the
+    merged validation keeps them. (Gap 4: these scenes used to fail the
+    contract validators on fewer-than-3 positive terms, which the
+    mechanical fix now pads; diagram scenes keep the repair path under
+    test.)"""
     import time
     from services.delivery_budget import DeliveryBudget
 
     budget = DeliveryBudget.create(total_seconds=60.0, render_reserve_seconds=0.0)
     budget.deadline_at = time.monotonic() - 10.0
     config = {"llm_provider": "external_agent", "_delivery_budget": budget}
-    scenes = ["Passengers board the Amtrak train.", "The crew changes at the station."]
+    scenes = ["Passengers board the Amtrak train, as the diagram shows.",
+              "The crew changes at the station, as the timeline shows."]
+    seen = []
 
     def fake_bundle(script, title, scene_texts, cfg):
-        rows = [{"query": "Amtrak train", "_llm": True} for _ in scene_texts]
-        return {"web": list(rows), "yt": list(rows),
+        seen.append(list(scene_texts))
+        web, yt = [], []
+        for text in scene_texts:
+            key = "passengers" if "Passengers" in text else "crew"
+            base = {
+                "scene_number": 1,
+                "section_subject": "Amtrak",
+                "container_subject": "Amtrak",
+                "scene_subject": "Amtrak",
+                "scene_subject_type": "topic",
+                "domain_category": "other",
+                "retrieval_positive_terms": ["Amtrak", "passengers", "station"],
+                "retrieval_negative_terms": [],
+                "youtube_query_intents": ["documentary footage"],
+                "visual_intent": "passengers boarding Amtrak train station",
+                "_llm": True,
+            }
+            web.append({**base, "search_query": f"Amtrak {key} train station photo"})
+            yt.append({**base, "search_query": f"Amtrak {key} train station footage"})
+        return {"web": web, "yt": yt,
                 "_planner": {"status": "directed", "selected_model": "external-agent"}}
 
     with mock.patch.object(server_app, "_generate_shared_scene_brain_bundle", fake_bundle):
         result = server_app._generate_source_query_bundle_parallel(
             "script", "Amtrak", scenes, config, needs_web=True, needs_yt=True,
         )
-    assert result.get("_planner", {}).get("status") == "directed"
+    assert seen == [scenes]
+    assert result.get("_planner", {}).get("status") == "mechanical_first_llm_repair"
+    assert result["web"][0].get("_llm") is True
+    assert result["web"][1].get("_llm") is True
 
 
 

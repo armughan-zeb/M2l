@@ -1,0 +1,66 @@
+{
+  "total_wall_seconds": 319.9,
+  "hard_timeout_seconds": 325,
+  "search_wall_seconds": 55.0,
+  "assign_wall_seconds": 20.1,
+  "transcript_wait_seconds": 45.5,
+  "ranged_deadline_seconds": 45.5,
+  "download_reserve_seconds": 203.4,
+  "download_workers": 5,
+  "downloads_attempted": 6,
+  "downloads": [
+    {
+      "video_id": "0ZY_bEuJdX4",
+      "sleep_seconds": 44.25,
+      "wall_seconds": 44.3
+    },
+    {
+      "video_id": "CCU93C1Q6WE",
+      "sleep_seconds": 44.25,
+      "wall_seconds": 44.3
+    },
+    {
+      "video_id": "tJbzMqJGH4k",
+      "sleep_seconds": 71.79,
+      "wall_seconds": 71.9
+    },
+    {
+      "video_id": "ByAS0Ak3-qA",
+      "sleep_seconds": 76.49,
+      "wall_seconds": 76.6
+    },
+    {
+      "video_id": "VQRLujxTm3c",
+      "sleep_seconds": 71.79,
+      "wall_seconds": 71.8
+    },
+    {
+      "video_id": "F39fE1AwOyc",
+      "sleep_seconds": 76.49,
+      "wall_seconds": 76.5
+    }
+  ],
+  "resolved_scenes": 11,
+  "requested_scenes": 11,
+  "replay_accepted_ratio_worker_scenes": 1.0,
+  "replay_accepted_ratio_job_scenes_13": 0.8462,
+  "run7_live_accepted_ratio_job_scenes_13": 0.2308,
+  "resolved": 11,
+  "resolution_layers": {
+    "cached": 5,
+    "perfect": 6
+  },
+  "resolution_layer_by_scene": {
+    "0": "cached",
+    "1": "perfect",
+    "2": "cached",
+    "3": "perfect",
+    "4": "perfect",
+    "5": "cached",
+    "6": "perfect",
+    "7": "perfect",
+    "8": "perfect",
+    "9": "cached",
+    "10": "cached"
+  }
+}

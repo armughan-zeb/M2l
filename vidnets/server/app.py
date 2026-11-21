@@ -4535,7 +4535,7 @@ def _apply_gaming_mode_policy(config, policy, title, script, scene_texts):
     function only reads ``config['mixed_media_weights']`` — the GTA hole was
     that the policy weights lived only in ``_niche_media_policy`` and never
     reached it. This copies them for gaming jobs and records
-    ``config['_gaming_mode']`` so the adapter binds the 0.90 YouTube target
+    ``config['_gaming_mode']`` so the adapter binds the 0.80 YouTube target
     and YT-primary lane order. Explicit operator weights stay authoritative:
     the copy only fills the gap when the job has none.
     """
@@ -4557,13 +4557,13 @@ def _apply_gaming_mode_policy(config, policy, title, script, scene_texts):
     config.setdefault('media_source_priority', ['youtube', 'web'])
     config['allow_relevant_stock'] = False
     config['allow_stock_last_resort'] = False
-    # Stamp the binding 0.90 YouTube target from the planner constant so
+    # Stamp the binding 0.80 YouTube target from the planner constant so
     # the adapter's quota math reads the same number the policy sets.
     try:
         from services.mixed_media_planner import GAMING_YOUTUBE_TARGET_RATIO
         config['_gaming_youtube_target'] = GAMING_YOUTUBE_TARGET_RATIO
     except Exception:
-        config['_gaming_youtube_target'] = 0.90
+        config['_gaming_youtube_target'] = 0.80
     weights = policy.get('weights')
     if isinstance(weights, dict) and weights:
         explicit = config.get('mixed_media_weights') or config.get('media_weights')
@@ -4579,6 +4579,44 @@ def _apply_gaming_mode_policy(config, policy, title, script, scene_texts):
         config['yt_download_candidate_limit'] = int(retrieval.get('yt_download_candidate_limit', 10))
     except (TypeError, ValueError):
         config['yt_download_candidate_limit'] = 10
+
+
+def _apply_documentary_mode_policy(config, policy, title, script, scene_texts):
+    """Wire the documentary niche policy into the config the quota math reads.
+
+    Mirrors _apply_gaming_mode_policy but stamps only the binding target:
+    documentary jobs get the 0.55 YouTube target from the planner constant
+    (AUTO_YOUTUBE_RATIO) via ``config['_documentary_mode']`` /
+    ``config['_documentary_youtube_target']``, which the adapter binds in
+    _mixed_media_youtube_target_ratio. No lane-order, retrieval, stock, or
+    weights changes: the documentary retrieval weights (YouTube 0.60) stay
+    a retrieval preference, web stays a primary lane alongside YouTube, and
+    explicit operator coverage keys still win in the adapter. Gaming mode
+    wins when a job is both: the adapter checks gaming before documentary.
+    Per-host throttle slots are untouched.
+    """
+    if not isinstance(config, dict) or not isinstance(policy, dict):
+        return
+    try:
+        from services.mixed_media_planner import documentary_mode_for
+        documentary = documentary_mode_for(
+            title, script, list(scene_texts or []),
+            config.get('category') or config.get('niche') or '',
+        )
+    except Exception:
+        documentary = False
+    if not documentary:
+        documentary = str(policy.get('niche') or '').strip().lower() == 'documentary'
+    config['_documentary_mode'] = bool(documentary)
+    if not documentary:
+        return
+    # Stamp the binding 0.55 YouTube target from the planner constant so
+    # the adapter's quota math reads the same number the policy sets.
+    try:
+        from services.mixed_media_planner import DOCUMENTARY_YOUTUBE_TARGET_RATIO
+        config['_documentary_youtube_target'] = DOCUMENTARY_YOUTUBE_TARGET_RATIO
+    except Exception:
+        config['_documentary_youtube_target'] = 0.55
 
 
 def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
@@ -4615,6 +4653,7 @@ def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
             existing = _apply_authenticated_youtube_mix(existing, config)
             config['_niche_media_policy'] = existing
             _apply_gaming_mode_policy(config, existing, title, script, scene_texts)
+            _apply_documentary_mode_policy(config, existing, title, script, scene_texts)
             return existing
         print("   [mix] refreshing stale niche policy for the current script context")
     try:
@@ -4674,6 +4713,7 @@ def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
         for key, value in retrieval_policy.items():
             config.setdefault(key, value)
     _apply_gaming_mode_policy(config, policy, title, script, scene_texts)
+    _apply_documentary_mode_policy(config, policy, title, script, scene_texts)
     weights = policy.get('weights') or {}
     print(
         f"   [mix] script niche policy: {policy.get('niche') or 'general'} "
@@ -4683,7 +4723,8 @@ def _resolve_mixed_media_niche_policy(config, title, script, scene_texts):
         f"stock={float(weights.get('Stock Media') or 0):.0%}"
         + (", verified YouTube session" if policy.get('youtube_coverage_mode') == 'verified_cookie_video_majority' else '')
         + (", GTA VI exact-title media; prior-title clips only for an explicit scene comparison" if policy.get('gta_vi') else '')
-        + (", gaming mode: 90% YouTube" if config.get('_gaming_mode') else '')
+        + (", gaming mode: 80% YouTube" if config.get('_gaming_mode') else '')
+        + (", documentary mode: 55% YouTube" if config.get('_documentary_mode') else '')
         + ")"
     )
     return policy
@@ -7595,19 +7636,47 @@ def _generate_source_query_bundle_parallel(
     topic_title = title or ""
     mechanical_bundle = _generate_mechanical_shared_scene_bundle(script, topic_title, scene_texts)
     _ground_exact_matchup_queries(mechanical_bundle, scene_texts, topic_title)
+    for source in enabled_sources:
+        bundle[source] = list(mechanical_bundle.get(source) or [])
+    # Mechanical-first: serve every scene whose mechanical rows already
+    # pass the retrieval-contract validators. File an LLM request ONLY
+    # for the failing subset (validator failures + diagram scenes, whose
+    # direction stays on inference by design).
+    from services.mechanical_scene_planner import mechanical_first_failing_scenes
+    failing = mechanical_first_failing_scenes(bundle, scene_texts, topic_title)
+    if not failing:
+        result = _attach_source_planner_metadata(
+            bundle,
+            status="mechanical_first",
+            route={
+                "mechanical_scenes": len(scene_texts),
+                "directed_scenes": 0,
+                "fallback_scenes": 0,
+                "llm_repair_scenes": [],
+            },
+            elapsed_seconds=time.monotonic() - stage_started,
+        )
+        print(
+            f"   [planning] mechanical-first: all {len(scene_texts)} scenes served mechanically "
+            f"in {time.monotonic() - stage_started:.1f}s (no inference request filed)"
+        )
+        _report_source_planner_status(progress_callback, result.get("_planner"))
+        return result
+
     print(
-        f"   [planning] OpenRouter scene director started: scenes={len(scene_texts)}, "
-        f"sources={','.join(enabled_sources)}, wall={stage_seconds:.1f}s, parallel scene chunks enabled"
+        f"   [planning] mechanical-first: {len(scene_texts) - len(failing)}/{len(scene_texts)} scenes served mechanically; "
+        f"LLM repair for scenes {[idx + 1 for idx in failing]}, wall={stage_seconds:.1f}s"
     )
+    subset_texts = [scene_texts[idx] for idx in failing]
     planner_state = {"bundle": None, "error": None}
     planner_done = threading.Event()
 
-    def _run_shared_planner():
+    def _run_repair_planner():
         try:
             planner_state["bundle"] = _generate_shared_scene_brain_bundle(
                 script,
                 topic_title,
-                scene_texts,
+                subset_texts,
                 config,
             )
         except BaseException as exc:
@@ -7616,8 +7685,8 @@ def _generate_source_query_bundle_parallel(
             planner_done.set()
 
     planner_thread = JobThread(
-        target=_run_shared_planner,
-        name="openrouter-scene-director",
+        target=_run_repair_planner,
+        name="openrouter-scene-director-repair",
         daemon=True,
     )
     planner_thread.start()
@@ -7634,58 +7703,82 @@ def _generate_source_query_bundle_parallel(
                 progress_value = 0.24 + min(0.04, elapsed / max(1.0, stage_seconds) * 0.04)
                 progress_callback(
                     progress_value,
-                    f"OpenRouter query planning: directing {len(scene_texts)} scenes "
+                    f"OpenRouter query repair: directing {len(subset_texts)} scenes "
                     f"({elapsed:.0f}s; ordered retries active)",
                 )
             except Exception:
                 pass
 
-    shared_bundle = planner_state.get("bundle") if planner_done.is_set() and planner_state.get("error") is None else None
-    if shared_bundle and isinstance(shared_bundle, dict):
-        all_complete = True
-        for source in enabled_sources:
-            rows = shared_bundle.get(source)
-            if isinstance(rows, list) and len(rows) == len(scene_texts) and all(isinstance(r, dict) and r.get("_llm") for r in rows):
-                bundle[source] = rows
-            else:
-                all_complete = False
-                break
-        if all_complete:
-            _ground_exact_matchup_queries(bundle, scene_texts, topic_title)
-            planner_route = shared_bundle.get("_planner") if isinstance(shared_bundle.get("_planner"), dict) else {}
-            result = _attach_source_planner_metadata(
-                bundle,
-                status=planner_route.get("status", "directed"),
-                route=planner_route,
-                elapsed_seconds=time.monotonic() - stage_started,
-            )
-            print(
-                f"   [planning] OpenRouter source plan complete in {time.monotonic() - stage_started:.1f}s "
-                f"({len(scene_texts)} scenes; model={planner_route.get('selected_model') or 'fallback route'})"
-            )
-            return result
+    # A failed repair used to vanish: the thread's exception was stored
+    # and never logged or recorded, so the plan checkpoint showed 0/13
+    # repaired with no reason (Panama f66daa53: the agent's row-1 type
+    # mismatch was only in the server log as one "Brain scene planning
+    # failed" line). Log it and persist it as the planner reason.
+    repair_error = planner_state.get("error")
+    if repair_error is not None:
+        print(
+            f"   [planning] LLM repair failed: {type(repair_error).__name__}: {repair_error}"
+        )
+    shared_bundle = planner_state.get("bundle") if planner_done.is_set() and repair_error is None else None
+    if isinstance(shared_bundle, dict):
+        _ground_exact_matchup_queries(shared_bundle, subset_texts, topic_title)
+    repaired = []
+    if isinstance(shared_bundle, dict):
+        for position, idx in enumerate(failing):
+            complete = True
+            for source in enabled_sources:
+                rows = shared_bundle.get(source)
+                # A _query_fallback row is mechanical (the brain salvaged
+                # an invalid LLM row); it must stay mechanical here, not
+                # count as LLM-repaired, or "repaired" would launder a
+                # mechanical row as directed.
+                if (not isinstance(rows, list) or position >= len(rows)
+                        or not isinstance(rows[position], dict) or not rows[position].get("_llm")
+                        or rows[position].get("_query_fallback")):
+                    complete = False
+                    break
+            if not complete:
+                continue
+            for source in enabled_sources:
+                bundle[source][idx] = shared_bundle[source][position]
+            repaired.append(idx)
 
-    # Missing or late rows are completed from the mechanical safety bundle
-    for source in enabled_sources:
-        completed_rows = list((shared_bundle.get(source) if isinstance(shared_bundle, dict) else None) or bundle.get(source) or [])
-        fallback_rows = list(mechanical_bundle.get(source) or [])
-        bundle[source] = [
-            completed_rows[idx]
-            if idx < len(completed_rows) and isinstance(completed_rows[idx], dict) and completed_rows[idx].get("_llm")
-            else (fallback_rows[idx] if idx < len(fallback_rows) else {})
-            for idx in range(len(scene_texts))
-        ]
-    _ground_exact_matchup_queries(bundle, scene_texts, topic_title)
+    # Re-validate the merged bundle against the real contract validators.
+    # An LLM row that still fails is reverted to its mechanical row, and
+    # if a previously-passing scene now fails, every repair is reverted.
+    from services.vidzeo_brain import adapted_scene_plan_errors
+    still_failing = adapted_scene_plan_errors(bundle, scene_texts, topic_title)
+    previously_passing = set(range(len(scene_texts))) - set(failing)
+    if repaired and any(idx in still_failing for idx in previously_passing):
+        for idx in repaired:
+            for source in enabled_sources:
+                bundle[source][idx] = mechanical_bundle[source][idx]
+        repaired = []
+    else:
+        for idx in list(repaired):
+            if idx in still_failing:
+                for source in enabled_sources:
+                    bundle[source][idx] = mechanical_bundle[source][idx]
+                repaired.remove(idx)
+    unrepaired = [idx for idx in failing if idx not in repaired]
     result = _attach_source_planner_metadata(
         bundle,
-        status="mechanical_fallback",
-        reason="planner_timeout_or_partial_failure",
+        status="mechanical_first_llm_repair",
+        route={
+            "mechanical_scenes": len(scene_texts) - len(repaired),
+            "directed_scenes": len(repaired),
+            "fallback_scenes": len(unrepaired),
+            "llm_repair_scenes": [idx + 1 for idx in failing],
+            "llm_repaired_scenes": [idx + 1 for idx in repaired],
+            "unrepaired_scenes": [idx + 1 for idx in unrepaired],
+            "reason": str(repair_error) if repair_error is not None else "",
+        },
         elapsed_seconds=time.monotonic() - stage_started,
     )
     print(
         f"   [planning] source-query stage complete in {time.monotonic() - stage_started:.1f}s "
-        f"(mechanical fill: web={len(bundle['web']) if needs_web else 0}, "
-        f"yt={len(bundle['yt']) if needs_yt else 0}, stock={len(bundle['stock']) if needs_stock else 0})"
+        f"(mechanical-first: {len(scene_texts) - len(repaired)} mechanical, LLM repair {len(repaired)}/{len(failing)}, "
+        f"unrepaired {[idx + 1 for idx in unrepaired]})"
     )
     _report_source_planner_status(progress_callback, result.get("_planner"))
     return result
@@ -10039,6 +10132,60 @@ def _run_stock_media_branch(scene_texts, scene_durations, config, title, script,
     }
 
 
+def _yt_audit_screened_paths(run_folder, *, lenient: bool) -> set:
+    """Paths the worker already screened, from its on-disk attempt audit.
+
+    The worker writes ``youtube_scene_*.attempts.json`` next to the cuts:
+    each downloaded attempt records its motion ``quality_check`` and
+    overlay verdict. A row with status ``downloaded``, a checked
+    non-rejecting quality check, an overlay check and no rejection
+    reason has already passed the deterministic FFmpeg screens, so the
+    salvage must not re-run them (~21s per file sequentially — test 20
+    spent ~333s re-screening 11 files it had already screened). Rows
+    without a passing verdict (or no audit at all) are absent from the
+    set, so those files are screened as before. Never raises.
+    """
+    passed = set()
+    try:
+        folder = Path(run_folder)
+        if not folder.is_dir():
+            return passed
+        for audit_path in sorted(folder.glob("youtube_scene_*.attempts.json")):
+            try:
+                rows = json.loads(audit_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("status") or "") != "downloaded":
+                    continue
+                quality_check = row.get("quality_check") or {}
+                if not isinstance(quality_check, dict):
+                    continue
+                if not quality_check.get("checked") or quality_check.get("reject"):
+                    continue
+                if not row.get("overlay_checked"):
+                    continue
+                if str(row.get("rejection_reason") or ""):
+                    continue
+                if not lenient and (row.get("facecam_inset") or row.get("talking_head")):
+                    continue
+                for key in ("path", "cleaned_path"):
+                    value = str(row.get(key) or "")
+                    if not value:
+                        continue
+                    try:
+                        passed.add(str(Path(value).resolve()))
+                    except Exception:
+                        passed.add(value)
+    except Exception:
+        return passed
+    return passed
+
+
 def _recover_completed_clips_from_disk(num_scenes: int, run_root=None) -> list:
     try:
         from pathlib import Path
@@ -10072,12 +10219,35 @@ def _recover_completed_clips_from_disk(num_scenes: int, run_root=None) -> list:
             return [None] * num_scenes
             
         run_folders.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+
+        # Test-20 salvage guard: re-screening every file sequentially
+        # cost ~333s for 11 files. Files the worker already screened
+        # (attempt audit) skip the ffmpeg screens, and screening as a
+        # whole is bounded: once the budget is spent, remaining files
+        # are accepted unscreened — the coordinator's vision gate still
+        # judges every salvaged clip before it can be selected.
+        _salvage_started = time.monotonic()
+        try:
+            _screen_budget_seconds = max(
+                0.0,
+                min(
+                    600.0,
+                    float(os.environ.get("VIDZEO_YT_SALVAGE_SCREEN_BUDGET_SECONDS", "60") or 60),
+                ),
+            )
+        except (TypeError, ValueError):
+            _screen_budget_seconds = 60.0
+        _salvage_lenient = str(os.environ.get("VIDZEO_YT_LENIENT_ACCEPTANCE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        _audit_skipped = 0
+        _budget_skipped = 0
+        _budget_logged = False
         
         results = [None] * num_scenes
         result_ranks = [0] * num_scenes
         # Walk recent folders newest-first so a just-finished V2 worker can be
         # salvaged even if the outer coordinator hit its timeout boundary.
         for latest_dir in run_folders[:6]:
+            _audited_paths = _yt_audit_screened_paths(latest_dir, lenient=_salvage_lenient)
             candidate_files = latest_dir.rglob("*.mp4") if run_root or latest_dir.name.startswith("pool_") else latest_dir.iterdir()
             candidate_files = sorted(
                 candidate_files,
@@ -10117,7 +10287,33 @@ def _recover_completed_clips_from_disk(num_scenes: int, run_root=None) -> list:
                         candidate = str(file.resolve())
                         if not _media_path_exists_for_render(candidate):
                             continue
-                        if _screen_moment_quality is not None and _screen_moment_overlays is not None:
+                        # Trust the worker's prior screening: a file whose
+                        # attempt audit already passed quality + overlay is
+                        # not re-screened. Otherwise bound the total
+                        # screening time; past the budget, accept the file
+                        # unscreened (vision still gates it downstream).
+                        _audit_passed = candidate in _audited_paths
+                        _screen_spent = (
+                            time.monotonic() - _salvage_started
+                        ) > _screen_budget_seconds
+                        if _audit_passed:
+                            _audit_skipped += 1
+                        elif _screen_spent:
+                            _budget_skipped += 1
+                            if not _budget_logged:
+                                _budget_logged = True
+                                print(
+                                    "   [yt] disk recovery: screen budget "
+                                    f"({_screen_budget_seconds:.0f}s) spent; "
+                                    "accepting remaining files unscreened",
+                                    flush=True,
+                                )
+                        if (
+                            _screen_moment_quality is not None
+                            and _screen_moment_overlays is not None
+                            and not _audit_passed
+                            and not _screen_spent
+                        ):
                             try:
                                 quality = _screen_moment_quality(candidate) or {}
                                 overlay = _screen_moment_overlays(
@@ -10128,7 +10324,7 @@ def _recover_completed_clips_from_disk(num_scenes: int, run_root=None) -> list:
                             except Exception:
                                 continue
                             is_cleaned = ".clean." in lower_name or ".overlay_clean." in lower_name
-                            lenient = str(os.environ.get("VIDZEO_YT_LENIENT_ACCEPTANCE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+                            lenient = _salvage_lenient
 
                             hard_quality_reject = False
                             if quality.get("reject"):
@@ -10163,6 +10359,12 @@ def _recover_completed_clips_from_disk(num_scenes: int, run_root=None) -> list:
                             result_ranks[scene_num - 1] = quality_rank
                 except Exception:
                     pass
+        if _audit_skipped or _budget_skipped:
+            print(
+                "   [yt] disk recovery: skipped re-screening for "
+                f"{_audit_skipped} audited file(s), {_budget_skipped} after screen budget",
+                flush=True,
+            )
         return results
     except Exception as e:
         print(f"   [yt] disk recovery error: {e}")
@@ -10442,7 +10644,7 @@ class _YoutubeProcessExecutor:
 
 
 def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, config,
-                            scene_query_overrides, openrouter_key):
+                            scene_query_overrides, openrouter_key, prep_manifest_title=None):
     config = dict(config or {})
     image_source = str(config.get('image_source') or '').strip()
     try:
@@ -10480,6 +10682,12 @@ def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, conf
     return {
         'script': script,
         'title': title,
+        # Full job title for the prep-manifest injection lookup in the
+        # child worker. ``title`` here is the search title (yt_title),
+        # which may be just the topic anchor and then never matches a
+        # manifest keyed on the full job title (run 3: anchor injected
+        # 0; full title injected 9).
+        'prep_manifest_title': prep_manifest_title or title,
         'scene_texts': list(scene_texts or []),
         'scene_durations': list(scene_durations or []),
         'openrouter_api_key': openrouter_key or '',
@@ -10573,6 +10781,30 @@ def _mixed_youtube_branch_wall_cap_seconds(config=None, scene_count=0):
             )
         except Exception:
             requested = min(requested, 360.0 if int(scene_count) <= 12 else 600.0)
+    if settings.get("_youtube_general_pool_build"):
+        # Track B general pool (GTA test 18, job 2451ee04): the pool runs
+        # the FULL fresh verification path (search -> transcript -> probe
+        # -> download) with no cache/prep shortcut, so the transfer-wave
+        # wall above (240s for 4 scenes) kills its child before one clip
+        # can verify — search alone took ~68s and the transcript stage
+        # has a 120s deadline. The adapter configures the pool's wall
+        # explicitly as discovery budget + download drain
+        # (yt_hard_timeout_seconds); never cap a pool build below it.
+        # Downloads stay exempt from the discovery budget: the soft
+        # timeout still stops new discovery at the budget — the floor
+        # only lets in-flight verification drain. The delivery-budget
+        # clamp downstream can still shrink the wall for render reserve.
+        try:
+            pool_floor = float(settings.get("yt_hard_timeout_seconds") or 0)
+        except (TypeError, ValueError):
+            pool_floor = 0.0
+        if not pool_floor:
+            try:
+                pool_floor = float(settings.get("yt_soft_timeout_seconds") or 0) + 120.0
+            except (TypeError, ValueError):
+                pool_floor = 0.0
+        if pool_floor > 0:
+            requested = max(requested, pool_floor)
     return requested
 
 
@@ -10660,12 +10892,26 @@ def _mixed_media_pool_first_enabled(config, scene_count, env_value=None):
     return bool(value)
 
 
-def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, script, progress_callback=None, cancellation=None):
+def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, script, progress_callback=None, cancellation=None, prep_manifest_title=None):
+    # Full job title for the prep-manifest injection lookup. The branch's
+    # ``title`` argument is the search title and may be just the topic
+    # anchor (the mixed-media adapter rewrites it to e.g. "Panama Canal"),
+    # which never matches a manifest keyed on the full job title (run 4:
+    # lookup_title='Panama Canal', 0 injected). Callers that know the full
+    # title pass it separately; otherwise the search title is the lookup.
+    effective_prep_manifest_title = prep_manifest_title or title
     # Job-specific retrieval tuning belongs to its child, never the shared backend.
     yt_environment = dict(os.environ)
     niche = str(config.get('script_niche') or config.get('category') or '').strip()
     if niche:
         yt_environment['VIDZEO_SCRIPT_NICHE'] = niche
+    # Test-20 fan-out: the YT branch worker's vision concurrency must be
+    # 8 (the inbox answer concurrency / pool ceiling), not the default 4
+    # — otherwise the branch's batched verification queues on the
+    # context semaphore and the pool never sees enough concurrent demand
+    # to scale. The server-process default is also 8 (see
+    # external_agent_vision_concurrency); this pins the child explicitly.
+    yt_environment['VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY'] = '8'
 
     from concurrent.futures import ThreadPoolExecutor
     from services.job_context import JobThreadPoolExecutor as ThreadPoolExecutor
@@ -11032,14 +11278,21 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             or "12"
         )
         # Transcript ranking is opportunistic; deterministic timestamp cuts
-        # remain valid when caption endpoints are slow. Gaming jobs get a
-        # 120 s transcript deadline: 18 s risks heuristic timestamps for
-        # every scene of a footage-led edit.
+        # remain valid when caption endpoints are slow. The deadline is
+        # 120 s for every mixed-media job, not just gaming: the old 18 s
+        # non-gaming default silently defeated the round-4 transcript fix
+        # (whose pipeline default is 120 s) — run 4 (job 3006fd62, a
+        # documentary) ran its YouTube worker with an 18 s transcript
+        # deadline, so only 2/11 transcripts could finish and the other 9
+        # never even wrote a cache row. 120 s fits the measured cost:
+        # isolated verification was 12/12 in 94.7 s (~8 s/video), and at
+        # the pool's 6 workers 11 videos need ~2 waves, well inside 120 s
+        # in a good hour; the 343 s branch wall still bounds the lane.
         yt_environment["VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS"] = str(
             config.get("yt_transcript_deadline_seconds")
             or ("120" if config.get("_gaming_mode") else None)
             or yt_environment.get("VIDZEO_MIXED_YT_TRANSCRIPT_DEADLINE_SECONDS")
-            or "18"
+            or "120"
         )
         # Sports/person jobs need enough independent footage queries to avoid
         # letting the first biography result monopolize the shared pool.
@@ -11298,6 +11551,12 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             return get_youtube_clips(
                 script=script,
                 title=yt_title,
+                # Full job title for the prep-manifest injection lookup:
+                # yt_title may be just the topic anchor, which never
+                # matches a manifest keyed on the full job title. The
+                # branch's effective title (adapter-supplied full title
+                # when present) is the lookup, not yt_title.
+                prep_manifest_title=effective_prep_manifest_title,
                 num_scenes=len(scene_texts),
                 scene_durations=scene_durations,
                 openrouter_api_key=openrouter_key,
@@ -11692,6 +11951,11 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             worker_payload = _youtube_worker_payload(
                 script=script,
                 title=yt_title,
+                # Full job title: the search title (yt_title) may be just
+                # the topic anchor, which never matches a prep manifest.
+                # Use the branch's effective title (adapter-supplied full
+                # title when present) for the child worker's lookup.
+                prep_manifest_title=effective_prep_manifest_title,
                 scene_texts=scene_texts,
                 scene_durations=scene_durations,
                 config=config,
@@ -11792,6 +12056,10 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                     yt_paths = get_youtube_clips(
                         script=script,
                         title=yt_title,
+                        # Full job title for the prep-manifest injection
+                        # lookup (yt_title may be just the topic anchor).
+                        # Use the branch's effective title, as above.
+                        prep_manifest_title=effective_prep_manifest_title,
                         num_scenes=len(scene_texts),
                         scene_durations=scene_durations,
                         openrouter_api_key=openrouter_key,
@@ -12662,6 +12930,23 @@ def _record_yt_to_web_substitution(metadata, scene_index, *, via, reason, to_pat
     })
 
 
+def _media_total_deadline_spent(config) -> bool:
+    """True when the adapter-stamped total media deadline has passed.
+
+    The V2 adapter stamps ``_media_total_deadline_at`` (monotonic) on the
+    job config when it computes the total media budget (discovery +
+    tail). Callers without that stamp (older paths, unit tests) behave
+    exactly as before.
+    """
+    try:
+        deadline_at = (config or {}).get("_media_total_deadline_at")
+        if deadline_at is None:
+            return False
+        return time.monotonic() >= float(deadline_at)
+    except (TypeError, ValueError):
+        return False
+
+
 def _fill_unresolved_with_general_web_fallback(
     final_paths,
     source_labels,
@@ -13150,8 +13435,23 @@ def _fill_unresolved_with_general_web_fallback(
     )
     authoritative_verifier = None
     authoritative_scenes = {}
+    # Bounded total media time (test-20): when the coordinator's total
+    # media budget already ended, the sequential authoritative
+    # re-verification below (~60s per scene, ~10 min in test 20) cannot
+    # fit the budget. Skip building the verifier entirely and resolve
+    # with best-so-far (the downloaded web candidate) instead of
+    # re-verifying scene by scene. Safety/dedupe checks below still
+    # apply, and no fake visual pass is stamped on the provenance.
+    media_total_spent = _media_total_deadline_spent(config)
+    if media_total_spent and required_visual_indices:
+        print(
+            "   [media] web fallback: total media budget spent; skipping "
+            f"authoritative re-verification for {len(required_visual_indices)} scene(s), "
+            "resolving with best-so-far",
+            flush=True,
+        )
     immutable_contracts = config.get('_scene_contracts_v2') or []
-    if immutable_contracts and required_visual_indices:
+    if immutable_contracts and required_visual_indices and not media_total_spent:
         from services.pipeline_v2_media_adapter import build_qwen_verifier
         for scene_idx in required_visual_indices:
             if scene_idx >= len(immutable_contracts):
@@ -13227,6 +13527,7 @@ def _fill_unresolved_with_general_web_fallback(
                                       visual_unverified=False)
                 if (
                     scene_idx in required_visual_indices
+                    and not media_total_spent
                     and not _has_live_visual_pass(provenance)
                 ):
                     continue
@@ -17972,6 +18273,41 @@ def _resolve_media_paths(config, audio_plan, report_progress, cancellation=None)
     }
 
 
+def _editorial_beats_from_director(director_future, director_deadline, scene_texts, job_config):
+    """Take the editorial beats folded into the director's plan (P1).
+
+    The director returns editorial_* fields with its scenes, so its plan
+    metadata already carries the beats — no separate
+    vidzeo_editorial_beats_v1 request is needed. The wait is bounded by
+    the director's own deadline (normally already passed by manifest
+    time, so this returns at once). Returns the beats only when they
+    cover every scene in order; anything else returns None and the
+    caller falls back to the standalone planner.
+    """
+    if director_future is None:
+        return None
+    try:
+        remaining = 0.0
+        if director_deadline is not None:
+            remaining = float(director_deadline) - time.monotonic()
+        wait = max(0.0, min(remaining, 300.0))
+        plan = director_future.result(timeout=wait)
+        metadata = getattr(plan, "director_metadata", None) or {}
+        if metadata.get("editorial_beats_source") != "direction":
+            return None
+        beats = metadata.get("editorial_beats")
+        if not isinstance(beats, list) or len(beats) != len(scene_texts or []):
+            return None
+        if any(int((beat or {}).get("scene_index", -1)) != index for index, beat in enumerate(beats)):
+            return None
+        selected_cards = sum(1 for beat in beats if beat.get("selected_for_text") is True)
+        print(f"   [edit] grounded editorial moments from director plan: {selected_cards}/{len(scene_texts)}")
+        return beats
+    except Exception as exc:
+        print(f"   [edit] director-plan beats unavailable: {type(exc).__name__}: {exc}")
+        return None
+
+
 def _run_editorial_brain(scene_texts, durations, job_config):
     """Plan editorial moments and single-word cards in parallel with media resolution."""
     try:
@@ -18380,6 +18716,10 @@ def _validate_remotion_edit_plan(manifest, expected_scene_count):
         load_admin1_catalog,
         load_geographic_catalog,
     )
+    # The director grounds narrated oceans/seas in the curated-region
+    # catalogue and the globe renderer centres on them; the validator must
+    # know the same geography or it rejects the director's own grounded maps.
+    from services.geographic_regions import is_curated_region
     from services.template_library import list_template_catalog, validate_template_recipe
     import unicodedata
 
@@ -18551,6 +18891,13 @@ def _validate_remotion_edit_plan(manifest, expected_scene_count):
             and not map_shot.get('route_id') and not props.get('route_points')
             and re.search(r'\bEarth\b', ' '.join(str(row.get('narration') or '') for row in scenes), re.I)
         )
+        # A narrated ocean/sea/region is a legitimate globe_3d camera centre
+        # (geographic_regions.REGION_CENTERS, used by both the director and
+        # the globe renderer). It is NOT a local-map place, so it only counts
+        # on globe_3d scenes -- never on satellite_local/vector maps.
+        is_globe_map = bool(
+            str(map_shot.get('render_style') or props.get('map_render_style') or props.get('render_style') or '').strip().lower() == 'globe_3d'
+        )
         if plan_version >= 4:
             text_contract = scene.get('text') if isinstance(scene.get('text'), Mapping) else {}
             inferred_frame_modes = {
@@ -18664,7 +19011,12 @@ def _validate_remotion_edit_plan(manifest, expected_scene_count):
                             break
                 for location in locations:
                     candidate = str(location or '').strip()
-                    known = geo_fold(candidate) in country_name_keys or geo_fold(candidate) in city_name_keys or geo_fold(candidate) in admin1_name_keys
+                    known = (
+                        geo_fold(candidate) in country_name_keys
+                        or geo_fold(candidate) in city_name_keys
+                        or geo_fold(candidate) in admin1_name_keys
+                        or (is_globe_map and is_curated_region(candidate))
+                    )
                     mentioned_here = geo_fold(candidate) in narration_folded
                     established_at_site = explicit_site_reference and geo_fold(candidate) in adjacent_site_places
                     if not known or not (mentioned_here or established_at_site):
@@ -18772,8 +19124,19 @@ def _validate_remotion_edit_plan(manifest, expected_scene_count):
             target = props.get('country') or props.get('target_country') or props.get('location') or props.get('place')
             map_shot_locations = props.get('map_shot', {}).get('location_names', []) if isinstance(props.get('map_shot'), Mapping) else []
             country_spotlight = known_place(target) or any(known_place(place) for place in map_shot_locations)
+            # A globe_3d scene whose only anchor is a narrated curated region
+            # (e.g. "North Atlantic") still has a renderable endpoint: the
+            # globe renderer centres on the region. Non-globe maps get no
+            # such endpoint -- a region is not a local-map place.
+            region_spotlight = bool(
+                is_globe_map
+                and (
+                    is_curated_region(target)
+                    or any(is_curated_region(place) for place in map_shot_locations)
+                )
+            )
             has_endpoint = bool(
-                point_pair or named_route or country_route or country_network or country_spotlight or global_map_scope
+                point_pair or named_route or country_route or country_network or country_spotlight or region_spotlight or global_map_scope
             )
             if props.get('no_data') or not has_endpoint:
                 errors.append({"code": "unsupported_map_location", "scene_index": index})
@@ -19083,6 +19446,144 @@ def _repair_unsupported_route_map_scenes(manifest):
         director = dict(manifest.get('director') or {})
         director['repairs'] = [*(director.get('repairs') or []), {
             'type': 'unverified_route_to_media', 'scene_indices': repaired,
+        }]
+        manifest['director'] = director
+    return repaired
+
+
+def _repair_unsupported_map_locations(manifest):
+    """Drop map locations the render-plan validator cannot ground.
+
+    The per-location rule here mirrors ``_validate_remotion_edit_plan``: a
+    name counts only when it is a known country/city/admin1 -- or, on a
+    globe_3d scene, a narrated curated region (ocean/sea) -- AND it is
+    mentioned in the scene narration (or established at an explicit site
+    reference). Names that fail are pruned from both the scene ``map_shot``
+    and the nested ``props.map_shot`` copy, so the globe pin label cannot
+    keep pointing at the dropped name. When no grounded name remains, the
+    scene falls back to its verified media exactly like an unverified route
+    does; without a resolved asset the scene is left untouched, so the
+    validator still fails honestly instead of hiding the defect.
+    """
+    import unicodedata
+
+    from services.editorial_director.director import load_admin1_catalog, load_geographic_catalog
+    from services.geographic_regions import is_curated_region
+
+    if not isinstance(manifest, dict):
+        return []
+    _country_codes, country_names, city_names = load_geographic_catalog()
+    admin1_by_name = load_admin1_catalog()
+
+    def geo_fold(value):
+        normalized = unicodedata.normalize('NFKD', str(value or '').casefold())
+        return ''.join(char for char in normalized if not unicodedata.combining(char))
+
+    country_name_keys = {geo_fold(value) for value in country_names}
+    city_name_keys = {geo_fold(value) for value in city_names}
+    admin1_name_keys = {geo_fold(value) for value in admin1_by_name}
+    catalog_keys = country_name_keys | city_name_keys | admin1_name_keys
+    scenes = list(manifest.get('scenes') or [])
+    repaired = []
+    pruned_rows = []
+    for index, scene in enumerate(scenes):
+        if not isinstance(scene, dict) or scene.get('locked'):
+            continue
+        primary = scene.get('primary_visual') if isinstance(scene.get('primary_visual'), dict) else {}
+        if str(primary.get('type') or '') != 'AnimatedMap':
+            continue
+        map_shot = scene.get('map_shot') if isinstance(scene.get('map_shot'), dict) else {}
+        if map_shot.get('enabled') is not True:
+            continue
+        locations = map_shot.get('location_names') if isinstance(map_shot.get('location_names'), list) else []
+        if not locations:
+            continue
+        props = primary.get('props') if isinstance(primary.get('props'), dict) else {}
+        is_globe = str(
+            map_shot.get('render_style') or props.get('map_render_style') or props.get('render_style') or ''
+        ).strip().lower() == 'globe_3d'
+        narration = str(scene.get('narration') or '')
+        narration_folded = geo_fold(narration)
+        explicit_site_reference = bool(
+            re.search(r'\b(?:site|location|located|where it stood|where it was built)\b', narration, re.I)
+            and re.search(r'\b(?:beside|near|along|within|adjacent to|located|where it stood|where it was built)\b', narration, re.I)
+        )
+        adjacent_site_places = set()
+        if explicit_site_reference:
+            for prior_index in range(index - 1, max(-1, index - 5), -1):
+                prior_scene = scenes[prior_index] if 0 <= prior_index < len(scenes) else {}
+                prior_text = str(prior_scene.get('narration') or '') if isinstance(prior_scene, Mapping) else ''
+                prior_folded = geo_fold(prior_text)
+                prior_places = {
+                    name for name in catalog_keys
+                    if name and name in prior_folded
+                }
+                if prior_places:
+                    adjacent_site_places = prior_places
+                    break
+
+        def grounded(candidate):
+            name = str(candidate or '').strip()
+            known = geo_fold(name) in catalog_keys or (is_globe and is_curated_region(name))
+            mentioned = geo_fold(name) in narration_folded
+            established = explicit_site_reference and geo_fold(name) in adjacent_site_places
+            return bool(name and known and (mentioned or established))
+
+        kept = [name for name in locations if grounded(name)]
+        if len(kept) == len(locations):
+            continue
+        dropped = [name for name in locations if name not in kept]
+        if kept:
+            map_shot['location_names'] = list(kept)
+            nested_shot = props.get('map_shot') if isinstance(props.get('map_shot'), dict) else None
+            if nested_shot is not None and isinstance(nested_shot.get('location_names'), list):
+                nested_shot['location_names'] = list(kept)
+            scene['director_decision'] = {
+                **(scene.get('director_decision') if isinstance(scene.get('director_decision'), dict) else {}),
+                'map_location_repair': {'dropped': dropped, 'kept': list(kept)},
+            }
+            pruned_rows.append({'scene_index': index, 'dropped': dropped})
+            repaired.append(index)
+            continue
+        asset = primary.get('asset') if isinstance(primary.get('asset'), dict) else {}
+        if not asset:
+            asset = scene.get('media') if isinstance(scene.get('media'), dict) else {}
+        source_path = str(asset.get('src') or asset.get('path') or '')
+        if not source_path or _remotion_asset_status(source_path) != 'resolved':
+            continue
+        is_video = str(asset.get('type') or '').lower() == 'video' or _is_video_path(source_path)
+        new_variant = 'full_bleed' if is_video else 'full_bleed_cinematic'
+        scene['primary_visual'] = {
+            **primary,
+            'type': 'SmartVideo' if is_video else 'SmartImage',
+            'variant': new_variant,
+            'props': {'variant': new_variant, 'image_treatment': 'cinematic_grade', 'fit': 'cover'},
+            'asset': dict(asset),
+        }
+        scene['graphic'] = {'template_id': 'full-bleed', 'props': {}}
+        scene['template_id'] = 'full-bleed'
+        scene['template_recipe'] = {}
+        scene['map_shot'] = {}
+        text_contract = dict(scene.get('text') or {})
+        text_contract['frame_mode'] = 'media_only'
+        text_contract['frame_contract_validation'] = {
+            'status': 'repaired',
+            'requested_mode': 'map',
+            'reason': 'unsupported_map_location_to_media',
+            'resolved_mode': 'media_only',
+        }
+        scene['text'] = text_contract
+        scene['director_decision'] = {
+            **(scene.get('director_decision') if isinstance(scene.get('director_decision'), dict) else {}),
+            'map_repair': 'unsupported_map_location_to_media',
+        }
+        pruned_rows.append({'scene_index': index, 'dropped': dropped})
+        repaired.append(index)
+    if repaired:
+        director = dict(manifest.get('director') or {})
+        director['repairs'] = [*(director.get('repairs') or []), {
+            'type': 'unsupported_map_location_to_grounded', 'scene_indices': repaired,
+            'pruned': pruned_rows,
         }]
         manifest['director'] = director
     return repaired
@@ -20024,6 +20525,84 @@ def _recover_perceptual_media_candidates(media_items, scene_texts, durations, sh
                        'visual_required':True})
     verify,_=build_qwen_verifier({**config,'visual_understanding':True},scenes)
     key=str(config.get('openrouter_api_key') or os.environ.get('OPENROUTER_API_KEY') or os.environ.get('VIDZEO_OPENROUTER_API_KEY') or '')
+    def _recovery_query_payload(index,text,item):
+        # The per-scene inputs for one fresh-query LLM call, shared by the
+        # batched prefetch and the single-call fallback.
+        scene_findings=[row for row in config.get('_creative_media_findings') or []
+                        if isinstance(row,Mapping) and str(row.get('scene_index'))==str(index)]
+        # Give each recovery worker enough neighboring visual context to avoid
+        # returning the same wide hero image for every beat of a single event.
+        # This is especially important when several adjacent scenes describe
+        # one phenomenon at different scales (cause, movement, consequence).
+        neighbor_beats=[]
+        for neighbor_index in range(max(0,index-2),min(len(scene_texts),index+3)):
+            if neighbor_index==index:
+                continue
+            neighbor=media_items[neighbor_index] if neighbor_index<len(media_items) else {}
+            requirement=neighbor.get('visual_requirement') if isinstance(neighbor.get('visual_requirement'),Mapping) else {}
+            neighbor_plan=neighbor.get('director_media_plan') if isinstance(neighbor.get('director_media_plan'),Mapping) else {}
+            neighbor_beats.append({
+                'scene_index':neighbor_index,
+                'narration':str(scene_texts[neighbor_index])[:420],
+                'visual_subject':str(requirement.get('canonical_entity') or requirement.get('subject') or neighbor_plan.get('subject') or '')[:180],
+                'visual_grammar':str(neighbor_plan.get('visual_grammar') or neighbor_plan.get('component_type') or '')[:100],
+                'source_kind':str(neighbor.get('media_type') or neighbor.get('type') or '')[:30],
+            })
+        current_requirement=item.get('visual_requirement') if isinstance(item.get('visual_requirement'),Mapping) else {}
+        current_plan=item.get('director_media_plan') if isinstance(item.get('director_media_plan'),Mapping) else {}
+        return {
+            'scene_index':index,
+            'owned_scene':text,
+            'subject_requirement':current_requirement,
+            'director_media_plan':current_plan,
+            'rejected_visual':{
+                'subject':str(current_requirement.get('canonical_entity') or current_requirement.get('subject') or current_plan.get('subject') or '')[:180],
+                'title':str(item.get('title') or item.get('alt') or item.get('description') or '')[:220],
+                'source_kind':str(item.get('media_type') or item.get('type') or '')[:30],
+            },
+            'neighboring_beats':neighbor_beats,
+            'recovery_attempt':max(0,int(item.get('_repeat_recovery_attempt') or 0)),
+            'observed_failure':scene_findings or 'Actual rendered pixels repeat an earlier shot. Find a genuinely different supported physical subject/detail or vantage.',
+        }
+    # P8: batch the attempt-0 fresh-query LLM calls. One client.chat covers
+    # up to 8 repeated scenes; retrieve() consults the cache first and
+    # falls back to its single call on a miss or failure. Attempt-1 retries
+    # always use single calls. A prefetch failure never breaks recovery.
+    batched_queries={}
+    recovery_budget_seconds=requested_budget
+    try:
+        repeat_indices=sorted({int(row['scene_index']) for row in
+            (shot_summary.get('perceptual_repetition_audit') or {}).get('unresolved_repeats') or []
+            if isinstance(row,Mapping)})
+        repeat_indices=[i for i in repeat_indices if 0 <= i < len(media_items)]
+    except (TypeError,ValueError):
+        repeat_indices=[]
+    if len(repeat_indices)>=2 and key:
+        _prefetch_started=time.monotonic()
+        try:
+            prefetch_client=OpenRouterLLM(api_key=key,model=DEFAULT_SCENE_BRAIN_MODEL,use_server_fallbacks=False)
+            prefetch_remaining=max(0.0,min(120.0,requested_budget)-1.0)
+            for _start in range(0,len(repeat_indices),8):
+                if prefetch_remaining<8:break
+                chunk=repeat_indices[_start:_start+8]
+                payloads=[_recovery_query_payload(i,scene_texts[i],media_items[i]) for i in chunk]
+                answer=prefetch_client.chat(user_prompt=json.dumps({'full_script':script,'scenes':payloads}),
+                    system_prompt='For EACH scene object in the array, create one fresh web photo query and two alternatives grounded in that exact scene and full-film context. '
+                    'Preserve named identity and the exact observable action. Treat neighboring scenes as separate editorial beats: do not return another image of the same wide subject, angle, scale, or composition already used nearby. '
+                    'Choose a different supported detail or vantage that illustrates each sentence. Never add facts, dates, places, actors, or measurements. '
+                    'If no distinct photograph can honestly show a beat, return {scene_index,subject:string,queries:[]} for it so the editor can use its grounded Remotion map/diagram grammar instead of a duplicate. '
+                    'Return JSON {scenes:[{scene_index,subject:string,queries:[up to three concise, materially different queries]}]}. No slides or stock infographics.',
+                    json_mode=True,max_tokens=400*len(chunk),temperature=.25,timeout_seconds=min(45,prefetch_remaining),total_timeout_seconds=min(45,prefetch_remaining),max_attempts=1)
+                answer=answer if isinstance(answer,Mapping) else json.loads(answer)
+                for entry in answer.get('scenes') or []:
+                    if not isinstance(entry,Mapping):continue
+                    entry_index=entry.get('scene_index')
+                    entry_queries=[str(value).strip() for value in entry.get('queries') or [] if str(value).strip()][:3]
+                    if isinstance(entry_index,int) and entry_index in chunk and entry_queries:
+                        batched_queries[entry_index]=(str(entry.get('subject') or title),entry_queries)
+        except Exception:
+            batched_queries={}
+        recovery_budget_seconds=max(8.0,requested_budget-(time.monotonic()-_prefetch_started))
     def retrieve(index,text,item,deadline):
         # A scene may already have unused alternates from its parallel media
         # retrieval wave. Recheck these exact files first: they are faster and
@@ -20104,51 +20683,36 @@ def _recover_perceptual_media_candidates(media_items, scene_texts, durations, sh
                 return local_candidates
         remaining=deadline-time.monotonic()
         if remaining<8 or not key:return []
-        scene_findings=[row for row in config.get('_creative_media_findings') or []
-                        if isinstance(row,Mapping) and str(row.get('scene_index'))==str(index)]
-        # Give each recovery worker enough neighboring visual context to avoid
-        # returning the same wide hero image for every beat of a single event.
-        # This is especially important when several adjacent scenes describe
-        # one phenomenon at different scales (cause, movement, consequence).
-        neighbor_beats=[]
-        for neighbor_index in range(max(0,index-2),min(len(scene_texts),index+3)):
-            if neighbor_index==index:
-                continue
-            neighbor=media_items[neighbor_index] if neighbor_index<len(media_items) else {}
-            requirement=neighbor.get('visual_requirement') if isinstance(neighbor.get('visual_requirement'),Mapping) else {}
-            neighbor_plan=neighbor.get('director_media_plan') if isinstance(neighbor.get('director_media_plan'),Mapping) else {}
-            neighbor_beats.append({
-                'scene_index':neighbor_index,
-                'narration':str(scene_texts[neighbor_index])[:420],
-                'visual_subject':str(requirement.get('canonical_entity') or requirement.get('subject') or neighbor_plan.get('subject') or '')[:180],
-                'visual_grammar':str(neighbor_plan.get('visual_grammar') or neighbor_plan.get('component_type') or '')[:100],
-                'source_kind':str(neighbor.get('media_type') or neighbor.get('type') or '')[:30],
-            })
-        current_requirement=item.get('visual_requirement') if isinstance(item.get('visual_requirement'),Mapping) else {}
-        current_plan=item.get('director_media_plan') if isinstance(item.get('director_media_plan'),Mapping) else {}
-        recovery_attempt=max(0,int(item.get('_repeat_recovery_attempt') or 0))
-        rejected_visual={
-            'subject':str(current_requirement.get('canonical_entity') or current_requirement.get('subject') or current_plan.get('subject') or '')[:180],
-            'title':str(item.get('title') or item.get('alt') or item.get('description') or '')[:220],
-            'source_kind':str(item.get('media_type') or item.get('type') or '')[:30],
-        }
-        client=OpenRouterLLM(api_key=key,model=DEFAULT_SCENE_BRAIN_MODEL,use_server_fallbacks=False)
-        answer=client.chat(user_prompt=json.dumps({'full_script':script,'owned_scene':text,
-             'subject_requirement':current_requirement,'director_media_plan':current_plan,
-             'rejected_visual':rejected_visual,'neighboring_beats':neighbor_beats,
-             'recovery_attempt':recovery_attempt,
-             'observed_failure':scene_findings or 'Actual rendered pixels repeat an earlier shot. Find a genuinely different supported physical subject/detail or vantage.'}),
-             system_prompt='Create one fresh web photo query and two alternatives grounded in this exact scene and full-film context. '
-             'Preserve named identity and the exact observable action. Treat neighboring scenes as separate editorial beats: do not return another image of the same wide subject, angle, scale, or composition already used nearby. '
-             'Choose a different supported detail or vantage that illustrates this sentence. Never add facts, dates, places, actors, or measurements. '
-             'If no distinct photograph can honestly show this beat, return {subject:string,queries:[]} so the editor can use its grounded Remotion map/diagram grammar instead of a duplicate. '
-             'When recovery_attempt is greater than zero, change the visual query and point of view materially; do not repeat the first search angle. '
-             'Return JSON {subject:string,queries:[up to three concise, materially different queries]}. No slides or stock infographics.',
-             json_mode=True,max_tokens=400,temperature=.25,timeout_seconds=min(12,remaining),total_timeout_seconds=min(12,remaining),max_attempts=1)
-        answer=answer if isinstance(answer,Mapping) else json.loads(answer)
-        queries=[str(value).strip() for value in answer.get('queries') or [] if str(value).strip()][:3]
-        if not queries:return []
-        subject=str(answer.get('subject') or title)
+        payload=_recovery_query_payload(index,text,item)
+        recovery_attempt=payload['recovery_attempt']
+        queries=[]
+        subject=title
+        # P8: attempt-0 fresh queries were prefetched in ONE batched call
+        # for all repeated scenes. Use the cached entry when present; a
+        # miss, an empty batch entry, or an attempt-1 retry falls back to
+        # the single-scene call below.
+        if recovery_attempt==0:
+            cached=batched_queries.get(index)
+            if cached:
+                subject,queries=cached
+        if not queries:
+            client=OpenRouterLLM(api_key=key,model=DEFAULT_SCENE_BRAIN_MODEL,use_server_fallbacks=False)
+            answer=client.chat(user_prompt=json.dumps({'full_script':script,'owned_scene':text,
+                 'subject_requirement':payload['subject_requirement'],'director_media_plan':payload['director_media_plan'],
+                 'rejected_visual':payload['rejected_visual'],'neighboring_beats':payload['neighboring_beats'],
+                 'recovery_attempt':recovery_attempt,
+                 'observed_failure':payload['observed_failure']}),
+                 system_prompt='Create one fresh web photo query and two alternatives grounded in this exact scene and full-film context. '
+                 'Preserve named identity and the exact observable action. Treat neighboring scenes as separate editorial beats: do not return another image of the same wide subject, angle, scale, or composition already used nearby. '
+                 'Choose a different supported detail or vantage that illustrates this sentence. Never add facts, dates, places, actors, or measurements. '
+                 'If no distinct photograph can honestly show this beat, return {subject:string,queries:[]} so the editor can use its grounded Remotion map/diagram grammar instead of a duplicate. '
+                 'When recovery_attempt is greater than zero, change the visual query and point of view materially; do not repeat the first search angle. '
+                 'Return JSON {subject:string,queries:[up to three concise, materially different queries]}. No slides or stock infographics.',
+                 json_mode=True,max_tokens=400,temperature=.25,timeout_seconds=min(12,remaining),total_timeout_seconds=min(12,remaining),max_attempts=1)
+            answer=answer if isinstance(answer,Mapping) else json.loads(answer)
+            queries=[str(value).strip() for value in answer.get('queries') or [] if str(value).strip()][:3]
+            if not queries:return []
+            subject=str(answer.get('subject') or title)
         row={'scene_number':1,'query':queries[0],'query_variants':queries,'queries':queries,
              'section_subject':subject,'scene_subject':subject,'subject_query':subject,'_llm':True}
         row['_semantic_locked']=True
@@ -20170,7 +20734,7 @@ def _recover_perceptual_media_candidates(media_items, scene_texts, durations, sh
             rows.extend(row for row in meta.get('alternates') or [] if isinstance(row,Mapping) and row.get('path'))
         return rows[:3]
     return recover_repeated_media(media_items,scene_texts,shot_summary.get('perceptual_repetition_audit') or {},
-        retrieve,lambda index,candidate:verify(scenes[index],candidate),budget_seconds=requested_budget,cancellation=cancellation)
+        retrieve,lambda index,candidate:verify(scenes[index],candidate),budget_seconds=recovery_budget_seconds,cancellation=cancellation)
 
 
 def _repair_creative_media(manifest, findings, budget, config, cancellation=None):
@@ -20492,7 +21056,12 @@ def _render_video_with_semantic_editing(
     # media even though the card/transition/SFX systems were installed.
     editorial_beats = None
     editorial_future = job_config.get('_editorial_beats_future') if isinstance(job_config, dict) else None
-    if editorial_future is not None:
+    if editorial_beats is None:
+        # P1: beats folded into the director's turn — try those first, so
+        # no separate vidzeo_editorial_beats_v1 request is filed.
+        editorial_beats = _editorial_beats_from_director(
+            director_future, director_deadline, scene_texts, job_config)
+    if editorial_beats is None and editorial_future is not None:
         try:
             try:
                 editorial_wait = float(
@@ -20759,6 +21328,7 @@ def _render_video_with_semantic_editing(
         # and update its frame contract and director audit trail atomically.
         _repair_unsupported_chart_scenes(manifest)
         _repair_unsupported_route_map_scenes(manifest)
+        _repair_unsupported_map_locations(manifest)
         _repair_verified_local_perceptual_repeats(manifest)
         _repair_repeated_adjacent_treatments(manifest)
         _diversify_text_panel_treatments(manifest)
@@ -21059,6 +21629,7 @@ def _render_video_with_semantic_editing(
         _repair_unsupported_chart_scenes(manifest)
         _repair_incomplete_diagram_scenes(manifest)
         _repair_unsupported_route_map_scenes(manifest)
+        _repair_unsupported_map_locations(manifest)
         _repair_repeated_adjacent_treatments(manifest)
         _diversify_text_panel_treatments(manifest)
         _repair_invalid_director_templates_and_motion_cues(manifest)
@@ -22108,6 +22679,48 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                     "   [flow] media: using script-derived scene contracts immediately "
                     f"({len(aligned_scene_texts)} scene(s)); Whisper will sync timings later"
                 )
+            # Resume reuse (Nov 20, 2026): when a previous attempt already
+            # completed the media coordinator, its result is checkpointed
+            # at checkpoints/media_plan.json (stage media_ready). Reuse it
+            # instead of re-running the whole media stage — launch-day job
+            # a7f52c58 paid ~47 min of pure rework for that re-run. The
+            # loader validates scene identity, terminal accounting, and
+            # that every asset still exists on disk; anything missing,
+            # partial, or stale returns None and media re-runs exactly as
+            # before. This sits before every query pre-bake so a reuse
+            # skips the LLM planning as well as the branches.
+            if package_dir is not None:
+                try:
+                    from services.media_plan_checkpoint import (
+                        load_saved_media_plan,
+                        rebuild_media_resolutions,
+                    )
+                    _saved_media_plan, _reuse_reason = load_saved_media_plan(
+                        package_dir, aligned_scene_texts
+                    )
+                except Exception as _reuse_error:  # loader must never break media
+                    _saved_media_plan, _reuse_reason = (
+                        None,
+                        f"loader error: {_reuse_error}",
+                    )
+                if _saved_media_plan is not None:
+                    print(
+                        "   [retry] reusing completed media plan from checkpoint "
+                        f"({_reuse_reason})"
+                    )
+                    report_progress(
+                        0.64, "Reusing completed media plan; skipping media retrieval..."
+                    )
+                    job_config['_v2_media_resolutions'] = rebuild_media_resolutions(
+                        _saved_media_plan
+                    )
+                    job_config['_media_plan_reused_from_checkpoint'] = True
+                    return _saved_media_plan
+                if _reuse_reason != "no saved media plan checkpoint":
+                    print(
+                        "   [retry] saved media plan not reusable "
+                        f"({_reuse_reason}); re-running media retrieval"
+                    )
             if _effective_source == 'Mixed Media':
                 # Mixed branches each run their own LLM scene-query planner from
                 # the full script. Do not block branch launch on a separate global
@@ -22469,9 +23082,11 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                             parallel_director_deadline = time.monotonic() + revised_budget['total_seconds']
                             print("   [flow] director: final transcript changed scene boundaries; replanning in parallel")
                             expected_director_texts = _ed_texts
-                        print("   [flow] editorial: starting editorial brain in parallel with media resolution")
-                        editorial_future = creative_executor.submit(_run_editorial_brain, _ed_texts, _ed_durs, job_config)
-                        job_config['_editorial_beats_future'] = editorial_future
+                        # P1: no separate editorial-brain filing. The beats
+                        # now ride in the director plan; the render path
+                        # takes them from the director future, and only
+                        # falls back to the standalone planner when the
+                        # director plan carries none.
             else:
                 try:
                     media_plan = future.result()
@@ -22506,9 +23121,7 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                     parallel_director_deadline = time.monotonic() + revised_budget['total_seconds']
                     print("   [flow] director: final transcript changed scene boundaries; replanning in parallel")
                     expected_director_texts = _ed_texts
-                print("   [flow] editorial: starting editorial brain in parallel with media resolution")
-                editorial_future = creative_executor.submit(_run_editorial_brain, _ed_texts, _ed_durs, job_config)
-                job_config['_editorial_beats_future'] = editorial_future
+                # P1: no separate editorial-brain filing (see above).
         if wait_for_final_audio_scenes and media_plan is None:
             try:
                 media_plan = _media_orchestrator(audio_plan)
@@ -23647,6 +24260,47 @@ def _normalize_flask_result(result):
     return payload or {}, status_code
 
 
+def _prep_script_duration_minutes(config: dict):
+    """Target duration in minutes for a prep-script lookup, or None.
+
+    The prep store keys a script by (normalized title, duration_minutes)
+    — the same key the Node script adapter uses (lib/prepScriptStore.js).
+    The queue payload carries the duration as a free-form string ("1min",
+    "1 minute", "10 minutes") or as duration_minutes, so parse it
+    tolerantly here instead of reusing _parse_duration_to_seconds, which
+    only accepts the long unit names ("1 minute") and returns 0.0 for the
+    "1min" form the CMS actually dispatches. A bare number string is
+    ambiguous (minutes or seconds) and is not guessed at — it returns
+    None and the lookup is skipped.
+    """
+    for key in ("duration_minutes", "target_duration_minutes"):
+        try:
+            minutes = float(config.get(key))
+        except (TypeError, ValueError):
+            continue
+        if minutes > 0:
+            return minutes
+    seconds = _parse_duration_to_seconds(config.get("duration"))
+    if seconds > 0:
+        return seconds / 60.0
+    text = str(config.get("duration") or "").strip().lower()
+    match = re.match(
+        r"^(\d+(?:\.\d+)?)\s*(min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours)$",
+        text,
+    )
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("min"):
+        return amount
+    if unit.startswith("sec"):
+        return amount / 60.0
+    if unit.startswith("hr") or unit.startswith("hour"):
+        return amount * 60.0
+    return None
+
+
 def _ensure_script_for_queue(config: dict, update_progress=None) -> dict:
     """Queue jobs must include the final narration script."""
     config = normalize_generation_config(config)
@@ -23654,7 +24308,75 @@ def _ensure_script_for_queue(config: dict, update_progress=None) -> dict:
     if len(script) >= 10:
         return _enforce_generation_plan_limits(config)
 
+    # Advance prep: a script pre-generated for this exact title + duration
+    # wins over failing here. The Node script adapter
+    # (adapters/script.js:generateScript) already does this lookup for the
+    # daemon/CMS path, but the Flask queue path never calls it, so a prepped
+    # script was unreachable via /api/queue/add — the job failed at this
+    # gate even with a ready script in the prep store (Panama job
+    # 2521f7de). Look the store up here, before requiring a pasted script.
+    # A broken store, an unparseable duration, or a too-short stored
+    # script all fall through to the original error below.
+    title = str(config.get('content_title') or config.get('title') or config.get('name') or '').strip()
+    duration_minutes = _prep_script_duration_minutes(config)
+    if title and duration_minutes:
+        try:
+            from services import advance_prep as _advance_prep
+            prepped = _advance_prep.find_prepped_script(title, duration_minutes)
+        except Exception as exc:
+            print(f"   [queue] prep script lookup failed ({exc}); requiring a pasted script", flush=True)
+            prepped = None
+        if prepped:
+            prepped_script = (prepped.get('script_text') or '').strip()
+            if len(prepped_script) >= 10:
+                config['script'] = prepped_script
+                config['_script_source'] = 'prep-cache'
+                config['_prep_script_path'] = prepped.get('path')
+                print(
+                    f"   [queue] prep script hit: reusing pre-generated narration for '{title}' "
+                    f"({duration_minutes:g} min, {len(prepped_script.split())} words)",
+                    flush=True,
+                )
+                if callable(update_progress):
+                    try:
+                        update_progress(5, 'Reusing pre-generated narration from advance prep')
+                    except Exception:
+                        pass
+                return _enforce_generation_plan_limits(config)
+            print(
+                f"   [queue] prep script hit for '{title}' is too short "
+                f"({len(prepped_script)} chars); requiring a pasted script",
+                flush=True,
+            )
+
     raise ValueError("Paste a finished narration script before creating a video.")
+
+
+def _remotion_render_sections_started(package_dir):
+    """True when a previous render of this package completed >=1 section.
+
+    The JS runner checkpoints finished sections beside the render output
+    (``.<basename>.render-sections/<hash>/section-<n>.mp4``). A completed
+    section proves this exact plan already started rendering, which is the
+    condition for render-start/resume parity: the resume gate must not
+    reject a plan the render-start gate already let through.
+    """
+    render_dir = Path(str(package_dir)).expanduser().resolve() / 'render'
+    if not render_dir.is_dir():
+        return False
+    try:
+        for sections_dir in render_dir.glob('.*.render-sections'):
+            if not sections_dir.is_dir():
+                continue
+            for section_file in sections_dir.rglob('section-*.mp4'):
+                try:
+                    if section_file.is_file() and section_file.stat().st_size > 0:
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        return False
+    return False
 
 
 def _resume_checkpointed_remotion_render(config, update_progress, cancellation=None):
@@ -23970,6 +24692,11 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
             return None
 
     try:
+        # Map locations are repaired on EVERY resume, not only after an
+        # edit_plan_invalid failure: the first resume after a reboot takes
+        # the interrupted-render path, so gating this on failure_kind would
+        # waste a driver retry on a plan the repair could have fixed.
+        map_location_repairs = _repair_unsupported_map_locations(manifest)
         if failure_kind == 'edit_plan_invalid':
             repairs = _repair_unsupported_route_map_scenes(manifest)
             repairs_charts = _repair_unsupported_chart_scenes(manifest)
@@ -24042,6 +24769,7 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
                 **dict(manifest.get('checkpoint_repair_audit') or {}),
                 'saved_plan_repair': {
                     'map_scenes_repaired': repairs,
+                    'map_locations_repaired': map_location_repairs,
                     'chart_scenes_repaired': repairs_charts,
                     'adjacent_treatments_repaired': repairs_adj,
                     'repeated_media': repeat_repair,
@@ -24066,7 +24794,24 @@ def _resume_checkpointed_remotion_render_impl(config, update_progress, cancellat
     except Exception as exc:
         print(f'   [retry] saved edit plan validation failed; rebuilding from script: {exc}')
         return None
-    if not isinstance(validation, Mapping) or validation.get('status') != 'pass':
+    if (
+        isinstance(validation, Mapping)
+        and validation.get('status') != 'pass'
+        and not _enabled(config.get('strict_creative_review'), False)
+        and _remotion_render_sections_started(package_dir)
+    ):
+        # Render-start parity: the first render already accepted this exact
+        # plan in non-strict mode (pass_with_notes) and rendered a finished
+        # section from it. A reboot must not let the stricter resume gate
+        # re-litigate that decision and park the job. Plans that never
+        # rendered still raise below.
+        print(
+            f"   [retry] saved edit plan still has advisory findings but the render already started; resuming like the first render did (non-strict): {validation.get('errors')}",
+            flush=True,
+        )
+        validation = {**validation, 'status': 'pass_with_notes'}
+        manifest['edit_plan_validation'] = validation
+    if not isinstance(validation, Mapping) or validation.get('status') not in {'pass', 'pass_with_notes'}:
         _write_render_failure_checkpoint(
             config,
             RemotionEditPlanError(
@@ -24434,6 +25179,8 @@ def _run_yt_clips_queue_job(config, update_progress, check_cancelled, cancellati
     from services.youtube_clips_service import get_youtube_clips
 
     title = config.get('title', 'YouTube Clips').strip()
+    job_title = title  # Full job title, before the topic-anchor rewrite
+    # below: the prep-manifest injection lookup needs the full title.
     script = (config.get('script') or '').strip()
     num_scenes = int(config.get('num_scenes') or 10)
     openrouter_api_key = (config.get('openrouter_api_key') or '').strip()
@@ -24470,6 +25217,9 @@ def _run_yt_clips_queue_job(config, update_progress, check_cancelled, cancellati
     clip_paths = get_youtube_clips(
         script=script,
         title=title,
+        # Full job title for the prep-manifest injection lookup: title
+        # above may have been rewritten to just the topic anchor.
+        prep_manifest_title=job_title,
         num_scenes=num_scenes,
         scene_durations=[7.0] * num_scenes,
         openrouter_api_key=openrouter_api_key,

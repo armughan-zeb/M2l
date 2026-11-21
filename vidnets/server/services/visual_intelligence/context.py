@@ -329,6 +329,58 @@ class _ContextClient:
             cache_lookup=lambda: self._lookup_raw("analyze_clip_frames", frame_paths, user_prompt, system_prompt),
         )
 
+    def analyze_clip_frames_batch(self, candidates: list, user_prompt: str, system_prompt: str) -> dict:
+        """Judge a scene's clip candidates in SAFE batches of 2, in parallel.
+
+        SAFE BATCH: at most 2 candidates x 1 frame each (2 images) per
+        vision request. A scene's candidates are split into chunks of 2 and
+        each chunk is filed as its own ``_run`` (operation ``clip_batch``)
+        — one batch counts as one vision call — filed in parallel via a
+        small thread pool, then merged. Each chunk gets its own semaphore /
+        budget / deadline accounting, so the call-count stays exact. No
+        context-cache lookup: a batch verdict is scene-specific and the
+        per-candidate sequential fallback still benefits from its own cache.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .vision_client import SAFE_VISION_BATCH_IMAGES
+
+        chunks: list = []
+        for start in range(0, len(candidates or []), SAFE_VISION_BATCH_IMAGES):
+            chunks.append(list((candidates or [])[start:start + SAFE_VISION_BATCH_IMAGES]))
+        if not chunks:
+            return {}
+        if len(chunks) == 1:
+            chunk = chunks[0]
+            paths: list = []
+            for cand in chunk:
+                if isinstance(cand, dict):
+                    paths.extend(str(p) for p in (cand.get("frame_paths") or []))
+            return self._run(
+                "clip_batch",
+                paths,
+                json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                lambda: self._client.analyze_clip_frames_batch(chunk, user_prompt, system_prompt),
+            )
+        merged: dict = {}
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            futures = []
+            for chunk in chunks:
+                paths = []
+                for cand in chunk:
+                    if isinstance(cand, dict):
+                        paths.extend(str(p) for p in (cand.get("frame_paths") or []))
+                futures.append(pool.submit(
+                    self._run,
+                    "clip_batch",
+                    paths,
+                    json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                    lambda _c=chunk: self._client.analyze_clip_frames_batch(_c, user_prompt, system_prompt),
+                ))
+            for future in futures:
+                merged.update(future.result())
+        return merged
+
     def compare_images(self, image_paths: list, user_prompt: str) -> dict:
         return self._run(
             "compare_images",
@@ -338,18 +390,71 @@ class _ContextClient:
             cache_lookup=lambda: self._lookup_raw("compare_images", image_paths[:4], user_prompt),
         )
 
+    def analyze_images_batch(self, image_paths: list, user_prompt: str, system_prompt: str, candidate_ids: list = None) -> dict:
+        """Judge a scene's image candidates in SAFE batches of 2, in parallel.
+
+        SAFE BATCH: at most 2 images per vision request. A scene's
+        candidates are split into chunks of 2 and each chunk is filed as
+        its own ``_run`` (one call-count slot, one semaphore slot, one
+        cache entry) — filed in parallel via a small thread pool, then
+        merged into {candidate_id: normalised verdict}, as
+        QwenVisionClient.analyze_images_batch does. Each chunk gets its own
+        reservation so the budget accounting stays exact.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .vision_client import SAFE_VISION_BATCH_IMAGES
+
+        paths = list(image_paths or [])
+        ids = list(candidate_ids or [])
+        while len(ids) < len(paths):
+            ids.append(str(paths[len(ids)]))
+        chunks: list = []
+        for start in range(0, len(paths), SAFE_VISION_BATCH_IMAGES):
+            chunks.append((paths[start:start + SAFE_VISION_BATCH_IMAGES],
+                           ids[start:start + SAFE_VISION_BATCH_IMAGES]))
+        if not chunks:
+            return {}
+        if len(chunks) == 1:
+            chunk_paths, chunk_ids = chunks[0]
+            return self._run(
+                "image_batch",
+                list(chunk_paths),
+                json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                lambda: self._client.analyze_images_batch(chunk_paths, user_prompt, system_prompt, chunk_ids),
+                cache_lookup=lambda: self._lookup_raw("analyze_images_batch", chunk_paths, user_prompt, system_prompt, chunk_ids),
+            )
+        merged: dict = {}
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            futures = []
+            for chunk_paths, chunk_ids in chunks:
+                futures.append(pool.submit(
+                    self._run,
+                    "image_batch",
+                    list(chunk_paths),
+                    json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                    lambda _p=chunk_paths, _i=chunk_ids: self._client.analyze_images_batch(_p, user_prompt, system_prompt, _i),
+                    cache_lookup=lambda _p=chunk_paths, _i=chunk_ids: self._lookup_raw("analyze_images_batch", _p, user_prompt, system_prompt, _i),
+                ))
+            for future in futures:
+                merged.update(future.result())
+        return merged
+
 
 def external_agent_vision_concurrency():
     """In-flight vision calls for an external-agent (inbox) verifier.
 
-    The resident inbox answers with concurrency 8, so 4 in flight is inside
-    it and matches the context default of 4. Tunable via
-    VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY (clamped 1-8).
+    The resident inbox answers with concurrency 8, so 8 in flight is at
+    its limit and matches the pool ceiling of 8. Tunable via
+    VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY (clamped 1-8). Raised from
+    4 on 2026-11-21 (test-20 fan-out): with 4, the YT lane's batched
+    verification queued on the context semaphore and the pool never saw
+    enough concurrent demand to scale past 2 workers.
     """
     try:
-        return max(1, min(8, int(os.environ.get("VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY", "4") or 4)))
+        return max(1, min(8, int(os.environ.get("VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY", "8") or 8)))
     except (TypeError, ValueError):
-        return 4
+        return 8
 
 
 def external_agent_vision_wall_seconds():
@@ -592,7 +697,7 @@ class VisualDecisionContext:
                 max(1.0, requested_deadline_seconds),
                 max(1.0, shared_deadline_seconds),
             )
-        max_concurrent = max(1, min(6, int(config.get("visual_concurrency") or 4)))
+        max_concurrent = max(1, min(8, int(config.get("visual_concurrency") or 4)))
         if v2_budget_policy:
             call_timeout_seconds = max(
                 10.0,

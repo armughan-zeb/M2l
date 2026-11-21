@@ -36,12 +36,14 @@ class TestRangedDownloadWorkers(unittest.TestCase):
         from services.youtube_pipeline_v2 import _ranged_download_worker_limit
 
         # This VM: 7.9 GB total, ~1.7 GB available. The old flat cap forced
-        # 2 workers on every host under 12 GB; the tiered cap allows 4.
-        self.assertEqual(_ranged_download_worker_limit(6, 1759, 8 * 1024**3), 4)
-        self.assertEqual(_ranged_download_worker_limit(8, 1759, 8 * 1024**3), 4)
+        # 2 workers on every host under 12 GB; the total-RAM tiers allow 6
+        # (the old (available-256)//320 rule fitted 4 here). A running
+        # job holding memory no longer collapses the fit.
+        self.assertEqual(_ranged_download_worker_limit(6, 1759, 8 * 1024**3), 6)
+        self.assertEqual(_ranged_download_worker_limit(8, 1759, 8 * 1024**3), 6)
         # Genuinely small hosts (< 6 GB total) still stay at 2.
         self.assertEqual(_ranged_download_worker_limit(6, 5000, 5 * 1024**3), 2)
-        # Big hosts are bound only by the request and the per-worker allowance.
+        # Big hosts are bound only by the request and the total-RAM tier.
         self.assertEqual(_ranged_download_worker_limit(8, 5000, 16 * 1024**3), 8)
         # Tight memory scales down on its own whatever the host size.
         self.assertEqual(_ranged_download_worker_limit(8, 300, 16 * 1024**3), 1)
@@ -62,7 +64,7 @@ class TestRangedDownloadWorkers(unittest.TestCase):
             # Memory fit still applies when host memory is known.
             self.assertEqual(
                 _ranged_download_workers(available_mb=1759, total_bytes=8 * 1024**3),
-                4,
+                6,
             )
             # Requested count (pre-fit, used by the telemetry receipt)
             # is the same parsing without the memory clamp.

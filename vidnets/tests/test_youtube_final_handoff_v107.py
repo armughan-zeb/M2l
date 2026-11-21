@@ -68,12 +68,16 @@ def test_late_clip_gate_has_its_own_finite_window_and_respects_delivery_budget(m
     assert not _quota_gate_is_hard_rejection('visual_deadline_exceeded', {})
 
 
-def test_coordinator_reserves_the_actual_serial_transfer_wave_budget(monkeypatch):
+def test_coordinator_reserves_the_actual_parallel_transfer_wave_budget(monkeypatch):
     from services.pipeline_v2_media_adapter import _media_stage_deadline_seconds, mixed_youtube_time_budget
+    from services.youtube_pipeline_v2 import mixed_youtube_download_worker_capacity
     monkeypatch.delenv('VIDZEO_YT_POOL_DIRECT_CLIPS_ONLY', raising=False)
     config = {'media_deadline_seconds': 240, 'yt_branch_wall_timeout_seconds': 150,
               '_youtube_budget_scene_count': 4}
-    wall, _ = mixed_youtube_time_budget(4, 150, download_workers=1, coverage_target=1.0)
+    # The wall is priced at the fitted parallel capacity (total-RAM tiers),
+    # not the serial 1-worker budget the downloader never runs.
+    workers = mixed_youtube_download_worker_capacity(config)
+    wall, _ = mixed_youtube_time_budget(4, 150, download_workers=workers, coverage_target=1.0)
     assert _media_stage_deadline_seconds(config, 'Mixed Media') >= wall + 180
 
 
@@ -128,17 +132,18 @@ def test_title_card_screen_reuses_decoded_samples_without_unbounded_capture(monk
 
 
 def test_small_host_reserves_serial_download_waves_before_child_memory_changes(monkeypatch):
-    # GTA fix (Nov 16): the wall is budgeted with the real memory-fitted
-    # worker count, not serial transfers. On this mocked 8 GB host with
-    # 3 GB available the fit is 4 workers (was a flat 1 for every host
-    # under 12 GB), so the 5-scene quota wall is the honest parallel
-    # 263s instead of the serial 503s+ the old test asserted.
+    # GTA fix (Nov 16) + yt-speed fix (Nov 18): the wall is budgeted with
+    # the real memory-fitted worker count, not serial transfers. On this
+    # mocked 8 GB host with 3 GB available the fit is 6 workers (total-RAM
+    # tiers; the old (available-256)//320 rule fitted 4), so a requested 5
+    # yields 5 workers. The 5-scene quota wall stays the honest parallel
+    # 263s (5 scenes fit one wave at 5 workers).
     import psutil
     from types import SimpleNamespace
     import server.app as app
     monkeypatch.setattr(psutil, 'virtual_memory', lambda: SimpleNamespace(
         total=8 * 1024 ** 3, available=3 * 1024 ** 3))
-    assert app._mixed_youtube_download_worker_capacity({'yt_download_concurrency': 5}) == 4
+    assert app._mixed_youtube_download_worker_capacity({'yt_download_concurrency': 5}) == 5
     assert app._mixed_youtube_branch_wall_cap_seconds({'_youtube_quota_preselected': True}, 5) == 263.0
 
 
