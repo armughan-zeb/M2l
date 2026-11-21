@@ -21,7 +21,6 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 import logging
 import os
 import re
@@ -40,11 +39,6 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import requests
-
-try:  # Optional fast Chrome-TLS transport used by the supplied scraper.
-    import primp  # type: ignore
-except Exception:  # pragma: no cover - optional in minimal deployments
-    primp = None
 
 try:  # Optional parser; regex fallback keeps the adapter lightweight.
     from bs4 import BeautifulSoup  # type: ignore
@@ -136,9 +130,7 @@ _URL_RE = re.compile(r"https?://[^\"'<>\\\s]+", re.I)
 # The state is module-global, so it bounds ALL managers and scene workers
 # collectively, not just one batch. This reuses the download limiter's
 # philosophy (per-host caps + backoff) for the search path, which
-# previously had no throttle at all. The DuckDuckGo engine is the one
-# exception: it goes through a subprocess worker, not a client.get, so it
-# is not routed through here (it has its own 15s budget + 2 attempts).
+# previously had no throttle at all.
 def _universal_per_host() -> int:
     try:
         return max(1, min(8, int(os.environ.get("VIDZEO_UNIVERSAL_PER_HOST", "2") or 2)))
@@ -166,6 +158,33 @@ def _universal_retry_delay(attempt: int) -> float:
     except (TypeError, ValueError):
         base = 1.0
     return min(8.0, base * (2 ** attempt))
+
+
+def _universal_fetch_timeout_seconds() -> float:
+    """Per-route socket timeout for one engine search-page fetch.
+
+    Round 5 (Nov 19): the 15s cap killed every engine in a slow hour —
+    prep-4 log (144x ReadTimeout at 15.0s, both routes) and the 01:01 UTC
+    curl check (Bing search direct 22.4s, proxy >40s; Yandex images
+    proxy 21.8s). Search pages take 20-40s to answer when the egress is
+    slow, while homepages answer in 2-3s — so the homepage check can
+    never predict this. 30s lets the direct route (22s) and the proxy
+    Yandex fetch (21.8s) complete; the batch wall and the route fallback
+    still bound a dead route (2 routes x 30s max per engine call).
+    """
+    try:
+        return max(
+            5.0,
+            min(
+                120.0,
+                float(
+                    os.environ.get("VIDZEO_UNIVERSAL_FETCH_TIMEOUT_SECONDS", "30")
+                    or 30
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 30.0
 
 
 def _universal_engine_stagger_seconds() -> float:
@@ -214,16 +233,23 @@ _universal_host_state: Dict[str, Dict[str, object]] = {}
 _universal_host_guard = threading.Lock()
 
 
-def _universal_host_slot(host: str) -> Dict[str, object]:
+def _universal_host_slot(host: str, route: str = "proxy") -> Dict[str, object]:
+    # The throttle namespace is per (host, route): a direct retry must not
+    # queue behind the abandoned proxied attempt's held slots (Nov 18:
+    # "throttled request to yandex.com exceeded its 15s budget waiting for
+    # a host slot" x7 in the Panama log). Each route keeps its own
+    # 2-concurrent cap and 0.5s min delay, so the retry still respects the
+    # per-host limit instead of bypassing it.
+    key = f"{host}|{route}"
     with _universal_host_guard:
-        state = _universal_host_state.get(host)
+        state = _universal_host_state.get(key)
         if state is None:
             state = {
                 "semaphore": threading.Semaphore(_universal_per_host()),
                 "last_start": 0.0,
                 "lock": threading.Lock(),
             }
-            _universal_host_state[host] = state
+            _universal_host_state[key] = state
         return state
 
 
@@ -232,47 +258,194 @@ def _universal_host_slot(host: str) -> Dict[str, object]:
 # re-injected on every shell/restart) and cannot be removed system-wide.
 # When a web search fails through the proxy (read timeouts, bot-gates), the
 # retry goes DIRECT: direct egress works and is fast (Bing 200 in ~1.5s,
-# Yandex 200 in ~1.3s, DuckDuckGo 200 in ~1.2s, verified live Nov 18).
-# The bypass is per-request, not global: a thread-local flag that
-# _throttled_get honours by passing proxies={http: None, https: None} to
-# the requests call, so only the retrying thread's requests go direct and
-# concurrent scene workers are unaffected. Thread-local, so no cross-thread
-# leak; the flag is always restored by the context manager.
-_WEB_BYPASS_PROXY = threading.local()
+# Yandex 200 in ~1.3s, verified live Nov 18).
+# The bypass is per-request, not global: the retry passes direct=True
+# explicitly down to _throttled_get, and the request is issued on a
+# trust_env=False Session (see _new_route_session) so no env proxy is
+# applied at all. The proxies={http: None, https: None} kwarg is still
+# passed as well — it is the route signal fake/test clients key on, and
+# belt-and-braces on a trust_env=False session — but it is NOT the bypass
+# mechanism: on a real Session it only works by an accident of requests'
+# internals (merge_environment_settings blocks the env proxy with the
+# None keys via setdefault BEFORE merge_setting strips them; a future
+# requests version, or a Session.send caller, would re-apply the env
+# proxy). Worker F (Nov 18) verified live on requests 2.34.2: the kwarg
+# alone DID return 200 under a dead proxy, 3/3 runs — so the earlier
+# "merge_setting strips it, proxy re-applied" diagnosis was wrong, and
+# the 0-row forced-failure proof did not reproduce in that hour (58 rows
+# baseline). The trust_env=False session makes the direct route correct
+# by construction instead of by that ordering accident, whatever the
+# requests version does next. (The original thread-local flag could never
+# reach the pool worker threads; see above.)
+# Nov 18 (web-resilience build): the original bypass was a thread-local
+# flag set on the CALLER thread — a NO-OP in production, because HTTP runs
+# on ThreadPoolExecutor worker threads where the flag is always False
+# (repro /tmp/repro_bypass.py). The production path now passes an explicit
+# ``direct=`` parameter down search() -> _run_engine() -> engine.search()
+# -> _throttled_get(), so the route is chosen on the thread that issues
+# the request. ``web_bypass_proxy()`` survives only as a compatibility
+# shim for direct callers: it is now a process-wide refcount (not
+# thread-local), so a caller-thread flag IS visible on pool threads. The
+# window is bounded (one retry leg) and direct is a legitimate route, so
+# a concurrent worker briefly going direct is safe — but production code
+# must pass direct= explicitly and never rely on this shim.
+_WEB_BYPASS_COUNT = 0
+_WEB_BYPASS_LOCK = threading.Lock()
 
 
 def _web_bypass_proxy_enabled() -> bool:
-    return bool(getattr(_WEB_BYPASS_PROXY, "enabled", False))
+    with _WEB_BYPASS_LOCK:
+        return _WEB_BYPASS_COUNT > 0
 
 
 @contextlib.contextmanager
 def web_bypass_proxy():
     """Run the enclosed web requests DIRECT, bypassing the egress proxy.
 
-    Use only for a bounded retry after a proxied request failed. The
-    requests calls inside the context pass proxies={http: None, https: None},
-    which overrides the env proxy vars for that single request. The isolated
-    native client (primp) does not accept a proxies override and is retried
-    without it; the engine's plain-requests fallback then honours the bypass.
+    Legacy shim (see above): the production retry passes ``direct=True``
+    explicitly instead. A request inside the context is issued on the
+    trust_env=False direct session (``_fetch`` folds the shim into its
+    preferred route), with proxies={http: None, https: None} passed as
+    well — the session is the bypass, the kwarg is only a signal.
     """
-    prev = getattr(_WEB_BYPASS_PROXY, "enabled", False)
-    _WEB_BYPASS_PROXY.enabled = True
+    global _WEB_BYPASS_COUNT
+    with _WEB_BYPASS_LOCK:
+        _WEB_BYPASS_COUNT += 1
     try:
         yield
     finally:
-        _WEB_BYPASS_PROXY.enabled = prev
+        with _WEB_BYPASS_LOCK:
+            _WEB_BYPASS_COUNT = max(0, _WEB_BYPASS_COUNT - 1)
 
 
-def _throttled_get(client, url: str, *, headers, timeout):
+# ── Per-engine, per-route health (Nov 18, web-resilience) ───────────────
+# Direct is NOT universally better: Flickr via direct egress timed out
+# (20s) while via proxy it answered in 2.6s (live Nov 18). The route is
+# therefore chosen per engine, not blanket: try the preferred route
+# first, fall back to the other route on a transport error. An HTTP
+# status (including 403/429/5xx) is an answer, not a route failure, so
+# it never triggers a route switch. A route that fails transport 3x in
+# a row is skipped fast for 120s, then re-probed.
+_ROUTE_FAILURE_THRESHOLD = 3
+_ROUTE_SKIP_SECONDS = 120.0
+_route_state: Dict[Tuple[str, str], Dict[str, float]] = {}
+_route_state_lock = threading.Lock()
+
+# Single-request proxy override: proxies={http: None, https: None} makes
+# one requests call skip the env proxy vars (direct egress) — on requests
+# 2.34.2, verified live Nov 18 (Worker F), and retained here as the route
+# signal fake/test clients key on plus belt-and-braces. It is NOT the
+# bypass mechanism for real sessions (see _new_route_session): the
+# trust_env=False session is.
+_DIRECT_PROXIES = {"http": None, "https": None}
+
+
+def _new_route_session(*, direct: bool) -> "requests.Session":
+    """A requests.Session for one route (proxy or direct).
+
+    Worker F (Nov 18): the direct route MUST go through a Session with
+    ``trust_env=False``. A default Session reads the proxy env vars on
+    every request, so a direct attempt on it is one requests-internals
+    change away from silently going through the (possibly dead) proxy:
+    the proxies={http: None, https: None} kwarg only bypasses because
+    merge_environment_settings blocks the env proxy via setdefault
+    before merge_setting strips the None keys — an ordering accident,
+    not a contract. With trust_env=False the session never consults the
+    proxy env vars at all (verified: 200 under a dead proxy while a
+    trust_env=True session raises ProxyError to 127.0.0.1:9), so the
+    direct route holds whatever requests does next. The proxy route
+    keeps the default trust_env=True session so the egress proxy keeps
+    working. ``session.proxies`` is emptied on the direct session as
+    belt-and-braces so no session-level proxy can leak in either.
+    """
+    session = requests.Session()
+    session.trust_env = not direct
+    if direct:
+        session.proxies = {}
+    return session
+
+
+def _route_proxies(direct: bool) -> Optional[Dict[str, object]]:
+    """proxies kwarg for a requests call on the given route (None = env proxy).
+
+    Route signal only: fake/test clients and _throttled_get key the
+    direct route on this kwarg. The real bypass is the trust_env=False
+    session from _new_route_session, not this kwarg.
+    """
+    return dict(_DIRECT_PROXIES) if direct else None
+
+
+def _route_name(direct: bool) -> str:
+    return "direct" if direct else "proxy"
+
+
+def _route_order(engine: str, prefer_direct: bool) -> List[str]:
+    """Routes to try for one engine fetch, best first, dead routes skipped."""
+    order = ["direct", "proxy"] if prefer_direct else ["proxy", "direct"]
+    now = time.monotonic()
+    live: List[str] = []
+    for route in order:
+        with _route_state_lock:
+            state = _route_state.get((engine, route)) or {}
+            failures = float(state.get("failures", 0) or 0)
+            last_fail = float(state.get("last_fail", 0) or 0)
+        if failures >= _ROUTE_FAILURE_THRESHOLD and now - last_fail < _ROUTE_SKIP_SECONDS:
+            LOGGER.debug(
+                "[universal] %s: skipping dead route=%s "
+                "(%.0f consecutive transport failures)",
+                engine, route, failures,
+            )
+            continue
+        live.append(route)
+    # Never return empty: if both routes look dead, re-probe the preferred
+    # one instead of failing without trying.
+    return live or order[:1]
+
+
+def _note_route_result(engine: str, route: str, ok: bool) -> None:
+    with _route_state_lock:
+        state = _route_state.setdefault(
+            (engine, route), {"failures": 0.0, "last_fail": 0.0, "last_ok": 0.0}
+        )
+        if ok:
+            state["failures"] = 0.0
+            state["last_ok"] = time.monotonic()
+        else:
+            state["failures"] = float(state.get("failures", 0) or 0) + 1.0
+            state["last_fail"] = time.monotonic()
+
+
+def _timeout_kind(exc: BaseException) -> str:
+    """Classify a transport exception as queue-wait vs socket-timeout."""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "budget" in text and ("queue" in text or "host slot" in text):
+        return "queue-timeout"
+    if "timeout" in name:
+        return "socket-timeout"
+    return "transport-error"
+
+
+def _throttled_get(client, url: str, *, headers, timeout, direct: bool = False):
     """GET through the per-host throttle, with bounded 429 backoff retries.
 
     ``client`` is any object with ``.get(url, headers=..., timeout=...)``
-    (the isolated native client, a requests.Session, or the requests
-    module). Returns the response-like object (status_code + text/json).
-    When the enclosing retry runs direct (``web_bypass_proxy`` context),
-    the call passes ``proxies={http: None, https: None}`` so this single
-    requests call skips the env proxy vars; clients that do not accept a
-    proxies override are retried without it.
+    (a requests.Session or the requests module). Returns the response-like
+    object (status_code + text/json).
+    ``direct=True`` issues the call on a trust_env=False session (the
+    caller — ``_Engine._fetch`` via ``_get_client(direct=True)`` — must
+    supply one; see ``_new_route_session``) so no env proxy is applied,
+    and also passes ``proxies={http: None, https: None}`` as the route
+    signal fake/test clients key on. The proxies kwarg alone is NOT the
+    bypass for a real Session (Worker F, Nov 18: it only works on
+    requests 2.34.2 by a setdefault-before-strip ordering accident), so
+    a real trust_env=True Session handed in with direct=True is logged
+    at debug level — the call still goes out, but the bypass is not
+    guaranteed for it. The legacy ``web_bypass_proxy()`` shim has the
+    same effect. The throttle slot is per (host, route), so a direct
+    retry does not queue behind the abandoned proxied attempt's held
+    slots. Clients that do not accept a proxies override are retried
+    without it.
     Only 429 is retried with exponential backoff. A 403 is returned
     immediately so the manager can retire that engine for this run rather
     than repeat a refusal for every scene. Other non-200 responses are
@@ -283,9 +456,28 @@ def _throttled_get(client, url: str, *, headers, timeout):
     socket timeout, so one engine call cost 53–200s of stacked 15s
     timeouts plus queueing. A call that cannot even start inside its
     budget now fails fast with TimeoutError instead of burning the batch.
+    Queue-wait and socket-timeout failures are logged separately
+    (kind=queue-timeout vs kind=socket-timeout) so the next outage is
+    diagnosable from the log alone.
     """
     host = (urlparse(url).netloc or "").lower()
-    state = _universal_host_slot(host)
+    route = _route_name(bool(direct) or _web_bypass_proxy_enabled())
+    if (
+        route == "direct"
+        and isinstance(client, requests.Session)
+        and getattr(client, "trust_env", False)
+    ):
+        # The bypass is the session, not the kwarg (see _new_route_session):
+        # a trust_env=True Session on the direct route depends on requests'
+        # merge ordering and may silently use the env proxy. Production
+        # engines always pass a trust_env=False session here; log it so a
+        # future caller regression is diagnosable instead of silent.
+        LOGGER.debug(
+            "[universal] throttled GET route=direct host=%s: client is a "
+            "trust_env=True Session; proxies kwarg is the only bypass",
+            host,
+        )
+    state = _universal_host_slot(host, route)
     semaphore = state["semaphore"]
     lock = state["lock"]
     try:
@@ -300,6 +492,11 @@ def _throttled_get(client, url: str, *, headers, timeout):
     response = None
     for attempt in range(_universal_retry_count() + 1):
         if _remaining() <= 0:
+            LOGGER.debug(
+                "[universal] throttled GET route=%s host=%s kind=queue-timeout "
+                "error=budget exhausted before start",
+                route, host,
+            )
             raise TimeoutError(
                 f"throttled request to {host} exceeded its {budget:.0f}s "
                 "budget before starting"
@@ -308,6 +505,11 @@ def _throttled_get(client, url: str, *, headers, timeout):
             wait = _universal_min_delay() - (time.monotonic() - float(state["last_start"]))
             if wait > 0:
                 if wait >= _remaining():
+                    LOGGER.debug(
+                        "[universal] throttled GET route=%s host=%s "
+                        "kind=queue-timeout error=budget in queue",
+                        route, host,
+                    )
                     raise TimeoutError(
                         f"throttled request to {host} exceeded its "
                         f"{budget:.0f}s budget in queue"
@@ -315,25 +517,35 @@ def _throttled_get(client, url: str, *, headers, timeout):
                 time.sleep(wait)
             state["last_start"] = time.monotonic()
         if _remaining() <= 0:
+            LOGGER.debug(
+                "[universal] throttled GET route=%s host=%s kind=queue-timeout "
+                "error=budget in queue",
+                route, host,
+            )
             raise TimeoutError(
                 f"throttled request to {host} exceeded its {budget:.0f}s "
                 "budget in queue"
             )
         acquired = semaphore.acquire(timeout=_remaining())
         if not acquired:
+            LOGGER.debug(
+                "[universal] throttled GET route=%s host=%s "
+                "kind=queue-timeout error=budget waiting for a host slot",
+                route, host,
+            )
             raise TimeoutError(
                 f"throttled request to {host} exceeded its {budget:.0f}s "
                 "budget waiting for a host slot"
             )
+        acquired_at = time.monotonic()
         try:
             request_timeout = max(0.5, min(float(timeout or 15), _remaining()))
-            # Proxy bypass (Nov 18 retry): when the enclosing retry runs
-            # direct, pass proxies={http: None, https: None} so this single
-            # requests call skips the env proxy vars. Clients that do not
-            # accept a proxies override (the isolated native client) raise
-            # TypeError immediately; retry them without it — the engine's
-            # plain-requests fallback then honours the bypass.
-            if _web_bypass_proxy_enabled():
+            # Proxy bypass (Nov 18 retry, fixed Nov 18 web-resilience):
+            # the route is an explicit parameter now, not a thread-local
+            # flag — the worker thread that issues the request sees it.
+            # Clients that do not accept a proxies override raise
+            # TypeError immediately; retry them without it.
+            if route == "direct":
                 try:
                     response = client.get(
                         url, headers=headers, timeout=request_timeout,
@@ -343,6 +555,16 @@ def _throttled_get(client, url: str, *, headers, timeout):
                     response = client.get(url, headers=headers, timeout=request_timeout)
             else:
                 response = client.get(url, headers=headers, timeout=request_timeout)
+        except Exception as exc:
+            queue_ms = int((acquired_at - started) * 1000)
+            socket_ms = int((time.monotonic() - acquired_at) * 1000)
+            LOGGER.debug(
+                "[universal] throttled GET route=%s host=%s kind=%s "
+                "queue_ms=%d socket_ms=%d error=%s: %s",
+                route, host, _timeout_kind(exc), queue_ms, socket_ms,
+                type(exc).__name__, str(exc)[:120],
+            )
+            raise
         finally:
             semaphore.release()
         status = int(getattr(response, "status_code", 0) or 0)
@@ -452,50 +674,129 @@ def _result(
 
 class _Engine:
     name = "engine"
+    # Route that served the last fetch ("proxy" | "direct"), and the routes
+    # tried by the last failed fetch — read by _run_engine for the
+    # route= log marker (item 8: every engine line carries its route).
+    _last_route: str = "proxy"
+    _last_routes_tried: Tuple[str, ...] = ()
 
-    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+    def search(self, query: str, limit: int, page: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         raise NotImplementedError
 
+    def _get_client(self, direct: bool = False):
+        """Thread-local requests.Session for one route (Worker F, Nov 18).
 
-class _IsolatedNativeClient:
-    """Keep Chrome TLS behavior without a native initialization in the API."""
-    def get(self, url, *, headers, timeout):
-        from ..job_context import check_job_active, remaining_seconds
-        check_job_active()
-        budget = min(float(timeout), remaining_seconds(float(timeout)))
-        if budget <= 0:
-            raise TimeoutError('Search budget is exhausted')
-        process = subprocess.Popen(
-            [sys.executable, '-B', str(Path(__file__).resolve().parents[1] / 'research_search_worker.py')],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        The proxy and direct routes get SEPARATE cached sessions: the
+        proxy session is a default Session (trust_env=True, env proxy
+        applies); the direct session is built by _new_route_session with
+        trust_env=False, so no env proxy is ever applied to it. Sharing
+        one session across routes would make the direct route depend on
+        the proxies kwarg alone — which only bypasses by a requests
+        merge-ordering accident. Sessions stay thread-local (one per
+        engine thread per route) because requests.Session is not
+        thread-safe for concurrent use.
+        """
+        local = getattr(self, "_local", None)
+        if local is None:
+            self._local = local = threading.local()
+        attr = "direct_client" if direct else "client"
+        client = getattr(local, attr, None)
+        if client is None:
+            client = _new_route_session(direct=bool(direct))
+            setattr(local, attr, client)
+        return client
+
+    def _drop_client(self, direct: bool = False) -> None:
+        """Drop the cached session for one route (poisoned connection)."""
+        local = getattr(self, "_local", None)
+        if local is not None:
+            setattr(local, "direct_client" if direct else "client", None)
+
+    def _engine_client(self, direct: bool = False):
+        """_get_client() tolerating pre-web-resilience test doubles.
+
+        Mirrors _run_engine's handling of engines whose search() takes
+        no ``direct`` keyword: a _get_client that takes no argument
+        raises TypeError mentioning 'direct'; retry it bare instead of
+        failing the engine.
+        """
         try:
-            output, _ = process.communicate(json.dumps({'kind': 'http', 'url': url,
-                'headers': headers, 'timeout': budget}), timeout=budget)
-            check_job_active()
-            data = json.loads(output[:2200000])
-            if not isinstance(data, dict) or not isinstance(data.get('text'), str):
-                # The worker writes '[]' for ANY failure (its __main__
-                # handler swallows the traceback). Indexing that list raised
-                # a bare TypeError that used to be masked by the engines'
-                # plain-requests fallback; with the fallback removed it
-                # zeroed the whole engine (live, Nov 16: primp DNS dead,
-                # plain requests fine). Fail as a clean transport error so
-                # the caller can fall back instead of dying on a TypeError.
-                raise RuntimeError(
-                    'search worker returned an unexpected payload '
-                    f'(expected a text response, got {type(data).__name__})'
-                )
-            body = data['text']
-            return SimpleNamespace(status_code=data['status_code'], text=body,
-                                   json=lambda: json.loads(body))
-        finally:
-            if process.poll() is None:
-                process.kill()
+            return self._get_client(direct=direct)
+        except TypeError as exc:
+            if "direct" not in str(exc):
+                raise
+            return self._get_client()
+
+    def _fetch(self, url: str, *, headers, timeout: float = 30, direct: bool = False):
+        """GET with per-engine route fallback. Returns (response, route).
+
+        Tries the preferred route first, then the other route on a
+        transport error (timeout / connection error / throttle-queue
+        timeout). An HTTP status — including 403/429/5xx — is an answer,
+        not a transport failure, so it is returned, never route-retried.
+        A route that failed transport repeatedly is skipped fast by
+        _route_order. Raises the last transport error when every live
+        route failed.
+
+        Each route attempt is issued on that route's own session
+        (trust_env=False for direct, trust_env=True for proxy), so the
+        wire path matches the route label — the direct attempt really
+        leaves via direct egress. The legacy web_bypass_proxy() shim is
+        folded into the preferred route so a shim-enabled caller also
+        gets the direct session, not a proxy session relabelled direct.
+
+        Nov 18 (web-resilience): this replaces the old primp-first +
+        plain-requests fallback. primp is DNS-dead from this VM (every
+        call paid a wasted subprocess spawn and failed), so plain
+        requests is now the only transport and the ROUTE (proxy vs
+        direct) is the fallback dimension instead.
+        """
+        routes = _route_order(self.name, bool(direct) or _web_bypass_proxy_enabled())
+        last_exc: Optional[BaseException] = None
+        tried: List[str] = []
+        for route in routes:
+            tried.append(route)
             try:
-                process.communicate(timeout=1)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                response = _throttled_get(
+                    self._engine_client(direct=(route == "direct")),
+                    url, headers=headers,
+                    timeout=timeout, direct=(route == "direct"),
+                )
+            except Exception as exc:
+                last_exc = exc
+                _note_route_result(self.name, route, False)
+                LOGGER.debug(
+                    "[universal] %s: route=%s transport failed "
+                    "kind=%s error=%s: %s",
+                    self.name, route, _timeout_kind(exc),
+                    type(exc).__name__, str(exc)[:120],
+                )
+                # Drop the poisoned session for THIS route only, so the
+                # next route gets a fresh one instead of reusing a broken
+                # connection. (The other route's session is untouched.)
+                drop = getattr(self, "_drop_client", None)
+                if drop is not None:
+                    drop(direct=(route == "direct"))
+                continue
+            _note_route_result(self.name, route, True)
+            self._last_route = route
+            self._last_routes_tried = tuple(tried)
+            return response, route
+        self._last_routes_tried = tuple(tried)
+        raise RuntimeError(
+            f"{self.name}: all routes failed ({','.join(tried)}): "
+            f"{type(last_exc).__name__}: {str(last_exc)[:120]}"
+        ) from last_exc
+
+
+# NOTE (Nov 18, web-resilience): _IsolatedNativeClient (primp via the
+# research_search_worker subprocess) is REMOVED. primp is DNS-dead from
+# this VM — primp.Client().get() fails instantly with DNSError, swallowed
+# by the worker — so every engine call paid a wasted subprocess spawn and
+# then fell back to plain requests anyway. Plain requests is now the only
+# transport; the route (proxy vs direct) is the fallback dimension. The
+# worker file itself keeps a requests-based 'http' kind for any other
+# caller, and now reports its errors as {"error": ...} instead of bare '[]'.
 
 
 class YandexEngine(_Engine):
@@ -504,30 +805,19 @@ class YandexEngine(_Engine):
     def __init__(self) -> None:
         self._local = threading.local()
 
-    def _get_client(self):
-        client = getattr(self._local, "client", None)
-        if client is None:
-            client = _IsolatedNativeClient() if primp is not None else requests.Session()
-            self._local.client = client
-        return client
+    # _get_client(direct=) is inherited from _Engine: per-route cached
+    # sessions (trust_env=False for direct). primp removed Nov 18 (DNS-dead).
 
-    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+    def search(self, query: str, limit: int, page: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         encoded = urllib.parse.quote(query)
         url = f"https://yandex.com/images/search?text={encoded}&p={max(0, page - 1)}"
         if safe_search:
             url += "&family=yes"
-        # Bounded plain-requests fallback (Nov 16 verification fix): the
-        # isolated client is one transport, not the only one. When it fails
-        # (live: primp DNS dead while plain requests returns 200), the
-        # engine falls back instead of returning zero rows. The old
-        # 53–200s stacking this fallback once caused is gone: queue time
-        # now counts inside each 15s budget, so the two attempts cost at
-        # most ~30s, not a runaway wall.
-        try:
-            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=15)
-        except Exception:
-            self._local.client = None
-            response = _throttled_get(requests, url, headers=_HEADERS, timeout=15)
+        # Route fallback (Nov 18 web-resilience): plain requests is the
+        # only transport now (primp DNS-dead, removed); the fallback
+        # dimension is the ROUTE — proxy first, direct on transport
+        # failure — with per-route health, inside _fetch().
+        response, _route = self._fetch(url, headers=_HEADERS, timeout=_universal_fetch_timeout_seconds(), direct=direct)
 
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
@@ -573,27 +863,18 @@ class BingEngine(_Engine):
     def __init__(self) -> None:
         self._local = threading.local()
 
-    def _get_client(self):
-        client = getattr(self._local, "client", None)
-        if client is None:
-            client = _IsolatedNativeClient() if primp is not None else requests.Session()
-            self._local.client = client
-        return client
+    # _get_client(direct=) is inherited from _Engine: per-route cached
+    # sessions (trust_env=False for direct). primp removed Nov 18 (DNS-dead).
 
-    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+    def search(self, query: str, limit: int, page: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         first = max(0, (page - 1) * limit)
         safe = "strict" if safe_search else "off"
         url = (
             "https://www.bing.com/images/async?"
             f"q={urllib.parse.quote(query)}&first={first}&count={limit}&mmasync=1&adlt={safe}"
         )
-        # Bounded plain-requests fallback — see YandexEngine: the isolated
-        # transport failing (e.g. primp DNS dead) must not zero the engine.
-        try:
-            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=15)
-        except Exception:
-            self._local.client = None
-            response = _throttled_get(requests, url, headers=_HEADERS, timeout=15)
+        # Route fallback (Nov 18 web-resilience) — see YandexEngine.
+        response, _route = self._fetch(url, headers=_HEADERS, timeout=_universal_fetch_timeout_seconds(), direct=direct)
 
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
@@ -636,7 +917,7 @@ class BingEngine(_Engine):
 class DuckDuckGoEngine(_Engine):
     name = "duckduckgo"
 
-    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+    def search(self, query: str, limit: int, page: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         if DDGS is None:
             raise RuntimeError("optional dependency 'ddgs' is not installed")
         start = max(0, (page - 1) * limit)
@@ -648,9 +929,10 @@ class DuckDuckGoEngine(_Engine):
         # it must return [] immediately (never retry a hang), per the
         # timeout contract. A persistent clean empty fails loudly instead
         # of returning a silent empty list that hid the bot-gate for weeks.
+        self._last_route = "direct" if direct else "proxy"
         for attempt in range(2):
             try:
-                out = self._search_once(query, limit, start, safe_search)
+                out = self._search_once(query, limit, start, safe_search, direct=direct)
             except subprocess.TimeoutExpired:
                 return []
             if out:
@@ -661,7 +943,7 @@ class DuckDuckGoEngine(_Engine):
             "DuckDuckGo returned no results after 2 attempts (likely bot-gate interstitial)"
         )
 
-    def _search_once(self, query: str, limit: int, start: int, safe_search: bool) -> List[UniversalImageResult]:
+    def _search_once(self, query: str, limit: int, start: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         out: List[UniversalImageResult] = []
         process = None
         try:
@@ -670,14 +952,31 @@ class DuckDuckGoEngine(_Engine):
             budget = min(15.0, remaining_seconds(15.0))
             if budget <= 0:
                 return out
+            # Route for the subprocess worker (Nov 18 web-resilience): a
+            # thread-local flag cannot cross a process boundary, so the
+            # route is passed explicitly — the child's proxy env vars are
+            # stripped for a direct run, and the worker payload carries
+            # 'direct' so it strips them again as belt-and-braces.
+            child_env = None
+            if direct:
+                child_env = {
+                    key: value for key, value in os.environ.items()
+                    if key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+                }
             process = subprocess.Popen(
                 [sys.executable, '-B', str(Path(__file__).resolve().parents[1] / 'research_search_worker.py')],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                text=True, encoding='utf-8', env=child_env,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             output, _ = process.communicate(json.dumps({'kind': 'images', 'query': query,
-                'timeout': budget, 'safe_search': safe_search, 'limit': start + limit}), timeout=budget)
+                'timeout': budget, 'safe_search': safe_search, 'limit': start + limit,
+                'direct': bool(direct)}), timeout=budget)
             check_job_active()
             raw_items = json.loads(output[:1000000])
+            if isinstance(raw_items, dict) and raw_items.get("error"):
+                # The worker now reports its failure instead of bare '[]'.
+                LOGGER.debug("DuckDuckGo worker error: %s", str(raw_items.get("error"))[:160])
+                return out
             if not isinstance(raw_items, list):
                 return out
             for idx, item in enumerate(raw_items or []):
@@ -718,14 +1017,10 @@ class BaiduEngine(_Engine):
     def __init__(self) -> None:
         self._local = threading.local()
 
-    def _get_client(self):
-        client = getattr(self._local, "client", None)
-        if client is None:
-            client = _IsolatedNativeClient() if primp is not None else requests.Session()
-            self._local.client = client
-        return client
+    # _get_client(direct=) is inherited from _Engine: per-route cached
+    # sessions (trust_env=False for direct). primp removed Nov 18 (DNS-dead).
 
-    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+    def search(self, query: str, limit: int, page: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         del safe_search
         start = max(0, (page - 1) * limit)
         encoded = urllib.parse.quote(query)
@@ -734,13 +1029,8 @@ class BaiduEngine(_Engine):
             f"&fp=result&queryWord={encoded}&word={encoded}&cl=2&lm=-1&ie=utf-8&oe=utf-8"
             f"&pn={start}&rn={limit}"
         )
-        # Bounded plain-requests fallback — see YandexEngine: the isolated
-        # transport failing (e.g. primp DNS dead) must not zero the engine.
-        try:
-            response = _throttled_get(self._get_client(), url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
-        except Exception:
-            self._local.client = None
-            response = _throttled_get(requests, url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=15)
+        # Route fallback (Nov 18 web-resilience) — see YandexEngine.
+        response, _route = self._fetch(url, headers={**_HEADERS, "Referer": "https://image.baidu.com/"}, timeout=_universal_fetch_timeout_seconds(), direct=direct)
 
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
@@ -783,26 +1073,17 @@ class OpenverseEngine(_Engine):
     def __init__(self) -> None:
         self._local = threading.local()
 
-    def _get_client(self):
-        client = getattr(self._local, "client", None)
-        if client is None:
-            client = _IsolatedNativeClient() if primp is not None else requests.Session()
-            self._local.client = client
-        return client
+    # _get_client(direct=) is inherited from _Engine: per-route cached
+    # sessions (trust_env=False for direct). primp removed Nov 18 (DNS-dead).
 
-    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+    def search(self, query: str, limit: int, page: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         del safe_search
         url = (
             f"https://api.openverse.org/v1/images/?q={urllib.parse.quote(query)}"
             f"&page={max(1, page)}&page_size={min(limit, 50)}"
         )
-        # Bounded plain-requests fallback — see YandexEngine: the isolated
-        # transport failing (e.g. primp DNS dead) must not zero the engine.
-        try:
-            response = _throttled_get(self._get_client(), url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
-        except Exception:
-            self._local.client = None
-            response = _throttled_get(requests, url, headers={**_HEADERS, "Accept": "application/json"}, timeout=15)
+        # Route fallback (Nov 18 web-resilience) — see YandexEngine.
+        response, _route = self._fetch(url, headers={**_HEADERS, "Accept": "application/json"}, timeout=_universal_fetch_timeout_seconds(), direct=direct)
 
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
@@ -838,14 +1119,10 @@ class FlickrEngine(_Engine):
     def __init__(self) -> None:
         self._local = threading.local()
 
-    def _get_client(self):
-        client = getattr(self._local, "client", None)
-        if client is None:
-            client = _IsolatedNativeClient() if primp is not None else requests.Session()
-            self._local.client = client
-        return client
+    # _get_client(direct=) is inherited from _Engine: per-route cached
+    # sessions (trust_env=False for direct). primp removed Nov 18 (DNS-dead).
 
-    def search(self, query: str, limit: int, page: int, safe_search: bool) -> List[UniversalImageResult]:
+    def search(self, query: str, limit: int, page: int, safe_search: bool, direct: bool = False) -> List[UniversalImageResult]:
         del safe_search
         terms = re.findall(r"[^\W_]+", query, re.UNICODE)
         stopwords = {"the", "and", "for", "with", "from", "this", "that", "how", "what", "where", "when", "which", "about"}
@@ -855,13 +1132,8 @@ class FlickrEngine(_Engine):
         params = urllib.parse.urlencode({"tags": ",".join(tags), "tagmode": "any",
                                          "format": "json", "nojsoncallback": "1"})
         url = f"https://www.flickr.com/services/feeds/photos_public.gne?{params}"
-        # Bounded plain-requests fallback — see YandexEngine: the isolated
-        # transport failing (e.g. primp DNS dead) must not zero the engine.
-        try:
-            response = _throttled_get(self._get_client(), url, headers=_HEADERS, timeout=15)
-        except Exception:
-            self._local.client = None
-            response = _throttled_get(requests, url, headers=_HEADERS, timeout=15)
+        # Route fallback (Nov 18 web-resilience) — see YandexEngine.
+        response, _route = self._fetch(url, headers=_HEADERS, timeout=_universal_fetch_timeout_seconds(), direct=direct)
 
         status = int(getattr(response, "status_code", 0) or 0)
         if status != 200:
@@ -921,21 +1193,22 @@ def is_bot_gate_error(exc: BaseException) -> bool:
 
 
 class UniversalScraperManager:
-    """Run the supplied four-engine search strategy as a resolver lane.
+    """Run the supplied three-engine search strategy as a resolver lane.
 
-    Baidu and Openverse are NOT in the default set: Baidu answers this
+    Baidu, Openverse and DuckDuckGo are NOT in the default set: Baidu answers this
     egress IP with ``{"antiFlag": 1, "message": "Forbid spider access"}``
     and api.openverse.org 504s through the egress proxy (verified live
-    2026-11-10). Their engine classes stay available and raise a clear
-    error if called directly, so they can be re-enabled if the egress
-    IP/proxy situation changes — but production must not spend a worker
-    slot on an engine that cannot return results.
+    2026-11-10), and DuckDuckGo bot-gates this egress (202 anomaly
+    interstitial, circuit open — GTA prep, Nov 19, 2026 — while
+    Yandex/Bing/Flickr each returned 20 results). Their engine classes stay
+    available and raise a clear error if called directly, so they can be
+    re-enabled if the egress IP/proxy situation changes — but production must
+    not spend a worker slot on an engine that cannot return results.
     """
 
     # Canonical engine order: Yandex first (it bot-walls least), then Bing,
-    # Flickr, DuckDuckGo. See WEB_ENGINE_PRIORITY in source_broker.py. The
-    # manager interleaves results in this order, so Yandex rows surface first
-    # and a bot-gated DuckDuckGo never outranks a working Flickr lane.
+    # Flickr. See WEB_ENGINE_PRIORITY in source_broker.py. The
+    # manager interleaves results in this order, so Yandex rows surface first.
     DEFAULT_ENGINES = WEB_ENGINE_PRIORITY
 
     def __init__(
@@ -957,7 +1230,6 @@ class UniversalScraperManager:
         self._engines: Dict[str, _Engine] = {
             "yandex": YandexEngine(),
             "bing": BingEngine(),
-            "duckduckgo": DuckDuckGoEngine(),
             "baidu": BaiduEngine(),
             "openverse": OpenverseEngine(),
             "flickr": FlickrEngine(),
@@ -1233,10 +1505,23 @@ class UniversalScraperManager:
         page: int,
         safe_search: bool,
         batch_finished: threading.Event,
+        direct: bool = False,
     ) -> Tuple[str, List[UniversalImageResult], UniversalEngineStat]:
         started = time.perf_counter()
         try:
-            rows = self._engines[engine_name].search(clean, limit, max(1, int(page)), bool(safe_search))
+            try:
+                rows = self._engines[engine_name].search(
+                    clean, limit, max(1, int(page)), bool(safe_search), direct=direct
+                )
+            except TypeError as exc:
+                # Engines (and test doubles) written before the Nov 18
+                # web-resilience build take no ``direct`` keyword; retry
+                # without it instead of failing the engine.
+                if "direct" not in str(exc):
+                    raise
+                rows = self._engines[engine_name].search(
+                    clean, limit, max(1, int(page)), bool(safe_search)
+                )
             duration = int((time.perf_counter() - started) * 1000)
             stat = UniversalEngineStat(engine_name, len(rows), duration, True)
             # A successful probe clears a gate (re-probe rule): the engine
@@ -1247,15 +1532,19 @@ class UniversalScraperManager:
                 self._bot_gate_reprobe_spent.pop(engine_name, None)
                 self._bot_gate_kind.pop(engine_name, None)
             self._note_progress()
+            # Route marker (Nov 18 web-resilience): every engine line
+            # carries route=proxy|direct so the next outage is
+            # diagnosable from the log alone.
+            route = getattr(self._engines[engine_name], "_last_route", "proxy")
             if batch_finished.is_set():
                 # The rows are NOT discarded: they sit in this future for
                 # collect_late_results() to harvest after the batch wall.
                 self._log(
                     f"[universal] {engine_name}: late result held for spool collection "
-                    f"after batch deadline ({len(rows)} result(s), {duration}ms)"
+                    f"after batch deadline ({len(rows)} result(s), {duration}ms, route={route})"
                 )
             else:
-                self._log(f"[universal] {engine_name}: {len(rows)} result(s) in {duration}ms")
+                self._log(f"[universal] {engine_name}: {len(rows)} result(s) in {duration}ms route={route}")
             return engine_name, rows, stat
         except Exception as exc:
             duration = int((time.perf_counter() - started) * 1000)
@@ -1296,13 +1585,15 @@ class UniversalScraperManager:
                     f"re-probe in {skip_seconds / 2.0:.0f}s)"
                 )
             self._note_progress()
+            routes_tried = getattr(self._engines[engine_name], "_last_routes_tried", ())
+            routes_label = ",".join(routes_tried) if routes_tried else ("direct" if direct else "proxy")
             if batch_finished.is_set():
                 self._log(
                     f"[universal] {engine_name}: late failure ignored after batch deadline "
-                    f"({duration}ms, {error})"
+                    f"({duration}ms, {error}, routes_tried={routes_label})"
                 )
             else:
-                self._log(f"[universal] {engine_name}: failed in {duration}ms ({error})")
+                self._log(f"[universal] {engine_name}: failed in {duration}ms ({error}, routes_tried={routes_label})")
             return engine_name, [], UniversalEngineStat(engine_name, 0, duration, False, error)
 
     def _collect_batch(
@@ -1395,7 +1686,16 @@ class UniversalScraperManager:
         safe_search: bool = True,
         timeout_seconds: Optional[float] = None,
         wait_until_complete: bool = False,
+        direct: bool = False,
     ) -> UniversalSearchResponse:
+        """Search all selected engines in parallel.
+
+        ``direct=True`` runs this batch's engines direct (proxy bypass);
+        the route is passed explicitly to the pool worker threads (the
+        old thread-local bypass flag never reached them). Per-engine
+        route fallback inside _fetch() may still switch an individual
+        engine to the other route on a transport error.
+        """
         clean = re.sub(r"\s+", " ", str(query or "")).strip()
         selected = [str(e).strip().lower() for e in (engine_ids or self.DEFAULT_ENGINES)]
         selected = list(dict.fromkeys(e for e in selected if e in self._engines))
@@ -1463,7 +1763,8 @@ class UniversalScraperManager:
         timeout_label = f"{engine_timeout:.1f}s+{stagger:.1f}s/engine"
         self._log(
             f"[universal] batch start query='{clean[:72]}' engines={','.join(selected)} "
-            f"parallel={len(selected)} timeout={timeout_label} max={max_deadline:.1f}s"
+            f"parallel={len(selected)} timeout={timeout_label} max={max_deadline:.1f}s "
+            f"route={'direct' if direct else 'proxy'}"
         )
         # Re-check the spool first: a previous batch's late engines may
         # have landed after that batch gave up.  Those rows are real
@@ -1478,6 +1779,7 @@ class UniversalScraperManager:
                 self._executor.submit(
                     self._run_engine, engine, clean, limit,
                     max(1, int(page)), bool(safe_search), batch_finished,
+                    direct,
                 ): engine
                 for engine in selected
             }
@@ -1486,8 +1788,11 @@ class UniversalScraperManager:
             )
             # Retry with backoff: an all-empty batch where at least one
             # engine timed out (a transport stall, not a bot gate) gets one
-            # more wave at 1.5x timeout.  A batch with any rows at all does
-            # not retry — partial success is a result, not a failure.
+            # more wave at 1.5x timeout — on the OTHER route, so the retry
+            # does not re-queue behind the dead attempt's held throttle
+            # slots (separate per-route namespace) or the same dead route.
+            # A batch with any rows at all does not retry — partial success
+            # is a result, not a failure.
             if not any(buckets.values()) and timed_out:
                 retry_engines = [
                     engine for engine in timed_out
@@ -1496,10 +1801,12 @@ class UniversalScraperManager:
                 ]
                 if retry_engines:
                     backoff = _universal_empty_retry_backoff_seconds()
+                    retry_direct = not direct
                     self._log(
                         f"[universal] empty batch with timed-out engine(s) "
                         f"{','.join(retry_engines)}; retrying once after "
-                        f"{backoff:.1f}s backoff"
+                        f"{backoff:.1f}s backoff "
+                        f"(route={'direct' if retry_direct else 'proxy'})"
                     )
                     if backoff:
                         time.sleep(backoff)
@@ -1513,6 +1820,7 @@ class UniversalScraperManager:
                             self._executor.submit(
                                 self._run_engine, engine, clean, limit,
                                 max(1, int(page)), bool(safe_search), retry_finished,
+                                retry_direct,
                             ): engine
                             for engine in retry_engines
                         }

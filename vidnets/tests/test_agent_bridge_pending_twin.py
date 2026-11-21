@@ -200,3 +200,113 @@ def test_answered_twin_reuse_still_works(tmp_path, monkeypatch):
             operation=payload['operation'], kind=payload['kind'])
     assert time.monotonic() - start < 5
     assert json.loads(response.json()['choices'][0]['message']['content']) == {'scenes': [1]}
+
+
+# D1 (fewer-requests): a vision payload is filed with inline data-URI images
+# but stored with local_image parts, so the raw fingerprint never matched a
+# stored twin and every vision re-file minted a duplicate. The fingerprint
+# now normalizes image parts to content hashes.
+_ONE_PIXEL_PNG_B64 = (
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+)
+
+
+def _vision_payload(**overrides):
+    payload = {
+        'job_id': 'job-1',
+        'operation': 'visual_review',
+        'kind': 'vision',
+        'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': 'Is this frame accurate for the scene?'},
+            {'type': 'image_url', 'image_url': {
+                'url': 'data:image/png;base64,' + _ONE_PIXEL_PNG_B64, 'detail': 'auto'}}]}],
+        'response_format': {'type': 'json_object'},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_vision_filed_and_stored_forms_share_a_fingerprint(tmp_path):
+    # The filed form (inline data-URI) and the stored form (local_image
+    # file) of the same vision payload must fingerprint identically, or
+    # twin dedupe and the answer cache can never fire for vision.
+    filed = _vision_payload()
+    stored_dir = tmp_path / 'stored'
+    stored_dir.mkdir()
+    stored_messages = agent_bridge._messages_with_local_images(
+        filed['messages'], stored_dir)
+    stored = dict(filed, messages=stored_messages)
+    assert agent_bridge.payload_fingerprint(filed) == agent_bridge.payload_fingerprint(stored)
+    other = _vision_payload(messages=[{'role': 'user', 'content': [
+        {'type': 'text', 'text': 'Is this frame accurate for the scene?'},
+        {'type': 'image_url', 'image_url': {
+            'url': 'data:image/png;base64,' + 'AAAA', 'detail': 'auto'}}]}])
+    assert agent_bridge.payload_fingerprint(filed) != agent_bridge.payload_fingerprint(other)
+
+
+def test_vision_refile_joins_the_pending_twin(tmp_path, monkeypatch):
+    # A vision re-file must wait on the pending twin instead of minting a
+    # duplicate the operator has to answer twice.
+    monkeypatch.setenv('VIDNETS_AGENT_BRIDGE_DIR', str(tmp_path))
+    monkeypatch.setenv('VIDZEO_AGENT_MIN_WALL_SECONDS', '0')
+    payload = _vision_payload()
+    results = {}
+    first = _post_in_thread(results, 'first', payload)
+    time.sleep(0.5)
+    assert len(_request_dirs(tmp_path)) == 1
+    second = _post_in_thread(results, 'second', payload)
+    time.sleep(0.5)
+    assert len(_request_dirs(tmp_path)) == 1, 'vision refile minted a duplicate request'
+    request_id = _request_dirs(tmp_path)[0].name
+    agent_bridge.complete_request(request_id, 'owner', '{"verdict": "pass"}')
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    assert _content(results['first']) == {'verdict': 'pass'}
+    assert _content(results['second']) == {'verdict': 'pass'}
+
+
+def test_expired_twin_fanout_mints_exactly_one_fresh_request(tmp_path, monkeypatch):
+    # Two waiters queued on one twin that expires unanswered must not each
+    # mint a fresh request: the twin scan and the mint are one atomic step
+    # under _mint_lock, so the second waiter finds the first waiter's fresh
+    # twin and joins it.
+    monkeypatch.setenv('VIDNETS_AGENT_BRIDGE_DIR', str(tmp_path))
+    monkeypatch.setenv('VIDZEO_AGENT_MIN_WALL_SECONDS', '0')
+    payload = _payload()
+    results = {}
+    first = _post_in_thread(results, 'first', payload, timeout=2)
+    time.sleep(0.5)
+    second = _post_in_thread(results, 'second', payload, timeout=120)
+    third = _post_in_thread(results, 'third', payload, timeout=120)
+    time.sleep(0.3)
+    assert len(_request_dirs(tmp_path)) == 1, 'joiner minted before the twin expired'
+    first.join(timeout=10)
+    assert isinstance(results['first'], agent_bridge.AgentBridgeError), results['first']
+    deadline = time.monotonic() + 5
+    fresh = None
+    while time.monotonic() < deadline:
+        pending = []
+        for d in _request_dirs(tmp_path):
+            request_file = d / 'request.json'
+            if not request_file.is_file():
+                continue
+            try:
+                state = json.loads(request_file.read_text(encoding='utf-8'))['state']
+            except (ValueError, KeyError):
+                continue
+            if state == 'pending':
+                pending.append(d)
+        if pending:
+            fresh = pending[0]
+            break
+        time.sleep(0.05)
+    assert fresh is not None, 'joiners did not file a fresh request after twin expiry'
+    time.sleep(0.5)
+    assert len(_request_dirs(tmp_path)) == 2, 'expired-twin fan-out minted duplicates'
+    agent_bridge.complete_request(fresh.name, 'owner', '{"scenes": [7]}')
+    second.join(timeout=10)
+    third.join(timeout=10)
+    assert not second.is_alive() and not third.is_alive()
+    assert _content(results['second']) == {'scenes': [7]}
+    assert _content(results['third']) == {'scenes': [7]}

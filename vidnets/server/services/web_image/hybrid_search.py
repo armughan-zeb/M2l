@@ -436,7 +436,17 @@ _EDITORIAL_SITE_BOOST = [
 ]
 
 
-def search_bing(query: str, limit: int = 36) -> List[Dict]:
+# Direct-egress proxy override (Nov 18, web-resilience): proxies=None
+# makes one requests call skip the env proxy vars. The resolver's
+# route-switching retry re-runs a failed lane direct via direct=True.
+_DIRECT_PROXIES = {"http": None, "https": None}
+
+
+def _request_proxies(direct: bool):
+    return dict(_DIRECT_PROXIES) if direct else None
+
+
+def search_bing(query: str, limit: int = 36, direct: bool = False) -> List[Dict]:
     """Search Bing synchronously (requests — reliable).
     
     Runs direct search first for maximum coverage and speed, then enriches
@@ -461,6 +471,7 @@ def search_bing(query: str, limit: int = 36) -> List[Dict]:
             params={"q": q, "form": "HDRSC2", "adlt": "strict"},
             headers=headers,
             timeout=10,
+            proxies=_request_proxies(direct),
         )
         if r is not None and r.status_code == 200:
             results = _parse_bing_html(r.text, limit)
@@ -489,6 +500,7 @@ def search_bing(query: str, limit: int = 36) -> List[Dict]:
                     params={"q": boosted_q, "form": "HDRSC2", "adlt": "strict"},
                     headers=headers,
                     timeout=8,
+                    proxies=_request_proxies(direct),
                 )
                 if r is not None and r.status_code == 200:
                     results = _parse_bing_html(r.text, limit)
@@ -508,7 +520,7 @@ _ddg_down_until: float = 0.0
 
 
 # ── URL DISCOVERY: DuckDuckGo (requests) ────────────────────────────
-def search_ddg(query: str, limit: int = 36) -> List[Dict]:
+def search_ddg(query: str, limit: int = 36, direct: bool = False) -> List[Dict]:
     """Search DuckDuckGo synchronously.
 
     Raises RuntimeError when the lane itself fails (homepage unreachable,
@@ -532,7 +544,8 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
 
     # Get vqd token
     try:
-        r = _request_get_with_retries(session, DUCKDUCKGO_HOMEPAGE, params={"q": q, "kp": "1"}, timeout=10)
+        r = _request_get_with_retries(session, DUCKDUCKGO_HOMEPAGE, params={"q": q, "kp": "1"}, timeout=10,
+                                        proxies=_request_proxies(direct))
     except Exception as exc:
         _ddg_down_until = time.monotonic() + 30.0
         raise RuntimeError(f"DDG homepage unreachable: {type(exc).__name__}: {exc}") from exc
@@ -560,6 +573,7 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
                 "Referer": f"https://duckduckgo.com/?q={q}",
             },
             timeout=10,
+            proxies=_request_proxies(direct),
         )
     except Exception as exc:
         _ddg_down_until = time.monotonic() + 30.0
@@ -604,7 +618,7 @@ def search_ddg(query: str, limit: int = 36) -> List[Dict]:
     return _relevance_gate(results[:limit * 2], q)
 
 
-# ── URL DISCOVERY: Parallel hybrid (Bing + DDG via ThreadPoolExecutor) ──
+# ── URL DISCOVERY: Parallel hybrid (Bing via ThreadPoolExecutor) ──
 def search_hybrid(
     queries: List[str],
     limit_per_query: int = 20,
@@ -612,7 +626,9 @@ def search_hybrid(
 ) -> Dict[str, List[Dict]]:
     """Search multiple queries in parallel using ThreadPoolExecutor.
 
-    Each query: Bing + DDG searched concurrently.
+    Each query: Bing searched (DuckDuckGo removed Nov 19, 2026 — it
+    bot-gates this egress; search_ddg stays defined for direct callers
+    and its unit tests, but no live lane calls it).
     Results merged, deduplicated per query.
     """
     if not queries:
@@ -627,9 +643,7 @@ def search_hybrid(
         # raised away Bing's already-fetched results for the query. A dead
         # engine must cost only its own rows, and the failure is logged
         # with its error class instead of swallowed.
-        for engine_name, engine_fn in (("bing", search_bing), ("ddg", search_ddg)):
-            if engine_name == "ddg" and time.monotonic() < _ddg_down_until:
-                continue
+        for engine_name, engine_fn in (("bing", search_bing),):
             try:
                 engine_results = engine_fn(q, limit_per_query)
             except Exception as exc:

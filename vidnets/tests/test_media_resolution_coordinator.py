@@ -318,6 +318,57 @@ class MediaResolutionCoordinatorTests(unittest.TestCase):
             assert _mixed_youtube_quota_reuse_cap(2) == 2
             assert _mixed_youtube_quota_reuse_cap(8) == 4
 
+    def test_youtube_reuse_cap_defaults_to_two_and_is_configurable(self):
+        # Run 9 (job a7f52c58): the single good clip tJbzMqJGH4k was capped
+        # at 1 use, so vision-passed frames for other scenes were dropped.
+        # One YouTube asset identity may now serve a second scene.
+        from services.media_resolution_coordinator import (
+            YOUTUBE_REUSE_CAP_DEFAULT,
+            _reuse_limit_for_resolution,
+            _youtube_reuse_cap,
+        )
+
+        assert YOUTUBE_REUSE_CAP_DEFAULT == 2
+        scene = {"source_policy": {"mixed_media": True}, "start_seconds": 30}
+        youtube = SceneResolution(scene_index=3, provider="youtube")
+        web = SceneResolution(scene_index=3, provider="web")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert _youtube_reuse_cap() == 2
+            assert _reuse_limit_for_resolution(scene, youtube, non_mixed_limit=4) == 2
+            assert _reuse_limit_for_resolution(scene, web, non_mixed_limit=4) == 2
+        with mock.patch.dict(
+            os.environ, {"VIDZEO_YT_REUSE_CAP": "3"}, clear=True
+        ):
+            assert _youtube_reuse_cap() == 3
+            assert _reuse_limit_for_resolution(scene, youtube, non_mixed_limit=4) == 3
+        with mock.patch.dict(
+            os.environ, {"VIDZEO_YT_REUSE_CAP": "junk"}, clear=True
+        ):
+            assert _youtube_reuse_cap() == 2
+        # The opening hook still never replays a physical asset.
+        intro = {"source_policy": {"mixed_media": True}, "is_intro": True}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert _reuse_limit_for_resolution(intro, youtube, non_mixed_limit=4) == 1
+
+    def test_youtube_quota_cap_default_follows_youtube_reuse_cap(self):
+        from services.media_resolution_coordinator import _mixed_youtube_quota_reuse_cap
+
+        with mock.patch.dict(
+            os.environ, {"VIDZEO_YT_REUSE_CAP": "3"}, clear=True
+        ):
+            assert _mixed_youtube_quota_reuse_cap(8) == 3
+            assert _mixed_youtube_quota_reuse_cap(2) == 2
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VIDZEO_YT_REUSE_CAP": "3",
+                "VIDZEO_MIXED_YT_QUOTA_REUSE_CAP": "4",
+            },
+            clear=True,
+        ):
+            # The quota-specific override still wins over the shared default.
+            assert _mixed_youtube_quota_reuse_cap(8) == 4
+
     def test_same_youtube_link_reuse_requires_a_distinct_vision_bound_distant_cut(self):
         import hashlib
         from pathlib import Path
@@ -1683,6 +1734,477 @@ def test_quota_retention_upgrades_fallback_stills_to_ready_youtube_cuts(tmp_path
     assert result[1].selected_path == str(clip_1)
 
 
+def _quota_clip_budget_scene():
+    """One relaxed gaming quota scene (GTA VI shape).
+
+    Strict like the production GTA scenes (``strict_identity`` and
+    ``strict_real_media``): the scene must fail closed without vision, so
+    the budget-exhausted best-so-far mint never applies to it.
+    """
+    return {
+        "scene_id": "quota-budget-scene",
+        "scene_index": 0,
+        "container_id": "game-features",
+        "text": "GTA VI feature detail scene",
+        "visual_requirement": {
+            "strict_identity": True,
+            "domain": "gaming",
+            "canonical_entity": "Grand Theft Auto VI",
+        },
+        "source_policy": {
+            "mixed_media": True,
+            "youtube_quota": True,
+            "strict_real_media": True,
+        },
+    }
+
+
+def test_quota_clip_batched_verdict_survives_expired_scene_budget(tmp_path):
+    """Regression: GTA VI tests 14/15 — a quota clip whose batched vision
+    verdict arrived after the per-scene budget expired was discarded
+    (``not_selected_finalist``) and the scene fell to a still, even though
+    the vision round trip was already paid for.
+
+    Non-adaptive review (no discovery-time early checks) so the only way
+    the clip can win is the batched verdict. The batch round trip (3s)
+    outlasts the per-scene budget (1s, the floor).
+    """
+    import time
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip = tmp_path / "yt_clip.mp4"
+    clip.write_bytes(b"\x00" * 1024)
+    still = tmp_path / "web_still.jpg"
+    still.write_bytes(b"\x00" * 1024)
+
+    def yt_lane(_scene, _cancel):
+        return [{
+            "path": str(clip), "source": "youtube", "provider": "youtube",
+            "media_type": "video", "candidate_id": "youtube:testclip",
+            "title": "Grand Theft Auto VI gameplay footage",
+            "metadata_score": 0.0,
+        }]
+
+    def web_lane(_scene, _cancel):
+        return [{
+            "path": str(still), "source": "web", "provider": "web",
+            "media_type": "image", "candidate_id": "web:teststill",
+            "title": "Grand Theft Auto VI official screenshot",
+            "final_score": 80.0,
+        }]
+
+    class SlowBatchVerifier:
+        """One batched vision round trip slower than the scene budget."""
+
+        def verify_batch(self, _scene, candidates):
+            time.sleep(3.0)
+            out = {}
+            for cand in candidates:
+                path = str(cand.get("path") or "")
+                if path == str(clip):
+                    out[path] = {
+                        "accepted": True, "status": "accepted",
+                        "visual_checked": True, "visual_available": True,
+                        "identity_score": 90.0, "action_score": 85.0,
+                        "context_score": 88.0, "final_score": 90.0,
+                    }
+                else:
+                    out[path] = {
+                        "accepted": False, "status": "rejected",
+                        "visual_checked": True, "visual_available": True,
+                        "identity_score": 10.0, "action_score": 10.0,
+                        "context_score": 10.0, "final_score": 10.0,
+                    }
+            return out
+
+        def __call__(self, _scene, _candidate):
+            return {
+                "accepted": True, "status": "accepted",
+                "visual_checked": True, "visual_available": True,
+                "final_score": 90.0,
+            }
+
+    result = resolve_storyboard_media_v2(
+        [_quota_clip_budget_scene()],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        visual_verifier=SlowBatchVerifier(),
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+        scene_budget_seconds=1.0,
+        adaptive_media_review=False,
+    )
+    assert result[0].provider == "youtube"
+    assert result[0].media_type == "video"
+    assert result[0].selected_path == str(clip)
+    # The paid-for batched verdict is consumed, not discarded on budget.
+    assert any(
+        a.get("stage") == "visual_gate"
+        and a.get("status") == "visual_pass"
+        and a.get("candidate_id") == "youtube:testclip"
+        for a in result[0].attempts
+    )
+    assert not any(
+        a.get("stage") == "visual_gate"
+        and a.get("status") == "not_selected_finalist"
+        and a.get("candidate_id") == "youtube:testclip"
+        for a in result[0].attempts
+    )
+
+
+def test_quota_clip_recovery_verified_after_scene_budget_expires(tmp_path):
+    """Regression: GTA VI test 12 — after the first YouTube clip was
+    vision-rejected, the cross-lane second clip was never vision-checked
+    (``skipped_after_scene_budget``) and the scene fell to a web still,
+    even though a second real clip was on disk.
+
+    The first clip carries a hard explicit-conflict rejection and the
+    still a watermark rejection (both production verdict shapes), so the
+    scene stays unresolved and must reach recovery. Each vision round
+    trip (3s) outlasts the per-scene budget (1s, the floor), so recovery
+    runs with the budget already expired.
+    """
+    import time
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip_1 = tmp_path / "yt_clip_1.mp4"
+    clip_1.write_bytes(b"\x00" * 1024)
+    clip_2 = tmp_path / "yt_clip_2.mp4"
+    clip_2.write_bytes(b"\x00" * 1024)
+    still = tmp_path / "web_still.jpg"
+    still.write_bytes(b"\x00" * 1024)
+
+    def yt_lane(_scene, _cancel):
+        return [{
+            "path": str(clip_1), "source": "youtube", "provider": "youtube",
+            "media_type": "video", "candidate_id": "youtube:first",
+            "title": "Grand Theft Auto VI gameplay footage",
+            "metadata_score": 0.0,
+        }]
+
+    def web_lane(_scene, _cancel):
+        # Finish after the YouTube lane so the discovery-time early check
+        # takes the clip, not the still: the clip must be judged (and
+        # rejected) in the primary gate for the cross-lane retry to trigger.
+        time.sleep(0.5)
+        return [{
+            "path": str(still), "source": "web", "provider": "web",
+            "media_type": "image", "candidate_id": "web:still",
+            "title": "Grand Theft Auto VI official screenshot",
+            "final_score": 80.0,
+        }]
+
+    def yt_fallback_lane(_scene, _cancel):
+        return [{
+            "path": str(clip_2), "source": "youtube", "provider": "youtube",
+            "media_type": "video", "candidate_id": "youtube:second",
+            "title": "Grand Theft Auto VI gameplay footage",
+            "metadata_score": 0.0,
+        }]
+
+    yt_fallback_lane.retry_rejected_primary = True
+
+    verified = []
+
+    def slow_verifier(_scene, candidate):
+        # One slow inbox-style round trip per call: the first call alone
+        # spends the whole per-scene budget.
+        time.sleep(3.0)
+        path = str(candidate.get("path") or "")
+        verified.append(path)
+        if path == str(clip_1):
+            # Hard explicit-conflict rejection (production shape): the
+            # relaxed gate must not soft-retain this clip.
+            return {
+                "accepted": False, "status": "rejected",
+                "visual_checked": True, "visual_available": True,
+                "fatal_mismatch": True,
+                "reason": "wrong game: footage shows a different game, not Grand Theft Auto VI",
+                "rejection_reason": "explicit_scene_conflict",
+                "identity_score": 10.0, "action_score": 10.0,
+                "context_score": 10.0, "final_score": 10.0,
+            }
+        if path == str(still):
+            # Hard watermark rejection, as in production test 12 scene 4.
+            return {
+                "accepted": False, "status": "rejected",
+                "visual_checked": True, "visual_available": True,
+                "watermark": True,
+                "reason": "watermark_detected",
+                "identity_score": 10.0, "action_score": 10.0,
+                "context_score": 10.0, "final_score": 10.0,
+            }
+        return {
+            "accepted": True, "status": "accepted",
+            "visual_checked": True, "visual_available": True,
+            "identity_score": 90.0, "action_score": 85.0,
+            "context_score": 88.0, "final_score": 90.0,
+        }
+
+    result = resolve_storyboard_media_v2(
+        [_quota_clip_budget_scene()],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        youtube_fallback_lane=yt_fallback_lane,
+        visual_verifier=slow_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+        scene_budget_seconds=1.0,
+        adaptive_media_review=True,
+    )
+    assert str(clip_2) in verified
+    assert result[0].provider == "youtube"
+    assert result[0].media_type == "video"
+    assert result[0].selected_path == str(clip_2)
+    assert not any(
+        a.get("status") == "skipped_after_scene_budget"
+        and a.get("candidate_id") == "youtube:second"
+        for a in result[0].attempts
+    )
+
+
+def test_quota_clip_inline_rejection_still_earns_cross_lane_retry(tmp_path):
+    """Regression: a quota clip first judged (and rejected) in the inline
+    branch — because the primary gate never reached it before the
+    per-scene budget expired — must still earn its cross-lane retry.
+
+    The batched round trip fails after outlasting the budget, so the
+    primary gate judges nothing; the clip is verified inline and
+    rejected there. Without the late-rejection record, the recovery
+    specs (computed before selection) would never offer the second clip.
+    """
+    import time
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip_1 = tmp_path / "yt_clip_1.mp4"
+    clip_1.write_bytes(b"\x00" * 1024)
+    clip_2 = tmp_path / "yt_clip_2.mp4"
+    clip_2.write_bytes(b"\x00" * 1024)
+    still = tmp_path / "web_still.jpg"
+    still.write_bytes(b"\x00" * 1024)
+
+    def yt_lane(_scene, _cancel):
+        # Finish after the web lane so the discovery-time early check
+        # takes the still: the clip must stay unjudged until selection.
+        time.sleep(0.5)
+        return [{
+            "path": str(clip_1), "source": "youtube", "provider": "youtube",
+            "media_type": "video", "candidate_id": "youtube:first",
+            "title": "Grand Theft Auto VI gameplay footage",
+            "metadata_score": 0.0,
+        }]
+
+    def web_lane(_scene, _cancel):
+        return [{
+            "path": str(still), "source": "web", "provider": "web",
+            "media_type": "image", "candidate_id": "web:still",
+            "title": "Grand Theft Auto VI official screenshot",
+            "final_score": 80.0,
+        }]
+
+    def yt_fallback_lane(_scene, _cancel):
+        return [{
+            "path": str(clip_2), "source": "youtube", "provider": "youtube",
+            "media_type": "video", "candidate_id": "youtube:second",
+            "title": "Grand Theft Auto VI gameplay footage",
+            "metadata_score": 0.0,
+        }]
+
+    yt_fallback_lane.retry_rejected_primary = True
+
+    verified = []
+
+    class FailingBatchVerifier:
+        """Batch fails after outlasting the budget; single verifies are slow."""
+
+        def verify_batch(self, _scene, _candidates):
+            time.sleep(3.0)
+            raise RuntimeError("batch transport failed")
+
+        def __call__(self, _scene, candidate):
+            time.sleep(3.0)
+            path = str(candidate.get("path") or "")
+            verified.append(path)
+            if path == str(clip_1):
+                return {
+                    "accepted": False, "status": "rejected",
+                    "visual_checked": True, "visual_available": True,
+                    "fatal_mismatch": True,
+                    "reason": "wrong game: footage shows a different game, not Grand Theft Auto VI",
+                    "rejection_reason": "explicit_scene_conflict",
+                    "identity_score": 10.0, "action_score": 10.0,
+                    "context_score": 10.0, "final_score": 10.0,
+                }
+            if path == str(still):
+                return {
+                    "accepted": False, "status": "rejected",
+                    "visual_checked": True, "visual_available": True,
+                    "watermark": True,
+                    "reason": "watermark_detected",
+                    "identity_score": 10.0, "action_score": 10.0,
+                    "context_score": 10.0, "final_score": 10.0,
+                }
+            return {
+                "accepted": True, "status": "accepted",
+                "visual_checked": True, "visual_available": True,
+                "identity_score": 90.0, "action_score": 85.0,
+                "context_score": 88.0, "final_score": 90.0,
+            }
+
+    result = resolve_storyboard_media_v2(
+        [_quota_clip_budget_scene()],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        youtube_fallback_lane=yt_fallback_lane,
+        visual_verifier=FailingBatchVerifier(),
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+        scene_budget_seconds=1.0,
+        adaptive_media_review=True,
+    )
+    assert str(clip_2) in verified
+    assert result[0].provider == "youtube"
+    assert result[0].media_type == "video"
+    assert result[0].selected_path == str(clip_2)
+
+
+def test_quota_gate_hard_rejection_not_softened_by_era_prose():
+    """The gate's reason code is authoritative, not the model's prose.
+
+    GTA VI tests 12/15: both clips were visual_rejected for severe
+    overlays, but ``_quota_gate_is_hard_rejection`` returned False because
+    the model's free-text reason contained the substring "era" ("it does
+    not literally show the subject" / "the subject, game, era and action
+    match") and the spurious-token scan ran before the hard-code check.
+    """
+    from services.media_resolution_coordinator import _quota_gate_is_hard_rejection
+
+    scene = _quota_clip_budget_scene()
+    assert _quota_gate_is_hard_rejection(
+        "visual_rejected",
+        {
+            "accepted": False, "visual_checked": True, "severe_overlay": True,
+            "rejection_reason": "severe_overlay_or_subtitle_detected",
+            "reason": "Accept: authentic GTA VI gameplay. Approximate: it "
+            "shows open-water Leonida, not Vice City streets, and the exact "
+            "action of the city opening is not literally visible.",
+        },
+        scene=scene,
+    )
+    assert _quota_gate_is_hard_rejection(
+        "visual_rejected",
+        {
+            "accepted": False, "visual_checked": True,
+            "reason": "Authentic GTA VI gameplay of a female character on "
+            "the run from police in Vice City; it does not literally show "
+            "Liberty City, but the subject, game, era and criminal-on-the-run "
+            "action match the scene at subject level.",
+        },
+        scene=scene,
+    )
+    # A non-hard code is still softened by spurious prose.
+    assert not _quota_gate_is_hard_rejection(
+        "visual_unavailable",
+        {"accepted": False, "reason": "footage from an older era, insufficient pixels"},
+        scene=scene,
+    )
+
+
+def test_quota_retention_never_restores_a_live_visual_rejection(tmp_path, capsys):
+    """Regression: GTA VI test 12 scene 12 / test 15 scene 4.
+
+    The YouTube clip was visual_rejected at the coordinator's vision gate
+    (severe overlay / subtitle), yet quota retention shipped it as
+    ``youtube_quota_upgrade``: the hard-rejection check was fooled by the
+    substring "era" in the model's prose, and the agent-job / relaxed
+    soft-pass then minted ``accepted=True`` over the live rejection.
+    The scene must stay on its web still; the rejection is respected.
+    """
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip = tmp_path / "yt_clip.mp4"
+    clip.write_bytes(b"\x00" * 1024)
+    still = tmp_path / "web_still.jpg"
+    still.write_bytes(b"\x00" * 1024)
+
+    def yt_lane(_scene, _cancel):
+        return [{
+            "path": str(clip), "source": "youtube", "provider": "youtube",
+            "media_type": "video", "candidate_id": "youtube:ryckrUic0dU",
+            "title": "Grand Theft Auto VI gameplay footage",
+            "metadata_score": 0.0,
+        }]
+
+    def web_lane(_scene, _cancel):
+        return [{
+            "path": str(still), "source": "web", "provider": "web",
+            "media_type": "image", "candidate_id": "web:teststill",
+            "title": "Grand Theft Auto VI official screenshot",
+            "final_score": 80.0,
+        }]
+
+    def verifier(_scene, candidate):
+        if str(candidate.get("path") or "") == str(clip):
+            # Production gate-time verdict for test 12 scene 12
+            # (ryckrUic0dU): rejected for severe overlays; the prose
+            # contains "literally", which used to defeat the hard check.
+            return {
+                "accepted": False, "status": "rejected",
+                "verification_status": "visual_verification_pending",
+                "visual_checked": True, "visual_available": True,
+                "semantic_verified": False, "deterministic_only": True,
+                "candidate_id": "youtube:ryckrUic0dU",
+                "entity_conflict": False, "fatal_mismatch": False,
+                "identity_score": 80.0, "action_score": 60.0,
+                "context_score": 80.0, "final_score": 76.0,
+                "severe_overlay": True, "watermark": True, "subtitle": False,
+                "rejection_reason": "severe_overlay_or_subtitle_detected",
+                "reason": "Accept: authentic GTA VI gameplay showing "
+                "Leonida's open water/Keys environment. Approximate: it "
+                "shows open-water Leonida, not Vice City streets, and the "
+                "exact action of the city opening is not literally visible.",
+                "scene_description": "GTA VI gameplay: a man fishing from "
+                "the water in the Leonida Keys/Grassrivers area.",
+            }
+        return {
+            "accepted": True, "status": "accepted",
+            "visual_checked": True, "visual_available": True,
+            "identity_score": 90.0, "action_score": 85.0,
+            "context_score": 88.0, "final_score": 90.0,
+        }
+
+    # Production shape: an external-agent job, so the agent-job soft-pass
+    # that used to resurrect the clip is live here too.
+    with job_scope({"llm_provider": "external_agent"}):
+        result = resolve_storyboard_media_v2(
+            [_quota_clip_budget_scene()],
+            youtube_lane=yt_lane,
+            web_lane=web_lane,
+            visual_verifier=verifier,
+            neutral_factory=lambda _s: None,
+            deadline_seconds=30.0,
+            adaptive_media_review=False,
+        )
+    assert result[0].provider == "web"
+    assert result[0].selected_path == str(still)
+    assert not any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+    assert any(
+        a.get("stage") == "visual_gate"
+        and a.get("status") == "visual_rejected"
+        and a.get("candidate_id") == "youtube:ryckrUic0dU"
+        for a in result[0].attempts
+    )
+    assert "live vision rejection respected" in capsys.readouterr().out
+
+
 def _quota_retention_strict_scene(tmp_path, clip_path, still_path, pool_decision_extra=None):
     """One strict quota scene whose YouTube cut arrives late (lazy lane).
 
@@ -1878,6 +2400,120 @@ def test_quota_upgrade_never_mints_acceptance_from_download_alone(tmp_path):
         and a.get("status") == "upgraded_to_scene_youtube_cut"
         for a in result[0].attempts
     )
+
+
+def test_quota_retention_fail_open_still_mints_a_never_judged_clip(tmp_path, monkeypatch):
+    """The legitimate fail-open survives the live-rejection fix.
+
+    When vision never judged the clip there is genuinely no verdict for
+    it — it arrives via the lane row after discovery, and the late quota
+    lane never verifies it — so the retention fail-open mints it as
+    ``deterministic_degraded``. Only a LIVE rejection is a veto, never a
+    missing verdict. The web still is watermark-rejected so the scene is
+    unresolved at retention (retention only fills unresolved quota slots).
+    Guards against over-blocking the fix above.
+    """
+    import services.media_resolution_coordinator as coordinator
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _quota_retention_strict_scene(tmp_path, clip, still)
+
+    real_hard_gate = coordinator._candidate_hard_gate
+
+    def hard_gate(scene, candidate):
+        # Fixture the "never judged" shape: keep the downloaded cut out
+        # of the late quota verification lane, so no gated outcome is
+        # recorded for it at all.
+        if str(candidate.get("path") or "") == str(clip):
+            return False, "fixture_no_vision_verdict"
+        return real_hard_gate(scene, candidate)
+
+    monkeypatch.setattr(coordinator, "_candidate_hard_gate", hard_gate)
+
+    def verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            raise AssertionError("a never-judged clip must not reach vision")
+        return {
+            "accepted": False, "status": "rejected",
+            "visual_checked": True, "visual_available": True,
+            "watermark": True, "identity_score": 10.0,
+            "action_score": 10.0, "context_score": 10.0, "final_score": 10.0,
+            "reason": "watermark_detected",
+        }
+
+    result = resolve_storyboard_media_v2(
+        [scene],
+        youtube_lane=yt_lane,
+        web_lane=web_lane,
+        visual_verifier=verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=30.0,
+    )
+
+    assert result[0].provider == "youtube"
+    assert result[0].selected_path == str(clip)
+    assert any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+    # The mint is the auditable fail-open, not a live vision pass.
+    decision = dict(result[0].visual_decision or {})
+    assert decision.get("status") == "deterministic_degraded"
+
+
+def test_quota_retention_agent_job_fail_open_survives_vision_outage(tmp_path):
+    """A vision outage still fail-opens for agent jobs (production shape).
+
+    Strict scene, vision down (``vision_unavailable`` recorded by the
+    late quota lane), scene unresolved: the agent-job soft-pass mints the
+    downloaded cut. The live-rejection veto must not fire here — there
+    is no live verdict, only a transport failure — or the outage path
+    that production relies on would fail closed.
+    """
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _quota_retention_strict_scene(tmp_path, clip, still)
+
+    def verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            return {"accepted": False, "status": "vision_unavailable",
+                    "reason": "vision_unavailable", "visual_checked": False,
+                    "visual_available": False}
+        return {
+            "accepted": False, "status": "rejected",
+            "visual_checked": True, "visual_available": True,
+            "watermark": True, "identity_score": 10.0,
+            "action_score": 10.0, "context_score": 10.0, "final_score": 10.0,
+            "reason": "watermark_detected",
+        }
+
+    with job_scope({"llm_provider": "external_agent"}):
+        result = resolve_storyboard_media_v2(
+            [scene],
+            youtube_lane=yt_lane,
+            web_lane=web_lane,
+            visual_verifier=verifier,
+            neutral_factory=lambda _s: None,
+            deadline_seconds=30.0,
+        )
+
+    assert result[0].provider == "youtube"
+    assert result[0].selected_path == str(clip)
+    assert any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+    # No live vision behind the mint: the verdict still says so.
+    decision = dict(result[0].visual_decision or {})
+    assert decision.get("accepted") is True
+    assert decision.get("status") == "vision_unavailable"
 
 
 def test_late_verification_deadline_floors_when_delivery_wall_spent():
@@ -2591,3 +3227,482 @@ def test_spare_pool_tier_a_runs_once_per_unresolved_scene(monkeypatch):
     )
     assert result[0].selected_path == ""
     assert len(calls) == 1, f"spare tier ran {len(calls)} times, expected exactly 1"
+
+
+# --- Verdict arbitration (Panama test 5, job 90f39628) ---
+#
+# Root cause: the coordinator seeds its in-memory fatal ledger ONCE at
+# resolve start. Worker-3's fatal REJECT for 39_4MuOX_2U (30,
+# fatal_mismatch — large burned-in captions block center-frame, expansion
+# story contradicts the scene) was filed to the file ledger
+# (_verdict_conflicts.json, record "adapter-fatal:7:39_4MuOX_2U") AFTER
+# the seed, while worker-4's ACCEPT (82) had already won first-write-wins
+# in the bridge. Nothing re-read the file ledger afterwards, so every
+# later decision point kept using the ACCEPT — the clip is in the
+# manifest's real_youtube_scenes (scenes 7 and 10, as seg1of2/seg2of2)
+# AND in final_real_media_rejected_paths. A fatal REJECT must win over
+# an ACCEPT for the same candidate; the tests below fail on clean HEAD
+# (the ACCEPT is used) and pass once the coordinator refreshes the fatal
+# ledger from the file at arbitration time.
+#
+# The fixtures below are faithful copies of the real Panama record
+# (video id, requirement hash, asset sha, fatal verdict fields) with the
+# job id re-scoped to a synthetic test job so the tests never touch the
+# live runtime ledger.
+
+_ARBITRATION_JOB_ID = "verdict-arbitration-panama"
+_ARBITRATION_VIDEO_ID = "39_4MuOX_2U"
+_ARBITRATION_REQUIREMENT_HASH = (
+    "8b78419c746855b3e6aa4958e7d7d34851f2075707cee2ba663a05afbf611f10"
+)
+_ARBITRATION_ASSET_SHA = (
+    "e902d61c37d371350ad9b7720a4b865d4d2613728d9f9a834b76c5c0bfc24bb0"
+)
+
+
+def _arbitration_fatal_verdict():
+    """Worker-3's verdict on 39_4MuOX_2U, verbatim from the live ledger."""
+    return {
+        "candidate_id": "youtube:39_4MuOX_2U",
+        "entity_conflict": False,
+        "identity_score": 70.0,
+        "action_score": 40.0,
+        "context_score": 45.0,
+        "fatal_mismatch": True,
+        "domain_match": True,
+        "scene_match": False,
+        "final_score": 30.0,
+        "visual_checked": True,
+        "visual_available": True,
+        "unsafe_content": False,
+        "suggestive_content": False,
+        "accepted": False,
+        "status": "rejected",
+        "reason": (
+            "Authentic Panama Canal footage, but every frame carries a large "
+            "burned-in caption ('AND THE WORLD NEEDED', 'MORE CAPACITY', "
+            "'SO PANAMA BEGAN ANOTHER', 'ENORMOUS ENGINEERING PROJECT', "
+            "'THE EXPANSION OF THE CANAL') that blocks the center of frame "
+            "and tells the expansion story, contradicting this scene's "
+            "narration about the two-hour passage. Frames 4-5 are the "
+            "expansion construction, a different event from the transit. "
+            "Unusable for this scene."
+        ),
+    }
+
+
+def _arbitration_accept_verdict():
+    """Worker-4's verdict on 39_4MuOX_2U: ACCEPT (82)."""
+    return {
+        "candidate_id": "youtube:39_4MuOX_2U",
+        "accepted": True,
+        "status": "accepted",
+        "verification_status": "accepted",
+        "visual_checked": True,
+        "visual_available": True,
+        "semantic_verified": True,
+        "identity_score": 85.0,
+        "action_score": 80.0,
+        "context_score": 82.0,
+        "final_score": 82.0,
+        "fatal_mismatch": False,
+        "entity_conflict": False,
+        "reason": (
+            "Authentic Panama Canal transit footage; captions are present "
+            "across the frame but do not block the lock chambers or the "
+            "transiting ship."
+        ),
+    }
+
+
+def _arbitration_scene():
+    """Panama scene 7 (0-based), the scene the fatal was filed for."""
+    return {
+        "scene_index": 7,
+        "scene_id": "panama-passage",
+        "text": "With it, the passage takes two hours.",
+        "visual_requirement": {
+            "requirement_hash": _ARBITRATION_REQUIREMENT_HASH,
+            "domain": "documentary",
+            "subject_type": "panama_canal",
+        },
+    }
+
+
+def _write_arbitration_fatal_ledger(
+    bridge_dir,
+    job_id=_ARBITRATION_JOB_ID,
+    scene_index=7,
+    requirement_hash=_ARBITRATION_REQUIREMENT_HASH,
+    video_id=_ARBITRATION_VIDEO_ID,
+    verdict=None,
+):
+    """File one fatal record in a scratch bridge ledger, as the adapter
+    does for a late bridge answer (``record_late_fatal_reject``)."""
+    import json
+    from pathlib import Path
+
+    record = {
+        "request_id": f"adapter-fatal:{scene_index}:{video_id}",
+        "candidate_id": f"youtube:{video_id}",
+        "video_id": video_id,
+        "asset_sha256": _ARBITRATION_ASSET_SHA,
+        "scene_index": scene_index,
+        "requirement_hash": requirement_hash,
+        "job_id": job_id,
+        "verdict": dict(verdict if verdict is not None else _arbitration_fatal_verdict()),
+        "winner": None,
+    }
+    Path(bridge_dir).mkdir(parents=True, exist_ok=True)
+    (Path(bridge_dir) / "_verdict_conflicts.json").write_text(
+        json.dumps([record]), encoding="utf-8"
+    )
+    return record
+
+
+def test_verdict_arbitration_late_fatal_reject_beats_cached_accept(tmp_path, monkeypatch):
+    """Fatal REJECT + cached ACCEPT for one candidate -> candidate NOT used.
+
+    Worker-4's ACCEPT is cached first (bridge ledger still empty, so the
+    in-memory fatal ledger is empty, exactly as seeded at resolve start).
+    Worker-3's fatal REJECT is then filed to the file ledger. A later
+    check of the same candidate must return the fatal veto, not the
+    cached ACCEPT, and must not spend a fresh vision read to do it.
+    """
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import _cached_verification_result
+
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setenv("VIDNETS_AGENT_BRIDGE_DIR", str(bridge_dir))
+    clip = tmp_path / "39_4MuOX_2U.mp4"
+    clip.write_bytes(b"panama clip bytes")
+    candidate = {
+        "path": str(clip),
+        "source": "youtube",
+        "candidate_id": "youtube:39_4MuOX_2U",
+    }
+    scene = _arbitration_scene()
+    cache, unavailable = {}, {}
+    fatal_rejections, fatal_reject_verdicts = set(), {}
+    with job_scope({"job_id": _ARBITRATION_JOB_ID}):
+        accepted, _reason, _score, _verdict = _cached_verification_result(
+            7, scene, candidate,
+            lambda _s, _c: dict(_arbitration_accept_verdict()),
+            cache, unavailable,
+            fatal_rejections=fatal_rejections,
+            fatal_reject_verdicts=fatal_reject_verdicts,
+        )
+        assert accepted is True
+        # Worker-3's fatal REJECT arrives late and is filed to the file ledger.
+        _write_arbitration_fatal_ledger(bridge_dir)
+
+        def _must_not_verify(_s, _c):
+            raise AssertionError(
+                "a late-filed fatal must veto without a fresh vision read"
+            )
+
+        accepted, reason, _score, verdict = _cached_verification_result(
+            7, scene, candidate, _must_not_verify,
+            cache, unavailable,
+            fatal_rejections=fatal_rejections,
+            fatal_reject_verdicts=fatal_reject_verdicts,
+        )
+    assert accepted is False
+    assert reason == "prior_fatal_mismatch_rejection"
+    assert verdict.get("fatal_mismatch") is True
+
+
+def test_verdict_arbitration_late_fatal_reject_beats_branch_accept(tmp_path, monkeypatch):
+    """Fatal REJECT + bound branch ACCEPT for one candidate -> NOT used.
+
+    Same Panama conflict in branch-verdict shape: the candidate row
+    carries worker-4's bound ACCEPT (the ``visual_pass`` reuse shortcut),
+    while worker-3's fatal REJECT sits in the file ledger, filed after
+    the job-start seed. The branch ACCEPT must not win: the fatal vetoes
+    before any branch reuse. The first half proves the fixture really
+    exercises branch reuse (ACCEPT with no ledger present).
+    """
+    import hashlib
+
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import _verification_result
+
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setenv("VIDNETS_AGENT_BRIDGE_DIR", str(bridge_dir))
+    clip = tmp_path / "39_4MuOX_2U.mp4"
+    clip.write_bytes(b"panama clip bytes")
+    clip_sha = hashlib.sha256(clip.read_bytes()).hexdigest()
+    branch = dict(
+        _arbitration_accept_verdict(),
+        verified_requirement_hash=_ARBITRATION_REQUIREMENT_HASH,
+        verified_asset_sha256=clip_sha,
+    )
+    candidate = {
+        "path": str(clip),
+        "source": "youtube",
+        "candidate_id": "youtube:39_4MuOX_2U",
+        "visual_decision": branch,
+    }
+    scene = _arbitration_scene()
+
+    def _must_not_verify(_s, _c):
+        raise AssertionError("branch reuse / fatal veto must not call vision")
+
+    with job_scope({"job_id": _ARBITRATION_JOB_ID}):
+        accepted, reason, _score, _verdict = _verification_result(
+            scene, candidate, _must_not_verify, scene_index=7,
+            fatal_rejections=set(), fatal_reject_verdicts={},
+        )
+        assert accepted is True
+        assert reason == "visual_pass"
+        # Worker-3's fatal REJECT is filed late; the in-memory ledger
+        # handed in below is still the empty pre-filing seed.
+        _write_arbitration_fatal_ledger(bridge_dir)
+        accepted, reason, _score, verdict = _verification_result(
+            scene, candidate, _must_not_verify, scene_index=7,
+            fatal_rejections=set(), fatal_reject_verdicts={},
+        )
+    assert accepted is False
+    assert reason == "prior_fatal_mismatch_rejection"
+    assert verdict.get("fatal_mismatch") is True
+
+
+def test_verdict_arbitration_lone_accept_still_uses_candidate(tmp_path, monkeypatch):
+    """Guard against over-blocking: with no fatal anywhere, a lone live
+    ACCEPT is still used — through the cache and through branch reuse."""
+    import hashlib
+
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import (
+        _cached_verification_result,
+        _verification_result,
+    )
+
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setenv("VIDNETS_AGENT_BRIDGE_DIR", str(bridge_dir))
+    clip = tmp_path / "39_4MuOX_2U.mp4"
+    clip.write_bytes(b"panama clip bytes")
+    clip_sha = hashlib.sha256(clip.read_bytes()).hexdigest()
+    scene = _arbitration_scene()
+    with job_scope({"job_id": _ARBITRATION_JOB_ID}):
+        accepted, reason, _score, _verdict = _cached_verification_result(
+            7, scene,
+            {"path": str(clip), "source": "youtube",
+             "candidate_id": "youtube:39_4MuOX_2U"},
+            lambda _s, _c: dict(_arbitration_accept_verdict()),
+            {}, {}, fatal_rejections=set(), fatal_reject_verdicts={},
+        )
+        assert accepted is True
+        branch = dict(
+            _arbitration_accept_verdict(),
+            verified_requirement_hash=_ARBITRATION_REQUIREMENT_HASH,
+            verified_asset_sha256=clip_sha,
+        )
+        accepted, reason, _score, _verdict = _verification_result(
+            scene,
+            {"path": str(clip), "source": "youtube",
+             "candidate_id": "youtube:39_4MuOX_2U", "visual_decision": branch},
+            lambda _s, _c: (_ for _ in ()).throw(
+                AssertionError("branch reuse must not call vision")),
+            scene_index=7, fatal_rejections=set(), fatal_reject_verdicts={},
+        )
+        assert accepted is True
+        assert reason == "visual_pass"
+
+
+def _arbitration_quota_scene(tmp_path, clip_path, still_path):
+    """Strict quota scene whose late YouTube cut carries its video id.
+
+    ``_quota_retention_strict_scene``'s late row has no candidate_id; the
+    production pool rows do, and the fatal ledger attributes a cut by
+    content (video id), so the id is set here to mirror production.
+    """
+    scene, yt_lane, web_lane = _quota_retention_strict_scene(
+        tmp_path, clip_path, still_path
+    )
+    yt_lane._late_rows[0]["candidate_id"] = "youtube:39_4MuOX_2U"
+    yt_lane._late_rows[0]["source_url"] = (
+        "https://www.youtube.com/watch?v=39_4MuOX_2U"
+    )
+    return scene, yt_lane, web_lane
+
+
+def test_quota_retention_vetoes_clip_with_late_filed_fatal_verdict(tmp_path, monkeypatch):
+    """Panama timing, end to end: worker-4's ACCEPT is the live verdict
+    the late quota lane records, while worker-3's fatal REJECT for the
+    same cut is filed to the file ledger mid-gate (the verifier files it
+    as a side effect, exactly as the adapter does for a late bridge
+    answer). Quota retention must not mint the clip over the late-filed
+    fatal: the scene stays on its web still."""
+    from services.agent_bridge import bridge_root
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+    from services.verdict_conflicts import record_late_fatal_reject
+
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setenv("VIDNETS_AGENT_BRIDGE_DIR", str(bridge_dir))
+    # The ledger lock opens its lock file without creating the parent
+    # directory (production always has a bridge dir); make it so the
+    # mid-gate filing below can write.
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _arbitration_quota_scene(tmp_path, clip, still)
+    filed = []
+
+    def verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            if not filed:
+                filed.append(True)
+                record_late_fatal_reject(bridge_root(), {
+                    "request_id": "adapter-fatal:0:39_4MuOX_2U",
+                    "candidate_id": "youtube:39_4MuOX_2U",
+                    "video_id": "39_4MuOX_2U",
+                    "asset_sha256": _ARBITRATION_ASSET_SHA,
+                    "scene_index": 0,
+                    "requirement_hash": "quota-strict-requirement-hash",
+                    "job_id": _ARBITRATION_JOB_ID,
+                    "verdict": _arbitration_fatal_verdict(),
+                    "winner": None,
+                })
+            return dict(_arbitration_accept_verdict())
+        return {"accepted": True, "status": "accepted", "visual_checked": True}
+
+    with job_scope({"job_id": _ARBITRATION_JOB_ID, "llm_provider": "external_agent"}):
+        result = resolve_storyboard_media_v2(
+            [scene],
+            youtube_lane=yt_lane,
+            web_lane=web_lane,
+            visual_verifier=verifier,
+            neutral_factory=lambda _s: None,
+            deadline_seconds=30.0,
+        )
+    assert filed == [True]
+    assert result[0].provider == "web"
+    assert result[0].selected_path == str(still)
+    assert not any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+
+
+def test_quota_retention_still_vetoes_preseeded_fatal_reject(tmp_path, monkeypatch):
+    """The a735a3f retention veto still holds: a fatal already in the
+    file ledger when the job starts (seeded at resolve start) vetoes the
+    quota mint even though live vision ACCEPTs the clip. Guards the
+    pre-existing veto against the refresh change below."""
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setenv("VIDNETS_AGENT_BRIDGE_DIR", str(bridge_dir))
+    clip = tmp_path / "quota-cut.mp4"
+    still = tmp_path / "quota-still.jpg"
+    scene, yt_lane, web_lane = _arbitration_quota_scene(tmp_path, clip, still)
+    _write_arbitration_fatal_ledger(
+        bridge_dir,
+        scene_index=0,
+        requirement_hash="quota-strict-requirement-hash",
+    )
+
+    def verifier(_scene, candidate):
+        if str(candidate.get("source") or "") == "youtube":
+            return dict(_arbitration_accept_verdict())
+        return {"accepted": True, "status": "accepted", "visual_checked": True}
+
+    with job_scope({"job_id": _ARBITRATION_JOB_ID, "llm_provider": "external_agent"}):
+        result = resolve_storyboard_media_v2(
+            [scene],
+            youtube_lane=yt_lane,
+            web_lane=web_lane,
+            visual_verifier=verifier,
+            neutral_factory=lambda _s: None,
+            deadline_seconds=30.0,
+        )
+    assert result[0].provider == "web"
+    assert result[0].selected_path == str(still)
+    assert not any(
+        a.get("stage") == "quota_retention_own_clip_upgrade"
+        and a.get("status") == "upgraded_to_scene_youtube_cut"
+        for a in result[0].attempts
+    )
+
+
+def _arbitration_nonfatal_reject_verdict():
+    """Worker-2's verdict on GRDGQERSmDE (Panama scene 9): REJECT (32,
+    wrong aspect/era), NOT fatal — the non-fatal half of the conflict."""
+    return {
+        "candidate_id": "youtube:GRDGQERSmDE",
+        "accepted": False,
+        "status": "rejected",
+        "visual_checked": True,
+        "visual_available": True,
+        "fatal_mismatch": False,
+        "entity_conflict": False,
+        "identity_score": 40.0,
+        "action_score": 30.0,
+        "context_score": 35.0,
+        "final_score": 32.0,
+        "reason": (
+            "Wrong aspect and era for the recognitions scene: vertical "
+            "archival footage of an earlier ceremony, not the canal "
+            "handover the scene narrates."
+        ),
+    }
+
+
+def test_verdict_arbitration_live_branch_reject_beats_later_live_accept(tmp_path, monkeypatch):
+    """Rule for non-fatal conflicts: a live vision REJECT for a candidate
+    wins over a later live ACCEPT for the SAME cut (same scene, same
+    bytes). The candidate row carries worker-2's live REJECT for
+    GRDGQERSmDE (32, wrong aspect/era, not fatal); a fresh live read
+    ACCEPTs the same cut. The REJECT stands and no fresh vision read is
+    spent: the candidate is not used. A different cut of the same video
+    is judged on its own — only the same cut is vetoed."""
+    from services.job_context import job_scope
+    from services.media_resolution_coordinator import _verification_result
+
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setenv("VIDNETS_AGENT_BRIDGE_DIR", str(bridge_dir))
+    clip = tmp_path / "GRDGQERSmDE.mp4"
+    clip.write_bytes(b"recognitions clip bytes")
+    scene = {
+        "scene_index": 9,
+        "scene_id": "panama-recognitions",
+        "text": "The canal recognitions ceremony honors the workers.",
+        "visual_requirement": {
+            "requirement_hash": "grdgqersmde-scene-9-hash",
+            "domain": "documentary",
+            "subject_type": "panama_canal",
+        },
+    }
+    candidate = {
+        "path": str(clip),
+        "source": "youtube",
+        "candidate_id": "youtube:GRDGQERSmDE",
+        "visual_decision": _arbitration_nonfatal_reject_verdict(),
+    }
+
+    def _accepting_verifier(_s, _c):
+        return {
+            "candidate_id": "youtube:GRDGQERSmDE",
+            "accepted": True,
+            "status": "accepted",
+            "visual_checked": True,
+            "visual_available": True,
+            "semantic_verified": True,
+            "final_score": 82.0,
+            "fatal_mismatch": False,
+            "entity_conflict": False,
+            "reason": "Authentic handover ceremony footage.",
+        }
+
+    with job_scope({"job_id": _ARBITRATION_JOB_ID}):
+        accepted, _reason, _score, verdict = _verification_result(
+            scene, candidate, _accepting_verifier, scene_index=9,
+            fatal_rejections=set(), fatal_reject_verdicts={},
+        )
+    assert accepted is False
+    assert verdict.get("final_score") == 32.0
+    assert verdict.get("fatal_mismatch") is False

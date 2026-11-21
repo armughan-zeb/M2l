@@ -194,10 +194,10 @@ test('spool rescues a request from a dead worker claim when another worker is al
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   assert.ok(fs.existsSync(requestFile), 'spool wrote the request file');
-  // worker-1 claims it, then dies: backdate the claim past the 2-minute grace.
+  // worker-1 claims it, then dies: backdate the claim past the 5-minute grace.
   const claimFile = path.join(dir, id + '.request.json.claimed-worker-1');
   fs.renameSync(requestFile, claimFile);
-  const old = new Date(Date.now() - 130000);
+  const old = new Date(Date.now() - 310000);
   fs.utimesSync(claimFile, old, old);
   // The spool must rescue the claim back to the pool instead of waiting
   // for the request to expire; worker-2 then answers it.
@@ -258,5 +258,35 @@ test('spool does not rescue a young claim even when its worker is dead', async t
   const result = await done;
   assert.equal(result.code, 0);
   assert.equal(result.stdout, 'eventual answer');
+  assert.doesNotMatch(result.stderr, /rescued request/);
+});
+
+// Regression (2026-11-18, job 89b01295): a worker composing a 32-scene
+// plan cannot heartbeat mid-turn, so its heartbeat goes stale while it is
+// still working. At the old 120s grace the spool "rescued" its live claim
+// and discarded ~160s of work. A claim 180s old is past the old grace but
+// inside the new 300s grace: it must NOT be rescued.
+test('spool does not rescue a 3-minute-old claim from a composing worker', async t => {
+  const dir = fixture(t);
+  writePoolHeartbeat(dir, 'worker-1', 300000); // stale: composing, not heartbeating
+  writePoolHeartbeat(dir, 'worker-2'); // alive
+  const id = '6'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id), t);
+  const requestFile = path.join(dir, id + '.request.json');
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const claimFile = path.join(dir, id + '.request.json.claimed-worker-1');
+  fs.renameSync(requestFile, claimFile);
+  const old = new Date(Date.now() - 180000);
+  fs.utimesSync(claimFile, old, old);
+  // Give the rescue checks time to run: the claim must stay put.
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  assert.equal(fs.existsSync(requestFile), false, 'composing worker claim is not rescued');
+  assert.equal(fs.existsSync(claimFile), true);
+  fs.writeFileSync(path.join(dir, id + '.answer.json'), 'composed answer');
+  const result = await done;
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'composed answer');
   assert.doesNotMatch(result.stderr, /rescued request/);
 });

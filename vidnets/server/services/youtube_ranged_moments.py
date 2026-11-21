@@ -1,9 +1,25 @@
 """Bounded temporal evidence for the existing ranged YouTube downloader."""
 from __future__ import annotations
 
-import time
+import os
 import re
+import time
 from collections.abc import Mapping
+
+
+def _has_verified_prep_moment(candidate) -> bool:
+    """True when a prep-manifest cut already carries its verified moment.
+
+    The prep phase vision-verified this exact cut at ``prep_best_timestamp``,
+    so re-deriving the moment from a fresh transcript fetch buys nothing:
+    the download planner falls back to the verified prep timestamp.
+    """
+    if not isinstance(candidate, Mapping) or not candidate.get('prep_manifest_injected'):
+        return False
+    try:
+        return float(candidate.get('prep_best_timestamp')) >= 0
+    except (TypeError, ValueError):
+        return False
 
 
 def prepare_ranged_moments(rows, assignments, pools, durations, *, session_jar=None,
@@ -17,11 +33,20 @@ def prepare_ranged_moments(rows, assignments, pools, durations, *, session_jar=N
     # Do not fetch transcripts for the entire search-result universe.
     selected = {}
     scene_sources = {}
+    prep_moment_skipped = 0
     for scene_index, candidate in enumerate(assignments):
         if not isinstance(candidate, Mapping):
             continue
         video_id = str(candidate.get('id') or candidate.get('video_id') or '')
         if re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+            # Skip the fetch (and the matching below) for a prep cut whose
+            # moment is already verified: its transcript would only
+            # re-derive the same timestamp at the cost of a fetch slot and
+            # a full transcript match. The scene's reserve video is still
+            # fetched below, so a failed prep cut still gets fresh moments.
+            if _has_verified_prep_moment(candidate):
+                prep_moment_skipped += 1
+                continue
             selected.setdefault(video_id, candidate)
             scene_sources[scene_index] = [video_id]
     source_cap = min(32, max(4, len(selected) + 4))
@@ -47,14 +72,40 @@ def prepare_ranged_moments(rows, assignments, pools, durations, *, session_jar=N
             # rejections cannot be revived by a transcript term match.
             if reserve.get('v2_reject_reason'):
                 continue
+            # A scene's own prep cut is already skipped above; do not let
+            # the reserve loop re-add it as its own fallback (its moment is
+            # verified, so fetching its transcript is pure waste). A prep
+            # cut mapped to a DIFFERENT scene stays eligible: that scene
+            # has no verified moment for it.
+            if _has_verified_prep_moment(reserve):
+                try:
+                    mapped_scene = int(reserve.get('prep_live_scene', -1))
+                except (TypeError, ValueError):
+                    mapped_scene = -1
+                if mapped_scene == scene_index:
+                    prep_moment_skipped += 1
+                    continue
             selected.setdefault(video_id, reserve)
             scene_sources.setdefault(scene_index, []).append(video_id)
             break
     if not selected or deadline_seconds <= 0:
-        return {}, {'status': 'skipped', 'sources_requested': 0}
+        return {}, {'status': 'skipped', 'sources_requested': 0,
+                    'prep_moment_skipped': prep_moment_skipped}
     index = index or YouTubeTranscriptIndex(session_jar=session_jar)
-    documents = index.fetch_many(list(selected), workers=3,
-                                 deadline_seconds=max(.05, min(25., float(deadline_seconds))))
+    # The caller bounds this by the remaining branch wall (min(120 s,
+    # remaining)). Do NOT clamp it again here: the old 25 s cap silently
+    # overrode the caller's 60 s and starved the lane — run 2 kept 1/12
+    # transcripts because one slow caption fetch is ~30 s and the
+    # per-video provider chain costs ~15 s even in a good hour.
+    # fetch_many still caps the wall at 300 s.
+    try:
+        ranged_workers = max(
+            1, min(12, int(os.environ.get("VIDZEO_YT_TRANSCRIPT_RANGED_WORKERS", "6") or 6))
+        )
+    except (TypeError, ValueError):
+        ranged_workers = 6
+    documents = index.fetch_many(list(selected), workers=ranged_workers,
+                                 deadline_seconds=max(.05, min(300., float(deadline_seconds))))
     if cancellation is not None:
         cancellation.raise_if_cancelled()
     moments = {}
@@ -79,6 +130,7 @@ def prepare_ranged_moments(rows, assignments, pools, durations, *, session_jar=N
         'sources_returned': len(documents),
         'sources_available': sum(document.available for document in documents.values()),
         'scenes_with_moments': len(moments),
+        'prep_moment_skipped': prep_moment_skipped,
         'source_statuses': {source: (documents[source].status if source in documents else 'deadline_or_unavailable')
                             for source in selected},
         'elapsed_seconds': round(time.monotonic() - started, 3)}

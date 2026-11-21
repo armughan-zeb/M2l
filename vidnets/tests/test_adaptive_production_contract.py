@@ -532,6 +532,17 @@ def test_missing_data_manager_fallback_has_no_narration_card():
     assert result['primary_visual']['props'] == {}
 
 
+def test_manager_text_free_fallback_uses_valid_frame_mode():
+    """The text-free fallback is a media-led scene: its frame mode must be
+    the v4 vocabulary value 'media_only', not the bare 'media' the validator
+    rejects as invalid_frame_mode (same class as the test-15 demotion bug)."""
+    scene = {'narration': 'A complex sentence must never become a card.', 'primary_visual': {'type': 'Chart', 'props': {}},
+             'text': {'display_text': 'old'}, 'editorial_contract': {'approved': True, 'display_text': 'old'}}
+    result = apply_manager_corrections({'scenes': [scene]})['scenes'][0]
+    assert result['text']['frame_mode'] == 'media_only'
+    assert result['primary_visual']['variant'] == 'full_bleed_cinematic'
+
+
 @pytest.mark.parametrize('source,span', [('local','Moon'), ('llm','invented phrase'), ('', 'Moon')])
 def test_copy_track_rejects_unapproved_provenance_and_invented_spans(source,span):
     scene={'start':0,'duration':5,'narration':'The Moon blocks sunlight.',

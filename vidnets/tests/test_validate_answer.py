@@ -185,6 +185,31 @@ def test_cli_exit_codes(tmp_path):
 # bounded_http files them into the bridge), so a hole in any live enum or
 # bound fails here first. The filed form is the normalised one: every
 # property is required and optional enums admit null.
+#
+# P2 (2026-11-18, "fold art direction into the first direction batch"):
+# the filed director schema now carries a top-level ``art_direction``
+# property. The normaliser makes it required-but-nullable, exactly like
+# every other optional field, and a real strict-mode answer always
+# carries the key (batch 0 returns a full art object; later batches may
+# return null). The fixtures below therefore carry a valid art object,
+# so a rejection here is always about the field under test, never about
+# the missing art key.
+
+_REAL_ART_DIRECTION = {
+    "style": "editorial",
+    "display_font": "Archivo Black",
+    "body_font": "Inter",
+    "accent_color": "#F2C14E",
+    "visual_motif": "maps and evidence traces",
+    "motion_rhythm": "trace, reveal, settle",
+    "story_arc": "A question leads through evidence to the payoff.",
+    "retention_plan": "Hook with the question, breathe at the consequence.",
+}
+
+
+def _real_director_answer(scenes):
+    """A real filed director answer: scenes plus the P2 art_direction key."""
+    return {"scenes": scenes, "art_direction": dict(_REAL_ART_DIRECTION)}
 
 
 def _filed_schema(schema):
@@ -225,6 +250,13 @@ def _real_director_scene(**overrides):
         "media_plan": {"visual_beats": 1, "media_preference": "clip",
                        "rhythm": "single_hold"},
         "diagram_nodes": [], "diagram_links": [], "motion_cues": [],
+        # P1 (2026-11-18): editorial beats folded into the director turn.
+        # Optional in the raw schema, so the filed strict form requires
+        # them as nullable keys — a real strict-mode answer carries them
+        # as null when the model nominates no beat for the scene.
+        "editorial_role": None, "editorial_treatment": None,
+        "editorial_emphasis": None, "editorial_highlight_kind": None,
+        "editorial_importance": None,
     }
     scene.update(overrides)
     return scene
@@ -261,7 +293,7 @@ def test_real_director_schema_rejects_split_wipe_transition(tmp_path):
     # director schema instead of the mini-schema above.
     schema = _director_design_contract_snapshot()["schema"]
     request = _request_file_with_schema(tmp_path, schema)
-    answer = _answer_file(tmp_path, {"scenes": [_real_director_scene(transition="split_wipe")]})
+    answer = _answer_file(tmp_path, _real_director_answer([_real_director_scene(transition="split_wipe")]))
     ok, issue = validate_answer.validate(answer, request)
     assert ok is False
     assert "$.scenes[0].transition" in issue
@@ -271,7 +303,7 @@ def test_real_director_schema_rejects_split_wipe_transition(tmp_path):
 def test_real_director_schema_accepts_valid_scene(tmp_path):
     schema = _director_design_contract_snapshot()["schema"]
     request = _request_file_with_schema(tmp_path, schema)
-    answer = _answer_file(tmp_path, {"scenes": [_real_director_scene()]})
+    answer = _answer_file(tmp_path, _real_director_answer([_real_director_scene()]))
     ok, issue = validate_answer.validate(answer, request)
     assert ok is True, issue
     assert issue == ""
@@ -280,7 +312,7 @@ def test_real_director_schema_accepts_valid_scene(tmp_path):
 def test_real_director_schema_rejects_empty_scenes(tmp_path):
     schema = _director_design_contract_snapshot()["schema"]
     request = _request_file_with_schema(tmp_path, schema)
-    answer = _answer_file(tmp_path, {"scenes": []})
+    answer = _answer_file(tmp_path, _real_director_answer([]))
     ok, issue = validate_answer.validate(answer, request)
     assert ok is False
     assert "$.scenes" in issue
@@ -297,7 +329,7 @@ def test_real_director_schema_rejects_empty_scenes(tmp_path):
 def test_real_director_schema_rejects_cross_enum_values(tmp_path, field, bad):
     schema = _director_design_contract_snapshot()["schema"]
     request = _request_file_with_schema(tmp_path, schema)
-    answer = _answer_file(tmp_path, {"scenes": [_real_director_scene(**{field: bad})]})
+    answer = _answer_file(tmp_path, _real_director_answer([_real_director_scene(**{field: bad})]))
     ok, issue = validate_answer.validate(answer, request)
     assert ok is False
     assert f"$.scenes[0].{field}" in issue

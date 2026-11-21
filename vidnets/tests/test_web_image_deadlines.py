@@ -374,7 +374,7 @@ def test_mixed_web_scene_worker_limit_defaults_to_two(monkeypatch):
 
 
 def test_first_wave_is_tier_one_and_families_deduped():
-    """(d) First wave = the 5 real transports; at most one Bing / one DDG lane."""
+    """(d) First wave = the 4 real transports; at most one Bing lane."""
     from services.web_image import resolver
 
     assert set(resolver._TIER_ONE_SOURCES) == {
@@ -382,16 +382,15 @@ def test_first_wave_is_tier_one_and_families_deduped():
         "yandex",
         "flickr_api",
         "bing_hybrid",
-        "ddg_hybrid",
     }
     names = [name for name, _kind in resolver._dedupe_transport_families(list(resolver._FAST_SOURCES))]
     assert names.count("bing_hybrid") == 1
     assert "primary_archive" not in names and "getty_bing" not in names
-    assert names.count("ddg_hybrid") == 1
+    assert "ddg_hybrid" not in names
     assert "getty_ddg" not in names
     assert names[0] == "universal_scraper"
     # Without the plain lane, the first listed family member is kept.
     kept = resolver._dedupe_transport_families(
-        [("primary_archive", "hybrid"), ("ddg_hybrid", "hybrid")]
+        [("primary_archive", "hybrid"), ("getty_bing", "hybrid")]
     )
-    assert [name for name, _kind in kept] == ["primary_archive", "ddg_hybrid"]
+    assert [name for name, _kind in kept] == ["primary_archive"]

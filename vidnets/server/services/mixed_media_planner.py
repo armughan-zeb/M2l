@@ -120,11 +120,21 @@ _NICHE_MEDIA_PROFILES.update({
     "entertainment": _media_share(.30, .65, .05), "music": _media_share(.30, .65, .05),
 })
 _GAMING_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["gaming"])
-# The gaming YouTube target: 90% of scenes served by YouTube. Single source
+# The gaming YouTube target: 80% of scenes served by YouTube. Single source
 # of truth for app._apply_gaming_mode_policy (which stamps it onto the job
 # config) and the adapter's quota math. The planner weights alone only
 # reach 0.80, so the target must not be derived from them.
-GAMING_YOUTUBE_TARGET_RATIO = 0.90
+GAMING_YOUTUBE_TARGET_RATIO = 0.80
+# The documentary YouTube target: 55% of scenes served by YouTube. Single
+# source of truth for app._apply_documentary_mode_policy (which stamps it
+# onto the job config) and the adapter's quota math. AUTO_YOUTUBE_RATIO
+# (0.55) is the pre-existing documentary constant; this name binds it to
+# the documentary niche the way GAMING_YOUTUBE_TARGET_RATIO binds 0.80 to
+# gaming. The planner's documentary retrieval weights (YouTube 0.60) are a
+# separate retrieval preference and must not be confused with this quota
+# target; without this stamp, documentary jobs fell through to the 0.30
+# adapter default.
+DOCUMENTARY_YOUTUBE_TARGET_RATIO = AUTO_YOUTUBE_RATIO
 _ACTION_SPORTS_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["sports"])
 _DOCUMENTARY_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["documentary"])
 _GENERAL_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["general"])
@@ -648,13 +658,38 @@ def gaming_mode_for(
 
     Reuses the two existing detectors — the GTA VI story regex and the
     topic classifier — instead of adding a third. Gaming mode drives the
-    0.90 YouTube target, YT-primary lane order, and the gaming retrieval
+    0.80 YouTube target, YT-primary lane order, and the gaming retrieval
     policy; it is wired into the job config by
     ``app._resolve_mixed_media_niche_policy`` as ``config['_gaming_mode']``.
     """
     if _gta_vi_story(title, script, scene_texts):
         return True
     return classify_mixed_media_topic(title, script, scene_texts, category) == "gaming"
+
+
+def documentary_mode_for(
+    title: str = "",
+    script: str = "",
+    scene_texts: List[str] | None = None,
+    category: str = "",
+) -> bool:
+    """True when a job is a documentary (any documentary-family topic).
+
+    Reuses the topic classifier instead of adding another detector. The
+    classifier returns "documentary" for an explicit documentary category
+    and "serious" for evidence-led history/disaster wording, which
+    resolve_media_policy maps onto the documentary policy niche; both mean
+    the job is documentary-family, so both count. Crime and royal jobs are
+    classified before "serious" and do not count. Gaming mode is checked
+    first by the caller and wins when a job is both. Jobs whose classifier
+    lands on a distinct sub-niche (history, maritime, ...) are not
+    documentary mode; only the resolved "documentary" policy niche (or the
+    classifier's documentary/serious outputs) stamps the 0.55 target.
+    """
+    return classify_mixed_media_topic(title, script, scene_texts, category) in {
+        "documentary",
+        "serious",
+    }
 
 
 def automatic_mixed_media_weights(

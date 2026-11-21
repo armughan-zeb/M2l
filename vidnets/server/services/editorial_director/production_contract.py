@@ -407,7 +407,11 @@ def _remove_incidental_maps(scenes: list[Any]) -> None:
         scene["motion_cues"] = [cue for cue in cues if not is_map_cue(cue)]
         style = scene.get("text")
         if isinstance(style, dict) and style.get("frame_mode") == "map":
-            style["frame_mode"] = "media"
+            # The v4 storyboard grammar has no bare "media" frame mode; a
+            # demoted map scene is a media-led scene ("media_only"). The old
+            # value made the validator report invalid_frame_mode on every
+            # demoted scene (test 15 scene 9).
+            style["frame_mode"] = "media_only"
         # Filter map layers from mixed recipes while retaining other approved
         # chart, copy, and evidence layers.
         if isinstance(recipe, Mapping):
@@ -424,8 +428,24 @@ def _remove_incidental_maps(scenes: list[Any]) -> None:
             media = mapping(scene.get("media"))
             has_media = bool(media.get("src") or media.get("path") or media.get("shots"))
             if map_primary:
-                visual_type = ("SmartVideo" if media.get("type") == "video" else "SmartImage") if has_media else "KineticText"
-                scene["primary_visual"] = {"type": visual_type, "props": {} if has_media else {"text": narration}}
+                if has_media:
+                    visual_type = "SmartVideo" if media.get("type") == "video" else "SmartImage"
+                    # A demoted map scene keeps its verified media, but the v4
+                    # edit-plan contract requires a treatment variant on every
+                    # scene. Use the same variants the map-repair path uses
+                    # (_repair_unsupported_map_locations in app.py); without
+                    # one the validator reports missing_scene_treatment and a
+                    # render resume after a reboot hard-fails (test 15).
+                    variant = "full_bleed" if visual_type == "SmartVideo" else "full_bleed_cinematic"
+                    scene["primary_visual"] = {"type": visual_type, "variant": variant, "props": {}}
+                else:
+                    # No verified media: a kinetic text scene. Its frame mode
+                    # is "kinetic" (a KineticText primary under "media_only"
+                    # would fail as a frame/visual mismatch), with a real
+                    # KineticText variant from the contract catalogue.
+                    scene["primary_visual"] = {"type": "KineticText", "variant": "bold_minimal_center", "props": {"text": narration}}
+                    if isinstance(style, dict):
+                        style["frame_mode"] = "kinetic"
             scene["template_id"] = "full-bleed" if has_media else "kinetic-statement"
             scene["graphic"] = {"template_id": scene["template_id"], "props": {} if has_media else {"text": narration}}
             scene["visual_role"] = "media_only" if has_media else "primary_explanation"

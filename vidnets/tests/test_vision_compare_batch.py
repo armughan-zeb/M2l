@@ -1,11 +1,16 @@
-"""Vision compare batching + external-agent vision concurrency (speedup item c).
+"""Batched image verification + external-agent vision concurrency.
 
-- verify_batch judges up to 4 image finalists in ONE compare_images request,
-  then runs the full single-candidate verify() only for the compare winner.
-  Compare rows carry relevance/quality/fatal_mismatch/watermark/
-  scene_description, but NOT the identity/action/context scores the V2
-  verdict schema requires, so losers get compare-only verdicts and are
-  never given invented scores.
+verify_batch now judges a scene's image finalists in ONE vision request
+(analyze_images_batch): one verdict row per candidate, each scored by the
+full single-candidate verify() — same validation, same subject-level
+acceptance. The old P4 shape (one analyze_image per finalist, in ranked
+order, early exit on the first accept) survives only as the fallback when
+the batch call fails or the client has no batch method. Every tried
+candidate gets a real, full visual_checked verdict (identity/action/
+context scores), so the D4 all-rejected waste (compare rows re-verified
+singly, 28/43 in job 31f5bfec) cannot recur: the losers' verdicts are
+already checked and cached.
+
 - The external-agent vision semaphore is 4 (matching the context default),
   tunable via VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY.
 """
@@ -33,21 +38,6 @@ SCENE = {
     },
 }
 
-COMPARE = {
-    "selected_index": 1,
-    "confidence": 88.0,
-    "reason": "candidate 1 shows the highway traffic",
-    "acceptable": True,
-    "candidates": [
-        {"relevance": 40, "quality": 60, "fatal_mismatch": False,
-         "watermark": False, "scene_description": "a quiet road"},
-        {"relevance": 92, "quality": 85, "fatal_mismatch": False,
-         "watermark": False, "scene_description": "highway traffic"},
-        {"relevance": 70, "quality": 70, "fatal_mismatch": True,
-         "watermark": False, "scene_description": "a different bridge"},
-    ],
-}
-
 FULL_VERDICT = {
     "candidate_id": "",
     "entity_conflict": False,
@@ -67,6 +57,20 @@ FULL_VERDICT = {
     "source_presentation_type": "photograph",
     "has_text": False,
 }
+
+# A raw verdict that _score_verdict hard-rejects (identity/final < 35).
+REJECTED_VERDICT = dict(
+    FULL_VERDICT,
+    identity_score=10,
+    action_score=10,
+    context_score=10,
+    final_score=10,
+    fatal_mismatch=True,
+    domain_match=False,
+    scene_match=False,
+    reason="wrong entity: a different bridge, unrelated to the highway",
+    scene_description="a different bridge",
+)
 
 
 def _candidate(tmp_path, name):
@@ -97,12 +101,11 @@ def _build_verifier(tmp_path, config=None):
     # Force client construction, then stub the raw vision client: no network.
     client = context.get_client()
     assert client is not None
-    calls = {"compare": 0, "analyze": 0}
+    calls = {"compare": 0, "analyze": 0, "batch": 0}
 
     def fake_compare(image_paths, _prompt):
         calls["compare"] += 1
-        assert len(image_paths) <= 4
-        return dict(COMPARE)
+        raise AssertionError("P4: compare_images must never be called")
 
     def fake_analyze(image_path, _prompt, _system):
         calls["analyze"] += 1
@@ -110,156 +113,138 @@ def _build_verifier(tmp_path, config=None):
         verdict["candidate_id"] = str(image_path)
         return verdict
 
+    def fake_batch(image_paths, _prompt, _system, candidate_ids=None):
+        calls["batch"] += 1
+        ids = list(candidate_ids or [])
+        rows = {}
+        for index, path in enumerate(image_paths):
+            cid = ids[index] if index < len(ids) else str(path)
+            verdict = dict(FULL_VERDICT)
+            verdict["candidate_id"] = str(path)
+            rows[cid] = verdict
+        return rows
+
     client._client.compare_images = fake_compare
     client._client.analyze_image = fake_analyze
     client._client.analyze_clip_frames = fake_analyze
+    client._client.analyze_images_batch = fake_batch
     return verifier, context, calls
 
 
-def test_batched_gate_keeps_all_rejected_hard_fatals(tmp_path):
-    """All-rejected compare (job 31f5bfec): the compare judged every
-    finalist and rejected them, so verify_batch used to return {} and the
-    gate re-verified each loser singly — 4 extra vision requests per
-    scene. The hard-rejected rows are now returned as checked
-    compare_rejected verdicts; non-fatal rows are still omitted so they
-    fall back to per-candidate verify(). No full verify() runs here."""
-    verifier, context, calls = _build_verifier(tmp_path)
-    client = context.get_client()
+def _batch_from_verdict_fn(client, calls, verdict_for):
+    """Stub analyze_images_batch from a per-path verdict function."""
 
-    def all_rejected(_paths, _prompt):
-        calls["compare"] += 1
-        return {
-            "selected_index": -1,
-            "confidence": 80.0,
-            "reason": "all four candidates are GTA V frames, no GTA VI content",
-            "acceptable": False,
-            "candidates": [
-                {"relevance": 25, "quality": 60, "fatal_mismatch": True,
-                 "watermark": False, "scene_description": "GTA V jet over water"},
-                {"relevance": 30, "quality": 65, "fatal_mismatch": False,
-                 "watermark": True, "scene_description": "city skyline, watermarked"},
-                {"relevance": 55, "quality": 70, "fatal_mismatch": False,
-                 "watermark": False, "scene_description": "a night street"},
-            ],
-        }
+    def fake_batch(image_paths, _prompt, _system, candidate_ids=None):
+        calls["batch"] += 1
+        ids = list(candidate_ids or [])
+        rows = {}
+        for index, path in enumerate(image_paths):
+            cid = ids[index] if index < len(ids) else str(path)
+            verdict = dict(verdict_for(path))
+            verdict["candidate_id"] = str(path)
+            rows[cid] = verdict
+        return rows
 
-    client._client.compare_images = all_rejected
-    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(3)]
-    results = verifier.verify_batch(SCENE, candidates)
-    assert calls["compare"] == 1, calls
-    assert calls["analyze"] == 0, "no winner to fully verify, no single re-check"
-    # Only the hard-rejected rows come back, as checked verdicts.
-    assert set(results) == {candidates[0]["path"], candidates[1]["path"]}
-    fatal = results[candidates[0]["path"]]
-    assert fatal["accepted"] is False
-    assert fatal["status"] == "compare_rejected"
-    assert fatal["fatal_mismatch"] is True
-    assert fatal["visual_checked"] is True
-    assert fatal["visual_available"] is True
-    assert fatal["schema_valid"] is False  # no invented identity scores
-    watermarked = results[candidates[1]["path"]]
-    assert watermarked["status"] == "compare_rejected"
-    assert watermarked["watermark"] is True
-    assert watermarked["visual_checked"] is True
+    client._client.analyze_images_batch = fake_batch
 
 
-def test_batched_gate_all_rejected_without_hard_flags_falls_back(tmp_path):
-    """All-rejected compare with no confident hard rejection: nothing is
-    trusted, verify_batch returns {} and the caller falls back to
-    per-candidate verify() exactly as before."""
-    verifier, context, calls = _build_verifier(tmp_path)
-    client = context.get_client()
-
-    def all_clean_rejected(_paths, _prompt):
-        calls["compare"] += 1
-        return {
-            "selected_index": -1,
-            "confidence": 60.0,
-            "reason": "none of the candidates shows the required subject",
-            "acceptable": False,
-            "candidates": [
-                {"relevance": 40, "quality": 60, "fatal_mismatch": False,
-                 "watermark": False, "scene_description": "a quiet road"},
-                {"relevance": 45, "quality": 62, "fatal_mismatch": False,
-                 "watermark": False, "scene_description": "another road"},
-            ],
-        }
-
-    client._client.compare_images = all_clean_rejected
-    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(2)]
-    assert verifier.verify_batch(SCENE, candidates) == {}
-    assert calls["compare"] == 1, calls
-    assert calls["analyze"] == 0
-
-
-def test_batched_gate_all_rows_hard_rejected_returns_all(tmp_path):
-    """Selected index is valid but every row is hard-rejected: previously
-    verify_batch returned {} (not usable) and the gate spent one single
-    verify per finalist. Now all rows come back as checked rejects."""
-    verifier, context, calls = _build_verifier(tmp_path)
-    client = context.get_client()
-
-    def all_fatal(_paths, _prompt):
-        calls["compare"] += 1
-        return {
-            "selected_index": 0,
-            "confidence": 85.0,
-            "reason": "every candidate is the wrong game",
-            "acceptable": False,
-            "candidates": [
-                {"relevance": 20, "quality": 60, "fatal_mismatch": True,
-                 "watermark": False, "scene_description": "GTA V jet"},
-                {"relevance": 22, "quality": 61, "fatal_mismatch": True,
-                 "watermark": False, "scene_description": "GTA V skyline"},
-            ],
-        }
-
-    client._client.compare_images = all_fatal
-    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(2)]
-    results = verifier.verify_batch(SCENE, candidates)
-    assert calls["compare"] == 1, calls
-    assert calls["analyze"] == 0
-    assert set(results) == {c["path"] for c in candidates}
-    assert all(v["status"] == "compare_rejected" and v["visual_checked"] is True
-               for v in results.values())
-
-
-def test_batched_gate_judges_four_finalists_in_one_request(tmp_path):
+def test_batched_verify_first_accept_wins_with_batches(tmp_path):
+    """Common case: the top-ranked finalist passes, so verify_batch spends
+    exactly one batched vision request and never touches the rest."""
     verifier, _context, calls = _build_verifier(tmp_path)
     candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(3)]
     results = verifier.verify_batch(SCENE, candidates)
-    assert set(results) == {c["path"] for c in candidates}
-    # One compare request for all three, one full verify for the winner only.
-    assert calls["compare"] == 1, calls
-    assert calls["analyze"] == 1, calls
-    winner = results[candidates[1]["path"]]
+    assert set(results) == {candidates[0]["path"]}
+    assert calls["compare"] == 0, calls
+    assert calls["analyze"] == 0, calls
+    assert calls["batch"] == 1, calls  # 3 candidates = 1 batch (cap 16)
+    winner = results[candidates[0]["path"]]
     assert winner["accepted"] is True
     assert winner["visual_checked"] is True
     assert winner["compare_selected"] is True
-    loser = results[candidates[0]["path"]]
-    assert loser["accepted"] is False
-    assert loser["status"] == "compare_not_selected"
-    assert loser["visual_checked"] is False
-    assert loser["relevance"] == 40
-    assert loser["final_score_source"] == "compare_relevance"
-    fatal = results[candidates[2]["path"]]
-    assert fatal["status"] == "rejected"
-    assert fatal["fatal_mismatch"] is True
-    assert fatal["visual_checked"] is False
 
 
-def test_batched_gate_returns_empty_when_compare_fails(tmp_path):
+def test_batched_verify_reject_then_accept_keeps_real_loser_verdict(tmp_path):
+    """First finalist rejected, second accepted: one batch request, and
+    the loser keeps its real checked verdict (no re-verification later)."""
     verifier, context, calls = _build_verifier(tmp_path)
     client = context.get_client()
 
-    def boom(_paths, _prompt):
-        calls["compare"] += 1
+    def reject_first(image_path, _prompt, _system):
+        calls["analyze"] += 1
+        verdict = dict(REJECTED_VERDICT if "cand-0" in str(image_path) else FULL_VERDICT)
+        verdict["candidate_id"] = str(image_path)
+        return verdict
+
+    client._client.analyze_image = reject_first
+    _batch_from_verdict_fn(client, calls, lambda path: (
+        REJECTED_VERDICT if "cand-0" in str(path) else FULL_VERDICT))
+    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(3)]
+    results = verifier.verify_batch(SCENE, candidates)
+    assert set(results) == {candidates[0]["path"], candidates[1]["path"]}
+    assert calls["compare"] == 0, calls
+    assert calls["analyze"] == 0, calls
+    assert calls["batch"] == 1, calls  # 3 candidates = 1 batch (cap 16)
+    loser = results[candidates[0]["path"]]
+    assert loser["accepted"] is False
+    assert loser["status"] == "rejected"
+    assert loser["fatal_mismatch"] is True
+    assert loser["visual_checked"] is True
+    winner = results[candidates[1]["path"]]
+    assert winner["accepted"] is True
+    assert winner["compare_selected"] is True
+
+
+def test_batched_verify_all_rejected_returns_checked_verdicts(tmp_path):
+    """All-rejected (job 31f5bfec): one batch request; every finalist gets
+    one real checked verdict and is returned — the gate never re-verifies
+    a loser, so the old D4 waste (28/43 re-verifications) cannot recur."""
+    verifier, context, calls = _build_verifier(tmp_path)
+    client = context.get_client()
+
+    def all_rejected(image_path, _prompt, _system):
+        calls["analyze"] += 1
+        verdict = dict(REJECTED_VERDICT)
+        verdict["candidate_id"] = str(image_path)
+        return verdict
+
+    client._client.analyze_image = all_rejected
+    _batch_from_verdict_fn(client, calls, lambda path: REJECTED_VERDICT)
+    candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(3)]
+    results = verifier.verify_batch(SCENE, candidates)
+    assert set(results) == {c["path"] for c in candidates}
+    assert calls["compare"] == 0, calls
+    assert calls["analyze"] == 0, calls
+    assert calls["batch"] == 1, calls  # 3 candidates = 1 batch (cap 16)
+    assert all(v["accepted"] is False and v["visual_checked"] is True
+               for v in results.values())
+
+
+def test_batched_verify_falls_back_to_sequential_when_batch_raises(tmp_path):
+    """A raising batch is a per-scene fallback, not an abort: verify_batch
+    tries each finalist once with the old single verifies and returns what
+    verify() recorded, with no compare call."""
+    verifier, context, calls = _build_verifier(tmp_path)
+    client = context.get_client()
+
+    def boom(_path, _prompt, _system):
+        calls["analyze"] += 1
         raise RuntimeError("inbox timeout")
 
-    client._client.compare_images = boom
+    def boom_batch(*args, **kwargs):
+        calls["batch"] += 1
+        raise RuntimeError("inbox timeout")
+
+    client._client.analyze_image = boom
+    client._client.analyze_images_batch = boom_batch
     candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(3)]
-    assert verifier.verify_batch(SCENE, candidates) == {}
-    assert calls["analyze"] == 0, "a failed compare must not spend a full verify"
+    results = verifier.verify_batch(SCENE, candidates)
+    assert set(results) == {c["path"] for c in candidates}
+    assert calls["compare"] == 0, calls
+    assert calls["batch"] == 1, calls  # 3 candidates = 1 batch, raises once
+    assert calls["analyze"] == 3, calls
+    assert all(v["accepted"] is False and v["status"] == "schema_invalid"
+               for v in results.values())
 
 
 def test_batched_gate_skips_video_finalists(tmp_path):
@@ -270,25 +255,29 @@ def test_batched_gate_skips_video_finalists(tmp_path):
     (tmp_path / "clip.mp4").write_bytes(b"fake video bytes")
     clip["media_type"] = "video"
     assert verifier.verify_batch(SCENE, [candidates[0], clip]) == {}
-    assert calls == {"compare": 0, "analyze": 0}
+    assert calls == {"compare": 0, "analyze": 0, "batch": 0}
 
 
 def test_batched_gate_needs_at_least_two_finalists(tmp_path):
     verifier, _context, calls = _build_verifier(tmp_path)
     assert verifier.verify_batch(SCENE, [_candidate(tmp_path, "only.png")]) == {}
-    assert calls == {"compare": 0, "analyze": 0}
+    assert calls == {"compare": 0, "analyze": 0, "batch": 0}
 
 
-def test_external_agent_vision_semaphore_is_four_by_default(tmp_path, monkeypatch):
+def test_external_agent_vision_semaphore_is_eight_by_default(tmp_path, monkeypatch):
+    # Test-20 fan-out (Nov 21, 2026): the default rose 4 -> 8 so the
+    # YT-branch verify pool can file 8 concurrent inbox requests and
+    # the pool scales to its ceiling. The from_config fallback without
+    # an explicit concurrency is still 4 (see the wall test below).
     monkeypatch.delenv("VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY", raising=False)
-    assert external_agent_vision_concurrency() == 4
+    assert external_agent_vision_concurrency() == 8
     config = {
         "llm_provider": "external_agent",
         "openrouter_api_key": "external-agent:local-user",
         "image_source": "Mixed Media",
     }
     _verifier, context = build_qwen_verifier(config, [SCENE])
-    assert context.max_concurrent == 4
+    assert context.max_concurrent == 8
     assert context._semaphore is not None
 
 

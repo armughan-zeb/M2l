@@ -511,7 +511,7 @@ def _seed_real_ledger(tmp_path):
     assert records[0]["requirement_hash"] == REQUIREMENT_HASH
 
 
-def _run_gta_resolution(tmp_path, clip):
+def _run_gta_resolution(tmp_path, clip, job_id="4f61cc9e"):
     scenes = [_scene(0), _scene(1)]
     calls = []
 
@@ -545,6 +545,7 @@ def _run_gta_resolution(tmp_path, clip):
         deadline_seconds=10,
         scene_budget_seconds=10,
         vision_reserve_seconds=0.5,
+        job_id=job_id,
     )
     return result, calls
 
@@ -554,12 +555,26 @@ def test_regression_real_f4y_verdicts_block_scene_1(tmp_path, monkeypatch):
     clip = _clip_file(tmp_path, "f4y.mp4")
     _seed_real_ledger(tmp_path)
 
-    result, calls = _run_gta_resolution(tmp_path, clip)
+    result, calls = _run_gta_resolution(tmp_path, clip, job_id="4f61cc9e")
 
     # The candidate consumed first was the ACCEPT — but the late REJECT is
     # in the file ledger, so scene 1 must not select this clip.
     assert result[1].selected_path != clip
     assert not any(call[0] == 1 for call in calls)
+
+
+def test_regression_real_f4y_verdicts_do_not_block_other_job(tmp_path, monkeypatch):
+    """Job scoping (run 8): the same late REJECT filed by job 4f61cc9e
+    must not veto the clip in a different job — the bound ACCEPT is
+    selected again (the verifier is not re-called: the bound verdict is
+    reused once the veto is gone, exactly as in the no-ledger control)."""
+    monkeypatch.setenv("VIDNETS_AGENT_BRIDGE_DIR", str(tmp_path))
+    clip = _clip_file(tmp_path, "f4y.mp4")
+    _seed_real_ledger(tmp_path)
+
+    result, _calls = _run_gta_resolution(tmp_path, clip, job_id="62d7671a")
+
+    assert result[1].selected_path == clip
 
 
 def test_regression_real_f4y_accept_selects_without_ledger(tmp_path, monkeypatch):

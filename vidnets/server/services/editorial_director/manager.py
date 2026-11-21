@@ -31,7 +31,10 @@ def _text_free_fallback(scene: Dict[str, Any], primary: Mapping[str, Any]) -> st
     media = scene.get("media") or primary.get("asset") or {}
     kind = "SmartVideo" if str(media.get("type") or "").startswith("video") or media.get("is_video") else "SmartImage"
     scene["primary_visual"] = {"type": kind, "variant": "full_bleed_cinematic", "props": {}, "asset": primary.get("asset")}
-    scene["text"] = {**(scene.get("text") or {}), "overlay_policy": "none", "display_text": "", "frame_mode": "media"}
+    # The v4 storyboard grammar has no bare "media" frame mode; a text-free
+    # media scene is "media_only". The old value made the validator report
+    # invalid_frame_mode on every scene this fallback touched.
+    scene["text"] = {**(scene.get("text") or {}), "overlay_policy": "none", "display_text": "", "frame_mode": "media_only"}
     scene["editorial_contract"] = {"version": 4, "approved": False, "enabled": False, "display_text": "", "emphasis_spans": []}
     scene["display_text"] = ""
     scene["emphasis_spans"] = []

@@ -26,6 +26,19 @@ def _accept_language() -> str:
     return configured or "en-US,en;q=0.9"
 
 
+# Direct-egress proxy override (Nov 18, web-resilience): passing
+# proxies={http: None, https: None} makes one requests call skip the env
+# proxy vars. Sources accept a ``direct=`` flag and pass this through at
+# their requests call sites, so the resolver's route-switching retry can
+# re-run a failed lane direct without touching global state.
+DIRECT_PROXIES = {"http": None, "https": None}
+
+
+def request_proxies(direct: bool):
+    """proxies kwarg for a requests call: direct bypass, or None (env proxy)."""
+    return dict(DIRECT_PROXIES) if direct else None
+
+
 @dataclass
 class ImageCandidate:
     """Standardized image candidate from any source."""

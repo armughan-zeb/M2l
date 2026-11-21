@@ -185,6 +185,37 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
     }
   }
 
+  // Advance prep (prep pipeline): a script pre-generated while the VM was
+  // idle for this exact title + duration wins over a live ScriptIT run.
+  // The store lives outside any one job directory
+  // (VIDZEO_PREP_ROOT/scripts/<key>/); a hit is copied into this job's
+  // workDir so the rest of the pipeline sees a normal saved script.
+  // The hit is surfaced on the progress channel (it replaces a live
+  // generation); the miss is the common case and goes to the daemon log
+  // only, so it never pollutes the CMS progress detail stream.
+  try {
+    const prepStore = require('../lib/prepScriptStore');
+    const prepped = prepStore.findPreppedScript(job.title, job.targetDurationMinutes || 8);
+    if (prepped) {
+      const check = validateScript(prepped.scriptText, job);
+      if (check.ok) {
+        saveScript(workDir, prepped.scriptText, {
+          engine: 'prep-cache',
+          preppedAt: prepped.meta?.prepped_at || prepped.meta?.preppedAt || '',
+          prepPath: prepped.path
+        });
+        onDetail?.(`prep script hit: reusing pre-generated narration (${check.words} words)`);
+        return { scriptText: prepped.scriptText, words: check.words, resumed: true, meta: { engine: 'prep-cache', prepPath: prepped.path } };
+      }
+      console.info('prep script miss: pre-generated narration failed validation; generating live');
+    } else {
+      console.info('prep script miss: no pre-generated script for this title; generating live');
+    }
+  } catch (error) {
+    // A broken prep store must never break the live script stage.
+    console.info(`prep script miss: store unreadable (${error.message}); generating live`);
+  }
+
   // Template fallback is opt-in only. The old synthesizer pads generic
   // paragraphs to a word count; it is not a researched script and must never
   // be the silent default.

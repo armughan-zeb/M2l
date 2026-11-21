@@ -13,12 +13,13 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .media_resolution_coordinator import SceneResolution, resolve_storyboard_media_v2, _is_moving_youtube_source, _is_youtube_source
-from .media_integrity import probe_media
+from .media_integrity import probe_media, resolve_ffmpeg_pair
 from .media_asset_policy import emergency_media_allowed, is_synthetic_media
 from .pipeline_contracts import MediaContractError
 from .visual_intelligence.context import (
@@ -38,6 +39,69 @@ from .visual_requirement import (
 from .web_image.source_broker import web_image_source_catalog, web_image_fallback_layers
 
 from .visual_intelligence.semantic_guard import VISUAL_REVIEW_POLICY_VERSION
+
+# Pre-scaled 1080p preference (render tweaks, Nov 18 2026): advance
+# preparation writes `<stem>.scaled-1080p.<ext>` next to an original image
+# or video, so Chromium never downscales a 4K source at render time. The
+# helper ships on the advance-prep branch as
+# vidnets.server.services.media_prescale (`scaled_path_for`); until it
+# lands, the inline path-math fallback below applies the same naming
+# convention. Either way this is a strict no-op when no scaled file
+# exists — the original path is used untouched.
+try:
+    from .media_prescale import scaled_path_for as _prescale_scaled_path_for
+except Exception:  # pragma: no cover - helper not present on this branch
+    try:
+        from vidnets.server.services.media_prescale import scaled_path_for as _prescale_scaled_path_for
+    except Exception:  # pragma: no cover - helper not present on this branch
+        _prescale_scaled_path_for = None
+
+_SCALED_1080P_MEDIA_EXTENSIONS = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}
+)
+
+
+def _scaled_1080p_path(path_value: str) -> str:
+    """Inline fallback for the advance-prep naming convention."""
+    raw = str(path_value or "").strip()
+    if not raw:
+        return path_value
+    candidate = Path(raw)
+    if candidate.suffix.lower() not in _SCALED_1080P_MEDIA_EXTENSIONS:
+        return path_value
+    return str(candidate.with_name(f"{candidate.stem}.scaled-1080p{candidate.suffix}"))
+
+
+def prefer_scaled_1080p(path_value: Any) -> Any:
+    """Return the pre-scaled 1080p sibling of an image/video asset when it
+    exists on disk, else the original path unchanged.
+
+    Images and video only; audio, fonts, and non-file values pass through
+    untouched. A scaled sibling is the same asset at 1080p, so scene
+    timing (clip start/end) is unaffected.
+    """
+    raw = str(path_value or "").strip()
+    if not raw:
+        return path_value
+    # Extension gate FIRST: the helper is pure path math and answers for
+    # any suffix, so it must never be consulted for audio/fonts. Only
+    # image/video assets may resolve to a scaled sibling.
+    if Path(raw).suffix.lower() not in _SCALED_1080P_MEDIA_EXTENSIONS:
+        return path_value
+    if _prescale_scaled_path_for is not None:
+        try:
+            resolved = _prescale_scaled_path_for(raw)
+        except Exception:
+            resolved = None
+        if resolved:
+            candidate = Path(str(resolved))
+            if candidate.is_file():
+                return str(candidate)
+        return path_value
+    candidate = Path(_scaled_1080p_path(raw))
+    if candidate.is_file():
+        return str(candidate)
+    return path_value
 
 
 def _bounded_audit_int(value: Any, default: int, upper: int) -> int:
@@ -1284,16 +1348,40 @@ def _score_verdict(scene: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict
         result.update(accepted=False, scene_match=False, fatal_mismatch=True,
                       status='rejected', rejection_reason=pixel_conflict)
         return result
-    if explicit_low_visual_match(result, scene=scene):
-        result.update(accepted=False, fatal_mismatch=True, status='rejected',
-                      rejection_reason='insufficient_visible_subject_match')
-        return result
+    # Subject-level acceptance (plan §3, both lanes): a candidate that
+    # authentically shows the scene's subject passes even when vision
+    # rejected it only for literal mismatch — but never past a genuine
+    # contradiction. The facet check (a different physical subsystem)
+    # and the unconfirmed-named-product check are hard rejects, so they
+    # are computed BEFORE the low-match branch and consulted by the
+    # rescue there as well as by their own returns below.
     product_identity = (requirement.get('strict_identity') and requirement.get('subject_type')
                         in {'automobile', 'aircraft', 'ship', 'product'})
     identity_uncertain = result.get('identity_confirmed') is False or bool(re.search(
         r'(?:cannot|can.t|unable to|not possible to)\s+(?:visually\s+)?(?:confirm|identify|verify|determine)'
         r'|(?:specific|exact)\s+(?:model|make|identity).{0,60}(?:not|cannot|can.t|uncertain|unidentif)',
         str(result.get('reason') or ''), re.I))
+    facet_conflict = explicit_visual_facet_conflict(narration, result.get('scene_description') or '')
+
+    def _subject_accepts() -> bool:
+        try:
+            from .visual_intelligence.semantic_guard import subject_level_accepts_verdict
+
+            return bool(subject_level_accepts_verdict(result, scene))
+        except Exception:
+            return False
+
+    if explicit_low_visual_match(result, scene=scene):
+        if not facet_conflict and not (product_identity and identity_uncertain) and _subject_accepts():
+            result.update({
+                "accepted": True, "fatal_mismatch": False, "entity_conflict": False,
+                "status": "accepted", "subject_level_accepted": True,
+                "accept_reason": "subject_level_accept",
+            })
+            return result
+        result.update(accepted=False, fatal_mismatch=True, status='rejected',
+                      rejection_reason='insufficient_visible_subject_match')
+        return result
     if product_identity and identity_uncertain:
         # A strict named make/model request cannot be satisfied by generic
         # category footage when the reviewer itself cannot confirm identity.
@@ -1306,7 +1394,6 @@ def _score_verdict(scene: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict
             rejection_reason='named_product_identity_unconfirmed',
         )
         return result
-    facet_conflict = explicit_visual_facet_conflict(narration, result.get('scene_description') or '')
     if facet_conflict:
         result.update(accepted=False, scene_match=False, fatal_mismatch=True, status='rejected',
                       rejection_reason=facet_conflict)
@@ -1362,6 +1449,17 @@ def _score_verdict(scene: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict
             result["spurious_mismatch"] = True
             result["fatal_mismatch"] = False
     if explicit_scene_conflict({key: value for key, value in result.items() if key != "fatal_mismatch"}, relaxed=is_relaxed, scene=scene):
+        # Subject-level rescue: the conflict veto fires on literal
+        # mismatch too, and authentic subject footage must not die on
+        # it. Facet / named-product contradictions already returned
+        # above, so only the guard decides here.
+        if _subject_accepts():
+            result.update({
+                "accepted": True, "fatal_mismatch": False, "entity_conflict": False,
+                "status": "accepted", "subject_level_accepted": True,
+                "accept_reason": "subject_level_accept",
+            })
+            return result
         result.update({"accepted": False, "fatal_mismatch": True, "status": "rejected", "rejection_reason": "explicit_scene_conflict"})
         return result
     # A factual scene can legitimately use a contextual establishing shot
@@ -1957,13 +2055,43 @@ def _record_raw_fatal_verdict(scene: Mapping[str, Any], candidate: Mapping[str, 
     The record carries a deterministic ``adapter-fatal:<scene>:<content>``
     request id (the adapter has no bridge request id of its own) so a
     re-record of the same content dedupes instead of duplicating.
+    The record is stamped with the current job id (from the job context
+    set by ``_run_job_scoped``) so the coordinator's file-ledger seed —
+    which vetoes only the job that filed the record — can attribute it;
+    without a job id the record is legacy/unattributable and never seeds
+    a later job. Within the same job the veto still holds, including
+    across that job's resume attempts, which share its job id.
     """
     try:
         if not isinstance(verdict, Mapping) or not _as_bool(verdict.get("fatal_mismatch")):
             return None
         from .agent_bridge import bridge_root
-        from .verdict_conflicts import parse_video_id, record_late_fatal_reject
+        from .verdict_conflicts import (
+            build_coherence_context,
+            parse_video_id,
+            record_late_fatal_reject,
+            verdict_reason_coherence_issue,
+        )
 
+        # Reasoning-coherence gate (run 9, job a7f52c58 scene 4): a fatal
+        # verdict whose reasoning is cross-contaminated ("the yacht from
+        # the earlier clip review") is NOT filed — the candidate stays
+        # rejected for this scene on its own merits, but no ledger entry
+        # is created, so a later attempt re-reads it live instead of
+        # vetoing it on contaminated reasoning.
+        try:
+            context = build_coherence_context(scene, candidate)
+            issue = verdict_reason_coherence_issue(verdict, context)
+        except Exception:
+            issue = None
+        if issue is not None:
+            print(
+                "   [v2] fatal ledger: NOT filing adapter-fatal for scene "
+                f"{scene.get('scene_index') if isinstance(scene, Mapping) else '?'} "
+                f"({issue}); candidate stays rejected for this scene only",
+                flush=True,
+            )
+            return None
         scene_row = scene if isinstance(scene, Mapping) else {}
         try:
             scene_index = scene_row.get("scene_index")
@@ -1988,6 +2116,12 @@ def _record_raw_fatal_verdict(scene: Mapping[str, Any], candidate: Mapping[str, 
             scene_index if scene_index is not None else requirement_hash or "unknown",
             identifier,
         )
+        try:
+            from .job_context import current_job as _current_job
+
+            job_id = str(_current_job().get("job_id") or "").strip() or None
+        except Exception:
+            job_id = None
         record = {
             "request_id": request_id,
             "candidate_id": candidate_id,
@@ -1995,6 +2129,7 @@ def _record_raw_fatal_verdict(scene: Mapping[str, Any], candidate: Mapping[str, 
             "asset_sha256": str(asset_sha256 or "").strip() or None,
             "scene_index": scene_index,
             "requirement_hash": requirement_hash or None,
+            "job_id": job_id,
             "verdict": dict(verdict),
             "winner": None,
         }
@@ -2206,10 +2341,32 @@ def build_qwen_verifier(
         except (TypeError, ValueError):
             reserve_after = float(delivery_budget.render_reserve_seconds)
         allowance = delivery_budget.allowance(None, reserve_after_seconds=reserve_after)
+    # Bounded total media time (test-20): the shared context itself must
+    # stop issuing calls at the total, not just at the delivery allowance.
+    # refresh_deadline only ever EXTENDS, so clamp the absolute deadline
+    # directly when the total is earlier.
+    _media_total_deadline_at = context_config.get("_media_total_deadline_at")
+    _total_remaining: float | None = None
+    if _media_total_deadline_at is not None:
+        try:
+            _total_remaining = float(_media_total_deadline_at) - time.monotonic()
+        except (TypeError, ValueError):
+            _total_remaining = None
     if allowance is not None:
+        if _total_remaining is not None:
+            allowance = min(allowance, max(0.05, _total_remaining))
         context.refresh_deadline(deadline_seconds=max(0.05, allowance))
     else:
-        context.refresh_deadline(deadline_seconds=max(450.0, float(scene_count) * 25.0))
+        _default_deadline = max(450.0, float(scene_count) * 25.0)
+        if _total_remaining is not None:
+            _default_deadline = min(_default_deadline, max(0.05, _total_remaining))
+        context.refresh_deadline(deadline_seconds=_default_deadline)
+    if _total_remaining is not None and _total_remaining > 0:
+        with context._lock:
+            if context.deadline_at > float(_media_total_deadline_at):
+                context.deadline_at = float(_media_total_deadline_at)
+                if context.degraded_reason == "visual_deadline_exceeded":
+                    context.degraded_reason = ""
     if mixed_media:
         # ``_web_visual_context`` is created earlier by the app and reused
         # here. Normalize that existing object as well; otherwise its .env
@@ -2862,6 +3019,14 @@ def build_qwen_verifier(
         def analyze_with(target_client) -> Any:
             if is_video:
                 return target_client.analyze_clip_frames(frames, prompt, system)
+            # Batched prefetch (verify_batch): one vision request already
+            # judged this candidate. The primary client consumes the row
+            # once; a schema-invalid row must NOT be re-offered to the
+            # fallback client — it gets a genuinely fresh attempt, as today.
+            if target_client is client and isinstance(candidate, dict):
+                prefetched = candidate.pop("_vision_batch_row", None)
+                if isinstance(prefetched, Mapping):
+                    return dict(prefetched)
             return target_client.analyze_image(path, prompt, system)
 
         primary_errors = list(previous_schema_errors)
@@ -2941,46 +3106,134 @@ def build_qwen_verifier(
             if frames and cleanup_frames is not None:
                 cleanup_frames(frames)
 
+    def _verify_batch_prefetch(scene_row, eligible, client):
+        """One vision request for a scene's finalists; {path: raw verdict}.
+
+        Builds one batched prompt (same scene contract and per-candidate
+        metadata the single-candidate prompt carries) and files a single
+        analyze_images_batch call. Any failure — no batch method on the
+        client, a transport/schema error, no usable row — returns {} and
+        the caller falls back to one verify() call per finalist, as today.
+        The returned rows are RAW normalised verdicts: the caller feeds
+        each through the full verify() so validation, subject-level
+        acceptance, the fatal ledger and the verdict cache all apply
+        exactly as for a single-candidate call.
+        """
+        batch_fn = getattr(client, "analyze_images_batch", None)
+        if not callable(batch_fn):
+            return {}
+        requirement = scene_row.get("visual_requirement") if isinstance(scene_row.get("visual_requirement"), Mapping) else {}
+        positives = ", ".join(str(value) for value in scene_row.get("positive_subjects") or ())
+        forbidden = ", ".join(str(value) for value in scene_row.get("forbidden_subjects") or ())
+        required_attributes = json.dumps(dict(requirement.get("required_attributes") or {}), ensure_ascii=False)
+        film_context = str(
+            config.get("script") or config.get("source_script") or config.get("__vip_script") or ""
+        ).strip()
+        if len(film_context) > 650:
+            film_context = film_context[:650].rsplit(" ", 1)[0] + "..."
+        blocks = []
+        for position, candidate in enumerate(eligible):
+            hint = " | ".join(
+                str(candidate.get(key) or "").strip().replace("\n", " ")
+                for key in ("title", "description", "tags", "domain", "provider", "query_used")
+                if str(candidate.get(key) or "").strip()
+            )
+            blocks.append(
+                f"Candidate {position} — ID: {candidate.get('candidate_id') or candidate.get('id') or candidate.get('path')}\n"
+                f"Metadata (retrieval hint, not pixel proof): {hint[:700] or 'none'}"
+            )
+        batch_prompt = (
+            "Judge EACH image below for exactly one storyboard scene. Return one JSON object with a "
+            "\"verdicts\" array holding one verdict object per candidate, in the same order, using the "
+            "candidate_id shown for each. Every verdict has scene_description (describe actual visible "
+            "objects/action first without borrowing words from query), candidate_id, entity_conflict, "
+            "identity_score, action_score, context_score, quality, final_score, relevance, confidence, "
+            "visible_overlays, subject_box, safe_text_regions, fatal_mismatch, domain_match, scene_match, "
+            "reason, source_presentation_type, and has_text. Use exact snake_case keys. visible_overlays "
+            "and safe_text_regions must be arrays. subject_box must be {} when no subject is confidently "
+            "localized, otherwise an object with normalized x, y, width, height (0 to 1). entity_conflict, "
+            "fatal_mismatch, domain_match and scene_match must be JSON booleans. All scores must be numbers "
+            "from 0 to 100.\n"
+            "CRITERIA (same as the single-candidate gate):\n"
+            "1. Base judgment on actual visible pixels, not search titles or candidate metadata.\n"
+            "2. identity_confirmed=true only when visible design/features identify the requested named subject. If unidentifiable, return false.\n"
+            "3. Score the narrated action honestly (action_score). Static logos cannot explain motion or mechanics.\n"
+            "4. Inspect pixels for text, watermarks, and infographics. Set has_text=true and return boxes in visible_overlays.\n"
+            "5. source_presentation_type: photograph, illustration, text_heavy_diagram, archival_document, lecture_slide, presentation_slide, homework, worksheet, quiz, or video_frame. Reject lecture slides, homework, and contradictory infographics with fatal_mismatch=true.\n"
+            "6. Return synthetic_content=true if AI generated. Return talking_head=true and talking_head_confidence (0-100) if a host/presenter addresses camera.\n"
+            "7. Authentic contextual B-roll or establishing shots can support abstract or private beats (scene_match=true) if they do not depict competing entities or contradict scene facts. For a named person, another identifiable person shown as the portrait/main subject is a wrong-entity conflict. Reserve fatal_mismatch for a wrong entity, conflicting event, contradictory era/year, or unsafe media.\n"
+            f"Exact narration: {scene_row.get('text') or ''}\n"
+            f"Film subject: {config.get('content_title') or config.get('title') or 'documentary'}\n"
+            f"Film context: {film_context or 'none'}\n"
+            f"Canonical entity: {str(requirement.get('canonical_entity') or '') or positives or 'generic context'}\n"
+            f"Required entity type: {requirement.get('subject_type') or 'unknown'}\n"
+            f"Required domain: {requirement.get('domain') or scene_row.get('domain') or 'general documentary'}\n"
+            f"Required attributes: {required_attributes}\n"
+            f"Scene subject scope: {json.dumps(dict(requirement.get('subject_context') or {}), ensure_ascii=False)}\n"
+            f"Positive subjects: {positives or 'none'}; forbidden subjects: {forbidden or 'none'}\n"
+            f"Requirement hash: {requirement.get('requirement_hash') or 'legacy'}\n"
+            f"Visual intent: {scene_row.get('visual_intent') or 'documentary_context'}\n"
+            "FINAL ACCEPTANCE TARGET: " + str(scene_row.get('text') or '') + "\n"
+            "Explain support in reason for this exact sentence based on visible evidence.\n\n"
+            + "\n\n".join(blocks)
+        )
+        system_prompt = (
+            "You are the final factual visual verifier. Inspect only the supplied assets. "
+            "Never infer fair use or rights. Return one JSON object with a verdicts array and no prose."
+        )
+        try:
+            rows = batch_fn(
+                [str(candidate.get("path") or "") for candidate in eligible],
+                batch_prompt,
+                system_prompt,
+                [str(candidate.get("candidate_id") or candidate.get("id") or candidate.get("path") or "") for candidate in eligible],
+            )
+        except Exception as exc:
+            # Log the message, not just the type: the type alone
+            # ("VisionClientError") hid the cause of test 13's 6/6 batch
+            # failures — the message was "Batched vision is disabled in
+            # fast mode", which named the bug. Never log only the type here.
+            print(f"   [vision] batched prefetch failed ({type(exc).__name__}: {exc}); falling back to single verifies")
+            return {}
+        if not isinstance(rows, Mapping) or not rows:
+            return {}
+        by_path = {}
+        for candidate in eligible:
+            path = str(candidate.get("path") or "")
+            cid = str(candidate.get("candidate_id") or candidate.get("id") or candidate.get("path") or "")
+            row = rows.get(cid)
+            if isinstance(row, Mapping):
+                by_path[path] = dict(row)
+        return by_path
+
     def verify_batch(scene: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-        """Judge up to 4 image finalists for one scene in ONE compare request.
+        """Judge up to 4 image finalists for one scene in SAFE batches of 2.
 
-        The per-candidate gate above files one analyze_image / analyze_clip_frames
-        request per finalist (3 per scene at the spec finalist limit). This
-        batch sends the finalists to compare_images once, then runs the full
-        single-candidate verify() only for the compare winner — the compare
-        rows carry relevance/quality/fatal_mismatch/watermark/scene_description
-        (see the web resolver's compare prompt), but NOT the identity/action/
-        context scores the V2 verdict schema requires, so those scores are
-        never invented for the losers. Losers get a compare-only verdict:
-        hard-rejected when their row shows a fatal mismatch, watermark, or
-        unsafe content, otherwise ``compare_not_selected`` with
-        visual_checked False, so a later recovery pass can still single-verify
-        them if the winner fails. The winner's verdict is the authoritative
-        full verify() result, cached like any other.
+        SAFE BATCH: at most 2 images per vision request. The context layer
+        splits the finalists into chunks of 2 and files them in parallel;
+        each chunk returns one verdict row per candidate. Each row is then
+        scored by the full single-candidate verify() — same validation,
+        same subject-level acceptance, same fatal ledger, same verdict
+        cache — so batching changes only how verdicts arrive, never which
+        images win. Never send a whole scene's frames in one request (test
+        13: the 4-candidate batch failed 6/6 live).
+        Finalists are still tried in ranked order with an early exit on
+        the first accept, as the sequential path did: a scene whose winner
+        ranks first spends exactly one vision request, and a scene whose
+        first finalists reject spends one request instead of one per
+        reject. Losers tried before the winner keep their real
+        single-verify verdicts (checked and cached, with the fatal-ledger
+        entry verify() records), so the coordinator never re-verifies a
+        frame this batch already judged. Candidates after the winner are
+        never tried and stay omitted, so a later recovery pass can still
+        single-verify them if the winner fails.
 
-        All-rejected compares keep their hard rejections instead of
-        discarding them: when the compare selects no winner
-        (``selected_index`` -1 / ``acceptable`` false) or every row is
-        hard-rejected, the hard-rejected rows are returned as
-        ``compare_rejected`` verdicts with ``visual_checked`` True — the
-        compare worker looked at the pixels and flagged a confident fatal
-        mismatch, watermark, or unsafe content, so the coordinator caches
-        and ledgers that verdict for this scene instead of re-verifying
-        each loser singly (job 31f5bfec: one all-rejected compare per scene
-        was followed by 4 single-frame verifications of the same frames,
-        28 wasted vision requests across 7 scenes). Non-fatal rows are
-        still omitted in that case, so they fall back to per-candidate
-        verify() as today — the compare stays a ranking aid, never the
-        rejection authority, for anything less than a confident hard
-        rejection. The veto is scene-scoped (the coordinator's fatal
-        ledger keys on scene + content), so a frame rejected for one
-        scene is still judged fresh for another.
-
-        Returns {candidate path: verdict} for the batched candidates, or {}
-        when batching does not apply (fewer than 2 image finalists, a video
-        finalist, no client, or any compare error): the caller then falls
-        back to one verify() call per finalist, as today. An all-rejected
-        compare returns only its hard-rejected rows (see above), never {}.
+        Returns {candidate path: verdict} for the tried candidates, or {}
+        when batching does not apply (fewer than 2 image finalists, a
+        video finalist, no client, or every verify() call failed): the
+        caller then falls back to one verify() call per finalist, as today.
+        A failed batch prefetch degrades to the old sequential loop
+        inside this function (one verify() per finalist), not to {}.
         """
         rows = [row for row in (candidates or []) if isinstance(row, Mapping)]
         if len(rows) < 2:
@@ -2988,7 +3241,6 @@ def build_qwen_verifier(
         scene_row = _verifier_scene_row(scene) if isinstance(scene, Mapping) else {}
         if not isinstance(scene_row, Mapping):
             scene_row = {}
-        paths: list[str] = []
         eligible: list[Mapping[str, Any]] = []
         for candidate in rows[:4]:
             path = str(candidate.get("path") or "")
@@ -2996,9 +3248,8 @@ def build_qwen_verifier(
                 return {}
             if _is_video(path, str(candidate.get("media_type") or "")):
                 return {}
-            paths.append(path)
             eligible.append(candidate)
-        if len(paths) < 2:
+        if len(eligible) < 2:
             return {}
         try:
             client = context.get_client()
@@ -3006,115 +3257,301 @@ def build_qwen_verifier(
             return {}
         if client is None:
             return {}
-        requirement = scene_row.get("visual_requirement") if isinstance(scene_row.get("visual_requirement"), Mapping) else {}
-        positives = ", ".join(str(value) for value in scene_row.get("positive_subjects") or ())
-        compare_prompt = (
-            f"Scene narration: {scene_row.get('text') or ''}\n"
-            f"Documentary topic: {config.get('content_title') or config.get('title') or 'documentary'}\n"
-            f"Required subject: {requirement.get('canonical_entity') or positives or 'documentary context'}\n"
-            "Select the candidate that best depicts the required subject/action. "
-            "Return JSON with an 'acceptable' boolean (true if at least one candidate "
-            "is plausibly on-topic), selected_index, confidence, reason, and a "
-            "candidates array containing relevance, quality, fatal_mismatch, "
-            "adult_content, suggestive_content, synthetic_content, unsafe_content, "
-            "watermark, and scene_description (describe visible objects, not search "
-            "metadata) for every candidate. Reject ONLY a confident wrong "
-            "entity/event/domain, clearly irrelevant media, or adult/unsafe content."
-        )
-        try:
-            comparison = client.compare_images(paths, compare_prompt)
-        except Exception as exc:
-            print(f"   [vision] compare batch failed ({type(exc).__name__}); falling back to per-candidate verify")
-            return {}
-        if not isinstance(comparison, dict):
-            return {}
-        model_rows = comparison.get("candidates")
-        model_rows = model_rows if isinstance(model_rows, list) else []
-        if not model_rows:
-            return {}
-        selected = comparison.get("selected_index")
-        has_winner = (
-            isinstance(selected, int)
-            and not isinstance(selected, bool)
-            and 0 <= selected < len(eligible)
-        )
-        def _row_number(row: Mapping[str, Any], keys: Sequence[str], default: float = 0.0) -> float:
-            for key in keys:
-                value = row.get(key)
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    continue
-                try:
-                    number = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if number == number:  # not NaN
-                    return number
-            return default
-
-        def _row_flag(row: Mapping[str, Any], keys: Sequence[str]) -> bool:
-            return any(_as_bool(row.get(key)) for key in keys)
-
-        top_reason = str(comparison.get("reason") or "")
-        top_confidence = _score(comparison.get("confidence"))
+        batched_rows = _verify_batch_prefetch(scene_row, eligible, client)
         results: dict[str, dict[str, Any]] = {}
-        usable = False
-        for position, candidate in enumerate(eligible):
-            row = model_rows[position] if position < len(model_rows) and isinstance(model_rows[position], dict) else {}
-            fatal = _row_flag(row, ("fatal_mismatch", "entity_conflict"))
-            watermark = _row_flag(row, ("watermark", "ownership_watermark"))
-            unsafe = _row_flag(row, ("unsafe_content", "adult_content", "suggestive_content"))
-            if not (fatal or watermark or unsafe):
-                usable = True
-            results[str(candidate.get("path") or "")] = {
-                "accepted": False,
-                "status": "rejected" if (fatal or watermark or unsafe) else "compare_not_selected",
-                "final_score": _row_number(row, ("relevance", "scene_relevance", "score")),
-                "final_score_source": "compare_relevance",
-                "relevance": _row_number(row, ("relevance", "scene_relevance", "score")),
-                "quality": _row_number(row, ("quality",)),
-                "fatal_mismatch": fatal,
-                "watermark": watermark,
-                "unsafe_content": unsafe,
-                "synthetic_content": _row_flag(row, ("synthetic_content",)),
-                "scene_description": str(row.get("scene_description") or ""),
-                "confidence": _row_number(row, ("confidence",), top_confidence),
-                "reason": str(row.get("reason") or top_reason or "compare_not_selected"),
-                "verification_attempt": "compare_batch",
-                "compare_selected": False,
-                "visual_checked": False,
-                "visual_available": False,
-                "schema_valid": False,
-            }
-        if not has_winner or not usable:
-            # No winner to fully verify (all-rejected compare), or every
-            # row is hard-rejected. Return ONLY the hard-rejected rows as
-            # checked verdicts: the compare worker inspected the pixels and
-            # flagged a confident fatal mismatch / watermark / unsafe
-            # content, so the coordinator caches and ledgers that verdict
-            # for this scene instead of spending a single-frame vision
-            # request per loser. Non-fatal rows are omitted, so they fall
-            # back to per-candidate verify() as today — the compare never
-            # rejects on a mere ranking judgement. When no row is
-            # hard-rejected this returns {} and the caller falls back
-            # exactly as before.
-            hard_rejected = {}
-            for path, verdict in results.items():
-                if verdict.get("fatal_mismatch") or verdict.get("watermark") or verdict.get("unsafe_content"):
-                    hard_rejected[path] = dict(
-                        verdict,
-                        status="compare_rejected",
-                        visual_checked=True,
-                        visual_available=True,
-                    )
-            return hard_rejected
-        winner = eligible[selected]
-        winner_verdict = verify(scene_row, dict(winner))
-        results[str(winner.get("path") or "")] = dict(winner_verdict, compare_selected=True)
+        for candidate in eligible:
+            path = str(candidate.get("path") or "")
+            trial = dict(candidate)
+            row = (batched_rows or {}).get(path)
+            if isinstance(row, Mapping):
+                trial["_vision_batch_row"] = dict(row)
+            try:
+                verdict = verify(scene_row, trial)
+            except Exception as exc:
+                print(f"   [vision] batched single verify failed for {path} ({type(exc).__name__}); trying next finalist")
+                continue
+            if not isinstance(verdict, dict):
+                continue
+            results[path] = dict(verdict, compare_selected=bool(verdict.get("accepted")))
+            if verdict.get("accepted"):
+                break
         return results
 
     verify.verify_batch = verify_batch
     verify.visual_context = context
     return verify, context
+
+
+# Floor for one usable distinct moment when a shared YouTube cut is split
+# across scenes. Below this, segments are too short to stand as a scene's
+# footage and the duplicate is left for the downstream dedup as before.
+DUPLICATE_CUT_MIN_SEGMENT_SECONDS = 2.0
+
+
+def _duplicate_cut_split_enabled() -> bool:
+    return _as_bool(os.environ.get("VIDZEO_DUPLICATE_CUT_SPLIT"), True)
+
+
+def _cut_video_segment(source: str, start: float, duration: float, dest: str, *, timeout_seconds: float = 120.0) -> bool:
+    """Cut one exact, re-encoded segment out of a local clip.
+
+    Re-encode (not stream copy) so the segment boundaries are frame-exact:
+    two segments of the same source must show disjoint moments, not
+    keyframe-rounded overlapping ones. Returns True only when the output
+    exists, decodes, and is a video asset.
+    """
+    ffmpeg, _ffprobe = resolve_ffmpeg_pair()
+    command = [
+        str(ffmpeg), "-y", "-v", "error",
+        "-ss", f"{max(0.0, float(start)):.3f}",
+        "-t", f"{max(0.0, float(duration)):.3f}",
+        "-i", str(source),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(dest),
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=False, capture_output=True, text=True,
+            timeout=max(10.0, float(timeout_seconds)),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"   [v2] duplicate cut split: ffmpeg failed for {dest}: {type(exc).__name__}", flush=True)
+        return False
+    if completed.returncode != 0:
+        print(
+            f"   [v2] duplicate cut split: ffmpeg rc={completed.returncode} for {dest}: "
+            f"{(completed.stderr or '').strip()[:200]}",
+            flush=True,
+        )
+        return False
+    valid, _reason, kind = _validate_renderable_asset(str(dest))
+    return bool(valid and kind == "video")
+
+
+def _duplicate_cut_video_id(row: Mapping[str, Any]) -> str:
+    candidate = str(row.get("candidate_id") or "").strip()
+    if candidate.startswith("youtube:"):
+        token = candidate[len("youtube:"):].split(":", 1)[0].strip()
+        if token:
+            return re.sub(r"[^A-Za-z0-9_-]", "", token) or "clip"
+    source_url = str(row.get("source_url") or "")
+    match = re.search(r"[?&]v=([A-Za-z0-9_-]{6,})", source_url)
+    if match:
+        return match.group(1)
+    return "clip"
+
+
+def _split_duplicate_youtube_cuts(
+    paths: list,
+    resolution_rows: list,
+    resolutions: Mapping[int, Any],
+) -> list[dict[str, Any]]:
+    """Split byte-identical YouTube cuts shared by several scenes.
+
+    A coordinator-accepted cut can be assigned to two scenes when the same
+    injected prep candidate maps twice (run 7: ZGyKOjovCOI at 671.76 s for
+    live scenes 7 and 9). The downstream byte-identity dedup caps YouTube
+    video reuse at 1, so the second copy is dropped and the scene falls to
+    a graphic — even though its own visual gate passed. Split the shared
+    clip into disjoint timestamp segments instead: same source video,
+    different moments, distinct bytes. Each segment is a subset of footage
+    vision already passed for that scene, so no new verification is faked;
+    the split is recorded on the row and in the plan metadata.
+
+    Only YouTube video rows are split (extracted frames and web stills keep
+    their own caps). A group is left untouched — and audited as skipped —
+    when the clip is too short for useful disjoint moments, unreadable, or
+    any segment cut fails. Never raises: assembly must not die on repair.
+    """
+    audit: list[dict[str, Any]] = []
+    if not _duplicate_cut_split_enabled():
+        return audit
+    try:
+        groups: dict[str, list[int]] = {}
+        for index, path in enumerate(paths):
+            if not path or index >= len(resolution_rows):
+                continue
+            row = resolution_rows[index]
+            if not isinstance(row, Mapping):
+                continue
+            if not _is_moving_youtube_source(row):
+                continue
+            source = Path(str(path))
+            if not source.is_file() or is_synthetic_media(str(path)):
+                continue
+            fingerprint = _asset_fingerprint(str(path))
+            if not fingerprint:
+                continue
+            groups.setdefault(fingerprint, []).append(index)
+        for fingerprint, indices in sorted(groups.items()):
+            if len(indices) < 2:
+                continue
+            indices = sorted(indices)
+            source_path = str(paths[indices[0]])
+            base_row = resolution_rows[indices[0]]
+            base_start: float | None = None
+            for index in indices:
+                value = resolution_rows[index].get("video_start")
+                try:
+                    if value is not None:
+                        base_start = float(value)
+                        break
+                except (TypeError, ValueError):
+                    continue
+            probe = probe_media(source_path, require_video=True, min_bytes=1024)
+            duration = float(probe.duration or 0.0)
+            segment_count = len(indices)
+            segment_seconds = duration / segment_count if duration > 0 else 0.0
+            if not probe.valid or segment_seconds < DUPLICATE_CUT_MIN_SEGMENT_SECONDS:
+                audit.append({
+                    "scene_indices": list(indices),
+                    "source_path": source_path,
+                    "source_candidate_id": str(base_row.get("candidate_id") or ""),
+                    "status": "skipped",
+                    "reason": (
+                        "clip_too_short_for_disjoint_segments"
+                        if probe.valid
+                        else f"unprobable_source_clip:{probe.reason or 'ffprobe_failed'}"
+                    ),
+                    "clip_duration_seconds": round(duration, 3),
+                    "segment_count": segment_count,
+                    "min_segment_seconds": DUPLICATE_CUT_MIN_SEGMENT_SECONDS,
+                })
+                continue
+            video_id = _duplicate_cut_video_id(base_row)
+            source_dir = Path(source_path).parent
+            planned: list[dict[str, Any]] = []
+            failed = ""
+            for slot, index in enumerate(indices):
+                start = slot * segment_seconds
+                length = duration - start if slot == segment_count - 1 else segment_seconds
+                dest = source_dir / f"{video_id}_distinct_seg{slot + 1}of{segment_count}.mp4"
+                if not _cut_video_segment(source_path, start, length, str(dest)):
+                    failed = f"segment_cut_failed:scene_{index}"
+                    break
+                new_fingerprint = _asset_fingerprint(str(dest))
+                if not new_fingerprint or new_fingerprint == fingerprint:
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                    failed = f"segment_not_distinct:scene_{index}"
+                    break
+                row = resolution_rows[index]
+                new_start = (base_start + start) if base_start is not None else start
+                planned.append({
+                    "scene_index": index,
+                    "segment_path": str(dest),
+                    "segment_sha256": new_fingerprint,
+                    "file_offset_start": round(start, 3),
+                    "file_offset_end": round(start + length, 3),
+                    "video_start": round(new_start, 3),
+                    "video_end": round(new_start + length, 3),
+                    "segment_index": slot + 1,
+                    "candidate_id": f"{str(row.get('candidate_id') or '')}:seg{slot + 1}of{segment_count}",
+                })
+            if failed or len(planned) != segment_count:
+                for entry in planned:
+                    try:
+                        Path(str(entry["segment_path"])).unlink()
+                    except OSError:
+                        pass
+                audit.append({
+                    "scene_indices": list(indices),
+                    "source_path": source_path,
+                    "source_candidate_id": str(base_row.get("candidate_id") or ""),
+                    "status": "skipped",
+                    "reason": failed or "segment_plan_incomplete",
+                    "clip_duration_seconds": round(duration, 3),
+                    "segment_count": segment_count,
+                })
+                continue
+            for entry in planned:
+                index = int(entry["scene_index"])
+                row = resolution_rows[index]
+                original_candidate = str(row.get("candidate_id") or "")
+                attempt = {
+                    "source": "youtube",
+                    "stage": "duplicate_cut_split",
+                    "status": "accepted_distinct_timestamp_segment",
+                    "candidate_id": str(entry["candidate_id"]),
+                    "source_candidate_id": original_candidate,
+                    "source_path": source_path,
+                    "segment_path": str(entry["segment_path"]),
+                    "segment_index": int(entry["segment_index"]),
+                    "segment_count": segment_count,
+                    "file_offset_start": float(entry["file_offset_start"]),
+                    "file_offset_end": float(entry["file_offset_end"]),
+                    "video_start": float(entry["video_start"]),
+                    "video_end": float(entry["video_end"]),
+                    "segment_sha256": str(entry["segment_sha256"]),
+                    "shared_with_scene_indices": [i for i in indices if i != index],
+                    "reason": "byte_identical_youtube_cut_shared_by_scenes",
+                }
+                paths[index] = str(entry["segment_path"])
+                new_attempts = list(row.get("attempts") or [])
+                new_attempts.append(attempt)
+                row.update({
+                    "selected_path": str(entry["segment_path"]),
+                    "video_start": float(entry["video_start"]),
+                    "video_end": float(entry["video_end"]),
+                    "render_clip_start": 0.0,
+                    "asset_fingerprint": str(entry["segment_sha256"]),
+                    "candidate_id": str(entry["candidate_id"]),
+                    "resolution_kind": "duplicate_cut_distinct_segment",
+                    "attempts": new_attempts,
+                })
+                resolution_key = row.get("scene_index", index)
+                try:
+                    resolution_key = int(resolution_key)
+                except (TypeError, ValueError):
+                    resolution_key = index
+                resolution = resolutions.get(resolution_key) if isinstance(resolutions, Mapping) else None
+                if resolution is not None:
+                    try:
+                        resolutions[resolution_key] = replace(
+                            resolution,
+                            selected_path=str(entry["segment_path"]),
+                            video_start=float(entry["video_start"]),
+                            video_end=float(entry["video_end"]),
+                            render_clip_start=0.0,
+                            asset_fingerprint=str(entry["segment_sha256"]),
+                            candidate_id=str(entry["candidate_id"]),
+                            resolution_kind="duplicate_cut_distinct_segment",
+                            attempts=new_attempts,
+                        )
+                    except Exception:
+                        pass
+                audit.append({
+                    "scene_index": index,
+                    "source_path": source_path,
+                    "source_candidate_id": original_candidate,
+                    "status": "split",
+                    "segment_path": str(entry["segment_path"]),
+                    "segment_index": int(entry["segment_index"]),
+                    "segment_count": segment_count,
+                    "file_offset_start": float(entry["file_offset_start"]),
+                    "file_offset_end": float(entry["file_offset_end"]),
+                    "video_start": float(entry["video_start"]),
+                    "video_end": float(entry["video_end"]),
+                    "segment_sha256": str(entry["segment_sha256"]),
+                    "shared_with_scene_indices": [i for i in indices if i != index],
+                })
+            print(
+                "   [v2] duplicate YouTube cut split: "
+                f"{source_path} -> {segment_count} disjoint segment(s) for scenes {indices}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"   [v2] duplicate cut split unavailable: {type(exc).__name__}: {exc}", flush=True)
+        audit.append({
+            "status": "skipped",
+            "reason": f"splitter_error:{type(exc).__name__}",
+        })
+    return audit
 
 
 def resolve_and_build_media_plan(
@@ -3136,6 +3573,10 @@ def resolve_and_build_media_plan(
     external_cancel_event: threading.Event | None = None,
     adaptive_media_review: bool = False,
     vision_reserve_seconds: float | None = None,
+    job_id: str | None = None,
+    youtube_general_pool: Any = None,
+    youtube_discovery_budget_seconds: float | None = None,
+    verification_deadline_seconds: float | None = None,
 ) -> tuple[dict[str, Any], dict[int, SceneResolution]]:
     resolutions = resolve_storyboard_media_v2(
         scenes,
@@ -3154,6 +3595,9 @@ def resolve_and_build_media_plan(
         external_cancel_event=external_cancel_event,
         adaptive_media_review=adaptive_media_review,
         vision_reserve_seconds=vision_reserve_seconds,
+        job_id=job_id,
+        youtube_general_pool=youtube_general_pool,
+        verification_deadline_seconds=verification_deadline_seconds,
     )
     paths: list[str | None] = []
     labels: list[str] = []
@@ -3164,6 +3608,11 @@ def resolve_and_build_media_plan(
         resolution = resolutions[index]
         row = resolution.to_dict()
         path = str(resolution.selected_path or "") or None
+        if path:
+            # Render-facing path only: prefer a pre-scaled 1080p sibling
+            # when advance preparation made one. The provenance row above
+            # keeps the original selected_path.
+            path = prefer_scaled_1080p(path)
         provider = str(resolution.provider or "neutral")
         label = {
             "youtube": "YouTube Clips",
@@ -3184,9 +3633,18 @@ def resolve_and_build_media_plan(
         if visual_status == "deterministic_degraded":
             resolution.verification_status = "deterministic_degraded"
             row["verification_status"] = "deterministic_degraded"
+    # A byte-identical YouTube cut shared by several scenes would be dropped
+    # by the downstream reuse dedup (cap 1) even though every scene's own
+    # visual gate passed. Split it into disjoint timestamp segments here,
+    # at assembly, so each scene keeps a real clip and no two scenes show
+    # the same moment.
+    duplicate_cut_splits = _split_duplicate_youtube_cuts(
+        paths, resolution_rows, resolutions
+    )
     metadata = {
         "pipeline_schema_version": "2.0",
         "media_resolution_v2": resolution_rows,
+        "duplicate_cut_splits": duplicate_cut_splits,
         "source_accounting": dict(source_counter),
         "terminal_accounting": dict(terminal_counter),
         "source_scene_texts": [str(_scene_value(scene, "text", "")) for scene in scenes],
@@ -3374,18 +3832,34 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
                 pass
 
     # Gaming mode (config['_gaming_mode'], set by
-    # app._resolve_mixed_media_niche_policy) binds the 0.90 YouTube target.
+    # app._resolve_mixed_media_niche_policy) binds the 0.80 YouTube target.
     # The copied gaming weights alone only reach 0.80, and a deployment env
     # default (e.g. 0.8) must not silently cap a gaming job below it. An
     # explicit per-job coverage key above still wins. The target value
     # itself lives in config['_gaming_youtube_target'] (stamped by
     # app._apply_gaming_mode_policy from the planner constant) so the
-    # number has one source of truth; 0.90 is the fallback.
+    # number has one source of truth; 0.80 is the fallback.
     if _as_bool(config.get("_gaming_mode"), False):
         try:
-            stamped = float(config.get("_gaming_youtube_target") or 0.90)
+            stamped = float(config.get("_gaming_youtube_target") or 0.80)
         except (TypeError, ValueError):
-            stamped = 0.90
+            stamped = 0.80
+        return max(0.0, min(1.0, stamped))
+
+    # Documentary mode (config['_documentary_mode'], set by
+    # app._apply_documentary_mode_policy) binds the 0.55 YouTube target
+    # from the planner constant AUTO_YOUTUBE_RATIO. The target value
+    # itself lives in config['_documentary_youtube_target'] (stamped by
+    # app._apply_documentary_mode_policy) so the number has one source of
+    # truth; 0.55 is the fallback. Gaming mode above wins when a job is
+    # both. An explicit per-job coverage key above still wins. Without
+    # this branch, documentary jobs fell through to the 0.30 default
+    # below (or to whatever the retrieval weights happened to say).
+    if _as_bool(config.get("_documentary_mode"), False):
+        try:
+            stamped = float(config.get("_documentary_youtube_target") or 0.55)
+        except (TypeError, ValueError):
+            stamped = 0.55
         return max(0.0, min(1.0, stamped))
 
     env_target = os.environ.get("VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET")
@@ -4136,6 +4610,13 @@ def resolve_existing_provider_branches_v2(
 ) -> tuple[dict[str, Any], dict[int, SceneResolution], VisualDecisionContext]:
     """Route the current provider transports through the strict V2 state machine."""
 
+    # Bounded total media time (test-20 long-tail guard): the resolve
+    # clock starts here. Lane setup below is seconds, so this start is
+    # within seconds of the coordinator's own start; the total deadline
+    # (discovery budget + tail) computed from it bounds every later
+    # YouTube wave and the post-coordinator gate.
+    _media_resolve_started_at = time.monotonic()
+    _media_total_deadline_at: float | None = None
     from .documentary_subject import title_hook_subject, collection_title_subject, search_key
     original_title = str(config.get('content_title') or config.get('title') or title)
     supported_title_subject = title_hook_subject(original_title, script)
@@ -4882,6 +5363,163 @@ def resolve_existing_provider_branches_v2(
     youtube_primary_attempted_indices: set[int] = set()
     youtube_indices_ref = {"indices": primary_youtube_scene_indices}
     youtube_fallback_mode = {"enabled": False}
+    # Two-track YouTube discovery (user order, Nov 21 2026): the discovery
+    # budget is 5 minutes per minute of video (300s/min, configurable via
+    # config key yt_discovery_seconds_per_minute or env
+    # VIDZEO_YT_DISCOVERY_SECONDS_PER_MINUTE), NO cap. It bounds ONLY
+    # discovery (search, rank, transcript, probe, vision). Downloads are
+    # exempt: the branch's soft timeout stops new discovery at the budget
+    # while in-flight downloads drain until the hard timeout (budget +
+    # drain below). Track B (general pool) runs in parallel with Track A
+    # (scene-by-scene) from the same budget; neither waits for the other.
+    from .youtube_discovery_budget import (
+        discovery_budget_seconds,
+        media_tail_seconds,
+        total_media_budget_seconds,
+        video_duration_minutes,
+    )
+    from .youtube_general_pool import (
+        YouTubeGeneralPool,
+        build_general_pool,
+        build_general_pool_queries,
+        general_pool_enabled,
+        general_pool_reuse_cap,
+    )
+    _yt_duration_minutes = video_duration_minutes(
+        sum(float(d or 0.0) for d in scene_durations), scene_count=len(scenes)
+    )
+    youtube_discovery_budget_seconds = discovery_budget_seconds(
+        _yt_duration_minutes, config=config
+    )
+    # Download drain after the discovery budget: enough for a few parallel
+    # ranged transfers to land. Bounded and small relative to the budget;
+    # the coordinator's media wall still bounds the whole stage.
+    youtube_download_drain_seconds = 120.0
+    youtube_discovery_hard_seconds = (
+        youtube_discovery_budget_seconds + youtube_download_drain_seconds
+    )
+    # Bounded total media time (GTA test 18 long-tail guard, job 2451ee04):
+    # the discovery budget bounds discovery only, and the review gate,
+    # recovery lanes, and sequential inline finalization after it used to
+    # run against the 3600s media wall — test 18 spent ~22 min there on 17
+    # sequential inline vision calls after discovery had stopped. The
+    # verification deadline is discovery budget + tail (default 120s) from
+    # resolve start: no post-discovery vision starts past it, and scenes
+    # cut off there resolve with cached/best-so-far verdicts. Downloads
+    # stay exempt (background drain to the hard deadline above); the stage
+    # never waits on them past the total.
+    youtube_media_tail_seconds = media_tail_seconds(config)
+    media_verification_deadline_seconds = total_media_budget_seconds(
+        youtube_discovery_budget_seconds, config=config
+    )
+    # Absolute end of the total media budget, from the resolve start
+    # above. The fallback batch (below) and the post-coordinator gate
+    # (app.py, via config) both read this: no YouTube wave starts past
+    # it and no authoritative re-verification starts past it.
+    _media_total_deadline_at = (
+        _media_resolve_started_at + float(media_verification_deadline_seconds)
+    )
+    if isinstance(config, dict):
+        config["_media_total_deadline_at"] = _media_total_deadline_at
+    print(
+        "   [budget] media verification tail: discovery "
+        f"{youtube_discovery_budget_seconds:.0f}s + tail "
+        f"{youtube_media_tail_seconds:.0f}s = total "
+        f"{media_verification_deadline_seconds:.0f}s; post-discovery vision "
+        "stops at the total",
+        flush=True,
+    )
+    # Track B shared pool (filled by the background builder thread below).
+    youtube_general_pool = YouTubeGeneralPool(
+        reuse_cap=general_pool_reuse_cap(config)
+    )
+    _general_pool_build_state: dict[str, Any] = {"started": False, "thread": None}
+
+    def _start_general_pool_build(pool_lane_config: Mapping[str, Any]) -> None:
+        """Start the Track B general-pool build once, in the background.
+
+        Runs in parallel with Track A and never blocks it: the pool is
+        filled as its clips verify, and the coordinator claims from
+        whatever is ready when a quota scene needs it. The pool build
+        shares the discovery budget (soft timeout) so it self-terminates
+        with Track A; a failed build leaves an empty pool and Track A
+        proceeds alone.
+
+        Disabled by default (Nov 21, 2026): the pool verified 0 clips
+        in test 18 and test 19 — its fresh downloads time out, so
+        nothing banks. Track A + web fallback deliver instead. The pool
+        object stays empty, so the coordinator's late-quota pass finds
+        nothing and scenes fall through to web exactly as they did with
+        an empty pool in those runs. Re-enable with
+        yt_general_pool_enabled / VIDZEO_YT_GENERAL_POOL_ENABLED.
+        """
+        if not general_pool_enabled(config):
+            print(
+                "   [v2] general YouTube pool disabled "
+                "(yt_general_pool_enabled off) — scene-by-scene + web only",
+                flush=True,
+            )
+            return
+        if _general_pool_build_state["started"]:
+            return
+        _general_pool_build_state["started"] = True
+        pool_queries = build_general_pool_queries(
+            original_title,
+            topic_anchor=str(provider_topic_title or ""),
+            scene_subjects=[
+                str(item.get("section_subject") or "")
+                for item in semantic_query_rows
+            ],
+        )
+        if not pool_queries:
+            return
+        pool_run_config = dict(pool_lane_config)
+        pool_run_config["yt_soft_timeout_seconds"] = youtube_discovery_budget_seconds
+        pool_run_config["yt_stop_on_soft_timeout"] = True
+        pool_run_config["yt_min_resolved_ratio_before_soft_stop"] = 0.0
+        pool_run_config["yt_hard_timeout_seconds"] = youtube_discovery_hard_seconds
+        pool_run_config["yt_max_download_scenes"] = len(pool_queries)
+        pool_output_dir = str(
+            Path(str(config.get("_run_temp_dir") or config.get("output_dir") or "output"))
+            / "youtube_general_pool"
+        )
+        print(
+            "   [v2] general YouTube pool: building in parallel with "
+            f"scene-by-scene discovery ({len(pool_queries)} topic queries, "
+            f"budget {youtube_discovery_budget_seconds:.0f}s)",
+            flush=True,
+        )
+
+        def _run_pool_build() -> None:
+            try:
+                built = build_general_pool(
+                    youtube_runner,
+                    queries=pool_queries,
+                    title=provider_topic_title,
+                    script=script,
+                    run_config=pool_run_config,
+                    output_dir=pool_output_dir,
+                    reuse_cap=general_pool_reuse_cap(config),
+                    cancellation=cancellation,
+                )
+                for entry in built.entries():
+                    youtube_general_pool.add(entry)
+                print(
+                    "   [v2] general YouTube pool ready: "
+                    f"{len(youtube_general_pool)} verified clip(s)",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"   [v2] general YouTube pool build failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        thread = threading.Thread(
+            target=_run_pool_build, daemon=True, name="yt-general-pool"
+        )
+        _general_pool_build_state["thread"] = thread
+        thread.start()
     primary_youtube_rows: dict[int, Any] = {}
     for source_key, enabled_key in (
         ("youtube", "youtube_enabled"),
@@ -4923,6 +5561,17 @@ def resolve_existing_provider_branches_v2(
             f"{len(youtube_scene_indices)}/{len(scenes)} quota scenes",
         )
         lane_config = dict(config)
+        # Two-track discovery budget: the soft timeout IS the discovery
+        # budget (300s per minute of video). With coverage 0 it fires
+        # regardless of how many clips are ready, so new scene workers stop
+        # at the budget; in-flight downloads drain until the hard timeout.
+        # Downloads are exempt from the discovery budget. Start Track B
+        # (general pool) now so it builds in parallel with Track A.
+        lane_config["yt_soft_timeout_seconds"] = youtube_discovery_budget_seconds
+        lane_config["yt_stop_on_soft_timeout"] = True
+        lane_config["yt_min_resolved_ratio_before_soft_stop"] = 0.0
+        lane_config["yt_hard_timeout_seconds"] = youtube_discovery_hard_seconds
+        _start_general_pool_build(lane_config)
         if broad_anchor and provider_topic_title != valid_topic_anchor:
             # The provider reads this field ahead of its title argument.
             # Keep its cache/search identity aligned with the actual subject.
@@ -5057,6 +5706,17 @@ def resolve_existing_provider_branches_v2(
                     recovery_wall,
                     _recovery_budget.allowance(None, reserve_after_seconds=_recovery_reserve),
                 )
+            # Bounded total media time (test-20): the delivery allowance
+            # above only ever RAISES the fallback wall. Clamp it by the
+            # remaining total so a wave started just before the deadline
+            # gets a short wall instead of a fresh 240s — the coordinator
+            # caps its wait at the total anyway, so a longer wall only
+            # burns a background worker past the budget.
+            if _media_total_deadline_at is not None:
+                _total_remaining = _media_total_deadline_at - time.monotonic()
+                recovery_wall = min(
+                    recovery_wall, max(60.0, _total_remaining)
+                )
             lane_config["yt_branch_wall_timeout_seconds"] = recovery_wall
             lane_config["yt_fallback_mode"] = True
         def _safe_scene_start(scene_index: int) -> float:
@@ -5139,6 +5799,15 @@ def resolve_existing_provider_branches_v2(
                     message,
                 ),
                 cancellation=cancellation,
+                # Full job title for the prep-manifest injection lookup.
+                # provider_topic_title above is the search title (the
+                # topic anchor, e.g. "Panama Canal"); the runner must not
+                # use it for the manifest lookup or injection finds 0
+                # (run 4). original_title is the un-rewritten title from
+                # config (line 4097); the title rewrite at 4100-4101 and
+                # the provider_topic_title derivation at 4715 keep serving
+                # search untouched.
+                prep_manifest_title=original_title,
             )
 
         started = time.monotonic()
@@ -6136,6 +6805,26 @@ def resolve_existing_provider_branches_v2(
         """Run one bounded YouTube recovery wave for all unresolved scenes."""
         nonlocal primary_youtube_audit
         primary_youtube_audit = dict(branch_audit.get("youtube") or {})
+        # Bounded total media time (test-20): a fallback wave starting
+        # past the total returns empty immediately instead of running a
+        # fresh discovery wave minutes after the budget ended. The
+        # coordinator then resolves with best-so-far / web. Downloads
+        # already in flight stay exempt (they drain to the hard deadline
+        # inside the branch); this gate only stops STARTING a new wave.
+        if (
+            _media_total_deadline_at is not None
+            and time.monotonic() >= _media_total_deadline_at
+        ):
+            print(
+                "   [v2] YouTube fallback skipped_after_media_deadline; "
+                "resolving with best-so-far/web instead of a new wave",
+                flush=True,
+            )
+            branch_audit["youtube_fallback"] = {
+                "status": "skipped_after_media_deadline",
+                "requested_scene_indices": list(fallback_youtube_scene_indices),
+            }
+            return {}
         if primary_youtube_audit.get('provider_network_unavailable') or primary_youtube_audit.get('network_diagnostic'):
             branch_audit['youtube_fallback'] = {'status': 'skipped_provider_network_unavailable'}
             print('   [v2] YouTube DNS unavailable; continuing with web/stock instead of repeating downloads', flush=True)
@@ -6247,20 +6936,18 @@ def resolve_existing_provider_branches_v2(
                     youtube_fallback_cache[index] = rows.get(index)
         return youtube_fallback_cache.get(scene_index)
 
-    # Gaming mode: YouTube is primary for every scene; web is rescue-only
-    # for YouTube quota misses. An empty primary web index disables the
-    # primary web batch (see fresh_web_lane below); the web fallback lane —
-    # fed by the coordinator with the rejected/missing scenes — remains the
-    # rescue path. Scenes with already-completed web rows keep them via
-    # web_lane's saved-row branch.
-    gaming_web_rescue_only = bool(
-        _as_bool(config.get("_gaming_mode"), False)
-        and lane_policy.get("mode") == "Mixed Media"
-        and lane_policy.get("youtube_enabled")
-    )
-    web_indices_ref = {"indices": [] if gaming_web_rescue_only else [index for index in range(len(scenes)) if index not in (completed_web_indices | completed_stock_indices | set(saved_youtube_rows))]}
-    if gaming_web_rescue_only:
-        print("   [v2] gaming mode: web primary disabled; web is rescue-only for YouTube quota misses", flush=True)
+    # Gaming mode: web runs as a real parallel lane alongside YouTube, not
+    # rescue-only. Rescue-only web resolved 0/7 on GTA test 11 (job 676bf2cf):
+    # with no primary web batch, web could only fill YouTube quota misses,
+    # and the rescue wave itself stalled waiting for a slow universal query
+    # while a 60-row shared pool sat unused. Web fills the scenes YouTube
+    # does not cover; it must not displace good YouTube clips, and it does
+    # not: the coordinator ranks youtube 0 / web 1 on youtube_quota scenes,
+    # so an accepted clip still wins its scene. The 80% gaming YouTube
+    # target is untouched — this only gives web a live lane for the rest.
+    web_indices_ref = {"indices": [index for index in range(len(scenes)) if index not in (completed_web_indices | completed_stock_indices | set(saved_youtube_rows))]}
+    if _as_bool(config.get("_gaming_mode"), False):
+        print("   [v2] gaming mode: web runs as a parallel lane; YouTube quota scenes still prefer clips", flush=True)
     web_fallback_mode = {"enabled": False}
     primary_web_audit: dict[str, Any] | None = None
     primary_web_failed: str = ""
@@ -7497,6 +8184,17 @@ def resolve_existing_provider_branches_v2(
             and _as_bool(os.environ.get("VIDZEO_MUSE_ADAPTIVE_MEDIA"), True)
         ),
         vision_reserve_seconds=_vision_reserve_seconds(config),
+        # Job-scoped fatal ledger: the coordinator seeds only this job's
+        # own records, so a rejection filed by an earlier job never vetoes
+        # this job's fresh vision read. Falls back to the job context
+        # when the config carries no job id.
+        job_id=(str(config.get("job_id") or "").strip() or None),
+        # Two-track YouTube discovery: the Track B general pool (built in
+        # parallel with Track A) for quota scenes with no scene-specific
+        # clip. The discovery budget is recorded in the media plan below.
+        youtube_general_pool=youtube_general_pool,
+        youtube_discovery_budget_seconds=youtube_discovery_budget_seconds,
+        verification_deadline_seconds=media_verification_deadline_seconds,
     )
     print(
         "   [v2] coordinator resolution summary: "
@@ -7536,6 +8234,31 @@ def resolve_existing_provider_branches_v2(
         ),
         "media_deadline_seconds": round(float(media_deadline_seconds), 3),
         "web_recovery_grace_seconds": round(float(web_recovery_grace_seconds), 3),
+        # Two-track YouTube discovery: the discovery budget (5 min per
+        # minute of video, downloads exempt) and the Track B general pool
+        # as it stood when the media plan was built. Pool entries are
+        # summarized without absolute paths or signed URLs.
+        "youtube_discovery_budget_seconds": round(float(youtube_discovery_budget_seconds), 3),
+        "youtube_discovery_hard_seconds": round(float(youtube_discovery_hard_seconds), 3),
+        # Bounded total media time (test-18 long-tail guard): discovery
+        # budget + post-discovery tail; no post-discovery vision starts
+        # past this total from resolve start.
+        "youtube_media_tail_seconds": round(float(youtube_media_tail_seconds), 3),
+        "media_verification_deadline_seconds": round(
+            float(media_verification_deadline_seconds), 3
+        ),
+        "youtube_general_pool": {
+            "size": len(youtube_general_pool),
+            "reuse_cap": int(youtube_general_pool.reuse_cap),
+            "entries": [
+                {
+                    "video_id": entry.video_id,
+                    "vision_score": round(float(entry.vision_score), 3),
+                    "use_count": int(entry.use_count),
+                }
+                for entry in youtube_general_pool.entries()
+            ],
+        },
         "stock_budget": {
             key: stock_budget_receipt[key]
             for key in (

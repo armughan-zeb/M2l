@@ -68,11 +68,11 @@ deliver — without asking for go-ahead. Report what you did, with numbers.
     rendering. A bare Stop/Wait halts first, questions later. A named stop
     covers exactly what was named.
 
-## Media settings (Nov 10, 2026 — do not "fix" these back)
+## Media settings (Nov 21, 2026 — do not "fix" these back)
 
 | Setting | Value | Where |
 |---|---|---|
-| YT accepted-coverage target | 0.30 | `MUSE_YOUTUBE_COVERAGE_TARGET` |
+| YT accepted-coverage target | 0.80 gaming / 0.55 documentary / 0.30 normal | per-niche target wired in code (`GAMING_YOUTUBE_TARGET_RATIO`, `AUTO_YOUTUBE_RATIO`); `MUSE_YOUTUBE_COVERAGE_TARGET` is the normal default |
 | Web pool per scene | 12 | `VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE` |
 | Vision finalists per scene | 3 | `VIDZEO_VISUAL_FINALIST_LIMIT` |
 | Vision gate workers | 12 | `VIDZEO_VISUAL_GATE_WORKERS` |
@@ -82,21 +82,25 @@ deliver — without asking for go-ahead. Report what you did, with numbers.
 | Agent min wall | 3600s | `VIDZEO_AGENT_MIN_WALL_SECONDS` |
 | Inference transport | spool (resident worker pool) | `MUSE_INFERENCE_COMMAND=node scripts/muse-inference-spool.cjs` |
 | Resident inbox | on (1s poll, 8 parallel) | daemon default when a transport is set |
-| Resident pool | supervisor + 2–8 workers, claim protocol | `POOL_SUPERVISOR_BRIEF.md`; target = clamp(ceil(pending/3), 2, 8); per-worker heartbeat `worker-alive-<workerId>.json` |
+| Resident pool | supervisor + 0–8 workers, claim protocol | `POOL_SUPERVISOR_BRIEF.md`; media floor 4, idle 2, ceiling 8, 0 during render; target = clamp(ceil(pending/3), 4, 8) in media; per-worker heartbeat `worker-alive-<workerId>.json` |
+| Media budget (total) | 412s for a 1-min video | 292s discovery (`yt_discovery_seconds_per_minute`, 300/min) + 120s tail (`VIDZEO_YT_MEDIA_TAIL_SECONDS`); YT recovery waves + post-coordinator gate cut off at the total; in-flight downloads exempt |
+| General YT pool | disabled by default | `VIDZEO_YT_GENERAL_POOL_ENABLED` (default False); scene-by-scene + web only |
+| Disk salvage | trusts prior screening; screening bounded 60s | `VIDZEO_YT_SALVAGE_SCREEN_BUDGET_SECONDS` (default 60); a clip with a passing download-time verdict in `youtube_scene_*.attempts.json` skips re-screening |
+| stop_graceful race | fixed Nov 21, 2026 | two-tick render confirm before queueing stops; cancelled stops kept as tombstones; a worker exiting on a seen stop is re-healed immediately (`POOL_SUPERVISOR_BRIEF.md`) |
 | Request wall (inbox transport wait) | 15 min | `MUSE_INBOX_REQUEST_WALL_MS` (default 900000); probes still cap at 2 min |
 | Query chunk | 32 scenes/request (bulk) | `VIDZEO_BRAIN_SCENE_CHUNK_SIZE` (clamp 3–32; a whole short job in one request) |
 | Direction batch | 8 scenes, 4 workers | external-agent override |
-| Vision batch | 4 candidates/request | `compare_images` in the vision gate |
-| Vision concurrency (external-agent) | 4 | `VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY` |
+| Vision batch | 16 candidates/request | `compare_images` in the vision gate (`SAFE_VISION_BATCH_IMAGES` = 16) |
+| Vision concurrency (external-agent) | 8 | `VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY` (raised 4 → 8 on Nov 21, test-20 fan-out; matches the pool ceiling of 8) |
 | Pending-twin dedupe | on | `agent_post` reuses a pending twin |
 | Pre-compute direction + queries | on (persisted scene plan) | first plan saved to job checkpoints; resume reuses directed rows, re-plans only missing scenes (ScriptIT emits narration only, so the plan lives on the Vidnets brain side) |
 | Filter-best | on | `MUSE_MEDIA_STRICT=0` |
 | Render concurrency | 1 (tested safe) | `MUSE_RENDER_CONCURRENCY` |
 | Skip thumbnails | on | `VIDZEO_SKIP_THUMBNAILS=1` |
 
-Web is the main source now (Yandex / Bing / DuckDuckGo / Flickr /
-Wikimedia / Library of Congress). Baidu is blocked from this IP, Openverse
-504s — both are out of the defaults. Scene queries keep viewpoint phrases
+Web is the main source now (Yandex / Bing / Flickr /
+Wikimedia / Library of Congress). DuckDuckGo is skipped (bot-gated).
+Baidu is blocked from this IP, Openverse 504s — both are out of the defaults. Scene queries keep viewpoint phrases
 and entity words from the narration (e.g. "from the cab", BNSF, whiteout)
 and drop negated terms. Fallback order: spare pool → YT clip frames →
 graphic last.

@@ -152,14 +152,19 @@ def test_coverage_check_records_graphics_without_percentage_rejection(tmp_path, 
         validate_documentary_coverage(plan, [1]*11, {'media_fallback_policy': 'real_media_only'})
 
 
-def test_web_rescue_limits_repetition_without_replaying_youtube():
+def test_web_rescue_limits_repetition_with_bounded_youtube_reuse():
     from services.media_resolution_coordinator import SceneResolution, _reuse_limit_for_resolution, _topic_reuse_limit
     scene = {'source_policy':{'mixed_media':True},'start_seconds':30}
     web = SceneResolution(scene_index=3, provider='web')
     youtube = SceneResolution(scene_index=3, provider='youtube')
     assert _reuse_limit_for_resolution(scene,web,non_mixed_limit=4) == 2
     assert _topic_reuse_limit(scene,web,non_mixed_limit=4) == 2
-    assert _reuse_limit_for_resolution(scene,youtube,non_mixed_limit=4) == 1
+    # Run 9 (job a7f52c58): one YouTube asset identity may now serve a
+    # second scene (YOUTUBE_REUSE_CAP_DEFAULT = 2) instead of being capped
+    # at a single use. Distinct timestamp segments are still required for a
+    # repeated master (same_master_cut_gate / quota reuse); this cap only
+    # bounds how many scenes may share one asset identity.
+    assert _reuse_limit_for_resolution(scene,youtube,non_mixed_limit=4) == 2
 
 
 def test_similar_quality_verified_clips_prefer_another_video_source():

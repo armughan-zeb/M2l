@@ -94,6 +94,19 @@ VI_TRAILER = {
     "channel": "Rockstar Games",
     "duration": 166,
 }
+# Real record: mHaQ_n03qeU, scene 3's only YouTube attempt in the proof
+# job (docs/gta-scene-accuracy-diagnosis.md §S3). A WWE 2K26 parody using
+# GTA VI character names: title "JASON DUVAL VS LUCIA CAMINOS ! #GTA6",
+# description "Gran Theft auto 6 in WWE 2k26." It scored 46.0 and became
+# the scene's top-1 because the GTA-entry regexes never see it
+# (misspelled "Gran" + hashtag "#GTA6" has no word boundary), and it
+# only failed to ship because the download bot-gated before vision.
+WWE_PARODY = {
+    "title": "JASON DUVAL VS LUCIA CAMINOS ! #GTA6",
+    "description": "Gran Theft auto 6 in WWE 2k26.",
+    "channel": "SAVVYONE619",
+    "duration": 120,
+}
 SAN_ANDREAS = {
     "title": "Grand Theft Auto: San Andreas - Official Trailer",
     "description": "GTA San Andreas trailer.",
@@ -184,6 +197,67 @@ class SceneGameGateTests(unittest.TestCase):
             )
             score, _ = self._score(idx, VICE_CITY_2002)
             self.assertEqual(score, -999.0, f"scene {idx}")
+
+    def test_wwe_parody_blocked_before_download(self):
+        # mHaQ_n03qeU: the gate must catch what vision never saw. The
+        # candidate names no GTA entry the regexes can match, so the
+        # entry comparison alone lets it through; the cross-game check
+        # (description places the footage "in WWE 2k26") blocks it.
+        for idx in (1, 2, 3, 4, 5, 6, 7):
+            row = self.rows[idx]
+            subject = row.get("candidate_subject") or ""
+            ctx = ytv2._row_retrieval_context(row)
+            self.assertTrue(
+                ytv2._gaming_exact_title_gate(dict(WWE_PARODY), subject, SCENE_TEXTS[idx], ctx),
+                f"scene {idx}: WWE parody must be gated before download",
+            )
+            score, cand = self._score(idx, WWE_PARODY)
+            self.assertEqual(score, -999.0, f"scene {idx}")
+            self.assertEqual(cand.get("v2_reject_reason"), "cross_game_footage", f"scene {idx}")
+
+    def test_cross_game_title_and_provenance_variants_blocked(self):
+        # Title naming another game, or a description provenance phrase,
+        # both block — for every game in the cross-game set.
+        variants = [
+            {"title": "GTA 6 in Fortnite - Vice City recreated", "description": "Fun recreation.", "channel": "Fun", "duration": 120},
+            {"title": "GTA VI Lucia and Jason", "description": "Made in Minecraft by fans.", "channel": "Fans", "duration": 120},
+            {"title": "GTA 6 Roblox roleplay", "description": "GTA VI roleplay in Roblox.", "channel": "RP", "duration": 120},
+            {"title": "GTA VI trailer", "description": "Recreated in Garry's Mod.", "channel": "Mods", "duration": 120},
+        ]
+        for candidate in variants:
+            for idx in (1, 3):
+                row = self.rows[idx]
+                subject = row.get("candidate_subject") or ""
+                ctx = ytv2._row_retrieval_context(row)
+                self.assertTrue(
+                    ytv2._gaming_exact_title_gate(dict(candidate), subject, SCENE_TEXTS[idx], ctx),
+                    f"scene {idx}: {candidate['title']!r} must be gated",
+                )
+                score, _ = self._score(idx, candidate)
+                self.assertEqual(score, -999.0, f"scene {idx}: {candidate['title']!r}")
+
+    def test_passing_mention_of_other_game_not_blocked(self):
+        # A bare passing mention in a description ("better than
+        # Fortnite") is not footage provenance and must not block a
+        # real trailer.
+        candidate = {
+            "title": "Grand Theft Auto VI Trailer 2",
+            "description": "Better than Fortnite, best trailer yet. Lucia and Jason in Leonida.",
+            "channel": "Rockstar Games",
+            "duration": 166,
+        }
+        score, cand = self._score(3, candidate)
+        self.assertGreater(score, 0, f"passing mention must not block, got {score} ({cand.get('v2_reject_reason')})")
+
+    def test_cross_game_gate_needs_gta_scene(self):
+        # The gate is scene-relative: a scene about no game is not
+        # gated, even when the candidate names another game.
+        self.assertFalse(
+            ytv2._gaming_exact_title_gate(
+                dict(WWE_PARODY), "Panama Canal",
+                "The canal changed world trade forever.", {},
+            )
+        )
 
     def test_san_andreas_and_franchise_roundup_blocked_for_vi_scenes(self):
         score, cand = self._score(1, SAN_ANDREAS)
@@ -355,9 +429,9 @@ class RatioLedgerTests(unittest.TestCase):
         from services.pipeline_v2_media_adapter import _mixed_media_youtube_target_ratio
         self.assertEqual(
             _mixed_media_youtube_target_ratio(
-                {"_gaming_mode": True, "_gaming_youtube_target": 0.90}), 0.90)
+                {"_gaming_mode": True, "_gaming_youtube_target": 0.80}), 0.80)
         self.assertEqual(
-            _mixed_media_youtube_target_ratio({"_gaming_mode": True}), 0.90)
+            _mixed_media_youtube_target_ratio({"_gaming_mode": True}), 0.80)
         # An explicit per-job coverage key still wins over gaming mode.
         self.assertEqual(
             _mixed_media_youtube_target_ratio(
@@ -374,7 +448,7 @@ class RatioLedgerTests(unittest.TestCase):
             "Grand Theft Auto Six is the most anticipated video game of the decade.",
             SCENE_TEXTS)
         self.assertTrue(config["_gaming_mode"])
-        self.assertEqual(config["_gaming_youtube_target"], 0.90)
+        self.assertEqual(config["_gaming_youtube_target"], 0.80)
 
     def test_planner_gaming_detector_spelled_out(self):
         from services.mixed_media_planner import (
@@ -382,7 +456,7 @@ class RatioLedgerTests(unittest.TestCase):
             _gta_vi_story,
             gaming_mode_for,
         )
-        self.assertEqual(GAMING_YOUTUBE_TARGET_RATIO, 0.90)
+        self.assertEqual(GAMING_YOUTUBE_TARGET_RATIO, 0.80)
         self.assertTrue(_gta_vi_story(
             "Grand Theft Auto Six: Return to Vice City",
             "Grand Theft Auto Six is the most anticipated video game.",

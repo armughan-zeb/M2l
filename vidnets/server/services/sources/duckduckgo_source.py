@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate, _accept_language
+from .base_source import BaseSource, ImageCandidate, _accept_language, request_proxies
 
 
 class DuckDuckGoSource(BaseSource):
@@ -40,12 +40,13 @@ class DuckDuckGoSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         clean = self._clean_query(query, max_words=6)
         if not clean:
             return []
 
-        vqd = self._get_vqd(clean)
+        vqd = self._get_vqd(clean, direct=direct)
         if not vqd:
             return []
 
@@ -53,6 +54,7 @@ class DuckDuckGoSource(BaseSource):
         try:
             resp = self.session.get(
                 self.IMAGE_API,
+                proxies=request_proxies(direct),
                 params={
                     'l': 'us-en',
                     'o': 'json',
@@ -83,12 +85,13 @@ class DuckDuckGoSource(BaseSource):
 
         return candidates
 
-    def _get_vqd(self, query: str) -> Optional[str]:
+    def _get_vqd(self, query: str, direct: bool = False) -> Optional[str]:
         try:
             resp = self.session.get(
                 self.HOMEPAGE,
                 params={'q': query, 'kp': '1'},
                 timeout=self.timeout,
+                proxies=request_proxies(direct),
             )
             match = re.search(r"vqd=['\"]?([0-9A-Za-z\-_]+)['\"]?", resp.text)
             if not match:

@@ -140,15 +140,16 @@ def test_library_of_congress_is_wired_into_fast_sources(monkeypatch):
     assert rows[0]["url"].startswith("https://tile.loc.gov/")
 
 
-def test_fast_sources_try_yandex_before_bing_flickr_and_ddg():
-    """Yandex bot-walls least, so it is first; Bing, Flickr and DDG are
-    fallbacks in that order (WEB_ENGINE_PRIORITY in source_broker.py)."""
+def test_fast_sources_try_yandex_before_bing_and_flickr():
+    """Yandex bot-walls least, so it is first; Bing and Flickr are
+    fallbacks in that order (WEB_ENGINE_PRIORITY in source_broker.py).
+    DuckDuckGo was removed Nov 19, 2026 — it bot-gates this egress."""
     from services.web_image import resolver
 
     names = [name for name, _kind in resolver._FAST_SOURCES]
     assert names.index("yandex") < names.index("bing_hybrid")
     assert names.index("bing_hybrid") < names.index("flickr_api")
-    assert names.index("flickr_api") < names.index("ddg_hybrid")
+    assert "ddg_hybrid" not in names
 
 
 def test_five_hundred_px_stays_out_of_slow_sources():
@@ -442,7 +443,6 @@ def test_exhaustive_recovery_cascades_into_secondary_sources(
         ("yandex", "api"),
         ("flickr_api", "flickr_api"),
         ("bing_hybrid", "hybrid"),
-        ("ddg_hybrid", "hybrid"),
         ("openverse", "api"),
     ]
     monkeypatch.setattr(resolver, "_FAST_SOURCES", source_rows)
@@ -509,7 +509,7 @@ def test_exhaustive_recovery_cascades_into_secondary_sources(
     # concrete query gets the fast tier; later queries get recovery sources.
     first_query = provider_calls[0][1]
     assert {source for source, query in provider_calls if query == first_query} == {
-        "universal_scraper", "yandex", "flickr_api", "bing_hybrid", "ddg_hybrid"
+        "universal_scraper", "yandex", "flickr_api", "bing_hybrid"
     }
     assert ('openverse', 'Prince Harry photo') in provider_calls
 
