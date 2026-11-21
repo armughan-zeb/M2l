@@ -165,24 +165,35 @@ def vision_cache_policy(client):
                 "VIDZEO_QWEN_VISION_MAX_IMAGE_BYTES", "VIDZEO_QWEN_VISION_MAX_CLIP_PAYLOAD_BYTES")}}
 
 
+def _valid_image_verdict(result):
+    """The strict per-row check for one single-image verdict dict."""
+    if not isinstance(result, dict) or not result or result.get("error") or result.get("_schema_errors") or result.get("status") in ("unavailable", "error", "timeout"):
+        return False
+    if "_schema_present" in result:
+        required = {"candidate_id", "entity_conflict", "identity_score", "action_score", "context_score", "quality", "visible_overlays", "subject_box", "safe_text_regions"}
+        return (required.issubset(set(result.get("_schema_present") or []))
+                and all(isinstance(result.get(key), (int, float)) and not isinstance(result.get(key), bool)
+                        and math.isfinite(result[key]) and 0 <= result[key] <= 100
+                        for key in ("identity_score", "action_score", "context_score", "quality"))
+                and isinstance(result.get("entity_conflict"), bool)
+                and isinstance(result.get("visible_overlays"), list)
+                and isinstance(result.get("subject_box"), dict)
+                and isinstance(result.get("safe_text_regions"), list))
+    # Legacy/custom verifiers remain supported, but empty/default dicts and
+    # unavailable placeholders are not useful successful cache entries.
+    return bool(result.get("reason") and result.get("scene_description")) and isinstance(result.get("quality"), (int, float))
+
+
 def valid_cached_decision(operation, result):
     """Only successful, complete verdicts; legitimate rejection is reusable."""
     if not isinstance(result, dict) or not result or result.get("error") or result.get("_schema_errors") or result.get("status") in ("unavailable", "error", "timeout"):
         return False
+    if operation in {"image_batch", "analyze_images_batch"}:
+        # A batched verdict is a {candidate_id: verdict} map; every row
+        # must be a complete image verdict for the batch to be reusable.
+        return bool(result) and all(_valid_image_verdict(row) for row in result.values())
     if operation in {"image", "clip", "analyze_image", "analyze_clip_frames"}:
-        if "_schema_present" in result:
-            required = {"candidate_id", "entity_conflict", "identity_score", "action_score", "context_score", "quality", "visible_overlays", "subject_box", "safe_text_regions"}
-            return (required.issubset(set(result.get("_schema_present") or []))
-                    and all(isinstance(result.get(key), (int, float)) and not isinstance(result.get(key), bool)
-                            and math.isfinite(result[key]) and 0 <= result[key] <= 100
-                            for key in ("identity_score", "action_score", "context_score", "quality"))
-                    and isinstance(result.get("entity_conflict"), bool)
-                    and isinstance(result.get("visible_overlays"), list)
-                    and isinstance(result.get("subject_box"), dict)
-                    and isinstance(result.get("safe_text_regions"), list))
-        # Legacy/custom verifiers remain supported, but empty/default dicts and
-        # unavailable placeholders are not useful successful cache entries.
-        return bool(result.get("reason") and result.get("scene_description")) and isinstance(result.get("quality"), (int, float))
+        return _valid_image_verdict(result)
     if operation == "review_editorial_frames":
         return (result.get("status") in ("pass", "needs_revision")
                 and isinstance(result.get("confidence"), (int, float)) and not isinstance(result.get("confidence"), bool)

@@ -32,15 +32,12 @@ WEB_IMAGE_SOURCE_CATALOG: Tuple[Dict[str, object], ...] = (
     {"name": "yandex", "tier": 0, "kind": "api", "role": "fast_scraper", "default": True},
     {"name": "bing_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": True},
     {"name": "flickr_api", "tier": 0, "kind": "flickr_api", "role": "fast_api", "default": True},
-    {"name": "ddg_hybrid", "tier": 0, "kind": "hybrid", "role": "fast_scraper", "default": True},
     {"name": "openverse", "tier": 1, "kind": "api", "role": "rights_friendly_api", "default": True},
     {"name": "wikimedia", "tier": 1, "kind": "api", "role": "rights_friendly_api", "default": True},
     {"name": "google_images", "tier": 1, "kind": "api", "role": "html_scraper", "default": True},
-    {"name": "duckduckgo", "tier": 1, "kind": "api", "role": "html_scraper", "default": True},
     {"name": "brave_images", "tier": 1, "kind": "api", "role": "optional_api", "default": False},
     {"name": "searxng_images", "tier": 1, "kind": "api", "role": "metasearch", "default": False},
     {"name": "getty_bing", "tier": 2, "kind": "hybrid", "role": "editorial_site_filter", "default": True},
-    {"name": "getty_ddg", "tier": 2, "kind": "hybrid", "role": "editorial_site_filter", "default": True},
     {"name": "pinterest", "tier": 3, "kind": "gdl", "role": "gallery_dl", "default": False},
     {"name": "reddit", "tier": 3, "kind": "api", "role": "community_api", "default": False},
     {"name": "flickr", "tier": 3, "kind": "gdl", "role": "gallery_dl", "default": False},
@@ -48,10 +45,12 @@ WEB_IMAGE_SOURCE_CATALOG: Tuple[Dict[str, object], ...] = (
 
 
 # Canonical search-engine priority for web-image retrieval. Yandex
-# bot-walls least on this deployment, so it is always tried first; Bing,
-# Flickr and DuckDuckGo are fallbacks in that order. The universal scraper
+# bot-walls least on this deployment, so it is always tried first; Bing
+# and Flickr are fallbacks in that order. DuckDuckGo was removed Nov 19,
+# 2026: it bot-gates this egress (202 anomaly interstitial, circuit open)
+# while Yandex/Bing/Flickr each return 20 results. The universal scraper
 # and the resolver's fast lanes must keep this relative order.
-WEB_ENGINE_PRIORITY = ("yandex", "bing", "flickr", "duckduckgo")
+WEB_ENGINE_PRIORITY = ("yandex", "bing", "flickr")
 
 
 def web_image_source_catalog() -> List[Dict[str, object]]:
@@ -255,6 +254,22 @@ class SourceHealth:
             self.note_failure(source, f"preflight dns: {type(exc).__name__}")
             return False
         return True
+
+    def failure_count(self, source: str) -> int:
+        """Failures recorded for ``source`` inside the current window.
+
+        Read by the resolver's route-switching retry: it snapshots the
+        count before a lane call and retries direct only when the count
+        grew (the lane errored), never on a genuine empty answer.
+        """
+        if not source:
+            return 0
+        now = time.monotonic()
+        with self._lock:
+            window = self._failures.get(source) or deque()
+            while window and now - window[0] > self.window_seconds:
+                window.popleft()
+            return len(window)
 
     def healthy(self, source: str) -> bool:
         if not source:

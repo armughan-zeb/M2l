@@ -1055,27 +1055,34 @@ async function runScriptGeneration({
   // let long but generic drafts reach the renderer. Thorough mode now runs
   // the same editorial gate as quick mode (evaluate + bounded revision +
   // sanitize + deterministic rescue) before anything is publishable.
-  if (!quickMode) {
-    let output = writerOutput(result?.content, wordTarget);
-    // Mechanical runtime adjustment only: expand a short draft to the
-    // requested duration before the editorial gate sees it.
-    if (modelAvailable && output.script && !output.ok && draftCalls < draftBudget) {
-      const promptTarget = wordTarget + (wordTarget >= 1000 ? 100 : Math.max(50, Math.round(wordTarget * 0.08)));
-      const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
-      const minRequired = Math.max(80, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance));
-      const fitted = await callDraft({ apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice,
-        briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, chatCompletionFn,
-        avoid: 'RUNTIME FIT ONLY: the current narration contains ' + output.words + ' spoken words. Expand the same story to at least ' + minRequired + ' spoken words; aim for ' + promptTarget + '. Retain the core payoff, hooks, viewer promise, and sourced facts. Develop only distinct sourced context and consequences. Longer useful output is acceptable. Deliver only the full expanded narration. CURRENT NARRATION:\n' + result.content });
-      if (fitted?.content) { result = fitted; output = writerOutput(fitted.content, wordTarget); }
-    }
-  }
-
   // Deterministic de-slop before the gate: strip AI-tell phrasing and recap
   // footers so the editorial checks judge the narration viewers will hear.
   if (result?.content) result.content = cleanVoiceRules(result.content);
   if (result?.content) result.content = repairEvidenceMarkers(result.content, evidence);
+  // P9: the editorial gate runs BEFORE the runtime fit, so a short draft
+  // that also fails the gate gets ONE combined call carrying both the
+  // length target and the quality issues — instead of a fit call followed
+  // by a separate revision. The revision loop below remains the single fix
+  // pass if the draft still fails after the combined call.
   let quality = evaluateDraft(result && result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType, duration });
   console.error('[ScriptIT DEBUG] initial quality:', { words: quality.words, passes: quality.passes, issues: quality.issues });
+
+  if (!quickMode) {
+    let output = writerOutput(result?.content, wordTarget);
+    // Mechanical runtime adjustment only: expand a short draft to the
+    // requested duration. When the gate already failed, the same call also
+    // carries the editorial issues (P9), so the fit doubles as the fix.
+    if (modelAvailable && output.script && !output.ok && draftCalls < draftBudget) {
+      const promptTarget = wordTarget + (wordTarget >= 1000 ? 100 : Math.max(50, Math.round(wordTarget * 0.08)));
+      const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
+      const minRequired = Math.max(80, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance));
+      const issueNote = quality.passes ? '' : ` Also fix every editorial issue: ${quality.issues.join(' ')}. Do not repeat the unsupported claims.`;
+      const fitted = await callDraft({ apiKey, model, topic: trimmedTopic, duration, contentType: plan.contentType, voice,
+        briefText, evidenceText, planText, narratorText, titleContext, referenceTranscript, customStructure, chatCompletionFn,
+        avoid: 'RUNTIME FIT ONLY: the current narration contains ' + output.words + ' spoken words. Expand the same story to at least ' + minRequired + ' spoken words; aim for ' + promptTarget + '. Retain the core payoff, hooks, viewer promise, and sourced facts. Develop only distinct sourced context and consequences. Longer useful output is acceptable.' + issueNote + ' Deliver only the full expanded narration. CURRENT NARRATION:\n' + result.content });
+      if (fitted?.content) { result = fitted; output = writerOutput(fitted.content, wordTarget); quality = evaluateDraft(result.content, { topic: trimmedTopic, wordTarget, previousScripts: history, evidence, contentType: plan.contentType, duration }); }
+    }
+  }
 
   // Give a failed draft focused editorial feedback. Long drafts are not
   // exempt: verbosity must never be used to bypass the quality gate.

@@ -285,6 +285,45 @@ class MixedMediaPlannerTests(unittest.TestCase):
             script="A factual history of the 1961 Jaguar E-Type classic automobile.",
         ))
 
+    def test_documentary_youtube_target_is_55_percent_and_gaming_stays_80(self):
+        # AUTO_YOUTUBE_RATIO (0.55) is the documentary constant, bound to
+        # the documentary niche; gaming keeps its own 0.80 target.
+        self.assertEqual(planner.AUTO_YOUTUBE_RATIO, 0.55)
+        self.assertEqual(planner.DOCUMENTARY_YOUTUBE_TARGET_RATIO, 0.55)
+        self.assertEqual(
+            planner.DOCUMENTARY_YOUTUBE_TARGET_RATIO, planner.AUTO_YOUTUBE_RATIO
+        )
+        self.assertEqual(planner.GAMING_YOUTUBE_TARGET_RATIO, 0.80)
+
+    def test_documentary_mode_for_detects_documentary_family_topics(self):
+        # Explicit documentary category is authoritative (Panama proof job).
+        self.assertTrue(planner.documentary_mode_for(
+            title="How the Panama Canal Changed World Trade",
+            script="The Panama Canal changed world trade.",
+            category="documentary",
+        ))
+        # Evidence-led wording that the classifier maps to "serious"
+        # (resolve_media_policy maps it onto the documentary policy niche).
+        self.assertTrue(planner.documentary_mode_for(
+            title="When the Earth Shook",
+            script="An earthquake documentary about the disaster and the rescue.",
+        ))
+        # Gaming is not documentary mode.
+        self.assertFalse(planner.documentary_mode_for(
+            title="GTA VI: Vice City",
+            script="Leonida revealed in the record-breaking first trailer.",
+        ))
+        # Crime is classified before "serious" and is not documentary mode.
+        self.assertFalse(planner.documentary_mode_for(
+            title="Crime investigation",
+            script="Police investigation, forensic evidence, and a murder trial.",
+        ))
+        # A plain general topic is not documentary mode.
+        self.assertFalse(planner.documentary_mode_for(
+            title="Morning routine",
+            script="A simple everyday routine.",
+        ))
+
     def test_crime_and_history_have_distinct_evidence_led_profiles(self):
         crime = planner.resolve_media_policy(
             title="Crime investigation",

@@ -123,18 +123,12 @@ class TestYouTubeWebPacingAndClipping(unittest.TestCase):
         ]
         mock_client = mock.MagicMock()
         # Vision model returns borderline score without fatal mismatch or explicit conflict
-        mock_client.compare_images.return_value = {
-            "acceptable": False,
+        mock_client.analyze_image.return_value = {
+            "relevance": 55.0,
             "confidence": 55.0,
-            "candidates": [
-                {
-                    "relevance": 55.0,
-                    "confidence": 55.0,
-                    "fatal_mismatch": False,
-                    "scene_description": "A historic harbor with steamships in the background",
-                    "reason": "Indirect establishing shot",
-                }
-            ],
+            "fatal_mismatch": False,
+            "scene_description": "A historic harbor with steamships in the background",
+            "reason": "Indirect establishing shot",
         }
 
         mock_context = mock.MagicMock()

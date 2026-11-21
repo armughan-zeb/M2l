@@ -46,6 +46,42 @@ def _cookie_opener(session_jar: Any) -> Any:
         return None
 
 
+def _api_timeout_seconds() -> float:
+    """Per-request timeout bound for the youtube-transcript-api leg.
+
+    The library calls ``session.get/post`` without a timeout, so one
+    stalled watch-page fetch could hang a transcript worker thread for
+    minutes (run 2: orphaned threads finished ~4 min after the 25 s
+    deadline). 30 s is generous against the measured ~9.5 s bad-hour
+    YouTube latency and still lets the fetch_many wall bound the lane.
+    """
+    try:
+        return max(
+            2.0,
+            min(
+                120.0,
+                float(os.environ.get("VIDZEO_YT_TRANSCRIPT_API_TIMEOUT_SECONDS", "30") or 30),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 30.0
+
+
+class _DefaultTimeoutSession:
+    """Mixin giving a ``requests`` session a default per-request timeout.
+
+    youtube-transcript-api never passes ``timeout`` to the http client, so
+    the session itself must supply one. Implemented as a mixin so the
+    session class stays a plain ``requests.Session`` subclass.
+    """
+
+    _vidzeo_default_timeout = 30.0
+
+    def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs.setdefault("timeout", self._vidzeo_default_timeout)
+        return super().request(method, url, **kwargs)  # type: ignore[misc]
+
+
 def _transcript_api_client(session_jar: Any) -> Any:
     """A ``requests`` session carrying the shared cookies for youtube-transcript-api.
 
@@ -60,7 +96,11 @@ def _transcript_api_client(session_jar: Any) -> Any:
 
         import requests
 
-        client = requests.Session()
+        class _TimedSession(_DefaultTimeoutSession, requests.Session):
+            pass
+
+        client = _TimedSession()
+        client._vidzeo_default_timeout = _api_timeout_seconds()
         for cookie in session_jar:
             if hasattr(cookie, "name"):
                 client.cookies.set_cookie(_copy.copy(cookie))
@@ -69,6 +109,26 @@ def _transcript_api_client(session_jar: Any) -> Any:
         return client
     except Exception:
         return None
+
+
+def _is_definite_no_transcript_error(exc: BaseException) -> bool:
+    """True when the API answered definitively that no transcript exists.
+
+    TranscriptsDisabled / NoTranscriptFound / AgeRestricted /
+    VideoUnavailable / InvalidVideoId / VideoUnplayable all mean the video
+    has no retrievable transcript, so re-running the yt-dlp extraction
+    cannot conjure captions. Everything else (timeouts, 429/IP-block,
+    unparsable responses, consent failures) is transport-class and worth
+    one retry through the next leg.
+    """
+    return type(exc).__name__ in {
+        "TranscriptsDisabled",
+        "NoTranscriptFound",
+        "AgeRestricted",
+        "VideoUnavailable",
+        "InvalidVideoId",
+        "VideoUnplayable",
+    }
 
 
 def _cache_ttl_seconds(status: str) -> float:
@@ -97,6 +157,21 @@ def _cache_ttl_seconds(status: str) -> float:
         )
     except (TypeError, ValueError):
         return default
+
+
+# Default yt-dlp player clients for the transcript legs, in try order.
+# ``web`` first, ``web_embedded`` as fallback. Measured live (Nov 19,
+# yt-dlp 2026.10.26, same video kZzKlAKNhOU, authenticated): ``web``
+# extracted in 20.9 s vs 77.7 s for ``web_embedded`` — and ``web``
+# never takes yt-dlp's embedded-ytcfg path, the unguarded
+# ``_fix_embedded_ytcfg`` that raises raw ``KeyError('INNERTUBE_CONTEXT')``
+# when YouTube serves an embed page without a ytcfg and killed all 6
+# run-4 downloads. ``web_embedded`` stays second because the Nov 18
+# measurement showed it returns the full automatic-caption list (the
+# android player response carries no captions at all); a KeyError there
+# is contained per-client by the caller, so listing it second is safe.
+# Env ``VIDZEO_YT_TRANSCRIPT_CLIENTS`` still overrides both.
+_DEFAULT_TRANSCRIPT_CLIENTS = "web,web_embedded"
 
 
 def _transcript_languages() -> List[str]:
@@ -385,6 +460,38 @@ class YouTubeTranscriptIndex:
                 _FLIGHTS.pop(video_id, None)
                 event.set()
 
+    def _log_fetch_many_count(
+        self,
+        documents: Dict[str, TranscriptDocument],
+        total: int,
+        *,
+        deadline_seconds: float,
+        cached_only: bool = False,
+    ) -> None:
+        """Print the completed/unfinished transcript accounting, always.
+
+        Run 7 gap: the count line only printed when the deadline was
+        hit with futures still pending, so a worker whose transcripts
+        all finished in time logged no accounting at all (main 9/11,
+        small 2/3 — ranged-moment evidence only, no count line). Every
+        fetch_many call with work to do prints this line, including the
+        all-cached path, so every YT worker's transcript accounting is
+        visible in its log. The ``retaining X/Y completed
+        transcript(s); Z unfinished`` wording is kept verbatim so
+        existing log analysis still matches; the deadline applied and
+        the ready sub-count are appended.
+        """
+        completed = len(documents)
+        unfinished = max(0, total - completed)
+        ready = sum(1 for doc in documents.values() if getattr(doc, "available", False))
+        suffix = "; all cached" if cached_only else ""
+        print(
+            "   [yt-transcript] deadline "
+            f"{deadline_seconds:g}s: retaining {completed}/{total} completed transcript(s); "
+            f"{unfinished} unfinished; {ready} ready{suffix}",
+            flush=True,
+        )
+
     def fetch_many(
         self,
         video_ids: Sequence[str],
@@ -399,7 +506,13 @@ class YouTubeTranscriptIndex:
         # Transcript lookup is I/O-bound. Keep enough workers to hide one
         # blocked YouTube request, but cap the fan-out so a large pool does not
         # trigger a rate-limit storm; caption endpoints 429 aggressively.
-        configured = workers or int(os.environ.get("VIDZEO_YT_TRANSCRIPT_CONCURRENCY", "3") or 3)
+        # Default 6 (was 3): the pool path is the one the live mixed-media
+        # worker uses, and 3 workers could not clear 11 videos inside the
+        # transcript deadline — run 4 kept 2/11 at an 18 s wall. 6 matches
+        # the ranged-moments caller (which already passes workers=6) and
+        # fits the measured cost (isolated 12/12 in 94.7 s, ~8 s/video:
+        # 11 videos at 6 workers is ~2 waves, ~16-30 s in a good hour).
+        configured = workers or int(os.environ.get("VIDZEO_YT_TRANSCRIPT_CONCURRENCY", "6") or 6)
         worker_count = max(1, min(12, int(configured)))
         if deadline_seconds is None:
             try:
@@ -436,6 +549,7 @@ class YouTubeTranscriptIndex:
             else:
                 uncached.append(video_id)
         if not uncached:
+            self._log_fetch_many_count(documents, len(unique), deadline_seconds=deadline_seconds, cached_only=True)
             return documents
 
         deadline = time.monotonic() + deadline_seconds
@@ -481,12 +595,11 @@ class YouTubeTranscriptIndex:
             if pending:
                 for future in pending:
                     future.cancel()
-                print(
-                    "   [yt-transcript] deadline: "
-                    f"retaining {len(documents)}/{len(unique)} completed transcript(s); "
-                    f"{len(pending)} unfinished",
-                    flush=True,
-                )
+            # Unconditional: the count line is the transcript accounting
+            # for this worker — it must appear whether the deadline was
+            # hit or every transcript finished in time (see
+            # _log_fetch_many_count).
+            self._log_fetch_many_count(documents, len(unique), deadline_seconds=deadline_seconds)
         finally:
             # Context-manager shutdown waits for every provider thread. That
             # made the nominal transcript deadline ineffective whenever the
@@ -554,20 +667,26 @@ class YouTubeTranscriptIndex:
         def _yt_dlp_caption_provider() -> dict:
             if yt_dlp is None:
                 raise RuntimeError("yt-dlp unavailable")
+            # ``web`` first (see _DEFAULT_TRANSCRIPT_CLIENTS): the android
+            # player response carries no caption tracks at all
+            # (en_auto/en_subs False on every probed video), so the android
+            # round only burned time — ~4 s in a good hour, up to ~24 s of
+            # socket-timeout burn in a bad one. The env override still
+            # re-adds clients when an operator needs them.
             configured_clients = str(
-                os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENTS", "web_embedded,android")
-                or "web_embedded,android"
+                os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENTS", _DEFAULT_TRANSCRIPT_CLIENTS)
+                or _DEFAULT_TRANSCRIPT_CLIENTS
             )
             clients = [client.strip() for client in configured_clients.split(",") if client.strip()]
             try:
                 timeout = max(2.0, min(30.0, float(
-                    os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENT_TIMEOUT_SECONDS", "8") or 8
+                    os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENT_TIMEOUT_SECONDS", "15") or 15
                 )))
             except (TypeError, ValueError):
-                timeout = 8.0
+                timeout = 15.0
             client_errors: List[str] = []
             info = None
-            for client in clients or ["web_embedded", "android"]:
+            for client in clients or _DEFAULT_TRANSCRIPT_CLIENTS.split(","):
                 try:
                     opts = {
                         "quiet": True,
@@ -576,6 +695,15 @@ class YouTubeTranscriptIndex:
                         "noplaylist": True,
                         "socket_timeout": timeout,
                         "retries": 0,
+                        # This leg only needs the caption tracks from the
+                        # info dict. Without the JS challenge solver the
+                        # player response carries storyboard formats only,
+                        # so format selection raises "Requested format is
+                        # not available" and discards the captions that
+                        # were already fetched (run 2: every extract_info
+                        # died this way before the API leg ran). Ignore the
+                        # format error and keep the info dict.
+                        "ignore_no_formats_error": True,
                         # Prefer the system SSL context over certifi so a host
                         # behind a TLS-intercepting proxy still works.
                         "compat_opts": {"no-certifi"},
@@ -584,18 +712,34 @@ class YouTubeTranscriptIndex:
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         if session_jar is not None:
                             ydl.cookiejar = session_jar
-                        info = ydl.extract_info(video_id, download=False)
-                    break
+                        candidate = ydl.extract_info(video_id, download=False)
+                    # Only stop at the first client whose player response
+                    # actually carries caption tracks for a wanted language.
+                    # The ``web`` response can lack captions the
+                    # ``web_embedded`` response has (measured live Nov 19:
+                    # nnsAUPuOYaY — ``web`` none, ``web_embedded`` auto),
+                    # so breaking on the first successful extraction would
+                    # throw away the fallback client's captions.
+                    wanted = _transcript_languages()
+                    has_captions = any(
+                        (candidate.get(kind) or {}).get(language)
+                        for kind in ("subtitles", "automatic_captions")
+                        for language in wanted
+                    )
+                    if has_captions:
+                        info = candidate
+                        break
+                    client_errors.append(f"{client}:no_captions")
                 except Exception as exc:
                     client_errors.append(f"{client}:{type(exc).__name__}:{exc}")
             if info is None:
                 raise RuntimeError("yt-dlp:all_clients_failed:" + " | ".join(client_errors))
             try:
                 caption_timeout = max(2.0, min(30.0, float(
-                    os.environ.get("VIDZEO_YT_TRANSCRIPT_CAPTION_TIMEOUT_SECONDS", "8") or 8
+                    os.environ.get("VIDZEO_YT_TRANSCRIPT_CAPTION_TIMEOUT_SECONDS", "15") or 15
                 )))
             except (TypeError, ValueError):
-                caption_timeout = 8.0
+                caption_timeout = 15.0
             import urllib.request as _urlrequest
             import json as _json
             for kind in ("subtitles", "automatic_captions"):
@@ -635,11 +779,22 @@ class YouTubeTranscriptIndex:
 
         # Prefer the authenticated yt-dlp caption endpoint when available;
         # otherwise retain the existing API-first public fallback.
-        if yt_dlp is not None and session_jar is not None:
+        auth_attempted = yt_dlp is not None and session_jar is not None
+        auth_transport_failed = False
+        auth_no_captions = False
+        if auth_attempted:
             try:
                 return _yt_dlp_caption_provider()
             except Exception as exc:
                 errors.append(f"yt-dlp-auth:{type(exc).__name__}:{exc}")
+                if "yt-dlp:no_en_captions" in str(exc):
+                    # The player response arrived but carries no usable
+                    # captions; re-running the same extraction cannot help.
+                    auth_no_captions = True
+                else:
+                    auth_transport_failed = True
+        api_definitive = False
+        api_transport_failed = False
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -653,6 +808,27 @@ class YouTubeTranscriptIndex:
             return {"source": "youtube_transcript_api", "language": "en", "segments": transcript.to_raw_data()}
         except Exception as exc:
             errors.append(f"{type(exc).__name__}:{exc}")
+            if _is_definite_no_transcript_error(exc):
+                api_definitive = True
+            else:
+                api_transport_failed = True
+        # The yt-dlp fallback re-fetches the same player response the
+        # authenticated leg already saw, so it only helps when BOTH prior
+        # legs failed on transport (a transient blip worth one retry) —
+        # never after a definitive no-captions answer from either leg, and
+        # never when the authenticated leg already proved there are no
+        # captions. Run 2 burned two extra extract_info rounds per video
+        # after the API had already answered TranscriptsDisabled.
+        # When the authenticated leg never ran (no yt-dlp / no session) the
+        # fallback is the first yt-dlp attempt, so it still runs on an API
+        # transport failure.
+        if (
+            api_definitive
+            or auth_no_captions
+            or not api_transport_failed
+            or (auth_attempted and not auth_transport_failed)
+        ):
+            raise RuntimeError(f"youtube_transcript_unavailable:{' | '.join(errors)}") from None
         enabled = str(os.environ.get("VIDZEO_YT_TRANSCRIPT_YTDLP_FALLBACK", "1") or "1").strip().lower()
         if enabled in {"1", "true", "yes", "on"}:
             try:
@@ -664,23 +840,23 @@ class YouTubeTranscriptIndex:
                 info = None
                 client_errors: List[str] = []
                 configured_clients = str(
-                    os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENTS", "web_embedded,android")
-                    or "web_embedded,android"
+                    os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENTS", _DEFAULT_TRANSCRIPT_CLIENTS)
+                    or _DEFAULT_TRANSCRIPT_CLIENTS
                 )
                 clients = [
                     client.strip() for client in configured_clients.split(",")
                     if client.strip()
-                ] or ["web_embedded", "android"]
+                ] or _DEFAULT_TRANSCRIPT_CLIENTS.split(",")
                 try:
                     client_timeout = max(
                         2.0,
                         min(
                             30.0,
-                            float(os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENT_TIMEOUT_SECONDS", "8") or 8),
+                            float(os.environ.get("VIDZEO_YT_TRANSCRIPT_CLIENT_TIMEOUT_SECONDS", "15") or 15),
                         ),
                     )
                 except (TypeError, ValueError):
-                    client_timeout = 8.0
+                    client_timeout = 15.0
                 for client in clients:
                     try:
                         with yt_dlp.YoutubeDL({
@@ -690,6 +866,10 @@ class YouTubeTranscriptIndex:
                             "noplaylist": True,
                             "socket_timeout": client_timeout,
                             "retries": 0,
+                            # Same as the primary leg: only the caption
+                            # tracks matter, so a storyboard-only player
+                            # response must not raise away the info dict.
+                            "ignore_no_formats_error": True,
                             # Prefer the system SSL context over certifi so a
                             # host behind a TLS-intercepting proxy still works.
                             "compat_opts": {"no-certifi"},
@@ -700,8 +880,19 @@ class YouTubeTranscriptIndex:
                             # configured. Attach it like the primary path.
                             if session_jar is not None:
                                 ydl.cookiejar = session_jar
-                            info = ydl.extract_info(video_id, download=False)
-                        break
+                            candidate = ydl.extract_info(video_id, download=False)
+                        # Same as the primary leg: only stop at a client
+                        # whose player response carries caption tracks —
+                        # ``web`` can lack captions ``web_embedded`` has.
+                        wanted = _transcript_languages()
+                        if any(
+                            (candidate.get(kind) or {}).get(language)
+                            for kind in ("subtitles", "automatic_captions")
+                            for language in wanted
+                        ):
+                            info = candidate
+                            break
+                        client_errors.append(f"{client}:no_captions")
                     except Exception as exc:
                         client_errors.append(f"{client}:{type(exc).__name__}:{exc}")
                 if info is None:
@@ -721,11 +912,11 @@ class YouTubeTranscriptIndex:
                                 2.0,
                                 min(
                                     30.0,
-                                    float(os.environ.get("VIDZEO_YT_TRANSCRIPT_CAPTION_TIMEOUT_SECONDS", "8") or 8),
+                                    float(os.environ.get("VIDZEO_YT_TRANSCRIPT_CAPTION_TIMEOUT_SECONDS", "15") or 15),
                                 ),
                             )
                         except (TypeError, ValueError):
-                            caption_timeout = 8.0
+                            caption_timeout = 15.0
                         caption_opener = _cookie_opener(session_jar)
                         if caption_opener is not None:
                             response_cm = caption_opener.open(url, timeout=caption_timeout)

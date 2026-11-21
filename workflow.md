@@ -19,7 +19,8 @@ cp .env.example .env   # then fill in the values below; .env is gitignored
 Settings that must be in `.env` (see `.env.example` for the full list):
 `MUSE_RENDER_COMMAND=node <absolute-repo-path>/render-vidnets-linux.js`,
 `MUSE_VIDNETS_ROOT=<repo>/vidnets`,
-`MUSE_YOUTUBE_COVERAGE_TARGET=0.30`,
+`MUSE_YOUTUBE_COVERAGE_TARGET=0.30` (normal default — gaming 0.80 /
+documentary 0.55 are wired per niche in code),
 `MUSE_MEDIA_STRICT=0` (filter-best; see §3),
 `MUSE_RENDER_CONCURRENCY=1`,
 `TMPDIR=<runtime>/temp` (NOT /tmp — it is a 512 MB tmpfs),
@@ -108,7 +109,7 @@ Every knob lives in `.env` / `.env.example`. Defaults are production.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MUSE_YOUTUBE_COVERAGE_TARGET` | 0.30 | Fraction of scenes the planner tries to fill with accepted YouTube clips (code default 0.6) |
+| `MUSE_YOUTUBE_COVERAGE_TARGET` | 0.30 (normal) | Fraction of scenes the planner tries to fill with accepted YouTube clips (code default 0.6); per-niche targets are wired in code — gaming 0.80, documentary 0.55, normal 0.30 |
 | `MUSE_MEDIA_STRICT` | 0 | 0 = filter-best (vision advisory); 1 = hard-required (strict retrieval + visual required) |
 | `MUSE_SCRIPT_MAX_DRAFTS` | 2 | Script model calls max (draft 1 + one fix pass) |
 | `MUSE_RESEARCH_TIMEOUT_MS` | 180000 | One shared research deadline for all providers |
@@ -118,8 +119,12 @@ Every knob lives in `.env` / `.env.example`. Defaults are production.
 | `MUSE_RENDER_CONCURRENCY` | 2 (code) / 1 (live `.env`) | Workers sharding ONE video's frames (see §8.4); live pins 1, the tested safe count |
 | `MUSE_RENDER_TIMEOUT_MS` | 21600000 | Overall render budget per job (6 h, matches the CMS hard limit) |
 | `TMPDIR` / `VIDZEO_TEMP_DIR` | `<runtime>/temp` | Scratch/temp root (never /tmp) |
-| `VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET` | 0.30 | Server-side YouTube coverage target (runtime `.env`) |
+| `VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET` | 0.30 (normal) | Server-side YouTube coverage target (runtime `.env`); per-niche — gaming 0.80, documentary 0.55, normal 0.30 |
 | `VIDZEO_AUTO_REQUEUE_INTERRUPTED` | 1 | Server auto-resumes jobs interrupted by a VM reboot |
+| `VIDZEO_YT_MEDIA_TAIL_SECONDS` | 120 | Media tail after YT discovery: total media budget for a 1-min video is 412s (292s discovery + 120s tail); YT recovery waves + the post-coordinator gate cut off at the total; in-flight downloads exempt |
+| `VIDZEO_YT_GENERAL_POOL_ENABLED` | 0 (False) | General YouTube pool disabled by default — scene-by-scene + web only |
+| `VIDZEO_YT_SALVAGE_SCREEN_BUDGET_SECONDS` | 60 | Disk salvage trusts prior screening (a clip with a passing download-time verdict in `youtube_scene_*.attempts.json` skips re-screening); total salvage screening bounded to this |
+| `VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY` | 8 | In-flight external-agent vision calls (raised 4 → 8 on Nov 21, test-20 fan-out; matches the pool ceiling of 8) |
 
 ## 5. Monitoring
 
@@ -151,6 +156,7 @@ claims, delivers, or restarts a job mid-render.
 | 0 real media / all graphics | Discovery returned 0 candidates (search transport) OR strict flags hard-rejected everything | Check the manifest: if every lane returned 0 candidates, it is a transport problem (DNS/proxy), not strictness. If candidates existed but none survived, check `MUSE_MEDIA_STRICT` and the vision verdicts — filter-best must be on |
 | Wrapper fails "0 real-media scenes" | All scenes graphic fallback | One bounded re-plan already ran (or was skipped for lack of budget). Fail the job; re-queue the title only after the cause above is fixed |
 | Vision rejects a correct clip | Operator prompt too strict, or a watermarked/wrong-operator frame | The hook prompt is filter-best (reject only clearly-wrong). A wrong-operator frame (e.g. CSX illustrating Amtrak) is correctly rejected |
+| Pool empties mid-media after a render ends | stop_graceful race (fixed Nov 21, 2026) | A cancelled stop is NOT recalled once a worker has read it. Fix: two-tick render confirm before queueing stops, cancelled stops kept as tombstones, a worker exiting on a seen stop is re-healed immediately (`POOL_SUPERVISOR_BRIEF.md`) |
 
 ## 7. Distribution checklist (handing the repo to the next agent)
 

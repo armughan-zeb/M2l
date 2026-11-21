@@ -94,6 +94,143 @@ def build_clip_prompt(topic: str, narration: str, subject: str = "", frame_count
     )
 
 
+# =============================================================================
+# BATCHED CLIP INTELLIGENCE PROMPT (several candidates, one vision call)
+# =============================================================================
+# One vision request judges every candidate of a scene at once: each
+# candidate's frames are labelled "Candidate <id>" in chronological order
+# and the model returns one verdict object per candidate. Batching only
+# changes HOW verdicts are obtained, never the acceptance rule: subject-
+# level acceptance still applies per candidate (wrong subject/entity,
+# terrible quality, duplicate, direct contradiction are hard rejects; a
+# low score only ranks, never rejects).
+
+CLIP_BATCH_SYSTEM_PROMPT = (
+    "You are a professional documentary editor. You are given frames from "
+    "several video-clip candidates for the SAME scene, each labelled "
+    "\"Candidate <id>\" with its frames in chronological order. Judge each "
+    "candidate on its own frames, as a whole, not frame by frame. Return "
+    "STRICT JSON only. No markdown, no prose. Return exactly one verdict "
+    "object per candidate, in the same order as the candidates were shown, "
+    "using each candidate's exact id. Be consistent: 0 means absent/poor, "
+    "100 means excellent."
+)
+
+CLIP_BATCH_USER_TEMPLATE = (
+    "Scene topic: {topic}\n"
+    "Scene narration: {narration}\n"
+    "Documentary subject: {subject}\n"
+    "Candidates: {candidate_ids} (frames labelled per candidate, chronological order)\n\n"
+    "Return this JSON object with numeric values from 0 to 100:\n"
+    "{{\"candidates\":[{{\"candidate_id\":\"<exact id>\",\"verdict\":\"accept|reject\","
+    "\"reason\":\"short reason\",\"score\":0,\"story_relevance\":0,\"confidence\":0,"
+    "\"fatal_mismatch\":false,\"talking_head\":false}}]}}\n"
+    "One entry per candidate, same order as shown. \"score\" is the candidate's "
+    "overall ranking score for this scene (0-100): a low score ranks the "
+    "candidate below the others, it never rejects on its own. Set "
+    "verdict=\"reject\" only for a hard reject: the frames show the wrong "
+    "subject or entity, a different event/era/location that contradicts the "
+    "narration, terrible quality, a duplicate of another candidate, or a "
+    "talking head / facecam presenter instead of documentary footage of the "
+    "subject. Set fatal_mismatch=true for those same hard-reject cases. "
+    "THEMATIC / NEAR-MATCH MANDATE FOR FOOTAGE: Accept genuinely relevant "
+    "b-roll for a general topic beat. A named, dated historical event has a "
+    "strict era contract: present-day footage of the same team/person/topic "
+    "is not an archival near-match; set fatal_mismatch=true when the visible "
+    "era conflicts. Do NOT fail a correctly period-matched clip merely because "
+    "it shows a different moment within the same event. For scenes without a "
+    "specific event/date, ordinary uniform or era differences remain "
+    "acceptable. Set fatal_mismatch=true when frames show kids or amateurs "
+    "playing in a park, video game simulations (FIFA/EAFC/PES/Roblox), 3D "
+    "renders, or generic stock when authentic professional footage of the "
+    "subject is required. Set talking_head=true when the frames feature any "
+    "person speaking directly to the camera (news anchor, news desk, "
+    "interviewer, interviewee talking to camera, commentator, vlog, streamer "
+    "webcam/facecam, reaction, podcast host, or studio presenter) instead of "
+    "documentary b-roll, archival footage, or real footage of the subject "
+    "itself. A crowd, a person acting within a scene, an athlete playing, "
+    "gameplay characters, or archival footage of a named historical figure "
+    "doing actions is NOT a talking head. A small persistent webcam/facecam "
+    "box over gameplay is talking_head=true even when most of the frame is "
+    "gameplay.\n"
+    "Return JSON only."
+)
+
+# OpenRouter json_schema response_format for a batched clip verdict. This is
+# the contract the resident inference worker validates against BEFORE
+# delivering (scripts/resident-inference-worker/validate_answer.py, via the
+# server's own _json_schema_error), and the server re-validates on receipt.
+# Every per-candidate field is required: the downstream gate needs
+# fatal_mismatch / talking_head / story_relevance / confidence for every
+# candidate, and a missing field must fail validation rather than silently
+# degrade into a wrong accept. additionalProperties is false so a stray
+# field is a validation error, not a silent schema drift.
+CLIP_BATCH_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "clip_batch_verdicts",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "required": ["candidates"],
+            "additionalProperties": False,
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "minItems": 1,
+                    # Must match the batch cap: analyze_clip_frames_batch
+                    # sends up to 16 candidates (16 images, 1 frame each)
+                    # in one request, and a scene has up to 8. A lower cap
+                    # makes every 7+ candidate batch fail submission with
+                    # 400 "too many items" (live, 2026-11-20, 8 verdicts).
+                    "maxItems": 16,
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "candidate_id",
+                            "verdict",
+                            "reason",
+                            "score",
+                            "story_relevance",
+                            "confidence",
+                            "fatal_mismatch",
+                            "talking_head",
+                        ],
+                        "additionalProperties": False,
+                        "properties": {
+                            "candidate_id": {"type": "string", "minLength": 1},
+                            "verdict": {"type": "string", "enum": ["accept", "reject"]},
+                            "reason": {"type": "string", "minLength": 1},
+                            "score": {"type": "number", "minimum": 0, "maximum": 100},
+                            "story_relevance": {"type": "number", "minimum": 0, "maximum": 100},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 100},
+                            "fatal_mismatch": {"type": "boolean"},
+                            "talking_head": {"type": "boolean"},
+                        },
+                    },
+                }
+            },
+        },
+    },
+}
+
+
+def build_clip_batch_prompt(
+    topic: str,
+    narration: str,
+    subject: str = "",
+    candidate_ids: List[str] | None = None,
+) -> str:
+    """User prompt for one batched verdict call over a scene's candidates."""
+    ids = ", ".join(str(c) for c in (candidate_ids or [])) or "none"
+    return CLIP_BATCH_USER_TEMPLATE.format(
+        topic=(topic or "").strip() or "documentary",
+        narration=(narration or "").strip()[:400],
+        subject=(subject or "").strip() or "unspecified",
+        candidate_ids=ids,
+    )
+
+
 # Keys we expect Qwen to return. Used to coerce partial/extra responses.
 IMAGE_EXPECTED_KEYS = (
     "relevance", "quality", "historical_match", "composition",

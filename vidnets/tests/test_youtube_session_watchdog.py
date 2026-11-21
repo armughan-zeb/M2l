@@ -168,6 +168,28 @@ class TestWatchdogFlip:
         assert _state(tmp_path)["alerts"][0]["account"] == 1
         assert "recovered" not in capsys.readouterr().out
 
+    def test_transient_probe_timeout_raises_no_reexport_alert(self, tmp_path, monkeypatch):
+        """Run 7 flap: a probe that times out is a network blip, not a
+        dead session — the watchdog must not tell the operator to
+        re-export, but the state must still show the account as
+        unverified + transient so the flap is visible, not silent."""
+        monkeypatch.setenv("VIDZEO_YT_PROBE_RETRY_DELAY_SECONDS", "0")
+        pool = _pool(tmp_path)
+        state_path = tmp_path / "watchdog.json"
+        with mock.patch.object(
+            session, "_verify_youtube_session",
+            return_value=(None, "youtube-probe-ReadTimeout"),
+        ):
+            result = watchdog.check(pool=pool, state_path=state_path, render_active=False)
+        assert result["checked"] is True
+        assert result["alerts"] == []
+        assert result["needs_reexport"] is False
+        assert result["healthy_accounts"] == 0
+        account = result["accounts"][0]
+        assert account["status"] == "unverified"
+        assert account["reason"] == "youtube-probe-ReadTimeout"
+        assert account["transient"] is True
+
     def test_watchdog_does_not_reprobe_within_ttl(self, tmp_path, monkeypatch):
         # Watchdog interval 3600s: the second check must not touch the
         # pool at all, so the probe runs exactly once.

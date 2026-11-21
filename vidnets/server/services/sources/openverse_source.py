@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate
+from .base_source import BaseSource, ImageCandidate, request_proxies
 
 
 class OpenverseSource(BaseSource):
@@ -231,7 +231,9 @@ class OpenverseSource(BaseSource):
             )
             return "", state
 
-    def _search_response(self, params: Dict[str, Any]) -> Optional[Any]:
+    def _search_response(
+        self, params: Dict[str, Any], direct: bool = False,
+    ) -> Optional[Any]:
         token, auth_state = self._get_access_token()
         if auth_state == "invalid_credentials":
             return None
@@ -248,6 +250,7 @@ class OpenverseSource(BaseSource):
                     params=params,
                     headers=headers,
                     timeout=self.timeout,
+                    proxies=request_proxies(direct),
                 )
             except requests.RequestException:
                 if attempt == 0:
@@ -281,6 +284,7 @@ class OpenverseSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         filters = filters or {}
         clean = self._clean_query(query, max_words=8)
@@ -303,7 +307,7 @@ class OpenverseSource(BaseSource):
         if aspect_ratio:
             params["aspect_ratio"] = aspect_ratio
 
-        response = self._search_response(params)
+        response = self._search_response(params, direct=direct)
         if response is None:
             return []
         try:
@@ -325,7 +329,7 @@ class OpenverseSource(BaseSource):
                     self.verify_license_pages
                     and len(candidates) < self.license_verification_limit
                 ):
-                    verified, evidence = self._verify_source_page_license(dict(item))
+                    verified, evidence = self._verify_source_page_license(dict(item), direct=direct)
                     candidate.metadata["license_verified"] = bool(verified)
                     candidate.metadata["license_verification_evidence"] = evidence
                     candidate.metadata["license_verification_required"] = not bool(verified)
@@ -335,7 +339,9 @@ class OpenverseSource(BaseSource):
                 candidates.append(candidate)
         return candidates
 
-    def _verify_source_page_license(self, item: Mapping[str, Any]) -> Tuple[bool, str]:
+    def _verify_source_page_license(
+        self, item: Mapping[str, Any], direct: bool = False,
+    ) -> Tuple[bool, str]:
         """Confirm Openverse's reported license on the independent origin page."""
         landing_url = str(item.get("foreign_landing_url") or "").strip()
         if not re.match(r"^https?://", landing_url, flags=re.IGNORECASE):
@@ -357,6 +363,7 @@ class OpenverseSource(BaseSource):
                     },
                     timeout=self.timeout,
                     allow_redirects=True,
+                    proxies=request_proxies(direct),
                 )
             except requests.RequestException:
                 response = None

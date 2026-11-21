@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate, _accept_language
+from .base_source import BaseSource, ImageCandidate, _accept_language, request_proxies
 
 
 class _StateAttributeParser(HTMLParser):
@@ -134,13 +134,14 @@ class YandexSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         with self._state_lock:
             if self._search_inflight:
                 return []
             self._search_inflight = True
         try:
-            return self._search_impl(query, limit=limit, filters=filters)
+            return self._search_impl(query, limit=limit, filters=filters, direct=direct)
         finally:
             with self._state_lock:
                 self._search_inflight = False
@@ -150,6 +151,7 @@ class YandexSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         del filters
         clean = self._clean_query(query, max_words=8)
@@ -184,7 +186,7 @@ class YandexSource(BaseSource):
         mocked_transport = self._is_mocked_transport()
         fast_candidates, fast_robot, fast_error = (
             ([], False, "") if mocked_transport
-            else self._fast_http_search(clean, params, limit)
+            else self._fast_http_search(clean, params, limit, direct=direct)
         )
         if fast_candidates:
             self._store_result_cache(clean, fast_candidates)
@@ -199,6 +201,7 @@ class YandexSource(BaseSource):
                         url,
                         params=params,
                         timeout=float(self.timeout),
+                        proxies=request_proxies(direct),
                     )
                     if response.status_code != 200:
                         last_error = f"HTTP {response.status_code}"
@@ -270,7 +273,9 @@ class YandexSource(BaseSource):
         with cls._result_cache_lock:
             cls._result_cache[query.casefold()] = (time.time(), list(candidates))
 
-    def _fast_http_search(self, query: str, params: Dict[str, str], limit: int) -> tuple[List[ImageCandidate], bool, str]:
+    def _fast_http_search(
+        self, query: str, params: Dict[str, str], limit: int, direct: bool = False,
+    ) -> tuple[List[ImageCandidate], bool, str]:
         """Try a Chrome-fingerprinted HTTP/2 request before requests/browser."""
         enabled = str(os.environ.get("VIDZEO_YANDEX_CURL_IMPERSONATE", "0") or "0").strip().lower()
         if enabled not in {"1", "true", "yes", "on"}:
@@ -290,7 +295,10 @@ class YandexSource(BaseSource):
             for page in range(3):
                 page_params = dict(params)
                 page_params["p"] = str(page)
-                response = session.get(self.SEARCH_URL, params=page_params, timeout=float(self.timeout))
+                response = session.get(
+                    self.SEARCH_URL, params=page_params, timeout=float(self.timeout),
+                    proxies=request_proxies(direct),
+                )
                 if response.status_code != 200:
                     if page == 0:
                         return [], False, f"HTTP {response.status_code}"

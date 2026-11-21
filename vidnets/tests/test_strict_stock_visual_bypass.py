@@ -292,19 +292,17 @@ def test_deferred_visual_gate_uses_domain_and_scene_context(tmp_path):
     prompts = []
 
     class Client:
-        def compare_images(self, _paths, prompt):
+        # P4: single-verify returns the one row directly.
+        def analyze_image(self, _path, prompt, _system):
             prompts.append(prompt)
             return {
-                "acceptable": True,
-                "candidates": [{
-                    "relevance": 35,
-                    "quality": 82,
-                    "confidence": 88,
-                    "fatal_mismatch": True,
-                    "domain_match": True,
-                    "scene_match": True,
-                    "reason": "The exact person is not visible, but this royal residence supports the scene.",
-                }],
+                "relevance": 35,
+                "quality": 82,
+                "confidence": 88,
+                "fatal_mismatch": True,
+                "domain_match": True,
+                "scene_match": True,
+                "reason": "The exact person is not visible, but this royal residence supports the scene.",
             }
 
     class Context:
@@ -330,7 +328,7 @@ def test_deferred_visual_gate_uses_domain_and_scene_context(tmp_path):
     assert winner and winner["path"] == str(image_path)
     assert winner["visual_decision"]["domain_match"] is True
     assert "Scene narration" in prompts[0]
-    assert "Candidate 0 metadata" in prompts[0]
+    assert "Candidate metadata" in prompts[0]
 
 
 def _run_deferred_gate(tmp_path, model_row, *, visual_required=True):
@@ -341,8 +339,9 @@ def _run_deferred_gate(tmp_path, model_row, *, visual_required=True):
     Image.new("RGB", (640, 360), color=(40, 70, 100)).save(image_path)
 
     class Client:
-        def compare_images(self, _paths, _prompt):
-            return {"acceptable": True, "candidates": [model_row]}
+        # P4: single-verify returns the one row directly.
+        def analyze_image(self, _path, _prompt, _system):
+            return dict(model_row)
 
     required = visual_required
 

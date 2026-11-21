@@ -952,10 +952,30 @@ class PipelineApiContractTests(unittest.TestCase):
         mock_yt_planner,
         mock_stock_planner,
     ):
+        # Mechanical-first: the single scene requests a diagram, so it stays
+        # on inference by design and the shared brain is filed as the repair
+        # path for exactly that scene. Its rows must carry real contract
+        # fields to survive the merged validation. (Gap 4: this scene used
+        # to fail the contract validators on fewer-than-3 retrieval terms,
+        # which the mechanical fix now pads; a diagram scene keeps the
+        # repair path under test.)
+        base = {
+            "scene_number": 1,
+            "section_subject": "Cristiano Ronaldo",
+            "container_subject": "Cristiano Ronaldo",
+            "scene_subject": "Cristiano Ronaldo",
+            "scene_subject_type": "person",
+            "domain_category": "sports",
+            "retrieval_positive_terms": ["Cristiano Ronaldo", "football", "goal"],
+            "retrieval_negative_terms": [],
+            "youtube_query_intents": ["match footage", "documentary footage"],
+            "visual_intent": "Cristiano Ronaldo scoring goal",
+            "_llm": True,
+        }
         shared = {
-            "web": [{"_llm": True, "scene_number": 1, "search_query": "Cristiano Ronaldo photo"}],
-            "yt": [{"_llm": True, "scene_number": 1, "youtube_query": "Cristiano Ronaldo real footage"}],
-            "stock": [{"_llm": True, "scene_number": 1, "primary_query": "football player goal"}],
+            "web": [{**base, "search_query": "Cristiano Ronaldo scoring goal photo"}],
+            "yt": [{**base, "search_query": "Cristiano Ronaldo scoring goal footage"}],
+            "stock": [{**base, "query_source": "stock", "primary_query": "football player goal"}],
             "_planner": {"status": "directed", "provider": "openrouter", "model": "openai/gpt-6-luna"},
         }
         mock_shared_brain.return_value = shared
@@ -963,19 +983,22 @@ class PipelineApiContractTests(unittest.TestCase):
         bundle = server_app._generate_source_query_bundle_parallel(
             "Number one is Cristiano Ronaldo.",
             "Football players",
-            ["Number one is Cristiano Ronaldo."],
+            ["Number one is Cristiano Ronaldo, as the chart shows."],
             {"openrouter_api_key": "openrouter-key", "llm_provider": "openrouter"},
             needs_web=True,
             needs_yt=True,
             needs_stock=True,
         )
 
-        # The shared planner's source rows remain unchanged; the API adds
-        # route/status metadata so downstream UI and saved jobs can report
-        # whether queries came from the LLM or a fallback.
+        # The shared planner is filed for the one failing scene only, and
+        # its source rows remain unchanged; the API adds route/status
+        # metadata so downstream UI and saved jobs can report whether
+        # queries came from the LLM repair or the mechanical first path.
+        mock_shared_brain.assert_called_once()
+        self.assertEqual(mock_shared_brain.call_args.args[2], ["Number one is Cristiano Ronaldo, as the chart shows."])
         for source in ("web", "yt", "stock"):
             self.assertEqual(bundle[source], shared[source])
-        self.assertEqual(bundle["_planner"]["status"], "directed")
+        self.assertEqual(bundle["_planner"]["status"], "mechanical_first_llm_repair")
         self.assertEqual(bundle["_planner"]["provider"], "openrouter")
         mock_web_planner.assert_not_called()
         mock_yt_planner.assert_not_called()

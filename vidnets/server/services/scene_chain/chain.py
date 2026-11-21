@@ -258,6 +258,9 @@ class YouTubeLane:
         scene_durations: Optional[List[float]] = None,
         scene_query_overrides: Optional[List[dict]] = None,
         visual_context=None,
+        # Full job title for the prep-manifest injection lookup; the
+        # search title may be just the topic anchor.
+        prep_manifest_title: Optional[str] = None,
     ) -> Optional["YouTubeLane"]:
         """Run the one-time metadata search and return a ready lane, or None if
         the search yielded no usable pools (so the caller can skip the lane)."""
@@ -270,6 +273,7 @@ class YouTubeLane:
                 title, list(scene_texts),
                 scene_query_overrides=scene_query_overrides,
                 scene_durations=list(scene_durations or []),
+                prep_manifest_title=prep_manifest_title,
             )
         except Exception:
             return None

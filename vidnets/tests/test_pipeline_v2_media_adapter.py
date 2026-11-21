@@ -600,16 +600,23 @@ def test_explicit_media_deadline_can_still_raise_youtube_budget():
 
 def test_mixed_youtube_coordinator_includes_cleanup_and_salvage_tail():
     with mock.patch.dict(os.environ, {}, clear=True):
+        from services.pipeline_v2_media_adapter import mixed_youtube_time_budget
+        from services.youtube_pipeline_v2 import mixed_youtube_download_worker_capacity
+        # Transfer waves are priced at the fitted parallel capacity
+        # (total-RAM tiers), not the serial 1-worker budget: on this host
+        # 24 clips need 6 waves x 80s + 128s overhead = 608s, plus the 180s
+        # reserve for cancellation, executor drain, salvage, and snapshots.
+        # That 788s sits below the explicit 990s media deadline, so the
+        # media deadline governs. (The old serial pricing needed 24 waves =
+        # 2228s; only genuine memory starvation still prices that way.) In
+        # production the delivery budget still clamps this coordinator wall.
+        workers = mixed_youtube_download_worker_capacity({"_youtube_budget_scene_count": 24})
+        wall, _ = mixed_youtube_time_budget(24, 360, download_workers=workers, coverage_target=1.0)
         deadline = _media_stage_deadline_seconds(
             {"media_deadline_seconds": 990, "_youtube_budget_scene_count": 24},
             "Mixed Media",
         )
-    # One-worker transfer budgeting scales with the waves the quota needs:
-    # 24 clips at full coverage = 24 waves x 80s + 128s overhead = 2048s
-    # (the old fixed 900s cap starved long jobs). Reserve a separate 180s
-    # for cancellation, executor drain, salvage, and snapshots. In
-    # production the delivery budget still clamps this coordinator wall.
-    assert deadline == 2228.0
+    assert deadline == max(990.0, wall + 180.0)
 
 
 def test_mixed_direct_clip_lane_uses_bounded_coordinator_wall():
@@ -762,6 +769,65 @@ def test_mixed_media_youtube_default_target_is_30_percent():
             script="A science documentary.",
         )
     assert len(indices) == 3
+
+
+def test_documentary_mode_youtube_target_is_55_percent():
+    # Documentary jobs bind the 0.55 target from AUTO_YOUTUBE_RATIO via
+    # config['_documentary_mode'] / config['_documentary_youtube_target']
+    # (stamped by app._apply_documentary_mode_policy). Quota math rounds
+    # UP to a minimum coverage target: ceil(N * 0.55).
+    config = {
+        "_documentary_mode": True,
+        "_documentary_youtube_target": 0.55,
+    }
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert _mixed_media_youtube_target_ratio(config) == 0.55
+        scenes_13 = [f"canal scene {index}" for index in range(13)]
+        assert len(_automatic_youtube_scene_indices(
+            config, scenes_13,
+            title="How the Panama Canal Changed World Trade",
+            script="The Panama Canal changed world trade.",
+        )) == 8  # ceil(13 * 0.55) = 8
+        scenes_20 = [f"canal scene {index}" for index in range(20)]
+        assert len(_automatic_youtube_scene_indices(
+            config, scenes_20,
+            title="How the Panama Canal Changed World Trade",
+            script="The Panama Canal changed world trade.",
+        )) == 11  # ceil(20 * 0.55) = 11
+
+
+def test_documentary_target_beats_retrieval_weights_but_not_explicit_coverage():
+    # The documentary retrieval weights say YouTube 0.60, but the binding
+    # quota target is 0.55: the stamped target wins over the weights branch.
+    config = {
+        "_documentary_mode": True,
+        "_documentary_youtube_target": 0.55,
+        "mixed_media_weights": {
+            "Web Images": 0.30,
+            "Stock Media": 0.10,
+            "YouTube Clips": 0.60,
+            "AI Images": 0.0,
+        },
+    }
+    assert _mixed_media_youtube_target_ratio(config) == 0.55
+    # An explicit operator coverage key still wins over documentary mode.
+    explicit = dict(config, youtube_accepted_coverage_target=0.60)
+    assert _mixed_media_youtube_target_ratio(explicit) == 0.60
+
+
+def test_gaming_target_still_80_percent_and_wins_over_documentary():
+    gaming = {"_gaming_mode": True, "_gaming_youtube_target": 0.80}
+    assert _mixed_media_youtube_target_ratio(gaming) == 0.80
+    both = {
+        "_gaming_mode": True,
+        "_gaming_youtube_target": 0.80,
+        "_documentary_mode": True,
+        "_documentary_youtube_target": 0.55,
+    }
+    assert _mixed_media_youtube_target_ratio(both) == 0.80
+    # A plain (non-gaming, non-documentary) job still falls back to 0.30.
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert _mixed_media_youtube_target_ratio({}) == 0.30
 
 
 def test_oversized_prebuilt_youtube_group_is_capped_and_spread_across_timeline():
@@ -2556,21 +2622,31 @@ def _gaming_config(**overrides):
     return config
 
 
-def test_gaming_mode_youtube_target_ratio_is_90_percent():
+def test_gaming_mode_youtube_target_ratio_is_80_percent():
     from services.pipeline_v2_media_adapter import _mixed_media_youtube_target_ratio
 
-    # The copied gaming weights alone only reach 0.80; gaming mode binds 0.90.
-    assert _mixed_media_youtube_target_ratio(_gaming_config()) == 0.90
+    # The copied gaming weights alone only reach 0.80; gaming mode binds 0.80.
+    assert _mixed_media_youtube_target_ratio(_gaming_config()) == 0.80
     # ... even when the deployment env default says 0.8 (the GTA run's case).
     with mock.patch.dict(
         os.environ, {"VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET": "0.8"}, clear=True
     ):
-        assert _mixed_media_youtube_target_ratio(_gaming_config()) == 0.90
+        assert _mixed_media_youtube_target_ratio(_gaming_config()) == 0.80
     # Without the flag the same weights give 0.80.
     assert (
         _mixed_media_youtube_target_ratio({"mixed_media_weights": dict(_GAMING_WEIGHTS)})
         == 0.80
     )
+    # Quota math follows the same number: 10 gaming scenes reserve 8 YT slots.
+    from services.pipeline_v2_media_adapter import _automatic_youtube_scene_indices
+
+    indices = _automatic_youtube_scene_indices(
+        _gaming_config(),
+        [f"gaming scene {index}" for index in range(10)],
+        title="Grand Theft Auto VI: Return to Vice City",
+        script="GTA VI gameplay in Vice City.",
+    )
+    assert len(indices) == 8
     # An explicit per-job coverage key still wins over gaming mode.
     assert (
         _mixed_media_youtube_target_ratio(
@@ -2594,16 +2670,18 @@ def test_gaming_mode_lane_policy_is_youtube_first_without_planned_stock():
     assert policy["media_source_priority"] == ["youtube", "web", "stock"]
 
 
-def test_gaming_quota_requests_all_eight_scenes():
+def test_gaming_quota_requests_seven_of_eight_scenes():
     from services.pipeline_v2_media_adapter import _automatic_youtube_scene_indices
 
+    # 80% of 8 scenes, rounded up: 7 YouTube slots, 1 web slot.
     indices = _automatic_youtube_scene_indices(
         _gaming_config(),
         [f"GTA VI scene {index}" for index in range(8)],
         title="GTA VI",
         script="Grand Theft Auto VI gameplay trailer breakdown.",
     )
-    assert indices == list(range(8))
+    assert len(indices) == 7
+    assert indices == sorted(set(indices))
 
 
 def test_gaming_mode_wiring_copies_weights_and_enforces_candidate_limit():

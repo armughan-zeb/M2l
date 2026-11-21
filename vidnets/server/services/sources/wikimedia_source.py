@@ -13,7 +13,7 @@ from typing import Dict, Iterable, List, Optional
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate
+from .base_source import BaseSource, ImageCandidate, request_proxies
 
 
 def _plain_text(value: object, limit: int = 500) -> str:
@@ -46,6 +46,7 @@ class WikimediaSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         clean = self._clean_query(query, max_words=8)
         if not clean:
@@ -65,7 +66,10 @@ class WikimediaSource(BaseSource):
             "origin": "*",
         }
         try:
-            response = self.session.get(self.API_URL, params=params, timeout=self.timeout)
+            response = self.session.get(
+                self.API_URL, params=params, timeout=self.timeout,
+                proxies=request_proxies(direct),
+            )
             response.raise_for_status()
             pages = (response.json().get("query") or {}).get("pages") or []
         except Exception:
@@ -108,6 +112,7 @@ class WikimediaSource(BaseSource):
         self,
         candidates: Iterable[ImageCandidate],
         limit: int = 6,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         """Batch-fetch expensive rights metadata for a bounded shortlist."""
         rows = list(candidates or [])
@@ -136,7 +141,10 @@ class WikimediaSource(BaseSource):
             "origin": "*",
         }
         try:
-            response = self.session.get(self.API_URL, params=params, timeout=self.timeout)
+            response = self.session.get(
+                self.API_URL, params=params, timeout=self.timeout,
+                proxies=request_proxies(direct),
+            )
             response.raise_for_status()
             pages = (response.json().get("query") or {}).get("pages") or []
         except Exception:

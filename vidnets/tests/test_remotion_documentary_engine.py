@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -678,7 +679,23 @@ def test_scene_batches_keep_full_story_context_and_isolate_a_timed_out_chunk(mon
     scene_prompts = [call["user_prompt"] for call in client.call_options
                      if call.get("json_schema_name") == "vidnets_scene_direction_v1"]
     assert len(scene_prompts) == 3
-    assert all("The opening question leads through evidence" in prompt for prompt in scene_prompts)
+    # P2: batch 0 returns the film-level art direction in the same turn as
+    # its scenes, so its prompt cannot yet carry the LLM's story arc — it
+    # carries the fallback art plus the same-turn art instruction instead.
+    # Batches 1+ are built lazily at call time and prompt with the art
+    # batch 0 resolved, so only they carry the LLM story arc. The
+    # full-film story map itself (script-derived) is in every prompt.
+    batch_starts = []
+    for prompt in scene_prompts:
+        match = re.search(r"preserving their global indices (\d+)-(\d+)", prompt)
+        assert match is not None
+        batch_starts.append(int(match.group(1)))
+    assert sorted(batch_starts) == [0, 2, 4]
+    batch0 = scene_prompts[batch_starts.index(0)]
+    later = [prompt for prompt, start in zip(scene_prompts, batch_starts) if start > 0]
+    assert len(later) == 2
+    assert "FILM ART DIRECTION (this batch only, same turn)" in batch0
+    assert all("The opening question leads through evidence" in prompt for prompt in later)
     assert all("Full-film story map" in prompt for prompt in scene_prompts)
     assert all("Immediate setup just before this window" in prompt for prompt in scene_prompts)
     assert all("Immediate narrative handoff after this window" in prompt for prompt in scene_prompts)

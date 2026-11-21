@@ -14,7 +14,7 @@ from urllib.parse import urljoin
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate, _accept_language
+from .base_source import BaseSource, ImageCandidate, _accept_language, request_proxies
 
 
 class SearXNGSource(BaseSource):
@@ -89,7 +89,8 @@ class SearXNGSource(BaseSource):
         return instances[start:] + instances[:start]
 
     def search(self, query: str, limit: int = 20,
-               filters: Optional[Dict] = None) -> List[ImageCandidate]:
+               filters: Optional[Dict] = None,
+               direct: bool = False) -> List[ImageCandidate]:
         if not self.is_available() or not str(query or "").strip():
             return []
         params = {
@@ -105,7 +106,8 @@ class SearXNGSource(BaseSource):
             try:
                 response = requests.get(urljoin(instance + "/", "search"), params=params,
                                         headers={"Accept": "application/json", "User-Agent": "VidzeoLocal/1.0"},
-                                        timeout=self.timeout)
+                                        timeout=self.timeout,
+                                        proxies=request_proxies(direct))
                 if response.status_code != 200:
                     self._cooldown_until[instance] = time.monotonic() + 60.0
                     continue

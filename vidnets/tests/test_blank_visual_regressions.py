@@ -78,11 +78,24 @@ def test_youtube_prefers_browser_native_hd_before_expensive_codec_fallback(monke
     assert all('height>=720' in selector for selector in formats)
 
 
-def test_native_clip_workers_fit_available_memory_without_render_limits():
+def test_native_clip_workers_fit_total_memory_not_instant_free_memory():
+    # Total-RAM tiers: a running job/render holding memory must not
+    # collapse downloads to serial. The Panama job ran at 637 MB available
+    # and fitted 1 worker under the old (available-256)//320 rule; on this
+    # 7.7 GB host the fit is 6 even with only 637 MB free.
     from services.youtube_pipeline_v2 import _ranged_download_worker_limit
-    assert _ranged_download_worker_limit(6, 700, 8*1024**3) == 1
-    assert _ranged_download_worker_limit(6, 1250, 8*1024**3) == 2
-    assert _ranged_download_worker_limit(6, 5000, 32*1024**3) == 6
+    assert _ranged_download_worker_limit(6, 637, 8 * 1024 ** 3) == 6
+    assert _ranged_download_worker_limit(4, 637, 8 * 1024 ** 3) == 4
+    assert _ranged_download_worker_limit(6, 700, 8 * 1024 ** 3) == 6
+    assert _ranged_download_worker_limit(6, 1250, 8 * 1024 ** 3) == 6
+    assert _ranged_download_worker_limit(6, 5000, 32 * 1024 ** 3) == 6
+    assert _ranged_download_worker_limit(6, 5000, 4 * 1024 ** 3) == 2
+    assert _ranged_download_worker_limit(6, 5000, 16 * 1024 ** 3) == 6
+    # Only genuine starvation (available below one worker's 320 MB reserve)
+    # drops to 1.
+    assert _ranged_download_worker_limit(6, 100, 8 * 1024 ** 3) == 1
+    assert _ranged_download_worker_limit(6, 255, 8 * 1024 ** 3) == 1
+    assert _ranged_download_worker_limit(8, 300, 16 * 1024 ** 3) == 1
 
 
 def test_fresh_stock_candidate_without_previous_visual_does_not_crash(tmp_path):

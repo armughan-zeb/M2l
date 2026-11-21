@@ -12,16 +12,30 @@ from services.web_image.source_broker import long_form_web_budget
 from services.pipeline_v2_media_adapter import _media_stage_deadline_seconds
 
 
-def test_isolated_client_exposes_json_for_flickr(monkeypatch):
-    response = {"status_code": 200, "text": json.dumps({"items": []})}
-    process = mock.Mock()
-    process.communicate.return_value = (json.dumps(response), "")
-    process.poll.return_value = 0
-    monkeypatch.setattr(universal_scraper.subprocess, "Popen", lambda *args, **kwargs: process)
-    client = universal_scraper._IsolatedNativeClient()
-    result = client.get("https://example.test/feed", headers={}, timeout=3)
-    assert result.status_code == 200
-    assert result.json() == {"items": []}
+def test_search_worker_http_kind_exposes_json_for_flickr(monkeypatch):
+    """Regression (Nov 18 web-resilience): the isolated native client
+    is removed (primp DNS-dead); the research_search_worker's 'http'
+    kind is the requests-based equivalent and must still expose the
+    response as {"status_code", "text"} JSON."""
+    import io
+
+    import requests
+
+    from services import research_search_worker as worker
+
+    response = mock.Mock(status_code=200, text=json.dumps({"items": []}))
+    session = mock.Mock()
+    session.get.return_value = response
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    payload = json.dumps({"kind": "http", "url": "https://yandex.com/images/search?text=x",
+                          "headers": {}, "timeout": 3})
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+    captured = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", captured)
+    worker.main()
+    data = json.loads(captured.getvalue())
+    assert data["status_code"] == 200
+    assert json.loads(data["text"]) == {"items": []}
 
 
 def test_flickr_feed_uses_short_subject_tags_and_parses_results():
