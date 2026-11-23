@@ -4810,6 +4810,7 @@ def resolve_storyboard_media_v2(
     job_id: Optional[str] = None,
     youtube_general_pool: Any = None,
     verification_deadline_seconds: Optional[float] = None,
+    web_verification_deadline_seconds: Optional[float] = None,
     vision_lane_budgets: Optional[Mapping[str, Any]] = None,
 ) -> Dict[int, SceneResolution]:
     """Resolve immutable storyboard scenes through the V2 fallback machine.
@@ -4874,6 +4875,13 @@ def resolve_storyboard_media_v2(
             )
         except (TypeError, ValueError):
             verification_deadline_at = None
+    web_verification_deadline_at = verification_deadline_at
+    if web_verification_deadline_seconds is not None:
+        web_verification_deadline_at = started_at + max(0.0, float(web_verification_deadline_seconds))
+    media_review_deadline_at = max(
+        (wall for wall in (verification_deadline_at, web_verification_deadline_at) if wall is not None),
+        default=None,
+    )
     # Vision reserve (seconds of the total wall kept for verification).
     # Threaded from the caller / VIDZEO_VISION_RESERVE_SECONDS; an
     # external-agent job needs >=1 inbox round trip (>=300s), a direct
@@ -4952,11 +4960,7 @@ def resolve_storyboard_media_v2(
     web_recovery_cancel_event = _LinkedCancellationEvent(external_cancel_event)
     discovered: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(rows))}
     attempts: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(rows))}
-    # Scenes whose primary web lane failed on transport (timeout/error with
-    # zero candidates). Their web recovery lane is skipped: it would hit the
-    # same proxy/hosts and fail the same way. See consume_discovery and
-    # _compute_cross_lane_specs.
-    web_transport_failed: set = set()
+    broken_primary_web: set[int] = set()
     # Live vision verdicts by (scene index, candidate identity). A candidate
     # re-checked in a later round for the same scene reuses its verdict
     # instead of spending a second live vision read. Job-scoped: discarded
@@ -5117,7 +5121,7 @@ def resolve_storyboard_media_v2(
         or getattr(stock_lane, "shared_batch", False)
     )
 
-    def _bounded_lane_call(callback, scene: Mapping[str, Any], event: threading.Event, timeout: float):
+    def _bounded_lane_call(callback, scene: Mapping[str, Any], event: threading.Event, timeout: float, *, deadline_getter=None):
         """Run a scene-scoped provider without making the coordinator hostage.
 
         Provider callbacks are legacy callables and cannot be force-killed
@@ -5149,7 +5153,8 @@ def resolve_storyboard_media_v2(
         worker.start()
         deadline = time.monotonic() + max(0.01, float(timeout))
         while not done.is_set():
-            remaining = deadline - time.monotonic()
+            current_deadline = deadline_getter() if deadline_getter is not None else deadline
+            remaining = current_deadline - time.monotonic()
             if remaining <= 0 or event.is_set():
                 return False, None, None
             done.wait(timeout=min(0.25, remaining))
@@ -5192,8 +5197,12 @@ def resolve_storyboard_media_v2(
             # Batch loaders share one all-scenes request; individual workers can
             # release their slot when a provider stalls, leaving other lanes active.
             lane_cap = youtube_lane_cap if source == 'youtube' else web_lane_cap
-            cap = remaining if getattr(lane, 'shared_batch', False) else min(remaining, lane_cap)
-            completed, value, error = _bounded_lane_call(lane, rows[index], lane_event, cap)
+            shared_batch = getattr(lane, "shared_batch", False)
+            cap = remaining if shared_batch else min(remaining, lane_cap)
+            completed, value, error = _bounded_lane_call(
+                lane, rows[index], lane_event, cap,
+                deadline_getter=(lambda: deadline_at) if shared_batch else None,
+            )
             if not completed:
                 lane_event.set()
                 return index, source, [], 'provider_timeout_handoff'
@@ -5410,10 +5419,11 @@ def resolve_storyboard_media_v2(
     # Bounded total media time (test-18 long-tail guard): the review gate,
     # recovery vision, and the sequential inline finalization after them
     # all stop at discovery budget + tail, not at the 3600s media wall.
-    if verification_deadline_at is not None:
-        visual_gate_deadline_at = min(visual_gate_deadline_at, verification_deadline_at)
+    if media_review_deadline_at is not None:
+        visual_gate_deadline_at = min(visual_gate_deadline_at, media_review_deadline_at)
+    if web_verification_deadline_at is not None:
         web_recovery_visual_deadline_at = min(
-            web_recovery_visual_deadline_at, verification_deadline_at
+            web_recovery_visual_deadline_at, web_verification_deadline_at
         )
 
     # Keep the bounded finalist contract explicit. The parallel gate only
@@ -5508,11 +5518,18 @@ def resolve_storyboard_media_v2(
     # batch simply calls the live verifier once, as today.
     batched_gate_verdicts = {}
 
+    def source_review_open(source, now):
+        cutoff = web_verification_deadline_at if source == "web" else verification_deadline_at
+        return cutoff is None or now < cutoff
+
     def verify_primary(item):
         index, tie, candidate, _source, score = item
         if gate_stop.is_set() or (external_cancel_event is not None and external_cancel_event.is_set()):
             return None
-        if visual_verifier is not None and time.monotonic() >= visual_gate_deadline_at:
+        now = time.monotonic()
+        if visual_verifier is not None and (
+            now >= visual_gate_deadline_at or not source_review_open(_source, now)
+        ):
             return None
         verifier = visual_verifier
         batched = batched_gate_verdicts.get((index, str(candidate.get("path") or "")))
@@ -5545,6 +5562,8 @@ def resolve_storyboard_media_v2(
         untouched and the gate falls back to one verify() call per
         finalist, as today.
         """
+        now = time.monotonic()
+        items = [item for item in items if source_review_open(item[3], now)]
         if len(items) < 2 or visual_verifier is None:
             return
         if not any(_lane_vision_open(item[3]) for item in items):
@@ -5647,13 +5666,12 @@ def resolve_storyboard_media_v2(
             "source": source, "stage": "discovery_result",
             "wave": wave_number, "status": status, "candidate_count": len(candidates),
         })
-        if source == "web" and not candidates and (
-            status == "provider_timeout_handoff" or status.startswith("error:")
-        ):
-            # Web transport failed (timeout / exception), not a content miss:
-            # the recovery web lane would hit the same proxy/hosts and fail
-            # the same way, so this scene falls through to YouTube only.
-            web_transport_failed.add(index)
+        if source == "web" and status.startswith("error:") and status not in {
+            "error:TimeoutError", "error:ConnectionError",
+        }:
+            # A broken callback may recur on the rescue path. A timeout,
+            # including the coordinator's own handoff, leaves recovery open.
+            broken_primary_web.add(index)
         discovered[index].extend(candidates)
         finished_sources[index].add(source)
         if not adaptive_media_review:
@@ -5730,7 +5748,7 @@ def resolve_storyboard_media_v2(
                             lane_progress_seen[_key] = _stamp
                             note_discovery_progress("lane_progress")
 
-                while pending and not cancel_event.is_set() and (web_wait_until_complete or time.monotonic() < deadline_at):
+                while pending and not cancel_event.is_set() and time.monotonic() < deadline_at:
                     done, pending = wait(
                         pending,
                         timeout=min(0.25, max(0.01, deadline_at - time.monotonic())),
@@ -5774,9 +5792,9 @@ def resolve_storyboard_media_v2(
             visual_gate_deadline_at = min(
                 visual_gate_deadline_at, verification_delivery_deadline
             )
-        if verification_deadline_at is not None:
+        if media_review_deadline_at is not None:
             visual_gate_deadline_at = min(
-                visual_gate_deadline_at, verification_deadline_at
+                visual_gate_deadline_at, media_review_deadline_at
             )
         web_recovery_visual_deadline_at = max(
             visual_gate_deadline_at,
@@ -5786,9 +5804,9 @@ def resolve_storyboard_media_v2(
             web_recovery_visual_deadline_at = min(
                 web_recovery_visual_deadline_at, verification_delivery_deadline
             )
-        if verification_deadline_at is not None:
+        if web_verification_deadline_at is not None:
             web_recovery_visual_deadline_at = min(
-                web_recovery_visual_deadline_at, verification_deadline_at
+                web_recovery_visual_deadline_at, web_verification_deadline_at
             )
         for index in range(len(rows)):
             queue_review(index)
@@ -5874,9 +5892,7 @@ def resolve_storyboard_media_v2(
         yt_fallback = youtube_fallback_lane
         if yt_primary_attempted and idx not in rejected_youtube_indices and not needs_youtube_retry:
             yt_fallback = None
-        if idx in web_transport_failed:
-            # Web transport failed for this scene: skip the web recovery lane
-            # (same proxy/hosts, same failure) and fall through to YouTube.
+        if idx in broken_primary_web:
             return (("youtube", yt_fallback),) if yt_fallback is not None else ()
         default_specs = (("youtube", yt_fallback), ("web", web_fallback_lane))
         if idx in rejected_youtube_indices and bool(_source_policy_value(rows[idx], "youtube_quota", False)):
@@ -6091,12 +6107,7 @@ def resolve_storyboard_media_v2(
                     continue
                 primary_finalist_keys[_lw_idx].add(_lw_path)
                 primary_top_pool_keys[_lw_idx].add(_lw_path)
-                # The wait proved the transport works: this scene was
-                # marked web_transport_failed only because its discover
-                # waiter gave up at the wall ('provider_timeout_handoff').
-                # Leaving the flag set would block the web recovery lane
-                # for a scene whose web transport demonstrably delivers.
-                web_transport_failed.discard(_lw_idx)
+                broken_primary_web.discard(_lw_idx)
                 if (_lw_idx, _lw_path) in gated_outcomes:
                     continue
                 _lw_outcome = _late_web_branch_accept(

@@ -10021,18 +10021,24 @@ def _run_web_media_branch(scene_texts, scene_durations, config, title, script,
                 config.get('_render_reserve_seconds')
                 or delivery_budget.render_reserve_seconds
             )
+            # The resolver already bounds exhaustive recovery by the actual
+            # job time left. Admission must use that same clock so the
+            # recovery wave isn't skipped before its budget is calculated.
+            if resolver_kwargs["exhaustive_fallback"]:
+                reserve_after = 0.0
             if not delivery_budget.optional_stage_allowed(
                 reserve_after_seconds=reserve_after,
                 minimum_useful_seconds=3.0,
             ):
-                print(f"   [budget] {branch_label} skipped: render reserve reached")
+                skip_reason = "delivery_budget_render_reserve" if reserve_after else "delivery_budget_exhausted"
+                print(f"   [budget] {branch_label} skipped: {skip_reason}")
                 return {
                     "scene_queries": scene_queries,
                     "web_result": {
                         "image_paths": [None] * len(scene_texts),
                         "scene_queries": scene_queries,
                         "audit_path": None,
-                        "error": "delivery_budget_render_reserve",
+                        "error": skip_reason,
                     },
                 }
             resolver_kwargs['delivery_budget'] = delivery_budget

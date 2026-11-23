@@ -27,7 +27,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from ..job_context import JobThreadPoolExecutor as ThreadPoolExecutor
-from ..job_context import check_job_active
+from ..job_context import JobThread, check_job_active, current_job
 from ..media_distinctness import (
     alternate_anchor_allows,
     content_identity as _distinct_content_identity,
@@ -9569,25 +9569,19 @@ def resolve_web_images_for_video_fast(
                 remaining = float(delivery_budget.remaining_seconds())
             except Exception:
                 remaining = 0.0
-            floored = _web_recovery_budget_floor_seconds(
-                stage_deadline_seconds, remaining
+            floored = min(
+                max(_web_recovery_budget_floor_seconds(stage_deadline_seconds, remaining), useful_floor),
+                remaining,
+                _web_stage_hard_cap_seconds(),
             )
-            if remaining > 0:
-                floored = max(floored, min(useful_floor, remaining))
-            else:
-                floored = max(floored, useful_floor)
-            floored = min(floored, _web_stage_hard_cap_seconds())
         else:
             floored = min(
                 max(stage_deadline_seconds, useful_floor),
                 _web_stage_hard_cap_seconds(),
             )
-        if floored > stage_deadline_seconds:
-            _web_log(
-                f"recovery budget: stage wall floored to "
-                f"{floored:.0f}s (batch+prefetch+scene waves fit the real phase budget)"
-            )
-            stage_deadline_seconds = floored
+        if floored != stage_deadline_seconds:
+            _web_log(f"recovery budget: stage wall {stage_deadline_seconds:.0f}s -> {floored:.0f}s")
+        stage_deadline_seconds = floored
     stage_deadline_at = stage_started_at + stage_deadline_seconds
     _web_log("=== WEB IMAGE PIPELINE START ===")
     _web_log(f"scenes: {len(scene_texts)}, title: {title[:60]}")
@@ -10314,7 +10308,7 @@ def resolve_web_images_for_video_fast(
                 prefetch_holder["error"] = exc
 
         try:
-            prefetch_thread = threading.Thread(
+            prefetch_thread = JobThread(
                 target=_run_shared_pool_prefetch,
                 name="web-shared-prefetch",
                 daemon=True,
@@ -10563,6 +10557,7 @@ def resolve_web_images_for_video_fast(
     max_scene_workers = min(max(1, int(max_scene_workers or 4)), n)
     _web_log(f"parallel scene workers: {max_scene_workers} (streaming vision workers: {visual_workers if visual_client_available else 0})")
     scene_cancel_event = threading.Event()
+    job_cancel = current_job().get("cancellation")
     scene_pool = ThreadPoolExecutor(max_workers=max_scene_workers)
     futures = {}
     fair_scene_indices = fair_round_robin_indices(scene_active_subjects)
@@ -10637,6 +10632,8 @@ def resolve_web_images_for_video_fast(
     record_activity("web")
     try:
         while pending and not scene_cancel_event.is_set():
+            if job_cancel is not None and job_cancel.cancelled():
+                break
             remaining = stage_deadline_at - time.monotonic()
             if remaining <= 0:
                 break
@@ -10690,7 +10687,6 @@ def resolve_web_images_for_video_fast(
             done, pending = wait(
                 pending,
                 timeout=_bounded_worker_drain_seconds(stage_deadline_seconds),
-                return_when=FIRST_COMPLETED,
             )
             for future in done:
                 idx = futures[future]
@@ -10918,8 +10914,8 @@ def resolve_web_images_for_video_fast(
     # VIDZEO_WEB_VISUAL_WINDOW_FLOOR_SECONDS are deleted: the old grace
     # collapsed onto a 240 s floor that retrieval had already consumed
     # (test 26: 6/13 scenes web_visual_grace_deadline). A direct caller
-    # without an injected lane budget gets the same lane formula as its
-    # phase wall. The delivery-budget clamp below still bounds the wait.
+    # without an injected lane budget honors its configured provider call
+    # window. The delivery-budget clamp below still bounds the wait.
     from services.visual_intelligence.lane_budget import lane_budget_seconds as _lane_budget_seconds
 
     _web_lane_budget = getattr(visual_context, "_lane_budget", None) if visual_context is not None else None
@@ -10927,7 +10923,13 @@ def resolve_web_images_for_video_fast(
         visual_grace_seconds = float(getattr(_web_lane_budget, "budget_seconds", 0) or 0) or _lane_budget_seconds("web", len(scene_texts))
         _web_log(f"[vision-lane] web visual phase budget: {visual_grace_seconds:.0f}s (lane clock starts at first submission)")
     else:
-        visual_grace_seconds = _lane_budget_seconds("web", len(scene_texts))
+        call_timeout = getattr(visual_context, "call_timeout_seconds", None)
+        try:
+            visual_grace_seconds = float(call_timeout)
+            if visual_grace_seconds <= 0 or not math.isfinite(visual_grace_seconds):
+                raise ValueError("invalid timeout")
+        except (TypeError, ValueError):
+            visual_grace_seconds = _lane_budget_seconds("web", len(scene_texts))
     if delivery_budget is not None:
         try:
             budget_visual_seconds = delivery_budget.allowance(

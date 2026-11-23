@@ -1113,7 +1113,7 @@ class CrossContainerReuseContractTests(unittest.TestCase):
         self.assertEqual(after_bounded_attempt[0].provider, "web")
         self.assertEqual(repeat_calls, [])
 
-    def test_web_transport_failure_falls_through_to_youtube_only(self):
+    def test_web_callback_error_and_timeout_have_different_recovery(self):
         from services.media_resolution_coordinator import resolve_storyboard_media_v2
 
         def scene(index):
@@ -1152,7 +1152,7 @@ class CrossContainerReuseContractTests(unittest.TestCase):
         self.assertEqual(youtube_fallback_calls, [True])
         self.assertEqual(web_fallback_calls, [])
 
-        # Web lane hangs past the env-tunable web cap: same fast fall-through.
+        # A primary waiter timeout still lets the bounded web rescue run.
         web_fallback_calls.clear()
         youtube_fallback_calls.clear()
 
@@ -1174,7 +1174,7 @@ class CrossContainerReuseContractTests(unittest.TestCase):
         self.assertEqual(result[0].provider, "youtube")
         self.assertEqual(result[0].resolution_kind, "cross_lane_youtube_fallback")
         self.assertEqual(youtube_fallback_calls, [True])
-        self.assertEqual(web_fallback_calls, [])
+        self.assertEqual(web_fallback_calls, [True])
 
     def test_vision_verdict_cache_reuses_candidate_across_rounds(self):
         from services.media_resolution_coordinator import (

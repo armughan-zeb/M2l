@@ -18,6 +18,8 @@ import threading
 from contextlib import AsyncExitStack, asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..job_context import JobThreadPoolExecutor as ThreadPoolExecutor
+from ..job_context import check_job_active
+from ..pipeline_activity import record_activity
 from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1107,7 +1109,10 @@ async def _download_bulk_async(
                 "bytes": 0,
             }
             try:
+                check_job_active()
                 result = await _dl_one_inner(url, info)
+                if info["transfer_ms"] > 0:
+                    record_activity("web_download")
             except Exception as exc:
                 result = (url, None, str(exc)[:80])
             if stats is not None:

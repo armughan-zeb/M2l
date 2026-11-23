@@ -2855,3 +2855,79 @@ def test_late_gate_alternate_rejects_deterministic_degraded_verdict(tmp_path, mo
         )
         is None
     )
+
+def test_muse_web_stream_maps_resumed_subset_and_keeps_completed_rows(monkeypatch, tmp_path):
+    from services import media_checkpoint_history, web_image_service
+    import services.pipeline_v2_media_adapter as adapter
+    from app import _run_web_media_branch
+    from PIL import Image
+
+    saved = tmp_path / "saved.jpg"
+    photo = tmp_path / "fresh.jpg"
+    Image.new("RGB", (640, 360), "red").save(saved)
+    Image.new("RGB", (640, 360), "blue").save(photo)
+    publish_done = threading.Event()
+    release_runner = threading.Event()
+    runner_done = threading.Event()
+    monkeypatch.setattr(media_checkpoint_history, "saved_web_candidates", lambda *_: {
+        0: [{"path": str(saved), "verification_status": "verified_reuse"}]
+    })
+
+    def resolver(**kwargs):
+        try:
+            assert len(kwargs["scene_texts"]) == 1
+            publish = kwargs["on_scene_result"]
+            publish(0, {"path": "", "visual_rejected": True})
+            publish(0, {
+                "path": str(photo),
+                "visual_verification_required": True,
+                "semantic_context_pending": True,
+                "candidate_evidence": {"missing_terms": ["locomotive"]},
+            })
+            publish_done.set()
+            assert release_runner.wait(5)
+            return {"image_paths": [], "audit": {"scenes": []}}
+        finally:
+            runner_done.set()
+
+    monkeypatch.setattr(web_image_service, "resolve_web_images_for_video_fast", resolver)
+
+    def coordinator(coordinator_scenes, **kwargs):
+        from concurrent.futures import ThreadPoolExecutor
+        lane = kwargs["web_lane"]
+        assert lane(coordinator_scenes[0], threading.Event())[0]["path"] == str(saved)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                result = pool.submit(lane, coordinator_scenes[1], threading.Event())
+                assert publish_done.wait(5)
+                fresh = result.result(timeout=2)[0]
+                assert fresh["path"] == str(photo)
+                assert fresh["provider"] == "web"
+                assert fresh["semantic_context_pending"] is True
+                assert fresh["identity_failed"] is False
+                assert lane.get_row(0)[0]["path"] == str(saved)
+                assert (tmp_path / "checkpoints" / "provider_web_candidates.json").is_file()
+            finally:
+                release_runner.set()
+                assert runner_done.wait(5)
+        return {"metadata": {"media_resolution_v2": []}}, {}
+
+    monkeypatch.setattr(adapter, "resolve_and_build_media_plan", coordinator)
+    scenes = [
+        {"scene_id": f"scene-{i}", "order": i, "text": "A railway locomotive in a rail yard.", "duration": 3.0}
+        for i in range(2)
+    ]
+    adapter.resolve_existing_provider_branches_v2(
+        {
+            "image_source": "Web Images", "pipeline_v2_mode": "on",
+            "visual_understanding": False, "visual_required": False,
+            "global_media_guarantee": False, "_skip_sync_topic_anchor": True,
+            "output_package_dir": str(tmp_path),
+        },
+        {"scene_contracts": scenes, "scene_timing_windows": []},
+        title="Railway locomotives", script="A railway locomotive in a rail yard.",
+        render_resolution=(1280, 720), youtube_runner=lambda *a, **k: [],
+        web_runner=_run_web_media_branch, stock_runner=lambda *a, **k: {},
+        snapshotter=lambda paths, namespace="": list(paths),
+        neutral_asset_factory=lambda *a, **k: None, report_progress=lambda *a, **k: None,
+    )

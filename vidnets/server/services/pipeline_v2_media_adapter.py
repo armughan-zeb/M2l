@@ -1063,12 +1063,11 @@ class LazyBatchLane:
 
     def get_row(self, index: int, timeout: float = 0.0) -> Any:
         with self._condition:
-            if self._state == "ready":
-                return self._rows.get(index)
             if self._state == "loading" and timeout > 0:
-                self._condition.wait(timeout=timeout)
-                if self._state == "ready":
-                    return self._rows.get(index)
+                self._condition.wait_for(
+                    lambda: index in self._rows or self._state != "loading",
+                    timeout=timeout,
+                )
             return self._rows.get(index)
 
 
@@ -3633,6 +3632,7 @@ def resolve_and_build_media_plan(
     youtube_general_pool: Any = None,
     youtube_discovery_budget_seconds: float | None = None,
     verification_deadline_seconds: float | None = None,
+    web_verification_deadline_seconds: float | None = None,
 ) -> tuple[dict[str, Any], dict[int, SceneResolution]]:
     resolutions = resolve_storyboard_media_v2(
         scenes,
@@ -3654,6 +3654,7 @@ def resolve_and_build_media_plan(
         job_id=job_id,
         youtube_general_pool=youtube_general_pool,
         verification_deadline_seconds=verification_deadline_seconds,
+        web_verification_deadline_seconds=web_verification_deadline_seconds,
     )
     paths: list[str | None] = []
     labels: list[str] = []
@@ -7054,8 +7055,7 @@ def resolve_existing_provider_branches_v2(
     web_indices_ref = {"indices": [index for index in range(len(scenes)) if index not in (completed_web_indices | completed_stock_indices | set(saved_youtube_rows))]}
     if _as_bool(config.get("_gaming_mode"), False):
         print("   [v2] gaming mode: web runs as a parallel lane; YouTube quota scenes still prefer clips", flush=True)
-    web_fallback_mode = {"enabled": False}
-    primary_web_audit: dict[str, Any] | None = None
+    streamed_web_paths: dict[int, tuple[str, str]] = {}
     primary_web_failed: str = ""
     primary_web_rows: dict[int, Any] = dict(saved_web_rows)
     web_fallback_cache: dict[int, Any] = {}
@@ -7070,7 +7070,196 @@ def resolve_existing_provider_branches_v2(
     # created below; load_web runs after that.
     _web_lane_holder: dict[str, Any] = {}
 
-    def load_web(active_indices: Sequence[int] | None = None) -> Mapping[int, Any]:
+    def build_web_candidate_rows(index, path, row):
+        nested_metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+        pending_visual_candidate = bool(
+            _web_candidate_is_explicitly_pending_visual(row)
+        )
+        license_verification_required = _as_bool(
+            row.get("license_verification_required", nested_metadata.get("license_verification_required")),
+            False,
+        )
+        license_verified = _as_bool(
+            row.get("license_verified", nested_metadata.get("license_verified")),
+            False,
+        )
+        web_decision = dict(row.get("visual_decision") or {})
+        candidate_id = f"web:{_scene_value(scenes[index], 'scene_id', index)}"
+        if not web_decision:
+            # When web retrieval runs in deterministic mode (visual_understanding=False),
+            # inspect candidate evidence before stamping a decision.
+            cand_ev = dict(row.get("candidate_evidence") or {})
+            rejection_reason = str(row.get("rejection_reason") or row.get("identity_gate_reason") or "")
+            is_mismatch = bool(
+                not pending_visual_candidate
+                and (
+                    (cand_ev.get("canonical_entity_mismatch") and not cand_ev.get("nearest_match"))
+                    or (row.get("identity_failed") and not cand_ev.get("nearest_match"))
+                    or rejection_reason in {"canonical_entity_mismatch", "forbidden_confusable_entity", "missing_required_model"}
+                    or (cand_ev.get("missing_terms") and not cand_ev.get("thematic_near_match") and not cand_ev.get("identity_proof") and not cand_ev.get("nearest_match"))
+                )
+            )
+            if is_mismatch:
+                web_decision = {
+                    "candidate_id": candidate_id,
+                    "entity_conflict": True,
+                    "identity_score": 0.0,
+                    "action_score": 0.0,
+                    "context_score": 0.0,
+                    "quality": 50.0,
+                    "final_score": 0.0,
+                    "visible_overlays": [],
+                    "subject_box": {},
+                    "safe_text_regions": [],
+                    "accepted": False,
+                    "status": "rejected",
+                    "source": "web_image_resolver",
+                    "verification_status": "rejected_entity_mismatch",
+                }
+            else:
+                raw_score = float(row.get("final_score") or row.get("pre_score") or 10.0)
+                norm_score = max(55.0, min(100.0, raw_score * 8.0 if raw_score <= 12.0 else raw_score))
+                web_decision = {
+                    "candidate_id": candidate_id,
+                    "entity_conflict": False,
+                    "identity_score": 100.0,
+                    "action_score": 100.0,
+                    "context_score": norm_score,
+                    "quality": 85.0,
+                    "final_score": norm_score,
+                    "visible_overlays": [],
+                    "subject_box": {},
+                    "safe_text_regions": [],
+                    "accepted": True,
+                    "status": "accepted",
+                    "source": "web_image_resolver",
+                    "verification_status": (
+                        "pending_visual_verification"
+                        if pending_visual_candidate
+                        else "deterministic_web_image"
+                    ),
+                    "visual_verification_required": pending_visual_candidate,
+                }
+        is_primary_mismatch = bool(web_decision.get("entity_conflict") or not web_decision.get("accepted"))
+        raw_final = float(row.get("final_score") or row.get("pre_score") or 10.0)
+        norm_final = 0.0 if is_primary_mismatch else max(55.0, min(100.0, raw_final * 8.0 if raw_final <= 12.0 else raw_final))
+        primary_row = {
+            **row,
+            "candidate_id": candidate_id,
+            "path": str(path),
+            "media_type": "image",
+            "provider": "web",
+            "source": "web",
+            "identity_failed": bool(row.get("identity_failed") or is_primary_mismatch),
+            "verified": bool(not is_primary_mismatch and row.get("verified", True)),
+            "container_id": str(_scene_value(scenes[index], "container_id", "")),
+            "query": str(row.get("query_used") or ""),
+            "origin_url": str(row.get("source_url") or row.get("page_url") or row.get("url") or ""),
+            "rights_status": str(row.get("rights_status") or nested_metadata.get("rights_status") or row.get("license") or "unknown"),
+            "license": str(row.get("license") or nested_metadata.get("license") or "unknown"),
+            "license_url": str(row.get("license_url") or nested_metadata.get("license_url") or ""),
+            "attribution": str(row.get("attribution") or nested_metadata.get("attribution") or ""),
+            "creator": str(row.get("creator") or nested_metadata.get("creator") or row.get("author") or ""),
+            "asset_fingerprint": _asset_fingerprint(str(path), row),
+            "qwen_result": web_decision,
+            "final_score": norm_final,
+            "gate_outcomes": {
+                "decodable": True,
+                "safe": True,
+                "container": True,
+                "rights": not license_verification_required or license_verified,
+            },
+        }
+        if pending_visual_candidate:
+            # This is a recall handoff only. Keep the marker so the
+            # coordinator knows the resolver's metadata mismatch was
+            # intentionally deferred and must be decided from the pixels.
+            primary_row["semantic_context_pending"] = True
+            primary_row["visual_verification_required"] = True
+        # The resolver keeps a small downloaded shortlist on the audit
+        # row. Snapshot those alternates as independent candidates so the
+        # coordinator can try a fresh, already screened still when the
+        # primary candidate's final visual gate rejects it.
+        candidate_rows = [primary_row]
+        alternate_rows = row.get("alternates") or []
+        if isinstance(alternate_rows, (list, tuple)):
+            for alt_index, alternate in enumerate(alternate_rows[:8], start=1):
+                if not isinstance(alternate, Mapping):
+                    continue
+                alternate_source = str(alternate.get("path") or "").strip()
+                if not alternate_source or alternate_source == str(path):
+                    continue
+                try:
+                    alternate_snapshot = list(snapshotter(
+                        [alternate_source],
+                        namespace=f"web_v2_alt_{index}_{alt_index}",
+                    ))
+                except Exception:
+                    alternate_snapshot = []
+                alternate_path = alternate_snapshot[0] if alternate_snapshot else None
+                if not alternate_path:
+                    continue
+                alt_ev = dict(alternate.get("candidate_evidence") or {})
+                alt_rejection = str(alternate.get("rejection_reason") or alternate.get("identity_gate_reason") or "")
+                alternate_pending_visual = bool(
+                    _web_candidate_is_explicitly_pending_visual(alternate)
+                )
+                alt_mismatch = bool(
+                    not alternate_pending_visual
+                    and (
+                        (alt_ev.get("canonical_entity_mismatch") and not alt_ev.get("nearest_match"))
+                        or (alternate.get("identity_failed") and not alt_ev.get("nearest_match"))
+                        or alt_rejection in {"canonical_entity_mismatch", "forbidden_confusable_entity", "missing_required_model"}
+                        or (alt_ev.get("missing_terms") and not alt_ev.get("thematic_near_match") and not alt_ev.get("identity_proof") and not alt_ev.get("nearest_match"))
+                    )
+                )
+                if alt_mismatch:
+                    alt_decision = {
+                        "candidate_id": f"{candidate_id}:alt{alt_index}",
+                        "entity_conflict": True,
+                        "identity_score": 0.0,
+                        "action_score": 0.0,
+                        "context_score": 0.0,
+                        "quality": 50.0,
+                        "final_score": 0.0,
+                        "visible_overlays": [],
+                        "subject_box": {},
+                        "safe_text_regions": [],
+                        "accepted": False,
+                        "status": "rejected",
+                        "source": "web_image_resolver",
+                        "verification_status": "rejected_entity_mismatch",
+                    }
+                else:
+                    alt_decision = dict(web_decision, candidate_id=f"{candidate_id}:alt{alt_index}")
+                alt_row = dict(primary_row)
+                alt_row.update({
+                    key: value
+                    for key, value in alternate.items()
+                    if key not in {"path", "alternates"} and value not in (None, "")
+                })
+                alt_row.update({
+                    "candidate_id": f"{candidate_id}:alt{alt_index}",
+                    "path": str(alternate_path),
+                    "identity_failed": bool(alternate.get("identity_failed") or alt_mismatch),
+                    "verified": bool(not alt_mismatch and alternate.get("verified", True)),
+                    "origin_url": str(
+                        alternate.get("source_url") or alternate.get("page_url")
+                        or alternate.get("url") or alt_row.get("origin_url") or ""
+                    ),
+                    "asset_fingerprint": _asset_fingerprint(str(alternate_path), alternate),
+                    "qwen_result": alt_decision,
+                    "final_score": 0.0 if alt_mismatch else alt_row.get("final_score", norm_final),
+                })
+                if alternate_pending_visual:
+                    alt_row["semantic_context_pending"] = True
+                    alt_row["visual_verification_required"] = True
+                    alt_row["qwen_result"]["verification_status"] = "pending_visual_verification"
+                    alt_row["qwen_result"]["visual_verification_required"] = True
+                candidate_rows.append(alt_row)
+        return candidate_rows
+
+    def load_web(active_indices: Sequence[int] | None = None, *, recovery_audit: dict | None = None) -> Mapping[int, Any]:
         nonlocal primary_web_rows, primary_web_failed
         active_indices = list(
             active_indices
@@ -7078,10 +7267,7 @@ def resolve_existing_provider_branches_v2(
             else web_indices_ref.get("indices") or range(len(scenes))
         )
         active_indices = [index for index in active_indices if 0 <= int(index) < len(scenes)]
-        is_scene_recovery = (
-            active_indices != list(range(len(scenes)))
-            or bool(web_fallback_mode.get("enabled"))
-        )
+        is_scene_recovery = recovery_audit is not None
         local_scene_texts = [scene_texts[index] for index in active_indices]
         local_scene_durations = [scene_durations[index] for index in active_indices]
         local_query_rows = [semantic_query_rows[index] for index in active_indices]
@@ -7102,14 +7288,33 @@ def resolve_existing_provider_branches_v2(
         lane_config["_web_visual_context"] = _web_lane_visual_context(
             verifier, transport_visual_context, "primary"
         )
-        def _publish_web_scene_row(idx, row):
-            _holder_lane = _web_lane_holder.get("lane")
-            if _holder_lane is not None and hasattr(_holder_lane, "publish_row"):
-                try:
-                    _holder_lane.publish_row(int(idx), row)
-                except Exception:
-                    pass
-        lane_config["_web_on_scene_result"] = _publish_web_scene_row
+        def publish_primary_row(index, candidates):
+            lane = _web_lane_holder.get("lane")
+            if not is_scene_recovery and lane is not None and candidates:
+                lane.publish_row(index, candidates)
+                primary_web_rows[index] = candidates
+
+        def on_scene_result(local_index, row):
+            if not isinstance(row, Mapping) or not row.get("path"):
+                # The final resolver receipt may still contain a recovered path.
+                return
+            index = active_indices[local_index]
+            original = str(row["path"])
+            paths = list(snapshotter([original], namespace=f"web_v2_stream_{index}"))
+            if paths and paths[0]:
+                path = str(paths[0])
+                streamed_web_paths[index] = (original, path)
+                candidates = build_web_candidate_rows(index, path, row)
+                if saved_package:
+                    from .media_checkpoint_history import save_pending_web_candidates
+                    try:
+                        save_pending_web_candidates(saved_package, scenes, {index: candidates})
+                    except OSError as checkpoint_error:
+                        branch_audit["web_checkpoint_error"] = type(checkpoint_error).__name__
+                publish_primary_row(index, candidates)
+
+        if not is_scene_recovery:
+            lane_config["_web_on_scene_result"] = on_scene_result
         lane_config["_final_visual_gate_required"] = True
         lane_config["_semantic_query_rows"] = local_query_rows
         lane_config["_semantic_query_lock"] = True
@@ -7392,17 +7597,26 @@ def resolve_existing_provider_branches_v2(
                 ),
             )
         except Exception as exc:
-            primary_web_failed = f"{type(exc).__name__}: {exc}"
-            branch_audit["web_error"] = primary_web_failed[:500]
+            failure = f"{type(exc).__name__}: {exc}"
+            if is_scene_recovery:
+                recovery_audit["error"] = failure[:500]
+            else:
+                primary_web_failed = failure
+                branch_audit["web_error"] = failure[:500]
             print(
-                f"   [v2] web lane failed; continuing with YouTube/stock rescue: {primary_web_failed}",
+                f"   [v2] web lane failed; continuing with YouTube/stock rescue: {failure}",
                 flush=True,
             )
             return {}
         result = dict((bundle or {}).get("web_result") or {})
         audit = dict(result.get("audit") or {})
         audit['scene_indices'] = list(active_indices)
-        branch_audit["web"] = audit
+        if result.get("error"):
+            audit["error"] = str(result["error"])[:500]
+        if is_scene_recovery:
+            recovery_audit.update(audit)
+        else:
+            branch_audit["web"] = audit
         if (
             not is_scene_recovery
             and int(audit.get("worker_error_count") or 0) > 0
@@ -7474,198 +7688,14 @@ def resolve_existing_provider_branches_v2(
                 audit_row = audit_scenes[local_index]
             if isinstance(audit_row, Mapping):
                 row.update(audit_row)
-            nested_metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
-            pending_visual_candidate = bool(
-                config.get("_final_visual_gate_required")
-                and _web_candidate_is_explicitly_pending_visual(row)
-            )
-            license_verification_required = _as_bool(
-                row.get("license_verification_required", nested_metadata.get("license_verification_required")),
-                False,
-            )
-            license_verified = _as_bool(
-                row.get("license_verified", nested_metadata.get("license_verified")),
-                False,
-            )
-            web_decision = dict(row.get("visual_decision") or {})
-            candidate_id = f"web:{_scene_value(scenes[index], 'scene_id', index)}"
-            if not web_decision:
-                # When web retrieval runs in deterministic mode (visual_understanding=False),
-                # inspect candidate evidence before stamping a decision.
-                cand_ev = dict(row.get("candidate_evidence") or {})
-                rejection_reason = str(row.get("rejection_reason") or row.get("identity_gate_reason") or "")
-                is_mismatch = bool(
-                    not pending_visual_candidate
-                    and (
-                        (cand_ev.get("canonical_entity_mismatch") and not cand_ev.get("nearest_match"))
-                        or (row.get("identity_failed") and not cand_ev.get("nearest_match"))
-                        or rejection_reason in {"canonical_entity_mismatch", "forbidden_confusable_entity", "missing_required_model"}
-                        or (cand_ev.get("missing_terms") and not cand_ev.get("thematic_near_match") and not cand_ev.get("identity_proof") and not cand_ev.get("nearest_match"))
-                    )
-                )
-                if is_mismatch:
-                    web_decision = {
-                        "candidate_id": candidate_id,
-                        "entity_conflict": True,
-                        "identity_score": 0.0,
-                        "action_score": 0.0,
-                        "context_score": 0.0,
-                        "quality": 50.0,
-                        "final_score": 0.0,
-                        "visible_overlays": [],
-                        "subject_box": {},
-                        "safe_text_regions": [],
-                        "accepted": False,
-                        "status": "rejected",
-                        "source": "web_image_resolver",
-                        "verification_status": "rejected_entity_mismatch",
-                    }
-                else:
-                    raw_score = float(row.get("final_score") or row.get("pre_score") or 10.0)
-                    norm_score = max(55.0, min(100.0, raw_score * 8.0 if raw_score <= 12.0 else raw_score))
-                    web_decision = {
-                        "candidate_id": candidate_id,
-                        "entity_conflict": False,
-                        "identity_score": 100.0,
-                        "action_score": 100.0,
-                        "context_score": norm_score,
-                        "quality": 85.0,
-                        "final_score": norm_score,
-                        "visible_overlays": [],
-                        "subject_box": {},
-                        "safe_text_regions": [],
-                        "accepted": True,
-                        "status": "accepted",
-                        "source": "web_image_resolver",
-                        "verification_status": (
-                            "pending_visual_verification"
-                            if pending_visual_candidate
-                            else "deterministic_web_image"
-                        ),
-                        "visual_verification_required": pending_visual_candidate,
-                    }
-            is_primary_mismatch = bool(web_decision.get("entity_conflict") or not web_decision.get("accepted"))
-            raw_final = float(row.get("final_score") or row.get("pre_score") or 10.0)
-            norm_final = 0.0 if is_primary_mismatch else max(55.0, min(100.0, raw_final * 8.0 if raw_final <= 12.0 else raw_final))
-            primary_row = {
-                **row,
-                "candidate_id": candidate_id,
-                "path": str(path),
-                "media_type": "image",
-                "provider": "web",
-                "source": "web",
-                "identity_failed": bool(row.get("identity_failed") or is_primary_mismatch),
-                "verified": bool(not is_primary_mismatch and row.get("verified", True)),
-                "container_id": str(_scene_value(scenes[index], "container_id", "")),
-                "query": str(row.get("query_used") or ""),
-                "origin_url": str(row.get("source_url") or row.get("page_url") or row.get("url") or ""),
-                "rights_status": str(row.get("rights_status") or nested_metadata.get("rights_status") or row.get("license") or "unknown"),
-                "license": str(row.get("license") or nested_metadata.get("license") or "unknown"),
-                "license_url": str(row.get("license_url") or nested_metadata.get("license_url") or ""),
-                "attribution": str(row.get("attribution") or nested_metadata.get("attribution") or ""),
-                "creator": str(row.get("creator") or nested_metadata.get("creator") or row.get("author") or ""),
-                "asset_fingerprint": _asset_fingerprint(str(path), row),
-                "qwen_result": web_decision,
-                "final_score": norm_final,
-                "gate_outcomes": {
-                    "decodable": True,
-                    "safe": True,
-                    "container": True,
-                    "rights": not license_verification_required or license_verified,
-                },
-            }
-            if pending_visual_candidate:
-                # This is a recall handoff only. Keep the marker so the
-                # coordinator knows the resolver's metadata mismatch was
-                # intentionally deferred and must be decided from the pixels.
-                primary_row["semantic_context_pending"] = True
-                primary_row["visual_verification_required"] = True
-            # The resolver keeps a small downloaded shortlist on the audit
-            # row. Snapshot those alternates as independent candidates so the
-            # coordinator can try a fresh, already screened still when the
-            # primary candidate's final visual gate rejects it.
-            candidate_rows = [primary_row]
-            alternate_rows = row.get("alternates") or []
-            if isinstance(alternate_rows, (list, tuple)):
-                for alt_index, alternate in enumerate(alternate_rows[:8], start=1):
-                    if not isinstance(alternate, Mapping):
-                        continue
-                    alternate_source = str(alternate.get("path") or "").strip()
-                    if not alternate_source or alternate_source == str(path):
-                        continue
-                    try:
-                        alternate_snapshot = list(snapshotter(
-                            [alternate_source],
-                            namespace=f"web_v2_alt_{index}_{alt_index}",
-                        ))
-                    except Exception:
-                        alternate_snapshot = []
-                    alternate_path = alternate_snapshot[0] if alternate_snapshot else None
-                    if not alternate_path:
-                        continue
-                    alt_ev = dict(alternate.get("candidate_evidence") or {})
-                    alt_rejection = str(alternate.get("rejection_reason") or alternate.get("identity_gate_reason") or "")
-                    alternate_pending_visual = bool(
-                        config.get("_final_visual_gate_required")
-                        and _web_candidate_is_explicitly_pending_visual(alternate)
-                    )
-                    alt_mismatch = bool(
-                        not alternate_pending_visual
-                        and (
-                            (alt_ev.get("canonical_entity_mismatch") and not alt_ev.get("nearest_match"))
-                            or (alternate.get("identity_failed") and not alt_ev.get("nearest_match"))
-                            or alt_rejection in {"canonical_entity_mismatch", "forbidden_confusable_entity", "missing_required_model"}
-                            or (alt_ev.get("missing_terms") and not alt_ev.get("thematic_near_match") and not alt_ev.get("identity_proof") and not alt_ev.get("nearest_match"))
-                        )
-                    )
-                    if alt_mismatch:
-                        alt_decision = {
-                            "candidate_id": f"{candidate_id}:alt{alt_index}",
-                            "entity_conflict": True,
-                            "identity_score": 0.0,
-                            "action_score": 0.0,
-                            "context_score": 0.0,
-                            "quality": 50.0,
-                            "final_score": 0.0,
-                            "visible_overlays": [],
-                            "subject_box": {},
-                            "safe_text_regions": [],
-                            "accepted": False,
-                            "status": "rejected",
-                            "source": "web_image_resolver",
-                            "verification_status": "rejected_entity_mismatch",
-                        }
-                    else:
-                        alt_decision = dict(web_decision, candidate_id=f"{candidate_id}:alt{alt_index}")
-                    alt_row = dict(primary_row)
-                    alt_row.update({
-                        key: value
-                        for key, value in alternate.items()
-                        if key not in {"path", "alternates"} and value not in (None, "")
-                    })
-                    alt_row.update({
-                        "candidate_id": f"{candidate_id}:alt{alt_index}",
-                        "path": str(alternate_path),
-                        "identity_failed": bool(alternate.get("identity_failed") or alt_mismatch),
-                        "verified": bool(not alt_mismatch and alternate.get("verified", True)),
-                        "origin_url": str(
-                            alternate.get("source_url") or alternate.get("page_url")
-                            or alternate.get("url") or alt_row.get("origin_url") or ""
-                        ),
-                        "asset_fingerprint": _asset_fingerprint(str(alternate_path), alternate),
-                        "qwen_result": alt_decision,
-                        "final_score": 0.0 if alt_mismatch else alt_row.get("final_score", norm_final),
-                    })
-                    if alternate_pending_visual:
-                        alt_row["semantic_context_pending"] = True
-                        alt_row["visual_verification_required"] = True
-                        alt_row["qwen_result"]["verification_status"] = "pending_visual_verification"
-                        alt_row["qwen_result"]["visual_verification_required"] = True
-                    candidate_rows.append(alt_row)
+            early = streamed_web_paths.get(index)
+            if early and early[0] == raw_paths[local_index]:
+                path = early[1]
+            candidate_rows = build_web_candidate_rows(index, path, row)
             rows[index] = candidate_rows
             # Vision lanes backstop: publish the row as built so scene
             # waiters wake even if the resolver callback never fires.
-            _publish_web_scene_row(index, candidate_rows)
+            publish_primary_row(index, candidate_rows)
         ready_count = sum(
             1 for row in rows.values()
             if bool((row[0] if isinstance(row, (list, tuple)) and row else row).get('path'))
@@ -7678,7 +7708,10 @@ def resolve_existing_provider_branches_v2(
             # Keep live candidates even when their recovery receipt cannot be written.
             branch_audit['web_checkpoint_error'] = type(checkpoint_error).__name__
             print(f'   [v2] web checkpoint write unavailable: {type(checkpoint_error).__name__}; downloaded candidates retained', flush=True)
-        print(f"   [v2] Web handoff: {ready_count}/{len(rows)} scenes ready", flush=True)
+        audit["handoff_scene_count"] = ready_count
+        if is_scene_recovery:
+            recovery_audit["handoff_scene_count"] = ready_count
+        print(f"   [v2] Web handoff: {ready_count}/{len(active_indices)} scenes ready", flush=True)
         if str(os.environ.get("VIDZEO_VERBOSE", "0")).lower() in {"1", "true", "yes"}:
             print(
                 "   [v2] Web handoff rows: "
@@ -7696,15 +7729,10 @@ def resolve_existing_provider_branches_v2(
         # only scenes that had no usable web candidate; reopening an all-scene
         # provider crawl after the visual gate was the main source of the
         # multi-minute production stall.
-        if not web_fallback_mode.get("enabled"):
-            primary_web_rows.update(rows)
         return rows
 
     def load_web_fallback_batch() -> Mapping[int, Any]:
         """Run one bounded web recovery wave for all unresolved scenes."""
-        nonlocal primary_web_audit
-        primary_web_audit = dict(branch_audit.get("web") or {})
-
         def _has_usable_primary(cand_list: Any) -> bool:
             if not cand_list:
                 return False
@@ -7768,27 +7796,17 @@ def resolve_existing_provider_branches_v2(
             0.44,
             f"V2 web recovery: retrying {len(fallback_targets)}/{len(scenes)} unresolved scene(s)",
         )
-        try:
-            # A single batch avoids one 14-second scraper request per scene.
-            # load_web recognizes the recovery flag and applies the short
-            # recovery deadlines while retaining provider diversity.
-            web_fallback_mode["enabled"] = True
-            rows = load_web(fallback_targets)
-            fallback_audit = dict(branch_audit.get("web") or {})
-            if fallback_audit:
-                audit = branch_audit.setdefault("web_fallback", {})
-                audit.setdefault("runs", []).append({**fallback_audit})
-                audit["requested_scene_indices"] = list(fallback_targets)
-            result_rows = dict(rows or {}) if isinstance(rows, Mapping) else {}
-            report_progress(
-                0.49,
-                f"V2 web recovery complete: {len(result_rows)}/{len(fallback_targets)} scene(s) returned",
-            )
-            return result_rows
-        finally:
-            web_fallback_mode["enabled"] = False
-            if primary_web_audit:
-                branch_audit["web"] = primary_web_audit
+        fallback_audit = {}
+        rows = load_web(fallback_targets, recovery_audit=fallback_audit)
+        if fallback_audit:
+            audit = branch_audit.setdefault("web_fallback", {})
+            audit.setdefault("runs", []).append(fallback_audit)
+            audit["requested_scene_indices"] = list(fallback_targets)
+        report_progress(
+            0.49,
+            f"V2 web recovery complete: {len(rows)}/{len(fallback_targets)} scene(s) returned",
+        )
+        return dict(rows)
 
     def prepare_web_recovery(indices: Sequence[int]) -> None:
         # The coordinator owns pixel verification. A downloaded primary path
@@ -7871,11 +7889,9 @@ def resolve_existing_provider_branches_v2(
             flush=True,
         )
         with web_fallback_retry_slots:
-            primary_audit = dict(primary_web_audit or branch_audit.get("web") or {})
-            web_fallback_mode["enabled"] = True
+            retry_audit = {}
             try:
-                rows = load_web([scene_index])
-                retry_audit = dict(branch_audit.get("web") or {})
+                rows = load_web([scene_index], recovery_audit=retry_audit)
                 branch_audit.setdefault("web_visual_rejection_retries", []).append({
                     "scene_index": scene_index,
                     "audit": retry_audit,
@@ -7888,10 +7904,6 @@ def resolve_existing_provider_branches_v2(
                     flush=True,
                 )
                 web_fallback_cache[scene_index] = None
-            finally:
-                web_fallback_mode["enabled"] = False
-                if primary_audit:
-                    branch_audit["web"] = primary_audit
         return web_fallback_cache.get(scene_index)
 
     def disabled_lane(_scene: Mapping[str, Any], _cancel_event: threading.Event) -> None:
@@ -8278,6 +8290,19 @@ def resolve_existing_provider_branches_v2(
                        '_web_budget_scene_count': len(coordinator_scenes),
                        'vision_reserve_seconds': _vision_reserve_seconds(config)}
     media_deadline_seconds = _media_stage_deadline_seconds(deadline_config, lane_policy["mode"])
+    web_verification_deadline_seconds = None
+    if lane_policy["web_enabled"] and str(config.get("llm_provider") or "") == "external_agent":
+        # Web collection and its vision batches have their own bounded wall.
+        # The YouTube discovery+tail clock must not expire already downloaded
+        # images before the web resolver can hand them to the coordinator.
+        web_verification_deadline_seconds = min(
+            media_deadline_seconds,
+            _mixed_web_completion_cap_seconds() + _vision_reserve_seconds(config),
+        )
+        if isinstance(config, dict):
+            config["_media_total_deadline_at"] = max(
+                _media_total_deadline_at, time.monotonic() + web_verification_deadline_seconds
+            )
     web_recovery_grace_seconds = _web_fallback_coordinator_grace_seconds(
         config,
         lane_policy,
@@ -8327,6 +8352,7 @@ def resolve_existing_provider_branches_v2(
         youtube_general_pool=youtube_general_pool,
         youtube_discovery_budget_seconds=youtube_discovery_budget_seconds,
         verification_deadline_seconds=media_verification_deadline_seconds,
+        web_verification_deadline_seconds=web_verification_deadline_seconds,
     )
     print(
         "   [v2] coordinator resolution summary: "
@@ -8378,6 +8404,10 @@ def resolve_existing_provider_branches_v2(
         "youtube_media_tail_seconds": round(float(youtube_media_tail_seconds), 3),
         "media_verification_deadline_seconds": round(
             float(media_verification_deadline_seconds), 3
+        ),
+        "web_verification_deadline_seconds": (
+            round(web_verification_deadline_seconds, 3)
+            if web_verification_deadline_seconds is not None else None
         ),
         "youtube_general_pool": {
             "size": len(youtube_general_pool),

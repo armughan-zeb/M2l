@@ -175,3 +175,52 @@ def test_stock_accuracy_gate_rejects_forbidden_and_non_photographic():
     passed, reason = _stock_candidate_passes_accuracy_gate(photo_item, config, scene=scene)
     assert passed
 
+
+
+def test_primary_web_failure_still_allows_bounded_web_recovery():
+    attempts = []
+
+    def failed_primary(_scene, _event):
+        raise TimeoutError("primary web handoff expired")
+
+    def rescue(scene, _event):
+        attempts.append(scene["scene_index"])
+        return {"path": "factory-recovery.jpg", "source": "web", "score": 95}
+
+    result = resolve_storyboard_media_v2(
+        [{"scene_index": 0, "text": "Factory machinery", "source_policy": {}}],
+        youtube_lane=lambda *_: [],
+        web_lane=failed_primary, web_fallback_lane=rescue,
+        neutral_factory=lambda *_: None,
+        deadline_seconds=4, web_fallback_grace_seconds=1,
+    )
+    assert attempts == [0]
+    assert result[0].selected_path == "factory-recovery.jpg"
+
+
+def test_web_verification_can_finish_after_its_own_youtube_tail(tmp_path):
+    from PIL import Image
+
+    photo = tmp_path / "locomotive.jpg"
+    Image.new("RGB", (640, 360), "blue").save(photo)
+
+    def slow_web(*_args):
+        time.sleep(0.15)
+        return {"path": str(photo), "source": "web", "score": 95}
+
+    checked = []
+
+    def verify(_scene, candidate):
+        checked.append(candidate["path"])
+        return {"accepted": True, "status": "visual_pass", "score": 95,
+                "visual_checked": True, "visual_available": True}
+
+    result = resolve_storyboard_media_v2(
+        [{"scene_index": 0, "text": "A railway locomotive in a rail yard.", "source_policy": {}}],
+        youtube_lane=lambda *_: [],
+        web_lane=slow_web, visual_verifier=verify,
+        neutral_factory=lambda *_: None, deadline_seconds=4,
+        verification_deadline_seconds=0.05, web_verification_deadline_seconds=3,
+    )
+    assert checked == [str(photo)]
+    assert result[0].selected_path == str(photo)
