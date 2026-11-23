@@ -2085,7 +2085,7 @@ Return one container row for every scene in order."""
                 for start in range(0, len(scene_texts), chunk_size)
             ]
             try:
-                worker_limit = max(1, min(8, int(os.environ.get("VIDZEO_BRAIN_SCENE_WORKERS", "4") or 4)))
+                worker_limit = max(1, min(4, int(os.environ.get("VIDZEO_BRAIN_SCENE_WORKERS", "4") or 4)))
             except (TypeError, ValueError):
                 worker_limit = 4
             from .media_query_strategy import query_planning_budget

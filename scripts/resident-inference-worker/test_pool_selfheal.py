@@ -191,24 +191,98 @@ def test_queued_spawn_executed_not_duplicated_by_scale_up(env):
     assert result["spawns"][1]["actionId"] is None
 
 
-def test_held_slot_skipped(env):
+def test_held_slot_skipped_but_target_filled_via_other_slot(env):
     env.hb("worker-1", answered=5)
     with open(os.path.join(env.state, "supervisor-state.json"),
               "w") as f:
         json.dump({"held_slots": {"worker-2": {"heldAtMs": 0}}}, f)
     result = env.plan()
-    # Target 2 minus the held slot: the pool runs at target-minus-one.
+    # The held slot is never spawned — but the pool still fills to the
+    # FULL target 2 via worker-3 (2026-11-21: a held slot no longer
+    # shrinks the target to target-minus-one).
     assert result["target"] == 2
-    assert result["spawns"] == []
+    assert [s["workerId"] for s in result["spawns"]] == ["worker-3"]
 
 
-def test_slot_above_target_cancelled_not_spawned(env):
+def test_spawn_cancelled_when_pool_at_target_not_for_slot_number(env):
     env.hb("worker-1", answered=5)
     env.hb("worker-2", answered=3)
     env.queue([env.action("spawn", "worker-3", age_s=700)])
     result = env.plan()
+    # Pool at target (live 2 == target 2): the spawn is cancelled —
+    # for the COUNT, not the slot number.
     assert result["spawns"] == []
     assert [c["workerId"] for c in result["mark_cancelled"]] == ["worker-3"]
+    # ...while the same high-slot spawn IS executed when the pool is
+    # short: a slot above target is owed whenever live < target.
+    # (It alone fills the gap to target 2, so no second spawn is due.)
+    env2 = Env(str(env.tmp) + "-short")
+    env2.hb("worker-1", answered=5)
+    env2.queue([env2.action("spawn", "worker-3", age_s=700)])
+    result2 = env2.plan()
+    assert [s["workerId"] for s in result2["spawns"]] == ["worker-3"]
+    assert result2["mark_cancelled"] == []
+
+
+def test_plan_marks_spawns_parent_only(env):
+    # Spawns must be executed by a top-level parent agent: cron-spawned
+    # workers die at the 300s timeout, so the plan labels itself.
+    result = env.plan()
+    assert result["spawn_executor"] == "parent-only"
+    assert any("parent-only" in r for r in result["reasons"])
+    assert any("300s" in r for r in result["reasons"])
+
+
+def test_scale_up_fills_past_held_slot_to_full_target(env):
+    # Live 2, held worker-3, pending 6 -> target 4: the pool fills to
+    # 4 via worker-4 and worker-5, not 3.
+    env.hb("worker-1", answered=5)
+    env.hb("worker-2", answered=3)
+    with open(os.path.join(env.state, "supervisor-state.json"),
+              "w") as f:
+        json.dump({"held_slots": {"worker-3": {"heldAtMs": 0}}}, f)
+    for i in range(6):
+        env.req("r%02d" % i)
+    result = env.plan()
+    assert result["target"] == 4
+    assert [s["workerId"] for s in result["spawns"]] == [
+        "worker-4", "worker-5"]
+
+
+def test_write_scaleup_signal_roundtrip(env):
+    # No workers, gate idle: the signal names the owed spawns; once
+    # the pool is staffed, a second call clears it.
+    result = sh.write_scaleup_signal_from_plan(
+        env.spool, env.state, env.gate, env.brief_dir,
+        executor_id="test-exec", now=env.now)
+    assert result["signalled"] is True
+    assert [s["workerId"] for s in result["spawns"]] == [
+        "worker-1", "worker-2"]
+    with open(os.path.join(env.spool,
+                           "supervisor-scaleup-needed.json")) as f:
+        doc = json.load(f)
+    assert doc["live"] == 0 and doc["target"] == 2
+    env.hb("worker-1", answered=1)
+    env.hb("worker-2", answered=1)
+    result2 = sh.write_scaleup_signal_from_plan(
+        env.spool, env.state, env.gate, env.brief_dir,
+        executor_id="test-exec", now=env.now)
+    assert result2["signalled"] is False
+    assert not os.path.exists(os.path.join(
+        env.spool, "supervisor-scaleup-needed.json"))
+
+
+def test_write_scaleup_signal_nothing_when_parked(env):
+    with open(os.path.join(env.spool, "supervisor-parked.json"),
+              "w") as f:
+        json.dump({"parkedAt": int(env.now * 1000), "reason": "test"}, f)
+    result = sh.write_scaleup_signal_from_plan(
+        env.spool, env.state, env.gate, env.brief_dir,
+        executor_id="test-exec", now=env.now)
+    assert result["signalled"] is False
+    assert result["parked"] is True
+    assert not os.path.exists(os.path.join(
+        env.spool, "supervisor-scaleup-needed.json"))
 
 
 def test_lock_held_blocks_spawns(env):

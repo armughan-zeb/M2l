@@ -107,8 +107,19 @@ def read_request(request_id, owner_id, *, locked=False):
     row = json.loads(path.read_text(encoding='utf-8'))
     if not secrets.compare_digest(str(row.get('owner_id', '')), str(owner_id)):
         raise PermissionError('This agent request belongs to another account.')
+    # A claim whose lease lapsed (owner died mid-work) releases the request
+    # back to pending so another answerer can take it.
+    if row.get('state') == 'claimed' and not _claim_is_live(row):
+        if not locked:
+            with _request_lock(path):
+                return read_request(request_id, owner_id, locked=True)
+        row['state'] = 'pending'
+        row.pop('claimed_by', None)
+        row.pop('claimed_at', None)
+        row.pop('claim_expires_at', None)
+        atomic_json(path, row)
     # Deadline is authoritative, even if the generation process exited.
-    if row['state'] == 'pending' and row['expires_at'] <= time.time():
+    if row['state'] in ('pending', 'claimed') and row['expires_at'] <= time.time():
         if not locked:
             with _request_lock(path):
                 return read_request(request_id, owner_id, locked=True)
@@ -118,6 +129,104 @@ def read_request(request_id, owner_id, *, locked=False):
             row['state'] = 'expired'
         atomic_json(path, row)
     return row
+
+
+# --- Request claims (duplicate-answer race) ---
+# 2026-11-21, job a42a1b7b: the daemon's resident inbox, the pool workers
+# (via the spool transport) and hook-woken agents all picked up the same
+# visual_review requests at once. The bridge had no ownership state, so
+# every answerer composed in parallel and complete_request's
+# first-write-wins refused all but the fastest with "already answered" —
+# 6 answers lost in 2.5 min (07:57:24-07:59:46 UTC), plus "Could not
+# record" noise when the daemon tried to file each failure. A claim marks
+# a pending request as owned by one answerer for a lease; every picker
+# skips live claims, and complete_request refuses a completion from
+# anyone but the claim owner while the lease is live.
+_CLAIM_LEASE_SECONDS = 900
+
+
+def _claim_is_live(row, now=None):
+    """True when row is claimed and its lease has not lapsed."""
+    if row.get('state') != 'claimed':
+        return False
+    try:
+        return float(row.get('claim_expires_at') or 0) > (time.time() if now is None else now)
+    except (TypeError, ValueError):
+        return False
+
+
+def _claim_lease_seconds(row, lease_seconds, now):
+    """Lease length in seconds, clamped to the request's remaining wall."""
+    try:
+        requested = float(lease_seconds or _CLAIM_LEASE_SECONDS)
+    except (TypeError, ValueError):
+        requested = float(_CLAIM_LEASE_SECONDS)
+    remaining = float(row.get('expires_at') or 0) - now
+    return max(1.0, min(requested, remaining)) if remaining > 0 else 1.0
+
+
+def claim_request(request_id, owner_id, claimant, lease_seconds=_CLAIM_LEASE_SECONDS):
+    """Claim a pending request for one answerer.
+
+    Returns True when the claim was taken (or refreshed by the same
+    claimant), False when the request is already claimed under a live
+    lease, answered, or expired. Atomic under the request lock. The lease
+    is capped by the request's own expiry so a claim can never outlive
+    the request.
+    """
+    path = _request_path(request_id)
+    if not path.is_file():
+        raise ValueError('Agent request was not found.')
+    with _request_lock(path):
+        row = json.loads(path.read_text(encoding='utf-8'))
+        if not secrets.compare_digest(str(row.get('owner_id', '')), str(owner_id)):
+            raise PermissionError('This agent request belongs to another account.')
+        now = time.time()
+        if row.get('state') == 'pending' and row.get('expires_at', 0) <= now:
+            row['state'] = 'expired'
+            atomic_json(path, row)
+            return False
+        if row.get('state') == 'claimed' and _claim_is_live(row, now):
+            # Same claimant re-claiming refreshes its own lease.
+            if str(row.get('claimed_by') or '') == str(claimant):
+                row['claim_expires_at'] = now + _claim_lease_seconds(row, lease_seconds, now)
+                atomic_json(path, row)
+                return True
+            return False
+        if row.get('state') not in ('pending', 'claimed'):
+            return False
+        row['state'] = 'claimed'
+        row['claimed_by'] = str(claimant)
+        row['claimed_at'] = now
+        row['claim_expires_at'] = now + _claim_lease_seconds(row, lease_seconds, now)
+        atomic_json(path, row)
+        return True
+
+
+def release_claim(request_id, owner_id, claimant=None):
+    """Release a claim back to pending. Returns True when released.
+
+    A claimant may only release its own claim; with no claimant given,
+    any live claim on the request is released (used when the holder is
+    known to be gone, e.g. the daemon's transport died).
+    """
+    path = _request_path(request_id)
+    if not path.is_file():
+        raise ValueError('Agent request was not found.')
+    with _request_lock(path):
+        row = json.loads(path.read_text(encoding='utf-8'))
+        if not secrets.compare_digest(str(row.get('owner_id', '')), str(owner_id)):
+            raise PermissionError('This agent request belongs to another account.')
+        if row.get('state') != 'claimed':
+            return False
+        if claimant is not None and str(row.get('claimed_by') or '') != str(claimant):
+            return False
+        row['state'] = 'pending'
+        row.pop('claimed_by', None)
+        row.pop('claimed_at', None)
+        row.pop('claim_expires_at', None)
+        atomic_json(path, row)
+        return True
 
 
 # --- Answer cache + bridge prune (inbox reliability) ---
@@ -412,13 +521,24 @@ def _record_late_fatal_reject(request_id, row, path, content):
         logger.warning('verdict-conflict ledger write failed for %s', request_id, exc_info=True)
 
 
-def complete_request(request_id, owner_id, content, error=''):
+def complete_request(request_id, owner_id, content, error='', claimant=None):
     path = _request_path(request_id)
     if not path.exists():
         raise ValueError('Agent request was not found.')
     with _request_lock(path):
         row = read_request(request_id, owner_id, locked=True)
-        if row['state'] != 'pending' or path.with_name('response.json').exists():
+        claimant = str(claimant) if claimant is not None else str(owner_id)
+        if row.get('state') == 'claimed' and _claim_is_live(row) and str(row.get('claimed_by') or '') != claimant:
+            # Owned by another live answerer: refuse with a distinct error
+            # so the loser can tell a race loss from an expiry. Preserve a
+            # late fatal verdict in the conflict ledger (same as the
+            # already-answered path) but do NOT cache the loser's answer:
+            # the winner's completion already cached (or will cache) its
+            # own verdict under this payload fingerprint.
+            if not error and content is not None:
+                _record_late_fatal_reject(request_id, row, path, content)
+            raise ValueError('This request is claimed by another worker.')
+        if row['state'] not in ('pending', 'claimed') or path.with_name('response.json').exists():
             # A late fatal vision verdict is preserved in the conflict
             # ledger before the refusal below — first-write-wins for the
             # response is preserved, only the discarded verdict is saved.
@@ -469,6 +589,9 @@ def complete_request(request_id, owner_id, content, error=''):
             reply = {'content': content}
         atomic_json(path.with_name('response.json'), reply)
         row['state'] = 'answered'
+        row.pop('claimed_by', None)
+        row.pop('claimed_at', None)
+        row.pop('claim_expires_at', None)
         atomic_json(path, row)
         if not error:
             # Cache the composed answer under its payload fingerprint so a
@@ -545,8 +668,11 @@ def find_pending_twin(*, owner, job_id, operation, kind, messages, response_form
             row = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             continue
-        if row.get('state') != 'pending':
+        if row.get('state') not in ('pending', 'claimed'):
             continue
+        # A claimed twin is still joinable: its answer is coming, and
+        # minting a duplicate would set up the same race the claim exists
+        # to prevent. (An expired claim is released to pending on read.)
         try:
             expires_at = float(row.get('expires_at') or 0)
         except (TypeError, ValueError):
@@ -630,7 +756,7 @@ def _wait_for_bridge_response(request_id, reply_path, deadline, *, operation='',
     return None
 
 
-def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
+def agent_post(payload, timeout, *, operation='', kind='text', handle='', lane=None):
     context = current_job()
     owner = str(context.get('agent_owner_id') or (handle[len(AGENT_HANDLE):] if handle.startswith(AGENT_HANDLE) else ''))
     if not owner:
@@ -656,6 +782,11 @@ def agent_post(payload, timeout, *, operation='', kind='text', handle=''):
         created_at = time.time()
         row = {'id': request_id, 'owner_id': owner, 'job_id': context.get('job_id', ''),
                'attempt_id': context.get('attempt_id', ''), 'kind': kind, 'operation': operation,
+               # Vision lanes (C8): observability only — the answering worker
+               # reads messages/response_format and ignores extra row keys
+               # (the inbox listing whitelists its keys; twin/cache
+               # fingerprints use operation+messages+format only).
+               'lane': str(lane or '').strip().lower() or None,
                'state': 'pending', 'created_at': created_at, 'expires_at': created_at + wall,
                'messages': _messages_with_local_images(messages, path.parent),
                'response_format': response_format,

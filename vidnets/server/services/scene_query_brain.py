@@ -27,8 +27,13 @@ def _stock_query_chunk_size() -> int:
 
 
 def _stock_query_workers() -> int:
+    # Spec (Vidzeo Local thread pools): Query Brain 3-4 workers. The
+    # Nov 22 spec alignment raised this to 8; the user's spec docs win
+    # over that local tuning, so the default is 4 (top of the spec
+    # range). Env override still wins, capped at 4 so query work stays
+    # inside the spec pool size.
     try:
-        return max(1, min(8, int(os.environ.get("VIDZEO_STOCK_LLM_QUERY_WORKERS", "4") or 4)))
+        return max(1, min(4, int(os.environ.get("VIDZEO_STOCK_LLM_QUERY_WORKERS", "4") or 4)))
     except Exception:
         return 4
 _STOPWORDS = {
@@ -548,15 +553,19 @@ def _generate_with_llm(
             for start_index, chunk_scene_texts in chunks
         }
         from .media_query_strategy import query_planning_budget
-        # Queries are the foundation: an agent answer needs a full
-        # round-trip per wave, not a 120s cut-off that replaces real queries
-        # with mechanical ones.
+        # Queries are the foundation: a Muse-inference answer needs a full
+        # inbox round trip per wave, not a 120s cut-off that replaces real
+        # queries with mechanical ones — but not an hour either. One round
+        # trip is ~270s (hook wake + worker answer), so per_wave is 300s:
+        # a wave that is still unanswered at 300s is a stalled wave, and
+        # its chunks fall back to mechanical queries instead of holding
+        # the whole job for 3600s per wave as the old default did.
         per_wave = None
         if str(provider or "").lower() == "external_agent":
             try:
-                per_wave = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+                per_wave = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "300") or 300))
             except (TypeError, ValueError):
-                per_wave = 3600.0
+                per_wave = 300.0
         completed, pending = wait(future_map, timeout=query_planning_budget(len(chunks), worker_count, per_wave_seconds=per_wave))
         for future in completed:
             start_index = future_map[future]

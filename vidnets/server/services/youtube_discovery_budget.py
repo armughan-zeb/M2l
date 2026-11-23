@@ -5,9 +5,15 @@ transcript fetch, probe download, and vision verification. Clip downloads
 are exempt: once a clip is vision-verified, its ranged download is queued
 to a background download queue and may finish after discovery ends.
 
-Budget rule (user-ordered): 5 minutes of discovery per minute of video.
-``budget_seconds = 300 * duration_minutes`` with NO cap. The rate is a
-configurable setting so it can be shifted:
+Budget rule (user-ordered, Nov 21 2026): 5 minutes of discovery per
+minute of video. ``budget_seconds = 300 * duration_minutes``, capped by
+the spec §3.3 YouTube branch wall (480–1200s, default 1200s): a 10-minute
+video would otherwise get 3000s of discovery alone, more than its whole
+delivery budget, and could crawl for 50 minutes instead of failing open
+to the parallel web lane. The cap is a config/env override
+(``yt_branch_wall_timeout_seconds`` /
+``VIDZEO_MIXED_YT_BRANCH_WALL_TIMEOUT_SECONDS``), not a hard constant.
+The rate is a configurable setting so it can be shifted:
 
 * config key ``yt_discovery_seconds_per_minute`` (job config wins), else
 * env ``VIDZEO_YT_DISCOVERY_SECONDS_PER_MINUTE``, else
@@ -34,6 +40,13 @@ from typing import Any, Mapping, Optional
 DEFAULT_SECONDS_PER_MINUTE = 300.0
 ENV_SECONDS_PER_MINUTE = "VIDZEO_YT_DISCOVERY_SECONDS_PER_MINUTE"
 CONFIG_SECONDS_PER_MINUTE = "yt_discovery_seconds_per_minute"
+
+# Spec §3.3: YouTube branch wall 480–1200s. The discovery cap defaults
+# to the top of that range; a job config or env override may raise it
+# for a long-form job whose delivery budget allows it.
+DEFAULT_BRANCH_WALL_SECONDS = 1200.0
+ENV_BRANCH_WALL_SECONDS = "VIDZEO_MIXED_YT_BRANCH_WALL_TIMEOUT_SECONDS"
+CONFIG_BRANCH_WALL_SECONDS = "yt_branch_wall_timeout_seconds"
 
 # Post-discovery tail (seconds). The discovery budget bounds ONLY discovery
 # (search, rank, transcript, probe, vision). The review gate, the recovery
@@ -81,6 +94,22 @@ def discovery_seconds_per_minute(config: Optional[Mapping[str, Any]] = None) -> 
     )
 
 
+def discovery_branch_wall_seconds(
+    config: Optional[Mapping[str, Any]] = None,
+) -> float:
+    """YouTube branch-wall cap for discovery (spec §3.3, default 1200s).
+
+    Job config wins, then env, then the 1200s default. A caller that
+    needs a longer wall for a long-form job sets it explicitly; an
+    uncapped rate must never silently outgrow the delivery budget.
+    """
+    settings = config or {}
+    raw = settings.get(CONFIG_BRANCH_WALL_SECONDS)
+    if raw is None:
+        raw = os.environ.get(ENV_BRANCH_WALL_SECONDS)
+    return _positive_number(raw, DEFAULT_BRANCH_WALL_SECONDS)
+
+
 def discovery_budget_seconds(
     duration_minutes: Any,
     *,
@@ -89,8 +118,10 @@ def discovery_budget_seconds(
 ) -> float:
     """Discovery budget in seconds for a video of ``duration_minutes``.
 
-    ``budget = rate * duration_minutes`` with NO cap. A zero/unknown
+    ``budget = min(rate * duration_minutes, branch_wall)``. A zero/unknown
     duration falls back to one minute of budget so discovery still runs.
+    A 1-minute video gets 300s, a 4-minute video 1200s, and anything
+    longer is capped at the branch wall instead of growing without bound.
     """
     rate = _positive_number(
         seconds_per_minute,
@@ -102,7 +133,7 @@ def discovery_budget_seconds(
         minutes = 0.0
     if not math.isfinite(minutes) or minutes <= 0:
         minutes = 1.0
-    return rate * minutes
+    return min(rate * minutes, discovery_branch_wall_seconds(config))
 
 
 def media_tail_seconds(config: Optional[Mapping[str, Any]] = None) -> float:

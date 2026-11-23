@@ -17,16 +17,19 @@ from .models import ImageAnalysis, ClipAnalysis
 # CONFIGURATION — low-end CPU friendly
 # =============================================================================
 
-# Historical/public-domain collections commonly expose clean 800x450 or
-# 800x600 derivatives. They are perfectly usable as documentary source
-# material after a modest upscale, and Qwen is better placed to judge their
-# visual quality than a 1000 px hard gate. Keep the free prefilter focused on
-# genuinely tiny assets while allowing the vision ranker to inspect the rest.
-MIN_LONG_EDGE = int(os.environ.get("VIDZEO_VIP_MIN_LONG_EDGE", "640") or 640)
+# Spec §7: resolution > 720p, aspect ~16:9. The long edge floor is 720
+# (spec §5.1 first doc: 720x480); the short edge stays 360, not 480,
+# because clean 800x450 / 800x600 archive derivatives are usable
+# documentary material after a modest upscale and Qwen is better placed
+# to judge their visual quality than a hard gate — a 480 short-edge
+# floor would reject every 800x450 still outright.
+# Spec §7 pHash: Hamming distance < 6 between sequential scenes is a
+# duplicate, so the reject threshold is 5 (was 4).
+MIN_LONG_EDGE = int(os.environ.get("VIDZEO_VIP_MIN_LONG_EDGE", "720") or 720)
 MIN_SHORT_EDGE = int(os.environ.get("VIDZEO_VIP_MIN_SHORT_EDGE", "360") or 360)
 ASPECT_TARGET = 16.0 / 9.0
 ASPECT_TOLERANCE = float(os.environ.get("VIDZEO_VIP_ASPECT_TOL", "0.30") or 0.30)
-PHASH_DUPLICATE_HAMMING = int(os.environ.get("VIDZEO_VIP_PHASH_HAMMING", "4") or 4)
+PHASH_DUPLICATE_HAMMING = int(os.environ.get("VIDZEO_VIP_PHASH_HAMMING", "5") or 5)
 
 
 @dataclass

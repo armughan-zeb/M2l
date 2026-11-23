@@ -46,6 +46,18 @@ Decision rules (thresholds from the briefs — do not retune silently):
     A shortfall shorter than that is normal churn (a render just ended,
     the loop is re-queueing, the self-heal cron is spawning) and stays
     silent. Never wakes during a render.
+  - Scale-up signal (2026-11-21 fix): the loop writes
+    `supervisor-scaleup-needed.json` into the spool the SAME tick it
+    queues scale-up spawns (or finds the pool short with pending work
+    and no spawn possible). A FRESH signal (< 120s) with the gate
+    provably idle and live workers below target wakes at once with
+    reason `pool_scaleup_needed` — no 300s shortfall wait, because the
+    loop already did the confirming: the signal names the exact
+    workerIds owed, and the wake payload carries them so the parent
+    (the only spawner whose workers survive) can spawn directly.
+    The 300s shortfall watch stays as the fallback for a dead loop
+    (no fresh signal). A stale signal is ignored; a signal with the
+    pool back at target wakes nothing. Cooldown (600s) still applies.
   - supervisor-parked.json present -> silent: the parent deliberately
     stopped the supervisor; delete that file to re-enable watching.
   - After a wake, a cooldown (default 600s) suppresses repeat wakes so a
@@ -78,6 +90,8 @@ import sys
 import time
 
 from pool_scaling import scaling_target
+from pool_scaling import SCALEUP_SIGNAL_FILENAME
+from pool_scaling import SCALEUP_SIGNAL_FRESH_S
 
 DEFAULT_SPOOL = os.path.expanduser(
     "~/workspace/vidnets-runtime/temp/inference-spool")
@@ -286,6 +300,39 @@ def _owner_unresponsive(spool):
         return None
 
 
+def _scaleup_signal(spool, now):
+    """The loop's (or self-heal's) scale-up signal, or None.
+
+    Returns {"age_s", "spawns", "blocked", "live", "target",
+    "pending"} when supervisor-scaleup-needed.json parses and is
+    FRESH (written within SCALEUP_SIGNAL_FRESH_S — the loop rewrites
+    it every 15s tick while the shortfall persists, so a fresh file
+    means the pool is short RIGHT NOW). A stale or unreadable file
+    is None: a dead loop must not summon the parent forever, and the
+    300s shortfall watch is the fallback for that case.
+    """
+    path = os.path.join(spool, SCALEUP_SIGNAL_FILENAME)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        updated_ms = float(doc["updatedAt"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    age = now - updated_ms / 1000.0
+    if not -5.0 <= age < SCALEUP_SIGNAL_FRESH_S:
+        return None
+    spawns = doc.get("spawns")
+    return {
+        "age_s": round(age, 1),
+        "spawns": spawns if isinstance(spawns, list) else [],
+        "blocked": doc.get("blocked") if isinstance(
+            doc.get("blocked"), list) else [],
+        "live": doc.get("live"),
+        "target": doc.get("target"),
+        "pending": doc.get("pending"),
+    }
+
+
 def decide(spool, state_dir, gate_path, now=None):
     """Core decision. Returns the dict printed on stdout."""
     now = time.time() if now is None else now
@@ -304,6 +351,7 @@ def decide(spool, state_dir, gate_path, now=None):
         "cooldown_remaining_s": 0,
         "pending_actions": [],
         "owner_unresponsive": None,
+        "scaleup_signal": None,
         "shortfall_s": None,
     }
 
@@ -322,6 +370,7 @@ def decide(spool, state_dir, gate_path, now=None):
             os.path.join(spool, "supervisor-parked.json"))
         checks["pending_actions"] = _pending_actions(spool, now)
         checks["owner_unresponsive"] = _owner_unresponsive(spool)
+        checks["scaleup_signal"] = _scaleup_signal(spool, now)
 
     if checks["parked"]:
         return silent("supervisor_parked")
@@ -338,6 +387,43 @@ def decide(spool, state_dir, gate_path, now=None):
             "render gate unprovable (node/gate error); failing open to idle")
     if render is True:
         return silent("render_active")
+
+    # Fast scale-up wake (2026-11-21): a fresh signal means the loop
+    # (or self-heal, when the loop is dead) found the pool short with
+    # the gate idle and named the owed workerIds THIS tick — wake at
+    # once, no 300s shortfall wait. An unprovable gate (None) never
+    # wakes on the signal: it fails open, so it cannot prove idle.
+    # Cooldown still applies, so a slow spawn cannot storm wakes.
+    if render is False and checks["scaleup_signal"] is not None \
+            and checks["target"] is not None \
+            and len(checks["live_workers"]) < checks["target"]:
+        checks["cooldown_remaining_s"] = _cooldown_remaining(
+            state_dir, now)
+        if checks["cooldown_remaining_s"] > 0:
+            return silent("respawn_cooldown")
+        payload = {
+            "status_age_s": checks["status_age_s"],
+            "marker_age_s": checks["marker_age_s"],
+            "live_workers": [w["workerId"]
+                             for w in checks["live_workers"]],
+            "live_worker_detail": checks["live_workers"],
+            "pending": checks["pending"],
+            "target": checks["target"],
+            "render_active": False,
+            "spool": spool,
+            "brief_path": BRIEF_PATH,
+            "respawn_note_path": RESPAWN_NOTE_PATH,
+            "action": "spawn_missing_workers",
+            "scaleup_spawns": checks["scaleup_signal"]["spawns"],
+            "scaleup_blocked": checks["scaleup_signal"]["blocked"],
+            "signal_age_s": checks["scaleup_signal"]["age_s"],
+            "pending_actions": checks["pending_actions"],
+            "owner_unresponsive": checks["owner_unresponsive"],
+            "generated_at": now,
+        }
+        _write_cooldown(state_dir, now)
+        return {"decision": "wake", "reason": "pool_scaleup_needed",
+                "payload": payload, "checks": checks}
 
     checks["supervisor_alive"] = (
         _is_fresh(checks["status_age_s"])

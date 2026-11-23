@@ -32,6 +32,21 @@ function writePoolHeartbeat(dir, workerId, ageMs = 0) {
   }));
 }
 
+function writeClaimedLine(dir, workerId, id, ageMs = 0) {
+  // What a real worker writes in the same command as the rename that
+  // claims the request: "YYYY-MM-DD HH:MM:SS UTC [worker] CLAIMED <id>".
+  // Claim age is time since this line (or the claim file's ctime), never
+  // the request file's mtime — a rename preserves mtime (2026-11-21
+  // rescue bug: an old request claimed recently read as old and was
+  // rescued mid-composition).
+  const d = new Date(Date.now() - ageMs);
+  const p = n => String(n).padStart(2, '0');
+  const stamp = `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+    `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} UTC`;
+  fs.appendFileSync(path.join(dir, 'worker.log'),
+    `${stamp} [${workerId}] CLAIMED ${id}\n`);
+}
+
 function runSpool(dir, request, t) {
   const child = spawn(process.execPath, [SPOOL], {
     env: { ...process.env, MUSE_INFERENCE_SPOOL_DIR: dir },
@@ -199,6 +214,9 @@ test('spool rescues a request from a dead worker claim when another worker is al
   fs.renameSync(requestFile, claimFile);
   const old = new Date(Date.now() - 310000);
   fs.utimesSync(claimFile, old, old);
+  // Claim age is time since the CLAIM, not the request file's mtime:
+  // the CLAIMED line (310s old) is what makes this claim rescuable.
+  writeClaimedLine(dir, 'worker-1', id, 310000);
   // The spool must rescue the claim back to the pool instead of waiting
   // for the request to expire; worker-2 then answers it.
   for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
@@ -226,6 +244,9 @@ test('spool does not rescue a claim from a heartbeating worker', async t => {
   fs.renameSync(requestFile, claimFile);
   const old = new Date(Date.now() - 130000);
   fs.utimesSync(claimFile, old, old);
+  // The claim is genuinely 310s old (past the grace) — the HEARTBEAT
+  // guard, not the grace, is what must block the rescue here.
+  writeClaimedLine(dir, 'worker-1', id, 310000);
   // Give the rescue checks time to run: the claim must stay put while
   // worker-1 still heartbeats, even though the claim is old.
   await new Promise(resolve => setTimeout(resolve, 3000));
@@ -261,6 +282,36 @@ test('spool does not rescue a young claim even when its worker is dead', async t
   assert.doesNotMatch(result.stderr, /rescued request/);
 });
 
+// Regression (2026-11-21 rescue bug): a request created 1446s earlier
+// but claimed only 111s ago was reported as 1446s old — a claim is an
+// atomic RENAME, and a rename preserves mtime, so the claim file's
+// mtime is the REQUEST's age, not the claim's. Claim age is time since
+// the CLAIM (the CLAIMED line, 111s): it must NOT be rescued.
+test('spool does not rescue a fresh claim on an old request', async t => {
+  const dir = fixture(t);
+  writePoolHeartbeat(dir, 'worker-1', 300000); // dead claiming worker
+  writePoolHeartbeat(dir, 'worker-2'); // alive
+  const id = '5'.repeat(32);
+  const { done } = runSpool(dir, requestRow(id, 3600), t);
+  const requestFile = path.join(dir, id + '.request.json');
+  for (let i = 0; i < 100 && !fs.existsSync(requestFile); i++) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const claimFile = path.join(dir, id + '.request.json.claimed-worker-1');
+  fs.renameSync(requestFile, claimFile);
+  const old = new Date(Date.now() - 1446000);
+  fs.utimesSync(claimFile, old, old); // old REQUEST, not an old claim
+  writeClaimedLine(dir, 'worker-1', id, 111000); // claimed 111s ago
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  assert.equal(fs.existsSync(requestFile), false, 'fresh claim on old request is not rescued');
+  assert.equal(fs.existsSync(claimFile), true);
+  fs.writeFileSync(path.join(dir, id + '.answer.json'), 'fresh claim answer');
+  const result = await done;
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'fresh claim answer');
+  assert.doesNotMatch(result.stderr, /rescued request/);
+});
+
 // Regression (2026-11-18, job 89b01295): a worker composing a 32-scene
 // plan cannot heartbeat mid-turn, so its heartbeat goes stale while it is
 // still working. At the old 120s grace the spool "rescued" its live claim
@@ -280,6 +331,9 @@ test('spool does not rescue a 3-minute-old claim from a composing worker', async
   fs.renameSync(requestFile, claimFile);
   const old = new Date(Date.now() - 180000);
   fs.utimesSync(claimFile, old, old);
+  // Claim age is time since the CLAIM: the CLAIMED line (180s old)
+  // is what makes this claim inside the 300s grace.
+  writeClaimedLine(dir, 'worker-1', id, 180000);
   // Give the rescue checks time to run: the claim must stay put.
   await new Promise(resolve => setTimeout(resolve, 3000));
   assert.equal(fs.existsSync(requestFile), false, 'composing worker claim is not rescued');

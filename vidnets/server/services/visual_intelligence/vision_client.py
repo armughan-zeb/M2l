@@ -106,23 +106,47 @@ def _max_frame_tokens_hint() -> int:
 def _vision_batch_size() -> int:
     """Candidates judged in one batched clip-vision call.
 
-    MAX PARALLEL (user order, 2026-11-20): up to 16 candidates per request
-    (16 images, 1 frame each). The live test proved 16 images in one
-    request judges fine (2/4/6/8/12/16 all returned complete verdicts);
-    the binding limit is the token budget, not the image count, and the
-    user ordered the token limit raised to 10k because time matters more
-    than tokens. Clamped 1..16; the env override cannot raise it above the
-    cap. A scene has at most 8 candidates, so this covers a full scene
-    in one request.
+    Vision lanes (2026-11-22): 4 candidates x 2 frames each (8 images)
+    per request — the top-3 finalists fit in one request with room for
+    one expansion candidate. Env ``VIDZEO_YT_VISION_BATCH_CANDIDATES``
+    (default 4, clamped 1..8); the transport ceiling is 16 images per
+    request (``SAFE_VISION_BATCH_IMAGES``), so 4 x 2 = 8 images keeps
+    the per-request image count identical to the web batch. The old
+    16-candidates-x-1-frame operating size is superseded: 1 frame per
+    candidate was a payload-saving compromise that the 4 MB payload cap
+    no longer needs (8 frames at 384px / quality 58 ≈ 400 KB).
     """
     try:
-        return max(1, min(16, int(os.environ.get("VIDZEO_YT_VISION_BATCH_SIZE", "16") or 16)))
+        from .lane_budget import yt_vision_batch_candidates
+
+        return yt_vision_batch_candidates()
     except Exception:
-        return 16
+        return 4
+
+
+def _vision_batch_frames() -> int:
+    """Frames per candidate in a batched clip-vision call (default 2)."""
+    try:
+        from .lane_budget import yt_vision_batch_frames
+
+        return yt_vision_batch_frames()
+    except Exception:
+        return 2
+
+
+def _web_vision_batch_images() -> int:
+    """Web images (scenes) per batched still-vision call (default 8)."""
+    try:
+        from .lane_budget import web_vision_batch_images
+
+        return web_vision_batch_images()
+    except Exception:
+        return 8
 
 
 # Max batch: max images carried in ONE vision request, both lanes.
-# A batch is up to 16 candidates x 1 frame each (YT) or 16 images (web).
+# A batch is up to 4 candidates x 2 frames each (YT, 8 images) or
+# 8 images (web). 16 images is the transport ceiling, not the size.
 # Live-tested 2026-11-20: 16 images in one request judges fine; the token
 # budget (raised alongside) is the binding limit, not the image count.
 # A scene has at most 8 candidates, so this covers a full scene in one
@@ -323,7 +347,7 @@ def _normalise_batch_response(payload: dict, image_paths: List[str], candidate_i
     return results
 
 
-# Batched image vision (web lane): one request judges up to 16 candidates
+# Batched image vision (web lane): one request judges up to 8 candidates
 # for one scene and returns one verdict object per candidate. This is the
 # response_format contract for that request: the resident worker's
 # validate-before-deliver gate (validate_answer.py, via the server's
@@ -534,6 +558,21 @@ def _normalise_clip_response(payload: dict) -> dict:
     }
 
 
+# Vision lanes (C8): the lane of the vision call in flight on this thread.
+# _ContextClient sets it around the raw-client callback; _post_with_hard_timeout
+# reads it so the filed agent-bridge row is tagged with its lane. A plain
+# threading.local: the transport client is shared across lanes/threads.
+_vision_lane_local = threading.local()
+
+
+def set_vision_lane(lane):
+    """Tag this thread's in-flight vision call with ``lane`` (or clear it)."""
+    _vision_lane_local.lane = str(lane or "").strip().lower() or None
+
+
+def _current_vision_lane():
+    return getattr(_vision_lane_local, "lane", None)
+
 class QwenVisionClient:
     """Thin multimodal client over OpenRouter targeting Qwen Flash."""
 
@@ -739,16 +778,17 @@ class QwenVisionClient:
         user_prompt: str,
         system_prompt: str,
     ) -> dict:
-        """Judge a scene's clip candidates in batches of up to 16.
+        """Judge a scene's clip candidates in batches of up to 4 candidates.
 
         ``candidates`` is a list of ``{"candidate_id": str, "frame_paths":
-        [str, ...]}``. A batch carries at most 16 candidates x 1 frame
-        each (16 images per request) — a full scene in one request. The
-        live test (2026-11-20) proved 16 images in one request judges
-        fine; the token budget (6000, raised alongside) is the binding
-        limit, not the image count. A scene with more candidates than the
-        cap is split into multiple batches, each its own vision request;
-        the verdicts are merged. Returns
+        [str, ...]}``. A batch carries at most 4 candidates x 2 frames
+        each (8 images per request) — the coordinator's top 3 finalists
+        fit in one request with room for 1 expansion candidate, and 2
+        frames (first + last sample of the probe window) bracket the
+        transcript-matched moment so the verdict sees the subject
+        persist across the cut, not just in one frame. A scene with more
+        candidates than the cap is split into multiple batches, each its
+        own vision request; the verdicts are merged. Returns
         ``{candidate_id: normalised clip verdict}`` in the same shape as
         ``analyze_clip_frames`` (plus ``batch_verdict`` / ``batch_score``),
         so the existing accept/reject decision code can consume a batched
@@ -775,9 +815,11 @@ class QwenVisionClient:
         wanted = [c for c in candidates if isinstance(c, dict) and c.get("candidate_id") and c.get("frame_paths")]
         if not wanted:
             raise VisionClientError("No clip candidates with frames for batch analysis")
-        # SAFE BATCH: never more than 2 candidates (2 images) per request.
-        # Chunk and merge; a chunk that fails raises so the caller falls
-        # back to sequential per-candidate vision (as today).
+        # Vision lanes: at most 4 candidates x 2 frames (8 images) per
+        # request. Chunk and merge; a chunk that fails raises so the
+        # caller falls back to sequential per-candidate vision (as today).
+        # The 16-image transport ceiling (SAFE_VISION_BATCH_IMAGES) is
+        # the hard cap, not the operating size.
         merged: dict = {}
         for start in range(0, len(wanted), batch_size):
             chunk = wanted[start:start + batch_size]
@@ -790,17 +832,25 @@ class QwenVisionClient:
         user_prompt: str,
         system_prompt: str,
     ) -> dict:
-        """One batch: up to 16 candidates x 1 frame each, one request."""
+        """One batch: up to 4 candidates x 2 frames each, one request."""
         from .prompts import CLIP_BATCH_RESPONSE_FORMAT
 
-        # 1 frame per candidate (the first/best frame). Two frames per
-        # candidate doubles the payload for little extra signal in a batch
-        # judgment; keep it to 1 frame each so 16 candidates fit in one
-        # request within the frame-payload cap.
+        # 2 frames per candidate (first + last sample of the probe
+        # window) bracket the transcript-matched moment: the verdict
+        # sees the subject persist across the cut. 8 frames at 384px /
+        # quality 58 is ~400 KB — 10% of the 4 MB payload cap — so the
+        # old 1-frame-per-candidate payload compromise is no longer needed.
+        frames_per_candidate = _vision_batch_frames()
         encoded: List[dict] = []
         for cand in candidates:
             frames = []
-            for path in list(cand.get("frame_paths") or [])[:1]:
+            paths = list(cand.get("frame_paths") or [])
+            # First + last distinct frames; a single-frame candidate
+            # keeps its one frame.
+            wanted_paths = paths[:1]
+            if frames_per_candidate > 1 and len(paths) > 1:
+                wanted_paths = [paths[0], paths[-1]][:frames_per_candidate]
+            for path in wanted_paths:
                 uri = _encode_image_to_data_uri(
                     path,
                     max_long_edge=_vision_frame_probe_edge(),
@@ -1023,7 +1073,7 @@ class QwenVisionClient:
 
     @cache_vision_response
     def analyze_images_batch(self, image_paths: List[str], user_prompt: str, system_prompt: str, candidate_ids: Optional[List[str]] = None) -> dict:
-        """Judge a scene's image candidates in batches of up to 16.
+        """Judge a scene's image candidates in batches of up to 8 images.
 
         One multimodal request carries at most SAFE_VISION_BATCH_IMAGES (16)
         candidates and returns one verdict object per candidate, with the
@@ -1058,13 +1108,17 @@ class QwenVisionClient:
         ids = [str(cid) for cid in (candidate_ids or [])]
         while len(ids) < len(paths):
             ids.append(str(paths[len(ids)]))
-        # SAFE BATCH: never more than 2 images in one vision request.
-        # Chunk and merge; a chunk that fails raises so the caller falls
-        # back to sequential singles for the whole scene (as today).
+        # Vision lanes: web batches carry 8 images per request (8 scenes
+        # x 1 candidate). The 16-image transport ceiling
+        # (SAFE_VISION_BATCH_IMAGES) is the hard cap, not the operating
+        # size: a 16-verdict web answer risks truncation mid-list and a
+        # failed batch loses 16 scenes at once. Chunk and merge; a chunk
+        # that fails raises so the caller falls back to sequential
+        # singles for the whole scene (as today).
         merged: dict = {}
-        for start in range(0, len(paths), SAFE_VISION_BATCH_IMAGES):
-            chunk_paths = paths[start:start + SAFE_VISION_BATCH_IMAGES]
-            chunk_ids = ids[start:start + SAFE_VISION_BATCH_IMAGES]
+        for start in range(0, len(paths), _web_vision_batch_images()):
+            chunk_paths = paths[start:start + _web_vision_batch_images()]
+            chunk_ids = ids[start:start + _web_vision_batch_images()]
             merged.update(self._analyze_images_batch_chunk(chunk_paths, chunk_ids, user_prompt, system_prompt))
         return merged
 
@@ -1186,7 +1240,8 @@ class QwenVisionClient:
         from ..bounded_http import provider_post
         return provider_post(requests.post, OPENROUTER_API_URL, headers=headers,
                              json=payload, timeout=self.timeout_seconds,
-                             usage_kind='vision', operation='visual_review')
+                             usage_kind='vision', operation='visual_review',
+                             lane=_current_vision_lane())
 
     def _post(
         self,

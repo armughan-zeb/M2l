@@ -80,6 +80,12 @@ def run_audio_first_pipeline(config: dict, progress_callback=None) -> dict:
         edge_tts_options=edge_tts_options,
         openrouter_api_key=openrouter_api_key,
         openrouter_tts_options=openrouter_tts_options,
+        # Narration is the 5%→15% band: map per-chunk progress into it
+        # so the job percentage moves while chunks synthesize.
+        progress_callback=(
+            (lambda p, msg: progress_callback(0.05 + 0.10 * p, msg))
+            if progress_callback is not None else None
+        ),
     )
     if not a_path or dur <= 0:
         raise ValueError("TTS generation failed")
@@ -190,8 +196,14 @@ def _run_tts(script: str, voice: str, vo_mode: str = DEFAULT_VO_MODE,
              tts_model: str = DEFAULT_TTS_MODEL,
              edge_tts_options: dict | None = None,
              openrouter_api_key: str | None = None,
-             openrouter_tts_options: dict | None = None) -> tuple:
-    """Run the selected TTS provider and return (audio_path, duration)."""
+             openrouter_tts_options: dict | None = None,
+             progress_callback=None) -> tuple:
+    """Run the selected TTS provider and return (audio_path, duration).
+
+    ``progress_callback`` receives ``(fraction_done, message)`` as
+    narration chunks resolve, so the job percentage moves during the
+    (previously silent) TTS stage.
+    """
     start = time.time()
     script_text = script or ""
     word_count = len(script_text.split())
@@ -258,6 +270,7 @@ def _run_tts(script: str, voice: str, vo_mode: str = DEFAULT_VO_MODE,
                     fallback_voice,
                     max_workers=3,
                     edge_options=edge_tts_options,
+                    progress_callback=progress_callback,
                 )
             else:
                 path, dur = edge_tts_service.generate_audio(
@@ -271,7 +284,8 @@ def _run_tts(script: str, voice: str, vo_mode: str = DEFAULT_VO_MODE,
     from services import edge_tts_service
     if long_form_parallel_tts:
         path, dur = edge_tts_service.generate_audio_chunked(
-            script, voice, max_workers=5, edge_options=edge_tts_options
+            script, voice, max_workers=5, edge_options=edge_tts_options,
+            progress_callback=progress_callback,
         )
     else:
         path, dur = edge_tts_service.generate_audio(

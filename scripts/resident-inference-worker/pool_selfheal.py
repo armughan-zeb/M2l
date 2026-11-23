@@ -26,6 +26,25 @@ action done. This script itself never spawns an agent, never starts a
 loop, never touches the spool except for the explicit ``--mark-*`` and
 lock commands — ``--check`` / ``--dry-run`` are strictly read-only.
 
+WHO EXECUTES SPAWNS (2026-11-21, pool scale-up fix): the plan's
+``spawns`` are PARENT-ONLY (``spawn_executor: "parent-only"``). A
+top-level cron run DOES have the spawn tool (proven 2026-11-20) — but
+workers it spawns DIE at the cron run's 300s timeout (proven
+2026-11-21: self-heal run f0a5782e spawned worker-1 + worker-2, both
+dead at the timeout with 0 answers), so a cron run must NEVER execute
+a spawn: it would staff the pool with workers that die mid-answer.
+The ONLY spawner whose workers survive is a top-level PARENT agent
+spawning directly. The cron's job for spawns is therefore to write
+the scale-up signal (``--write-scaleup-signal`` — the same
+``supervisor-scaleup-needed.json`` the loop writes, so the watch hook
+wakes the parent within ~60s) and report the spawn list to the
+parent, never to spawn. The same applies to the loop: a cron-started
+loop dies ~1 minute after its run ends, so a cron loop restart is a
+stopgap that re-queues and re-signals, and the parent must start the
+loop directly for stability. Do NOT "fix" this by re-enabling cron
+spawns: there is no shell mechanism that makes a cron run's
+descendants survive the run.
+
 Guards (all in ``plan()``, all tested in ``test_pool_selfheal.py``):
   - Parked (``supervisor-parked.json`` present): empty plan. A deliberate
     parent stop is never healed over.
@@ -43,8 +62,14 @@ Guards (all in ``plan()``, all tested in ``test_pool_selfheal.py``):
     for it are marked done/cancelled instead.
   - Target from the one scaling rule (``pool_scaling.scaling_target``):
     idle 2, media floor 4, ceiling 8; render 0. A held slot (3 deaths
-    in 30 min, in ``supervisor-state.json``) runs the pool at
-    target-minus-one and is never spawned.
+    in 30 min, in ``supervisor-state.json``) is never spawned — but it
+    no longer shrinks the target (2026-11-21, count-based scale-up):
+    the pool fills to the FULL target via higher free slots. A queued
+    spawn/respawn is cancelled only when the pool is back at target
+    (live >= target), never for its slot NUMBER: a slot above target
+    is owed whenever the pool is short (a held lower slot is exactly
+    how a high slot becomes owed), and a cancellation made at idle
+    target 2 must not block scale-up after the target rises.
   - Scale-down grace: a ``stop_idle`` action is only executed (marked
     for the worker to see — workers self-execute stops by polling the
     queue, proven by ``worker.log`` "STOP action seen") when no worker
@@ -58,6 +83,7 @@ Guards (all in ``plan()``, all tested in ``test_pool_selfheal.py``):
 Run:
   python3 pool_selfheal.py [--check | --dry-run] [--spool DIR]
                            [--state-dir DIR] [--gate PATH]
+  python3 pool_selfheal.py --write-scaleup-signal [--agent-id <id>]
   python3 pool_selfheal.py --acquire-lock --agent-id <id>
   python3 pool_selfheal.py --release-lock --agent-id <id>
   python3 pool_selfheal.py --mark-done <action-id> --agent-id <id>
@@ -65,6 +91,13 @@ Run:
                            --reason <why>
 Exit: 0 normally; 2 when the plan says "do not act" for a hard reason
 (parked, render-active spawns requested) — the plan JSON still prints.
+
+``--write-scaleup-signal`` writes ``supervisor-scaleup-needed.json``
+into the spool from the computed plan (spawns owed + what blocks the
+rest) when the gate is idle and spawns are planned, and clears it
+otherwise. It is how the cron summons the parent when the loop is
+dead (no loop = no loop-written signal): the watch hook wakes the
+parent within ~60s of a fresh signal. It writes a file, never spawns.
 """
 import argparse
 import glob
@@ -85,6 +118,43 @@ except Exception:  # pragma: no cover - fallback mirrors the old floor-2 rule
         if pending == 0:
             return 2
         return max(2, min(8, -(-pending // 3)))
+
+# Signal helpers: a SEPARATE import with its own fallback, so a module
+# that lacks them (staggered deploy) never nukes the scaling rule
+# above — the two imports must not share one try block (2026-11-21).
+try:
+    from pool_scaling import (build_scaleup_signal,
+                              clear_scaleup_signal, write_scaleup_signal)
+except Exception:  # pragma: no cover - fallbacks mirror pool_scaling.py
+    def build_scaleup_signal(live, target, pending, spawns, blocked=None,
+                             supervisor_id=None, now_ms=None):
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        return {"updatedAt": int(now_ms),
+                "supervisorAgentId": supervisor_id,
+                "live": int(live), "target": int(target),
+                "pending": int(pending),
+                "spawns": [{"action": s.get("action"),
+                            "actionId": s.get("id") or s.get("actionId"),
+                            "workerId": s.get("workerId"),
+                            "reason": s.get("reason")}
+                           for s in (spawns or [])],
+                "blocked": list(blocked or [])}
+
+    def write_scaleup_signal(spool_dir, payload):
+        path = os.path.join(spool_dir, "supervisor-scaleup-needed.json")
+        tmp = "%s.tmp-scaleup-%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+        return path
+
+    def clear_scaleup_signal(spool_dir):
+        try:
+            os.remove(os.path.join(
+                spool_dir, "supervisor-scaleup-needed.json"))
+        except OSError:
+            pass
 
 
 DEFAULT_SPOOL = os.path.expanduser(
@@ -321,6 +391,13 @@ def plan(spool, state_dir, gate_path, brief_dir, now=None,
         "lock_held": False,
         "lock_holder": None,
         "spawns": [],
+        # Spawns are PARENT-ONLY (2026-11-21): only a top-level parent
+        # agent spawning directly produces workers that survive.
+        # Cron-spawned workers die at the 300s timeout, so a cron run
+        # must NEVER execute a spawn — it writes the scale-up signal
+        # instead (--write-scaleup-signal) and reports the spawn list
+        # to the parent. This field is the plan's own warning label.
+        "spawn_executor": "parent-only",
         "mark_done": [],
         "mark_cancelled": [],
         "reasons": [],
@@ -402,18 +479,24 @@ def plan(spool, state_dir, gate_path, brief_dir, now=None,
                 continue
             if active:
                 continue  # render: reconcile will cancel; never spawn
-            slot = slot_number(wid)
-            if slot is not None and slot > target:
-                out["mark_cancelled"].append({
-                    "id": action.get("id"), "workerId": wid,
-                    "reason": "slot %d above current target %d (reserved "
-                              "for scale-up)" % (slot, target)})
-                continue
             if wid in held_ids:
                 out["mark_cancelled"].append({
                     "id": action.get("id"), "workerId": wid,
-                    "reason": "slot held after 3 deaths — pool runs at "
-                              "target-minus-one"})
+                    "reason": "slot held after 3 deaths — never spawned; "
+                              "the pool fills to target via other slots"})
+                continue
+            if len(live) >= target:
+                # Count-based (2026-11-21): a queued spawn/respawn is
+                # owed whenever the pool is short, whatever its slot
+                # NUMBER. The old slot-number cancel ("slot above
+                # target") deleted a respawn cancelled at idle target 2
+                # and blocked scale-up after the target rose — a held
+                # lower slot is exactly how a high slot becomes owed.
+                # Only a pool back at target cancels the action.
+                out["mark_cancelled"].append({
+                    "id": action.get("id"), "workerId": wid,
+                    "reason": "pool at target (%d/%d) — spawn no longer "
+                              "owed" % (len(live), target)})
                 continue
             if wid not in spawned_ids:
                 out["spawns"].append(spawn_entry(
@@ -470,14 +553,18 @@ def plan(spool, state_dir, gate_path, brief_dir, now=None,
     # render just ended and the loop has not re-queued yet).
     if not active:
         incoming = additive_spawns
-        eff_target = max(0, target - len(held_ids))
-        needed = eff_target - len(live) - incoming
+        # Count-based scale-up (2026-11-21): fill to the FULL target via
+        # any free non-held slot. A held slot is skipped, never
+        # subtracted from the target — the old target-minus-one rule
+        # plus the slot-number cap let a held slot + a flapping worker
+        # leave the pool short with nothing queued.
+        needed = target - len(live) - incoming
         if needed > 0:
             for i in range(1, MAX_WORKERS + 1):
                 if needed <= 0:
                     break
                 wid = "worker-%d" % i
-                if (i <= target and wid not in live
+                if (wid not in live
                         and wid not in held_ids
                         and wid not in spawned_ids):
                     out["spawns"].append(spawn_entry(
@@ -508,11 +595,70 @@ def plan(spool, state_dir, gate_path, brief_dir, now=None,
                 "freshness re-probe: render started since the first "
                 "gate read — no spawns this run")
 
+    if out["spawns"]:
+        out["reasons"].append(
+            "spawns are parent-only: a top-level parent agent must "
+            "execute them — cron-spawned workers die at the 300s "
+            "timeout (2026-11-21), so a cron run must NOT spawn "
+            "workers; it writes the scale-up signal instead "
+            "(--write-scaleup-signal)")
+
     if not out["spawns"] and not out["mark_done"] \
             and not out["mark_cancelled"] and alive:
         out["reasons"].append("pool healthy: live=%d target=%d pending=%d"
                               % (len(live), target, pending))
     return out
+
+
+def write_scaleup_signal_from_plan(spool, state_dir, gate_path, brief_dir,
+                                   executor_id="selfheal-check", now=None):
+    """Write (or clear) the scale-up signal from a computed plan.
+
+    How the cron summons the parent when the loop is dead (no loop =
+    no loop-written signal): if the plan has spawns and the gate is
+    idle, write ``supervisor-scaleup-needed.json`` with the owed
+    workerIds; otherwise clear it. Writes a file, never spawns.
+    Returns the signal payload (plus ``signalled``) that was written,
+    or ``{"signalled": False, ...}`` when cleared.
+    """
+    now = time.time() if now is None else now
+    result = plan(spool, state_dir, gate_path, brief_dir, now=now,
+                  executor_id=executor_id)
+    if result["parked"] or result["render_active"] is True \
+            or not result["spawns"]:
+        clear_scaleup_signal(spool)
+        return {"signalled": False,
+                "parked": result["parked"],
+                "render_active": result["render_active"],
+                "live": result["live"], "target": result["target"],
+                "pending": result["pending"],
+                "reason": "no spawns owed — signal cleared"}
+    queued = {a.get("id"): a.get("action")
+              for a in load_actions(spool)}
+    signal_spawns = []
+    for spawn in result["spawns"]:
+        action = queued.get(spawn.get("actionId")) or "spawn"
+        signal_spawns.append({
+            "action": action,
+            "id": spawn.get("actionId"),
+            "workerId": spawn.get("workerId"),
+            "reason": spawn.get("reason"),
+        })
+    blocked = []
+    shortfall = (result["target"] - len(result["live"])
+                 - len(result["spawns"]))
+    if shortfall > 0:
+        held = held_slots(state_dir)
+        if held:
+            blocked.append("held slots (3 deaths in 30 min): %s"
+                           % ", ".join(sorted(held)))
+    payload = build_scaleup_signal(
+        len(result["live"]), result["target"], result["pending"],
+        signal_spawns, blocked=blocked, supervisor_id=executor_id,
+        now_ms=int(now * 1000))
+    write_scaleup_signal(spool, payload)
+    payload["signalled"] = True
+    return payload
 
 
 def main(argv=None):
@@ -530,6 +676,11 @@ def main(argv=None):
     parser.add_argument("--agent-id", default=None)
     parser.add_argument("--acquire-lock", action="store_true")
     parser.add_argument("--release-lock", action="store_true")
+    parser.add_argument("--write-scaleup-signal", action="store_true",
+                        help="write supervisor-scaleup-needed.json from "
+                             "the computed plan (cron summoning the "
+                             "parent when the loop is dead); writes a "
+                             "file, never spawns")
     parser.add_argument("--mark-done", default=None, metavar="ACTION-ID")
     parser.add_argument("--mark-cancelled", default=None, metavar="ACTION-ID")
     parser.add_argument("--reason", default="")
@@ -571,6 +722,12 @@ def main(argv=None):
         print(json.dumps({"marked": mark_action(
             spool, args.mark_cancelled, "cancelled", args.agent_id,
             args.reason)}, indent=2))
+        return 0
+    if args.write_scaleup_signal:
+        print(json.dumps(write_scaleup_signal_from_plan(
+            spool, state_dir, gate, brief_dir,
+            executor_id=args.agent_id or "selfheal-check", now=now),
+            indent=2))
         return 0
 
     result = plan(spool, state_dir, gate, brief_dir, now=now,

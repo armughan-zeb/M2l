@@ -59,6 +59,32 @@ _EDGE_TTS_MAX_RETRIES = max(3, int(os.environ.get("VIDZEO_EDGE_TTS_MAX_RETRIES",
 _EDGE_TTS_BACKOFF_BASE = float(os.environ.get("VIDZEO_EDGE_TTS_BACKOFF_BASE", "2.0") or 2.0)
 _EDGE_TTS_FALLBACK_ENABLED = str(os.environ.get("VIDZEO_EDGE_TTS_FALLBACK", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
+# Narration no-progress watchdog (2026-11-21, jobs 64fc9ddb + 26fa018b):
+# both narration lanes have per-chunk timeouts, but neither had a
+# *no-progress* bound: a provider call that never completes a chunk (an
+# Edge websocket against the blocked egress proxy, a wedged Muse CLI
+# subprocess) left the worker thread blocked with no progress callback,
+# so the queue heartbeat's delivery-deadline stop killed the heartbeat
+# while the worker stayed deaf inside the call -- frozen progress AND
+# frozen heartbeat, i.e. exactly the "worker+heartbeat dead" stall the
+# job-debugger had to restart the server for. If no chunk completes
+# within this many seconds, the narration stage fails loudly
+# (TimeoutError) instead of hanging silently; the queue worker marks
+# the job and the driver/debugger can resume or restart it.
+# Default 300s: a healthy Muse chunk finishes in ~25s and a whole dead
+# Edge lane returns in ~75s (per-chunk timeout), so 300s of zero
+# completions means the provider is wedged, not slow.
+_NARRATION_CHUNK_STALL_SECONDS_DEFAULT = 300.0
+
+
+def _narration_chunk_stall_seconds() -> float:
+    """Seconds with zero completed narration chunks before failing loudly."""
+    try:
+        value = float(os.environ.get("VIDZEO_NARRATION_CHUNK_STALL_SECONDS", "") or _NARRATION_CHUNK_STALL_SECONDS_DEFAULT)
+    except (TypeError, ValueError):
+        value = _NARRATION_CHUNK_STALL_SECONDS_DEFAULT
+    return max(60.0, min(3600.0, value))
+
 # Muse TTS is the PRIMARY narration voice on Linux: this VM's Shortwave
 # CLI (/opt/hatch/bin/tts). Edge TTS websockets are blocked by the egress
 # proxy on this host, so Edge is only the fallback. The operator can
@@ -428,11 +454,49 @@ async def _generate_edge_tts_chunk_batch(chunks, voice_id: str, speak_options: d
     return [r for r in results if r is not None]
 
 
-def _split_script_for_parallel_tts(script: str) -> list[str]:
+def _split_script_for_parallel_tts(script: str, *, target_chunk_chars: int | None = None,
+                                   max_chunks: int | None = None) -> list[str]:
+    """Split a script into chunks at sentence boundaries.
+
+    Default (Edge TTS): short ~360-char chunks, at most 5, matching the
+    Edge websocket lane's per-chunk timeout and parallel ladder.
+
+    Linux (Muse) TTS: pass ``target_chunk_chars`` for balanced chunks of
+    roughly that size, at most ``max_chunks``. The Muse CLI is a network
+    client whose per-call cost is dominated by session setup plus
+    synthesis at ~0.18s per audio-second, so a few large chunks beat many
+    small ones: 56 x 360-char calls pay the setup cost 56 times and take
+    ~280s for a 2,711-word script, while 8 x ~2,000-char calls at 4
+    workers take ~80s. The balanced split below sizes chunks from the
+    total length (no per-chunk char cap fighting the chunk-count target,
+    which is what produced the 56-chunk blowup).
+    """
     sentences = re.split(r'(?<=[.!?])\s+', str(script or '').strip())
     sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
     if not sentences:
         return []
+
+    if target_chunk_chars is not None:
+        total_chars = len(script)
+        count = max(1, min(
+            max(1, int(max_chunks or 1)),
+            -(-total_chars // max(1, int(target_chunk_chars))),
+            len(sentences),
+        ))
+        target = max(1.0, total_chars / count)
+        chunks = []
+        current = []
+        current_chars = 0
+        for sentence in sentences:
+            if current and current_chars >= target and len(chunks) < count - 1:
+                chunks.append(' '.join(current).strip())
+                current = []
+                current_chars = 0
+            current.append(sentence)
+            current_chars += len(sentence) + 1
+        if current:
+            chunks.append(' '.join(current).strip())
+        return [chunk for chunk in chunks if chunk]
 
     target_chunk_count = max(
         1,
@@ -477,37 +541,105 @@ def _concat_edge_chunks(chunk_paths: list[str], batch_start: float) -> tuple[str
     try:
         import wave
         from .speech_timing import load_speech_timing, save_speech_timing, timing_path
+
+        def _decode_chunk(chunk_path):
+            """Decode one chunk to wav and read its duration + timings.
+
+            One sequential retry: a transient ffmpeg failure under load
+            must not discard a whole narration — decode is idempotent,
+            so retrying is cheap. (rc=228 is ffmpeg's exit code for
+            ENOSPC: it was seen twice when /tmp, a 512 MB tmpfs, filled
+            with pytest basetemps; the live TEMP_DIR is on disk, and the
+            final concat now preflights disk space, but the retry still
+            covers genuine transient decode failures.)
+            """
+            decoded = str(Path(chunk_path).with_suffix('.decoded.wav'))
+            last_exc = None
+            for attempt in range(2):
+                try:
+                    subprocess.run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                                    '-i', chunk_path, '-ar', '24000', '-ac', '1',
+                                    '-c:a', 'pcm_s16le', decoded], capture_output=True, timeout=60, check=True)
+                    with wave.open(decoded, 'rb') as wav:
+                        chunk_duration = wav.getnframes() / wav.getframerate()
+                    rows = load_speech_timing(chunk_path, _get_audio_duration(chunk_path))
+                    return decoded, chunk_duration, rows
+                except subprocess.CalledProcessError as exc:
+                    detail = (exc.stderr or b'').decode('utf-8', 'replace').strip()[-300:]
+                    last_exc = RuntimeError(
+                        f"ffmpeg decode of {Path(chunk_path).name} failed "
+                        f"(rc={exc.returncode}): {detail}")
+                except Exception as exc:
+                    last_exc = exc
+                if attempt == 0:
+                    print(f"   [tts-concat] decode of {Path(chunk_path).name} failed; "
+                          f"retrying once", flush=True)
+                    time.sleep(1.0)
+            raise last_exc
+
+        # Decode in parallel (ffmpeg + ffprobe per chunk are independent);
+        # pool.map preserves chunk order, so the merge below still walks
+        # the chunks in narration order and the timing cursor stays exact.
+        from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(4, len(chunk_paths)),
+                                thread_name_prefix="tts-concat-decode") as pool:
+            decoded_results = list(pool.map(_decode_chunk, chunk_paths))
         decoded_paths, merged_words = [], []
         cursor = 0.0
         timing_complete = True
-        for chunk_path in chunk_paths:
-            decoded = str(Path(chunk_path).with_suffix('.decoded.wav'))
-            subprocess.run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                            '-i', chunk_path, '-ar', '24000', '-ac', '1',
-                            '-c:a', 'pcm_s16le', decoded], capture_output=True, timeout=60, check=True)
-            with wave.open(decoded, 'rb') as wav:
-                chunk_duration = wav.getnframes() / wav.getframerate()
-            rows = load_speech_timing(chunk_path, _get_audio_duration(chunk_path))
+        for decoded, chunk_duration, rows in decoded_results:
+            decoded_paths.append(decoded)
             timing_complete = timing_complete and bool(rows)
             merged_words.extend({**row, 'start': row['start'] + cursor,
                                  'end': min(row['end'], chunk_duration) + cursor} for row in rows)
             cursor += chunk_duration
-            decoded_paths.append(decoded)
         with open(concat_file, 'w', encoding='utf-8') as handle:
             for chunk_path in decoded_paths:
                 abs_path = os.path.abspath(chunk_path).replace('\\', '/')
                 handle.write(f"file '{abs_path}'\n")
 
-        subprocess.run(
-            [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-f', 'concat', '-safe', '0', '-i', concat_file,
-                '-c:a', 'pcm_s16le', output_path
-            ],
-            capture_output=True,
-            timeout=max(60, int(cursor / 5) + 30),
-            check=True
-        )
+        # Preflight the output write: the concatenated wav is ~48 kB per
+        # audio-second (24 kHz mono 16-bit). A full TEMP_DIR makes ffmpeg
+        # fail with the cryptic rc=228 ("No space left on device"); fail
+        # here with a clear message instead of after a wasted concat.
+        # (Seen in the harness when /tmp, a 512 MB tmpfs, filled with
+        # pytest basetemps; the live TEMP_DIR is on the 150 GB disk.)
+        needed_bytes = int(cursor * 48000) + 10 * 1024 * 1024
+        try:
+            free_bytes = shutil.disk_usage(str(TEMP_DIR)).free
+        except Exception:
+            free_bytes = needed_bytes
+        if free_bytes < needed_bytes:
+            raise RuntimeError(
+                f"not enough disk space to concatenate narration in {TEMP_DIR}: "
+                f"need ~{needed_bytes // (1024 * 1024)} MB for {cursor:.0f}s audio, "
+                f"have {free_bytes // (1024 * 1024)} MB free")
+
+        concat_argv = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-f', 'concat', '-safe', '0', '-i', concat_file,
+            '-c:a', 'pcm_s16le', output_path
+        ]
+        concat_timeout = max(60, int(cursor / 5) + 30)
+        for concat_attempt in range(2):
+            try:
+                subprocess.run(
+                    concat_argv,
+                    capture_output=True,
+                    timeout=concat_timeout,
+                    check=True,
+                )
+                break
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or b'').decode('utf-8', 'replace').strip()[-300:]
+                if concat_attempt == 0:
+                    print(f"   [tts-concat] final concat failed (rc={exc.returncode}): "
+                          f"{detail}; retrying once", flush=True)
+                    time.sleep(2.0)
+                    continue
+                raise RuntimeError(
+                    f"final ffmpeg concat failed (rc={exc.returncode}): {detail}"
+                ) from exc
 
         if timing_complete and merged_words:
             # S8: keep the script-timing label when every chunk's timings
@@ -686,7 +818,9 @@ def _synthesize_linux_chunk(text, cache_dir, identity, work_dir, index, total, c
         deadline = chunk_start + _LINUX_TTS_CHUNK_BUDGET_SECONDS
         generated = work_dir / f'generated-{index}{suffix}.mp3'
         try:
-            _generate_linux_tts_audio(text, str(generated), timeout_seconds=60.0, deadline=deadline)
+            _generate_linux_tts_audio(text, str(generated),
+                                      timeout_seconds=_linux_tts_chunk_attempt_timeout(),
+                                      deadline=deadline)
             os.replace(generated, cached)
         except Exception:
             if not allow_split:
@@ -722,22 +856,71 @@ def _synthesize_linux_chunk(text, cache_dir, identity, work_dir, index, total, c
 
 
 def _linux_tts_workers() -> int:
-    """Bounded parallelism for Linux TTS chunks (default 2).
+    """Bounded parallelism for Linux TTS chunks (default 5, spec §4.1).
 
-    The box has 4 cores and ~8 GB RAM; the TTS subprocess is the worker, so
-    2 concurrent keeps headroom for the Vidnets server and the render.
-    VIDZEO_LINUX_TTS_WORKERS overrides (clamped to 1–4).
+    The Muse TTS CLI is a network client (remote inference): each worker
+    is a subprocess mostly waiting on the API, so 5 concurrent calls run
+    at ~full speed each (measured: 8 x 400-char chunks take 58s
+    sequential vs 16s at 4 workers, with no per-chunk slowdown) and use
+    little local CPU/RAM. VIDZEO_LINUX_TTS_WORKERS overrides (clamped
+    to 1–5).
     """
     try:
-        workers = int(os.environ.get("VIDZEO_LINUX_TTS_WORKERS", "") or 2)
+        workers = int(os.environ.get("VIDZEO_LINUX_TTS_WORKERS", "") or 5)
     except (TypeError, ValueError):
-        workers = 2
-    return max(1, min(4, workers))
+        workers = 5
+    return max(1, min(5, workers))
 
 
-def _generate_linux_tts_chunked(script: str) -> tuple:
-    """Keep completed speech chunks across retries and assemble them in order."""
-    chunks = _split_script_for_parallel_tts(script)
+# Linux chunk sizing: ~1,600-char target, chunk count scales with script
+# length up to 32 chunks. A 2,711-word (~14.5k-char) script becomes 10
+# x ~1,450-char chunks (~90s audio each); each synthesizes in ~25s,
+# inside the 90s per-attempt timeout below. The count MUST scale: a
+# fixed cap (the old code effectively made 8) would let chunk size grow
+# unboundedly on long scripts — a 30k-char script would become 8 x
+# ~3,750-char chunks (~235s audio, ~50s+ wall each, flirting with the
+# attempt timeout) instead of 15 bounded ones. 32 covers scripts to
+# ~64k chars at target size; beyond that chunks grow gracefully
+# (~3,100 chars at 100k chars, still inside the timeout). More chunks
+# also means more progress events and better wave balancing; the cost
+# is one ~2s session setup per chunk, negligible next to synthesis.
+# Target 2000 (not 1600): with 4 workers the canonical ~14.5k-char
+# script lands on 8 chunks = 2 full waves. At 1600 it made 10 chunks,
+# a third mostly-empty wave — measured 96.7s cold vs 81.2s for 8 chunks.
+_LINUX_TTS_TARGET_CHUNK_CHARS = 2000
+_LINUX_TTS_MAX_CHUNKS = 32
+
+
+def _linux_tts_chunk_attempt_timeout() -> float:
+    """Per-attempt timeout for one Linux TTS chunk (default 90s).
+
+    A ~2,000-char chunk synthesizes ~130s of audio and needs ~25s wall
+    unloaded, more under load; 60s was tight enough to burn retries.
+    The 240s whole-chunk budget in _synthesize_linux_chunk still bounds
+    all attempts together. VIDZEO_LINUX_TTS_CHUNK_TIMEOUT_SECONDS
+    overrides.
+    """
+    try:
+        return float(os.environ.get("VIDZEO_LINUX_TTS_CHUNK_TIMEOUT_SECONDS", "") or 90.0)
+    except (TypeError, ValueError):
+        return 90.0
+
+
+def _generate_linux_tts_chunked(script: str, progress_callback=None) -> tuple:
+    """Keep completed speech chunks across retries and assemble them in order.
+
+    Linux chunks are large and balanced (~1,600 chars, count scales with
+    script length up to 32) and synthesize at up to 4 workers: the CLI is
+    network-bound, so this is ~3x faster than the old 56 x 360-char /
+    2-worker shape. Progress is reported as each chunk finishes (``progress_callback(fraction,
+    message)``) so the job percentage moves during narration instead of
+    sitting at 10%; assembly still happens strictly in chunk order.
+    """
+    chunks = _split_script_for_parallel_tts(
+        script,
+        target_chunk_chars=_LINUX_TTS_TARGET_CHUNK_CHARS,
+        max_chunks=_LINUX_TTS_MAX_CHUNKS,
+    )
     if not chunks:
         raise ValueError("Cannot synthesize empty narration.")
     cache_dir = Path(TEMP_DIR) / 'linux-tts-chunks'
@@ -748,6 +931,12 @@ def _generate_linux_tts_chunked(script: str) -> tuple:
     identity = '\0'.join(resolved)
     work_dir = Path(tempfile.mkdtemp(prefix='linux-tts-', dir=str(TEMP_DIR)))
     assembled = []
+    total = len(chunks)
+
+    def _report(done: int):
+        if progress_callback is not None:
+            progress_callback(done / total, f"Generating voice over... chunk {done}/{total}")
+
     try:
         def _run(args):
             index, text = args
@@ -758,16 +947,53 @@ def _generate_linux_tts_chunked(script: str) -> tuple:
         if workers <= 1 or len(chunks) <= 1:
             for index, text in enumerate(chunks):
                 assembled.extend(_run((index, text)))
+                _report(index + 1)
         else:
+            from concurrent.futures import as_completed
             from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
-            # pool.map preserves chunk order in its results, so the assembled
-            # narration keeps word order while chunks synthesize concurrently.
-            # Each chunk writes distinct cache/work files, so no locking is
-            # needed; a failed chunk raises after its siblings drain.
+            # as_completed reports each chunk as it finishes (progress
+            # moves during narration); parts are collected by index and
+            # assembled in order below, so word order is preserved. A
+            # failed chunk raises after its siblings drain (the pool
+            # context waits on exit), as pool.map did before.
+            #
+            # No-progress watchdog: as_completed's timeout bounds each
+            # wait for the NEXT chunk, so a provider that stops
+            # completing chunks entirely raises TimeoutError after
+            # _narration_chunk_stall_seconds() instead of blocking the
+            # worker thread forever with no progress callback (the
+            # 2026-11-21 narration stall: heartbeat dead, worker deaf).
+            # Pending futures are cancelled and the error names the
+            # completed/total counts, so the queue worker can fail the
+            # job loudly and the driver can resume it.
+            stall_seconds = _narration_chunk_stall_seconds()
+            narration_started = time.monotonic()
+            parts_by_index = {}
             with ThreadPoolExecutor(max_workers=min(workers, len(chunks)),
                                     thread_name_prefix="linux-tts") as pool:
-                for parts in pool.map(_run, enumerate(chunks)):
-                    assembled.extend(parts)
+                futures = {
+                    pool.submit(_run, (index, text)): index
+                    for index, text in enumerate(chunks)
+                }
+                done = 0
+                try:
+                    for future in as_completed(futures, timeout=stall_seconds):
+                        parts_by_index[futures[future]] = future.result()
+                        done += 1
+                        _report(done)
+                except TimeoutError:
+                    for future in futures:
+                        if not future.done():
+                            future.cancel()
+                    raise TimeoutError(
+                        f"Linux TTS narration stalled: no chunk completed in "
+                        f"{stall_seconds:.0f}s ({done}/{len(chunks)} chunks done, "
+                        f"{time.monotonic() - narration_started:.0f}s elapsed); "
+                        "the TTS provider is not answering, failing loudly "
+                        "instead of hanging the narration stage"
+                    ) from None
+            for index in range(len(chunks)):
+                assembled.extend(parts_by_index[index])
         if len(assembled) == 1:
             final = Path(TEMP_DIR) / ('linux-tts-full-' + hashlib.sha256(os.urandom(32)).hexdigest()[:16] + '.mp3')
             old = assembled[0]
@@ -895,7 +1121,8 @@ def generate_audio(script: str, voice: str = 'Brian (Male US)',
 
 def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
                            speed: float = 1.0, api_key: str = None,
-                           max_workers: int = 2, edge_options=None):
+                           max_workers: int = 2, edge_options=None,
+                           progress_callback=None):
     """
     Generate audio in chunks for long scripts, then concatenate.
     Primary narration on Linux is Muse TTS (chunked, in parallel);
@@ -903,12 +1130,15 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
     egress proxy on this host. Retries with exponential backoff between
     ladder levels. Falls back to single-chunk generate_audio if all
     chunked attempts fail.
+
+    ``progress_callback`` receives ``(fraction_done, message)`` as chunks
+    resolve, so the job percentage moves during narration.
     """
     # Muse TTS first; a failure here falls through to the Edge ladder
     # below instead of killing the narration.
     if linux_tts_config() is not None:
         try:
-            return _generate_linux_tts_chunked(script)
+            return _generate_linux_tts_chunked(script, progress_callback=progress_callback)
         except Exception as exc:
             print(f"   Muse TTS (chunked) failed, falling back to Edge TTS: {exc}", flush=True)
 
@@ -938,6 +1168,15 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
     resolved_paths = {}
     last_errors = {}
     lane_attempt = 0
+    # No-progress watchdog (same stall as the Muse lane): a lane whose
+    # chunks all time out returns in ~75s per chunk at most, so a lane
+    # that runs past the stall with zero new completions means the
+    # provider call itself is wedged (not merely slow). Fail loudly
+    # instead of grinding through the remaining lanes + single-audio
+    # fallback against the same dead websocket.
+    stall_seconds = _narration_chunk_stall_seconds()
+    last_chunk_completed_at = time.monotonic()
+    resolved_before_lane = 0
 
     for lane in _EDGE_TTS_PARALLEL_LADDER:
         if not remaining:
@@ -963,6 +1202,22 @@ def generate_audio_chunked(script: str, voice: str = 'Brian (Male US)',
             print(f"   Chunk {chunk_index + 1} failed: {last_errors[chunk_index]}")
 
         remaining = next_remaining
+        if progress_callback is not None and chunks:
+            progress_callback(
+                len(resolved_paths) / len(chunks),
+                f"Generating voice over... chunk {len(resolved_paths)}/{len(chunks)}",
+            )
+        if len(resolved_paths) > resolved_before_lane:
+            resolved_before_lane = len(resolved_paths)
+            last_chunk_completed_at = time.monotonic()
+        elif time.monotonic() - last_chunk_completed_at >= stall_seconds:
+            raise TimeoutError(
+                f"Edge TTS narration stalled: no chunk completed in "
+                f"{stall_seconds:.0f}s "
+                f"({len(resolved_paths)}/{len(chunks)} chunks done); "
+                "the Edge websocket is not answering, failing loudly "
+                "instead of hanging the narration stage"
+            )
         if remaining and _EDGE_TTS_FALLBACK_ENABLED and all(_permanent_provider_error(last_errors.get(index, '')) for index, _ in remaining):
             print("   Edge TTS authorization rejected; recovering narration offline")
             return _generate_sapi_audio(script, str(TEMP_DIR / f'edge_recovered_{hashlib.sha256((script + str(time.time())).encode()).hexdigest()[:12]}.mp3'))

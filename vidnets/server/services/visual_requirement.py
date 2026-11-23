@@ -735,6 +735,24 @@ def _script_subject(script: str) -> str:
     return ""
 
 
+# Bare pronouns / demonstratives that must never become a scene identity.
+# A pronoun carries no searchable entity: it only ever refers back to the
+# film's established subject. Kept in one place so the contract, the rebase
+# and the query cleaner all refuse the same words.
+_PRONOUN_WORDS = frozenset({
+    'they', 'he', 'she', 'we', 'you', 'i', 'it', 'his', 'her', 'hers',
+    'their', 'theirs', 'its', 'this', 'these', 'those', 'there', 'here',
+    'who', 'whom', 'what', 'which', 'my', 'our', 'your', 'me', 'him',
+    'them', 'us',
+})
+
+
+def _is_pronoun_subject(value: str) -> bool:
+    """True when ``value`` is a bare pronoun (or only pronouns)."""
+    tokens = [token for token in re.findall(r"[A-Za-z]+", str(value or ""))]
+    return bool(tokens) and all(token.lower() in _PRONOUN_WORDS for token in tokens)
+
+
 def scene_subject_contract(title: str, scene_text: str, context: Mapping[str, Any] | None = None) -> Dict[str, Any]:
     """Resolve a grounded local subject independently of the film's niche.
 
@@ -764,7 +782,18 @@ def scene_subject_contract(title: str, scene_text: str, context: Mapping[str, An
     evidence_words = {word_stem(word) for word in _tokens(evidence or text)}
     compositional = bool(directed_type in {'component', 'object', 'process', 'activity', 'mechanism', 'concept'}
                          and subject_words and subject_words.issubset(evidence_words))
-    grounded = bool(subject and (_contains_phrase(normalized, _norm(subject)) or compositional)
+    # Nov 22 (d1ece590 stall fix): a bare pronoun must never ground as a
+    # scene-local identity. The mechanical planner used to emit
+    # scene_subject='They' for narration "They drove.", and the substring
+    # match below ("they" appears verbatim in the scene text) then grounded
+    # it as grounded_director, so the requirement became canonical_entity
+    # 'They' and every provider query for the scene was garbage. Pronouns
+    # retain the established film identity: refuse them here and the
+    # contract falls back to film_context, exactly as the docstring above
+    # already promises.
+    subject_is_pronoun = _is_pronoun_subject(subject)
+    grounded = bool(subject and not subject_is_pronoun
+                    and (_contains_phrase(normalized, _norm(subject)) or compositional)
                     and evidence_valid
                     and not is_source_attribution_subject(subject, text))
     origin = 'grounded_director' if grounded else ''

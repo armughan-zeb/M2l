@@ -267,6 +267,16 @@ class QueueManager:
         self._queue_lock = threading.Lock()
         self._persistence_lock = threading.Lock()
         self._queue_condition = threading.Condition(self._queue_lock)
+        # Status snapshots for /api/queue/status. The queue holds completed
+        # jobs with multi-MB manifests (live queue.json is ~38 MB), so
+        # building a status payload means a ~10s deepcopy + ~17s redact.
+        # That work must never run under _queue_lock (it starved the
+        # endpoint past a 10s curl timeout) and the endpoint must never
+        # block on the lock: get_status serves the last snapshot when the
+        # lock is busy. Guarded by its own small lock; entries are
+        # (compact, owner_id) -> (built_at_monotonic, payload_dict).
+        self._status_cache: Dict = {}
+        self._status_cache_lock = threading.Lock()
         self._queue_needs_secret_scrub = False
         self._queue_needs_config_migration = False
         self._save_tick = 0
@@ -363,8 +373,30 @@ class QueueManager:
             with self._persistence_lock:
                 self._save_tick += 1
                 do_full_backup = (self._save_tick % self._full_backup_interval) == 0
+                # Snapshot queue state briefly under its state lock, then
+                # deepcopy, redact and serialize outside it so status
+                # polling is not held behind large job manifests. Progress
+                # writes are separately rate-limited by the worker.
+                # NOTE: the deepcopy used to run under _queue_lock. The
+                # live queue holds ~38 MB of completed-job manifests, so
+                # that deepcopy took ~11s under the lock and starved
+                # /api/queue/status past its 10s timeout. A shallow copy
+                # freezes each item's top-level keys (the worker only ever
+                # assigns top-level keys, or appends to progress_events,
+                # which deepcopy tolerates); nested config/result dicts are
+                # replaced wholesale, never mutated in place. If a
+                # concurrent mutation does raise, retry once with the lock
+                # held (old behaviour, bounded).
                 with self._queue_lock:
-                    queue_snapshot = copy.deepcopy(self.queue)
+                    queue_snapshot = [
+                        dict(item) if isinstance(item, dict) else item
+                        for item in self.queue
+                    ]
+                try:
+                    queue_snapshot = copy.deepcopy(queue_snapshot)
+                except RuntimeError:
+                    with self._queue_lock:
+                        queue_snapshot = copy.deepcopy(self.queue)
                 data = {
                     'items': _redact_sensitive_data(queue_snapshot, persistence=True),
                     'last_updated': datetime.now().isoformat()
@@ -977,68 +1009,209 @@ class QueueManager:
         compact["result"] = result_summary
         return compact
 
-    def get_status(self, compact: bool = False, owner_id: Optional[str] = None) -> Dict:
-        """Get queue status for API; compact mode keeps polling responsive."""
-        with self._queue_lock:
-            if compact:
-                # Do not deep-copy the full historical manifests before
-                # trimming them. That was the remaining source of latency on
-                # the polling endpoint even after the response was compacted.
-                status_fields = (
-                    'id', 'created_at', 'started_at', 'completed_at', 'status',
-                    'progress', 'progress_text', 'progress_seq', 'progress_events',
-                    'type', 'error', 'error_detail', 'paused_reason',
-                    'cancel_requested', 'retryable', 'memory_warning', 'needs_human',
-                    'checkpoint_dir', 'edit_plan_path', 'last_run_id', 'config', 'result',
-                )
-                items = []
-                for raw_item in self.queue:
-                    if not isinstance(raw_item, dict):
-                        continue
-                    if owner_id is not None and (raw_item.get('config') or {}).get('auth_user_id') != owner_id:
-                        continue
-                    item = {
-                        key: raw_item.get(key)
-                        for key in status_fields
-                        if key in raw_item
-                    }
-                    if isinstance(item.get('config'), dict):
-                        item['config'] = _redact_sensitive_data(item['config'])
-                    items.append(_redact_sensitive_data(self._compact_status_item(item)))
-            else:
-                items = _redact_sensitive_data([item for item in self.queue if owner_id is None or
-                    (item.get('config') or {}).get('auth_user_id') == owner_id])
-            visible_ids = {item['id'] for item in items}
-            active = {
-                job_id: {
-                    'run_id': state.get('run_id'),
-                    'attempt': state.get('attempt'),
-                    'cancellation_requested': bool(state.get('context') and state['context'].cancelled()),
-                    'requested_at': state.get('requested_at'),
-                    'active_processes': state.get('context').active_process_count() if state.get('context') else 0,
-                    'active_futures': state.get('context').active_future_count() if state.get('context') else 0,
-                    'cancellation_acknowledged': bool(state.get('cancellation_acknowledged', False)),
-                    'cleanup_status': state.get('cleanup_status') or ('stopping' if state.get('context') and state['context'].cancelled() else 'running'),
-                    'quiesced_at': state.get('quiesced_at'),
+    # Status snapshot TTLs: compact payloads build in ~0.2s (the UI polls
+    # this); full payloads walk ~38 MB of completed-job manifests (~17s of
+    # redact), so they are cached longer. Both are served from cache when
+    # the queue lock is busy, so the endpoint answers in <1s under load.
+    _STATUS_CACHE_TTL_COMPACT_SECONDS = 2.0
+    _STATUS_CACHE_TTL_FULL_SECONDS = 5.0
+    _STATUS_LOCK_TIMEOUT_SECONDS = 0.5
+
+    def _status_cache_state(self):
+        """Return (cache_dict, lock) for the status snapshot cache.
+
+        Normally created in __init__; lazily created here because tests
+        build bare QueueManager instances with object.__new__ (no
+        __init__) and set only the fields they need. The setdefault
+        dance converges on one lock even if two threads race the first
+        access.
+        """
+        cache = self.__dict__.get('_status_cache')
+        if cache is None:
+            cache = self.__dict__.setdefault('_status_cache', {})
+        lock = self.__dict__.get('_status_cache_lock')
+        if lock is None:
+            self.__dict__.setdefault('_status_cache_lock', threading.Lock())
+            lock = self.__dict__['_status_cache_lock']
+        return cache, lock
+
+    def _status_cache_get(self, compact: bool, owner_id: Optional[str]):
+        """Return (payload, is_stale, structure_sig) for the cached status.
+
+        ``structure_sig`` is the (id, status) tuple the payload was built
+        from; a caller compares it with the live queue to notice items
+        being added/removed or changing status.
+        """
+        cache, lock = self._status_cache_state()
+        with lock:
+            entry = cache.get((compact, owner_id))
+        if entry is None:
+            return None, False, None
+        built_at, payload, sig = entry
+        ttl = (self._STATUS_CACHE_TTL_COMPACT_SECONDS if compact
+               else self._STATUS_CACHE_TTL_FULL_SECONDS)
+        return payload, (time.monotonic() - built_at) > ttl, sig
+
+    def _status_cache_put(self, compact: bool, owner_id: Optional[str],
+                          payload: Dict, sig):
+        cache, lock = self._status_cache_state()
+        with lock:
+            cache[(compact, owner_id)] = (time.monotonic(), payload, sig)
+
+    @staticmethod
+    def _status_structure_sig(queue_snapshot) -> tuple:
+        """Cheap (id, status) fingerprint of the queue's structure.
+
+        Progress values change every few seconds and are allowed to go
+        stale up to the cache TTL; additions, removals and status
+        transitions must be visible on the next poll, so they are part
+        of the fingerprint and force a rebuild when they change.
+        """
+        return tuple(
+            (item.get('id'), item.get('status'))
+            for item in queue_snapshot if isinstance(item, dict)
+        )
+
+    def _build_status_payload(self, queue_snapshot, active_snapshot, compact: bool,
+                              owner_id: Optional[str] = None) -> Dict:
+        """Build the status dict from lock-free snapshots (no lock held).
+
+        Callers pass shallow copies taken under _queue_lock; the expensive
+        redact/deep-copy of multi-MB manifests runs here, outside the
+        lock, so progress updates and cancellation never wait on it.
+        """
+        if compact:
+            # Do not deep-copy the full historical manifests before
+            # trimming them. That was the remaining source of latency on
+            # the polling endpoint even after the response was compacted.
+            status_fields = (
+                'id', 'created_at', 'started_at', 'completed_at', 'status',
+                'progress', 'progress_text', 'progress_seq', 'progress_events',
+                'type', 'error', 'error_detail', 'paused_reason',
+                'cancel_requested', 'retryable', 'memory_warning', 'needs_human',
+                'checkpoint_dir', 'edit_plan_path', 'last_run_id', 'config', 'result',
+            )
+            items = []
+            for raw_item in queue_snapshot:
+                if not isinstance(raw_item, dict):
+                    continue
+                if owner_id is not None and (raw_item.get('config') or {}).get('auth_user_id') != owner_id:
+                    continue
+                item = {
+                    key: raw_item.get(key)
+                    for key in status_fields
+                    if key in raw_item
                 }
-                for job_id, state in self.active_jobs.items()
-                if owner_id is None or job_id in visible_ids
+                if isinstance(item.get('config'), dict):
+                    item['config'] = _redact_sensitive_data(item['config'])
+                items.append(_redact_sensitive_data(self._compact_status_item(item)))
+        else:
+            items = _redact_sensitive_data([item for item in queue_snapshot if owner_id is None or
+                (item.get('config') or {}).get('auth_user_id') == owner_id])
+        visible_ids = {item['id'] for item in items}
+        active = {
+            job_id: {
+                'run_id': state.get('run_id'),
+                'attempt': state.get('attempt'),
+                'cancellation_requested': bool(state.get('context') and state['context'].cancelled()),
+                'requested_at': state.get('requested_at'),
+                'active_processes': state.get('context').active_process_count() if state.get('context') else 0,
+                'active_futures': state.get('context').active_future_count() if state.get('context') else 0,
+                'cancellation_acknowledged': bool(state.get('cancellation_acknowledged', False)),
+                'cleanup_status': state.get('cleanup_status') or ('stopping' if state.get('context') and state['context'].cancelled() else 'running'),
+                'quiesced_at': state.get('quiesced_at'),
             }
+            for job_id, state in active_snapshot.items()
+            if owner_id is None or job_id in visible_ids
+        }
+        return {
+            'items': items,
+            'active_jobs': list(active),
+            'active_job_state': active,
+        }
+
+    def get_status(self, compact: bool = False, owner_id: Optional[str] = None) -> Dict:
+        """Get queue status for API; compact mode keeps polling responsive.
+
+        Never blocks on the queue lock: a brief snapshot is taken under
+        it (0.5s timeout) and the payload is built outside it. A fresh
+        cached snapshot is served when the queue structure (item ids and
+        statuses) is unchanged — progress values may lag up to the cache
+        TTL. When the lock is busy and only a stale snapshot exists, the
+        stale payload is served with ``snapshot_stale: true`` — a
+        slightly old progress reading beats a timed-out poll.
+        """
+        snapshot = None
+        acquired = self._queue_lock.acquire(timeout=self._STATUS_LOCK_TIMEOUT_SECONDS)
+        if acquired:
+            try:
+                queue_snapshot = [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in self.queue
+                ]
+                active_snapshot = {
+                    job_id: dict(state) for job_id, state in self.active_jobs.items()
+                }
+                worker_running = self.worker_running
+                worker_count = int(self.worker_count or 1)
+                sig = self._status_structure_sig(queue_snapshot)
+                snapshot = (queue_snapshot, active_snapshot, worker_running,
+                            worker_count, sig)
+            except RuntimeError:
+                # A lock-free progress mutation raced the snapshot copy;
+                # treat the lock as busy and serve the cache below.
+                snapshot = None
+            finally:
+                self._queue_lock.release()
+        if snapshot is None:
+            cached, stale, _sig = self._status_cache_get(compact, owner_id)
+            if cached is not None:
+                return dict(cached, snapshot_stale=True) if stale else dict(cached)
             return {
-                'items': items,
+                'items': [],
                 'worker_running': self.worker_running,
                 'worker_count': int(self.worker_count or 1),
-                'active_jobs': list(active),
-                'active_job_state': active,
+                'active_jobs': [],
+                'active_job_state': {},
+                'snapshot_stale': True,
+                'snapshot_empty': True,
             }
+        queue_snapshot, active_snapshot, worker_running, worker_count, sig = snapshot
+        cached, stale, cached_sig = self._status_cache_get(compact, owner_id)
+        if cached is not None and not stale and cached_sig == sig:
+            return dict(cached)
+        try:
+            payload = self._build_status_payload(
+                queue_snapshot, active_snapshot, compact, owner_id)
+        except RuntimeError:
+            # A concurrent mutation raced the lock-free build; retry once
+            # with the lock held (old behaviour, bounded).
+            with self._queue_lock:
+                queue_snapshot = copy.deepcopy(self.queue)
+                active_snapshot = {
+                    job_id: dict(state) for job_id, state in self.active_jobs.items()
+                }
+            payload = self._build_status_payload(
+                queue_snapshot, active_snapshot, compact, owner_id)
+        payload['worker_running'] = worker_running
+        payload['worker_count'] = worker_count
+        self._status_cache_put(compact, owner_id, payload, sig)
+        return dict(payload)
 
     def get_item_snapshot(self, job_id: str, owner_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Return one redacted queue item, including its full manifest."""
+        """Return one redacted queue item, including its full manifest.
+
+        The item is shallow-copied under the lock; the ~1s redact of a
+        multi-MB manifest runs outside it, like get_status.
+        """
         with self._queue_lock:
             item = next((row for row in self.queue if row.get('id') == job_id), None)
             if item and owner_id is not None and (item.get('config') or {}).get('auth_user_id') != owner_id:
                 return None
-            return _redact_sensitive_data(dict(item)) if isinstance(item, dict) else None
+            snapshot = dict(item) if isinstance(item, dict) else None
+        if snapshot is None:
+            return None
+        return _redact_sensitive_data(snapshot)
 
     # =========================================================================
     # WORKER MANAGEMENT

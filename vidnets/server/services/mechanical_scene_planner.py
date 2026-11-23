@@ -20,7 +20,28 @@ STOP = set("""a an the of and in on to for with from into over under after befor
 between about than then there here while since until per via at by as or but not no is are was were be been
 how what when where why who which that this these those very just also still yet more most other another
 it its he she they we you his her their our your my me him them us i""".split())
-SENT_START = {'The', 'A', 'An', 'On', 'In', 'It', 'That', 'Before', 'After', 'When', 'While', 'But', 'And', 'So', 'Now', 'Picture', 'Think', 'Both', 'At', 'As', 'If', 'One', 'Two', 'Three', 'For', 'From', 'With', 'By', 'To', 'Of'}
+SENT_START = {'The', 'A', 'An', 'On', 'In', 'It', 'That', 'Before', 'After', 'When', 'While', 'But', 'And', 'So', 'Now', 'Picture', 'Think', 'Both', 'At', 'As', 'If', 'One', 'Two', 'Three', 'For', 'From', 'With', 'By', 'To', 'Of',
+              # Pronouns / demonstratives (Nov 22, d1ece590 stall fix): a
+              # sentence-initial pronoun is capitalized but is not an entity.
+              # Without these, cap_phrases("They drove.") returned ['They']
+              # and the scene subject became the pronoun 'They', which the
+              # adapter then grounded as the scene identity and turned into
+              # the garbage queries 'They documentary drove photograph' etc.
+              # Pronoun-only scenes must fall through to the container/topic
+              # fallback in plan_mechanical_scene_rows instead.
+              'They', 'He', 'She', 'We', 'You', 'I', 'His', 'Her', 'Hers',
+              'Their', 'Theirs', 'Its', 'This', 'These', 'Those', 'There',
+              'Here', 'Who', 'Whom', 'What', 'Which', 'My', 'Our', 'Your',
+              'Me', 'Him', 'Them', 'Us'}
+
+# Bare pronouns that must never be a scene subject (lowercase). Used by the
+# subject-selection loop as a second guard beside SENT_START.
+_PRONOUN_SUBJECTS = frozenset({
+    'they', 'he', 'she', 'we', 'you', 'i', 'it', 'his', 'her', 'hers',
+    'their', 'theirs', 'its', 'this', 'these', 'those', 'there', 'here',
+    'who', 'whom', 'what', 'which', 'my', 'our', 'your', 'me', 'him',
+    'them', 'us',
+})
 PLACE_WORDS = {'city', 'pass', 'desert', 'keys', 'summit', 'mountains', 'mountain', 'streets', 'street', 'island', 'beach', 'beaches', 'swamp', 'swamps', 'state', 'washington', 'utah', 'florida', 'chile', 'pakistan', 'york', 'sierra', 'nevada', 'leonida', 'vice', 'donner', 'promontory', 'wellington', 'stevens', 'yuba', 'atacama', 'salt', 'lake', 'northeast', 'country', 'network', 'track'}
 COMPANY_WORDS = {'games', 'railway', 'railways', 'railroad', 'brothers', 'company', 'studios', 'studio', 'pacific', 'central', 'union', 'southern', 'northern', 'great', 'ferrocarril'}
 EVENT_WORDS = {'blizzard', 'avalanche', 'flood', 'floods', 'trapped', 'buried', 'stranded', 'disaster', 'wreck', 'wrecks', 'rescue'}
@@ -293,6 +314,12 @@ def plan_mechanical_scene_rows(scene_texts: Sequence[str], title: str, topic: st
         if not subject:
             for e in ents:
                 if e.lower() in ('grand theft auto vi', 'grand theft auto six') and idx > 0:
+                    continue
+                # Belt and braces beside SENT_START: a bare pronoun must
+                # never become the scene subject even if cap_phrases ever
+                # returns one (multi-word phrase, casing quirk). The
+                # pronoun-only fallback below then inherits the container.
+                if e.strip().lower() in _PRONOUN_SUBJECTS:
                     continue
                 subject = expand_name(e)
                 break

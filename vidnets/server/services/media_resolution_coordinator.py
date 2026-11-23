@@ -780,7 +780,7 @@ def _env_seconds(name: str, default: float) -> float:
 class MediaResolutionCoordinator:
     """Run scene workers concurrently within one cooperative job deadline."""
 
-    def __init__(self, *, deadline_seconds: float | None = None, max_workers: int = 12, drain_seconds: float = 5.0):
+    def __init__(self, *, deadline_seconds: float | None = None, max_workers: int = 8, drain_seconds: float = 5.0):
         if deadline_seconds is None:
             deadline_seconds = _env_seconds("VIDZEO_MEDIA_COORDINATOR_DEADLINE_SECONDS", 210.0)
         self.deadline_seconds = max(1.0, float(deadline_seconds))
@@ -4215,21 +4215,22 @@ def _finalists_for_storyboard(rows, configured):
 
 
 def _visual_gate_workers(primary_count: int) -> int:
-    """Parallel vision checks in the primary gate (default 12, cap 24).
+    """Parallel vision checks in the primary gate (spec: Vision 4-8).
 
-    Was a hardcoded 6. The old bound was written for OpenRouter/free-model
-    rate limits; vision now goes through the inbox hook, where the cost is
-    one ~4.5-minute worker round trip per call — so the wave's wall time is
-    roughly ceil(work / workers) round trips, and 6 workers turned a
-    38-candidate wave into ~7 sequential rounds. 12 halves that; the vision
-    deadline still bounds the whole gate. Env VIDZEO_VISUAL_GATE_WORKERS
-    wins.
+    Spec (Vidzeo Local thread pools): Vision 4-8 workers; default 8,
+    capped at 8. (The Nov 22 local tuning ran 12: the pool-to-8 fix and
+    the 300s gate grace let a 12-call wave drain in ~2 rounds, and
+    cutting to 8 slowed the parallel-rescue timing test (16.1s vs its
+    14.0s threshold). The user ordered the spec values applied verbatim
+    over that local measurement; the proof run will show the measured
+    result.) Env VIDZEO_VISUAL_GATE_WORKERS wins, clamped to the spec
+    range.
     """
     try:
-        configured = int(os.environ.get("VIDZEO_VISUAL_GATE_WORKERS") or 12)
+        configured = int(os.environ.get("VIDZEO_VISUAL_GATE_WORKERS") or 8)
     except (TypeError, ValueError):
-        configured = 12
-    return max(1, min(24, configured, max(1, int(primary_count or 1))))
+        configured = 8
+    return max(1, min(8, configured, max(1, int(primary_count or 1))))
 
 
 def _visual_relative_floor() -> float:
@@ -4434,7 +4435,9 @@ def _pick_spare_candidate(
     return best
 
 
-def _rescue_visual_budget_seconds(is_external_agent: bool) -> float:
+def _rescue_visual_budget_seconds(
+    is_external_agent: bool, unresolved_count: int = 1
+) -> float:
     """Bounded wall for the pre-stock rescue's own visual budget.
 
     The rescue runs after the main visual context has expired, so live
@@ -4442,6 +4445,15 @@ def _rescue_visual_budget_seconds(is_external_agent: bool) -> float:
     External-agent vision needs one inbox round trip (>=300s); direct
     providers answer far faster.  Operator override:
     VIDZEO_WEB_RESCUE_VISUAL_SECONDS (30-900s).
+
+    The window scales with the unresolved count (Nov 22 2026, d1ece590:
+    a fixed 300s window starved a 112-scene rescue after a few scenes).
+    The rescue verifies scenes in parallel (8 workers), so the wall is
+    roughly (unresolved / 8) x per-call seconds, with a floor at the old
+    fixed default and a 5400s cap. The delivery deadline still caps the
+    effective window in :func:`_grant_rescue_visual_budget`. The budget
+    is generous on purpose (user order Nov 22: "increase vision budget")
+    — the delivery deadline is the hard stop, not the window.
     """
     try:
         configured = float(os.environ.get("VIDZEO_WEB_RESCUE_VISUAL_SECONDS") or 0)
@@ -4449,7 +4461,14 @@ def _rescue_visual_budget_seconds(is_external_agent: bool) -> float:
         configured = 0.0
     if configured > 0:
         return max(30.0, min(900.0, configured))
-    return 300.0 if is_external_agent else 120.0
+    base = 300.0 if is_external_agent else 120.0
+    # ~75s per external-agent round trip / 8 parallel workers ~= 10s per
+    # scene of wall clock; the 30s allowance is 3x that (generous, per
+    # user order Nov 22) to absorb imperfect parallelism and retries.
+    # Direct providers answer in ~20s / 8 ~= 2.5s; 10s is the same margin.
+    per_scene = 30.0 if is_external_agent else 10.0
+    count = max(1, int(unresolved_count or 1))
+    return min(5400.0, max(base, per_scene * count))
 
 
 def _grant_rescue_visual_budget(
@@ -4464,7 +4483,7 @@ def _grant_rescue_visual_budget(
     possibly its call cap spent), so ``_verification_result`` cannot
     verify a live candidate.  Refresh the deadline for one bounded
     rescue window and, only when the call cap is already spent, add
-    just enough headroom for one check per unresolved scene (cap 10).
+    just enough headroom for one check per unresolved scene (cap 64).
     The main branch is finished, so this touches no live lane budget;
     the caller MUST restore the returned record with
     :func:`_restore_rescue_visual_budget` when the rescue loop ends,
@@ -4475,7 +4494,8 @@ def _grant_rescue_visual_budget(
     """
     try:
         window = _rescue_visual_budget_seconds(
-            str(job_provider or "").strip().lower() == "external_agent"
+            str(job_provider or "").strip().lower() == "external_agent",
+            unresolved_count,
         )
         rescue_deadline = time.monotonic() + window
         if delivery_deadline is not None:
@@ -4488,7 +4508,11 @@ def _grant_rescue_visual_budget(
         old_calls = int(getattr(context, "calls", 0) or 0)
         headroom = 0
         if old_calls >= old_max_calls:
-            headroom = max(1, min(int(unresolved_count or 1), 10))
+            # Headroom scales with the rescue size (Nov 22 2026, d1ece590:
+            # a fixed 10-call cap starved a 112-scene rescue). Cap 64
+            # bounds fresh vision calls; beyond it scenes fall back to
+            # deterministic verdicts instead of hanging.
+            headroom = max(1, min(int(unresolved_count or 1), 64))
         refresh = getattr(context, "refresh_deadline", None)
         if callable(refresh):
             refresh(deadline_at=rescue_deadline)
@@ -4600,6 +4624,170 @@ def _general_pool_candidate_row(entry: Any, scene: Mapping[str, Any]) -> Dict[st
     }
 
 
+def _late_web_branch_accept(
+    scene: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> Optional[tuple]:
+    """Accept a late web row on its own paid live verdict — or refuse it.
+
+    Used only by the late-web promotion in ``resolve_storyboard_media_v2``
+    (test 26, job ffe90224): the shared web batch returns after the
+    coordinator's discovery wall and visual gate have closed, so its rows
+    can no longer be verified live. A row may still enter the plan when
+    it already carries a live vision verdict for THIS scene and THESE
+    bytes. No new vision is spent here; every check is local.
+
+    The rule deliberately differs from ``_verification_result``'s
+    branch-verdict reuse in one place: that rule treats a verdict with
+    no ``verification_status`` field as pending, but the web lane's live
+    verdicts never carry that field (``SceneVisualDecision.to_dict()``
+    has none; the resolver stamps ``accepted`` / ``visual_checked`` /
+    ``semantic_verified`` / ``visual_available`` plus the hashes
+    instead). Live evidence — not the status field — is what separates
+    a real model read from the adapter's synthesized
+    ``deterministic_web_image`` stamp, which carries no
+    ``visual_checked`` / ``semantic_verified`` at all.
+
+    Scene binding also differs from ``_branch_review_is_bound``: the
+    verdict's hash is the resolver's own ``scene_context_hash``
+    (narration/subject/topic), which never equals the pipeline's
+    ``requirement_hash`` (a hash over the full visual-requirement
+    struct), so hash equality on the verdict would refuse every web
+    verdict. Bind through the candidate instead — the resolver stamps
+    the scene's semantic-requirement hash onto the rows it chose for
+    that scene (``candidate_evidence.requirement_hash``) — and require
+    the verdict to have been created for this scene (``scene_index``)
+    when both indices are known. A verdict created for ANOTHER scene
+    (a cache image shared across scenes) is refused; the web reuse cap
+    would forbid the shared asset anyway. Scenes without a
+    requirement hash skip the scene half, mirroring
+    ``_branch_review_is_bound``'s legacy rule.
+
+    The policy-version half of ``_branch_review_is_bound`` is NOT
+    applied here: the resolver hardcodes
+    ``visual_review_policy_version = 17`` while the current constant
+    is 26, so requiring equality would refuse every web-lane verdict.
+    The file + scene binding, live evidence, and the coordinator's hard
+    gate (which still runs on the row at selection time) are the
+    guards; the stale hardcoded stamp is a separate cleanup.
+
+    Returns ``(True, "visual_pass", score, verdict)`` when the row is
+    admissible, else None.
+    """
+    branch = candidate.get("qwen_result") or candidate.get("visual_decision")
+    if not isinstance(branch, Mapping) or not branch:
+        return None
+    if not (
+        branch.get("accepted") is True
+        or str(branch.get("status") or "").strip().lower()
+        in {"accepted", "pass", "keep"}
+    ):
+        return None
+    if branch.get("entity_conflict") or branch.get("fatal_mismatch"):
+        return None
+    if branch.get("unsafe_content") or branch.get("suggestive_content"):
+        return None
+    if _is_web_source(candidate) and (
+        branch.get("watermark")
+        or str(branch.get("rejection_reason") or "").strip().lower()
+        == "watermark_detected"
+    ):
+        return None
+    verification_status = str(branch.get("verification_status") or "").strip().lower()
+    if verification_status in {
+        "deterministic_web_image",
+        "deterministic_only",
+        "deterministic_degraded",
+    }:
+        return None
+    if "pending" in verification_status or verification_status in {
+        "unverified",
+        "discovered",
+    }:
+        return None
+    # Live evidence: a real model read, not a metadata stamp.
+    if not _verdict_has_vision_evidence(branch):
+        return None
+    if not (
+        branch.get("visual_checked") is True
+        or branch.get("semantic_verified") is True
+    ):
+        return None
+    # File binding ("these bytes"): the verdict's asset hash must match
+    # the file on disk.
+    asset_sha = str(branch.get("verified_asset_sha256") or "").strip()
+    if not asset_sha:
+        return None
+    try:
+        digest = hashlib.sha256()
+        with Path(str(candidate.get("path") or "")).open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != asset_sha:
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    # Scene binding ("this scene").
+    requirement = scene.get("visual_requirement") if isinstance(scene, Mapping) else {}
+    expected = (
+        str((requirement or {}).get("requirement_hash") or "").strip()
+        if isinstance(requirement, Mapping)
+        else ""
+    )
+    if expected:
+        evidence = candidate.get("candidate_evidence") or {}
+        evidence_hash = (
+            str((evidence or {}).get("requirement_hash") or "").strip()
+            if isinstance(evidence, Mapping)
+            else ""
+        )
+        row_hash = str(candidate.get("requirement_hash") or "").strip()
+        verdict_hash = str(branch.get("verified_requirement_hash") or "").strip()
+        if not (
+            evidence_hash == expected
+            or row_hash == expected
+            or verdict_hash == expected
+        ):
+            return None
+        try:
+            verdict_scene = branch.get("scene_index")
+            verdict_scene = (
+                int(verdict_scene) if verdict_scene is not None else None
+            )
+        except (TypeError, ValueError):
+            verdict_scene = None
+        try:
+            scene_index = scene.get("scene_index")
+            scene_index = int(scene_index) if scene_index is not None else None
+        except (TypeError, ValueError):
+            scene_index = None
+        if (
+            verdict_scene is not None
+            and scene_index is not None
+            and verdict_scene != scene_index
+        ):
+            return None
+    # Strict scenes need a semantic pass, not just a checked box.
+    try:
+        from .visual_intelligence.context import scene_requires_visual_verification
+
+        strict = bool(scene_requires_visual_verification(scene))
+    except Exception:
+        strict = False
+    if strict and not (
+        branch.get("semantic_verified")
+        or branch.get("visual_checked")
+        or branch.get("visual_available")
+    ):
+        return None
+    score = float(
+        branch.get("final_score")
+        or branch.get("relevance")
+        or branch.get("score")
+        or 0.0
+    )
+    return True, "visual_pass", score, dict(branch)
+
+
 def resolve_storyboard_media_v2(
     scenes: Sequence[Any],
     *,
@@ -4613,7 +4801,7 @@ def resolve_storyboard_media_v2(
     progress_callback: Optional[Callable[[float, str], Any]] = None,
     deadline_seconds: float = 600.0,
     web_fallback_grace_seconds: float = 0.0,
-    max_workers: int = 6,
+    max_workers: int = 8,
     web_wait_until_complete: bool = False,
     external_cancel_event: Optional[threading.Event] = None,
     adaptive_media_review: bool = False,
@@ -4622,6 +4810,7 @@ def resolve_storyboard_media_v2(
     job_id: Optional[str] = None,
     youtube_general_pool: Any = None,
     verification_deadline_seconds: Optional[float] = None,
+    vision_lane_budgets: Optional[Mapping[str, Any]] = None,
 ) -> Dict[int, SceneResolution]:
     """Resolve immutable storyboard scenes through the V2 fallback machine.
 
@@ -4836,6 +5025,39 @@ def resolve_storyboard_media_v2(
         0, min(2, vision_max_starts_per_scene - 1)
     )
     vision_starts: Dict[int, int] = {}
+    # Vision lanes: per-lane budgets (LaneVisionBudget) passed by the
+    # adapter via the kwarg or attached to the verifier as
+    # ``visual_verifier.lane_budgets``. Absent entirely, the gate keeps
+    # its legacy shared-deadline behaviour unchanged.
+    lane_budgets: Dict[str, Any] = {}
+    try:
+        _lb = vision_lane_budgets
+        if _lb is None and visual_verifier is not None:
+            _lb = getattr(visual_verifier, "lane_budgets", None)
+        if isinstance(_lb, Mapping):
+            lane_budgets = {str(k): v for k, v in _lb.items()}
+    except Exception:
+        lane_budgets = {}
+
+    def _lane_budget_for(source: str):
+        return lane_budgets.get(str(source or "").strip().lower())
+
+    def _lane_vision_open(source: str) -> bool:
+        """True when a new vision filing is allowed for ``source``'s lane.
+
+        Drain-only gate (§3.2): once a lane's own budget has expired,
+        the coordinator files zero new vision calls for that lane — it
+        only collects verdicts already in flight (batched verdicts are
+        consumed by verify_primary regardless). No lane budgets means
+        the legacy gate deadline governs, unchanged.
+        """
+        budget = _lane_budget_for(source)
+        if budget is None:
+            return True
+        try:
+            return not bool(budget.expired())
+        except Exception:
+            return True
 
     def vision_start_allowed(index: int, *, frame_reserved: bool = False) -> bool:
         """Call-count gate: frame fallbacks may spend the last reserved
@@ -4850,12 +5072,22 @@ def resolve_storyboard_media_v2(
         vision_starts[index] = vision_starts.get(index, 0) + 1
     scene_verify_started_at: Dict[int, float] = {}
 
-    def scene_budget_open(index: int) -> bool:
+    def scene_budget_open(index: int, lane: Optional[str] = None) -> bool:
+        # Per-lane-scene: the window is measured from that lane's
+        # visual-phase start, not from first-verify-start on a shared
+        # clock (vision lanes §3.2). Without lane budgets the legacy
+        # per-scene clock applies unchanged.
         started = scene_verify_started_at.get(index)
         if started is None:
             scene_verify_started_at[index] = time.monotonic()
             return True
-        return time.monotonic() - started < scene_budget_value
+        origin = started
+        if lane is not None:
+            budget = _lane_budget_for(lane)
+            lane_start = getattr(budget, "started_at", None) if budget is not None else None
+            if lane_start is not None:
+                origin = min(started, float(lane_start))
+        return time.monotonic() - origin < scene_budget_value
 
     def _quota_clip_budget_open(index: int, source: str) -> bool:
         """Per-scene budget gate for a quota scene's YouTube clip.
@@ -4873,7 +5105,7 @@ def resolve_storyboard_media_v2(
             _source_policy_value(rows[index], "youtube_quota", False)
         ):
             return True
-        return scene_budget_open(index)
+        return scene_budget_open(index, lane=source)
 
     # LazyBatchLane-backed providers perform one all-scenes network batch and
     # return indexed rows.  Treat that as a single discovery wave even when
@@ -5149,8 +5381,8 @@ def resolve_storyboard_media_v2(
             # Verification of downloaded files gets its own bounded window.
             # A long shared YouTube batch must not consume that window before
             # queued scene checks have started. No new discovery is admitted.
-            default_grace = max(45.0, min(180.0, math.ceil(len(rows) * 2 / 6) * 25.0))
-            visual_gate_grace = max(2.0, min(180.0, float(
+            default_grace = max(45.0, min(300.0, math.ceil(len(rows) * 2 / 6) * 25.0))
+            visual_gate_grace = max(2.0, min(300.0, float(
                 os.environ.get("VIDZEO_MEDIA_VISUAL_GRACE_SECONDS") or default_grace)))
         except (TypeError, ValueError):
             visual_gate_grace = 20.0
@@ -5290,7 +5522,12 @@ def resolve_storyboard_media_v2(
             # while it was in flight, or the quota clip silently becomes a
             # still. The global visual-gate deadline above still bounds it.
             verifier = _BatchedVerifier(batched)
-        elif not scene_budget_open(index):
+        elif not scene_budget_open(index, lane=_source):
+            return None
+        if batched is None and not _lane_vision_open(_source):
+            # Drain-only: this lane's budget is closed, so the gate files
+            # zero new vision calls for it (it still consumes verdicts
+            # already in flight, above).
             return None
         accepted, reason, visual_score, verdict = _cached_verification_result(
             index, rows[index], candidate, verifier, vision_verdict_cache,
@@ -5309,6 +5546,11 @@ def resolve_storyboard_media_v2(
         finalist, as today.
         """
         if len(items) < 2 or visual_verifier is None:
+            return
+        if not any(_lane_vision_open(item[3]) for item in items):
+            # Drain-only: every finalist's lane budget is closed — file
+            # zero new vision calls; in-flight verdicts are still
+            # collected by the gate wait loop.
             return
         batch_fn = getattr(visual_verifier, "verify_batch", None)
         if not callable(batch_fn):
@@ -5429,11 +5671,10 @@ def resolve_storyboard_media_v2(
                 early_checks[index] = str(item[2]["path"]), gate_pool.submit(verify_primary, item)
 
     try:
-        if callable(getattr(visual_context, "refresh_deadline", None)):
-            try:
-                visual_context.refresh_deadline(deadline_at=visual_gate_deadline_at)
-            except Exception:
-                pass
+        # Vision lanes: a lane budget is never extended by refreshing a
+        # shared deadline — the refresh_deadline calls that used to
+        # re-extend the gate deadline are deleted. The lane clocks and
+        # the outer delivery/media wall bound verification now.
         # A shared batch lane has one in-flight loader but every scene still needs
         # a waiter future.  Limiting the pool to the normal six per-scene workers
         # leaves most waiters queued behind the slow batch request; when the
@@ -5681,6 +5922,223 @@ def resolve_storyboard_media_v2(
         candidates = _candidate_rows(result, source)
         return candidates, "candidates" if candidates else "empty", elapsed
 
+    # ── Late web promotion (test 26, job ffe90224) ──
+    # Timing proof: the shared web batch publishes nothing until its
+    # loader returns — search + download + its own visual phase — while
+    # the coordinator's discovery wall (deadline_at) and the parallel
+    # visual gate close earlier. In test 26 the coordinator's last look
+    # at the web lane was the ~715s discovery wall and the plan locked
+    # at 722.7s, but the web batch returned at 754.68s with 13 resolved
+    # scenes (7 cached vision passes, 15 fresh downloads, one ACCEPT
+    # landing during render). Those verdicts sat in the lane's own state
+    # and the audit file — never in ``discovered`` — because every
+    # consumption point is non-blocking: the per-scene ``discover``
+    # waiters give up at the wall (``_bounded_lane_call`` caps a shared
+    # batch at the remaining wall), and every
+    # ``_promote_completed_batch_lanes`` call passes ``timeout=0.0``,
+    # which returns None while the lane is still loading (the web loader
+    # never calls ``publish_row`` — only the YouTube loader does — so
+    # no web row is visible until the whole batch returns). The plan
+    # therefore shipped 0 web and 7 graphics.
+    #
+    # Before the plan locks, give the still-loading web batch one
+    # bounded chance to finish. The wait is capped by
+    # VIDZEO_WEB_LATE_WAIT_SECONDS (default 60s) and by the delivery
+    # budget wall, so it can never eat the render reserve or stall the
+    # job; it ends as soon as the batch reports ready. A scene whose
+    # verdict never arrives is left unverified and falls through to the
+    # existing per-scene fallback (YT clip / graphic) — the wait is
+    # bounded per run, never per scene, so one slow scene cannot hold
+    # the plan open. Promoted rows are registered as primary finalists
+    # so the selection pass below can consider them, and rows that
+    # already carry a paid live verdict are seeded into gated_outcomes
+    # through _late_web_branch_accept — no new vision is spent here.
+    _late_web_wait_seconds = min(
+        300.0, _env_seconds("VIDZEO_WEB_LATE_WAIT_SECONDS", 60.0)
+    )
+    _late_web_get_row = getattr(web_lane, "get_row", None)
+    _late_web_shared = bool(
+        getattr(web_lane, "shared_batch", False)
+    ) and callable(_late_web_get_row)
+    _late_web_needing: list = []
+    if _late_web_shared:
+        for _lw_idx in range(len(rows)):
+            _lw_has_web = any(
+                _normalize_candidate_source(_lw_c) == "web"
+                and bool(_lw_c.get("path"))
+                for _lw_c in discovered.get(_lw_idx, [])
+            )
+            _lw_has_accept = any(
+                _lw_outcome is not None and bool(_lw_outcome[2])
+                for (_lw_o_idx, _lw_o_path), _lw_outcome in gated_outcomes.items()
+                if _lw_o_idx == _lw_idx
+            )
+            _lw_web_loading = getattr(web_lane, "_state", None) == "loading"
+            _lw_lane_expired = False
+            _lw_web_budget = lane_budgets.get("web")
+            if _lw_web_budget is not None:
+                try:
+                    _lw_lane_expired = bool(_lw_web_budget.expired())
+                except Exception:
+                    _lw_lane_expired = False
+            if not _lw_has_accept and (
+                not _lw_has_web
+                or (_lw_web_loading and _lw_lane_expired)
+            ):
+                _late_web_needing.append(_lw_idx)
+    # Observability (§4.2): discovered-per-source counts at late-web time.
+    _lw_discovered_web = sum(
+        1
+        for _lw_rows in discovered.values()
+        for _lw_c in _lw_rows
+        if _normalize_candidate_source(_lw_c) == "web" and bool(_lw_c.get("path"))
+    )
+    _lw_discovered_yt = sum(
+        1
+        for _lw_rows in discovered.values()
+        for _lw_c in _lw_rows
+        if _normalize_candidate_source(_lw_c) == "youtube" and bool(_lw_c.get("path"))
+    )
+    _lw_scenes_with_web = sum(
+        1
+        for _lw_rows in discovered.values()
+        if any(
+            _normalize_candidate_source(_lw_c) == "web" and bool(_lw_c.get("path"))
+            for _lw_c in _lw_rows
+        )
+    )
+    print(
+        "   [v2] discovered at late-web: "
+        f"web={_lw_discovered_web} youtube={_lw_discovered_yt} "
+        f"scenes_with_web={_lw_scenes_with_web}/{len(rows)}",
+        flush=True,
+    )
+    # Late-web wait gate (§3): the wait is a bounded second chance for a
+    # loader that is *nearly done*, not a retrieval extension. Gate it on
+    # the loader being past retrieval — i.e. in its visual phase (the web
+    # lane clock started, proof a vision submission happened) or already
+    # holding rows. Otherwise skip it entirely: waiting on a loader still
+    # searching burns the wall for a batch that cannot return rows yet.
+    # The gate applies only when a web lane budget exists to judge by:
+    # with no lane budget at all (legacy path, d0f80b7's rescue tests)
+    # there is no clock evidence, so the bounded wait stays the second
+    # chance for a batch finishing just after the wall.
+    _web_lane_budget = lane_budgets.get("web")
+    _web_has_lane_budget = _web_lane_budget is not None
+    _web_clock_started = bool(
+        _web_has_lane_budget
+        and getattr(_web_lane_budget, "started_at", None) is not None
+    )
+    _web_in_visual_phase = _web_clock_started or _lw_discovered_web > 0
+    if (
+        _late_web_needing
+        and _late_web_wait_seconds > 0
+        and _web_has_lane_budget
+        and not _web_in_visual_phase
+    ):
+        print(
+            "   [v2] late web promotion [vision-lane] web late-wait skipped: "
+            "loader still in retrieval, "
+            f"needing={len(_late_web_needing)} scene(s), rows=0",
+            flush=True,
+        )
+    elif _late_web_needing and _late_web_wait_seconds > 0:
+        _late_web_wait_until = time.monotonic() + _late_web_wait_seconds
+        if verification_delivery_deadline is not None:
+            _late_web_wait_until = min(
+                _late_web_wait_until, float(verification_delivery_deadline)
+            )
+        _late_web_wait_started = time.monotonic()
+        _late_web_paths_before = {
+            _lw_idx: {
+                str(_lw_c.get("path") or "")
+                for _lw_c in discovered.get(_lw_idx, [])
+                if _normalize_candidate_source(_lw_c) == "web"
+            }
+            for _lw_idx in range(len(rows))
+        }
+        for _lw_idx in _late_web_needing:
+            _lw_remaining = _late_web_wait_until - time.monotonic()
+            if _lw_remaining <= 0 or (
+                external_cancel_event is not None
+                and external_cancel_event.is_set()
+            ):
+                break
+            try:
+                _lw_row = _late_web_get_row(_lw_idx, timeout=_lw_remaining)
+            except TypeError:
+                try:
+                    _lw_row = _late_web_get_row(_lw_idx)
+                except Exception:
+                    _lw_row = None
+            except Exception:
+                _lw_row = None
+            if _lw_row:
+                break
+        _late_web_promoted = _promote_completed_batch_lanes(
+            "late_web_promotion", timeout=0.0
+        )
+        _late_web_waited = time.monotonic() - _late_web_wait_started
+        _late_web_seeded = 0
+        for _lw_idx in range(len(rows)):
+            for _lw_candidate in discovered.get(_lw_idx, []):
+                if _normalize_candidate_source(_lw_candidate) != "web":
+                    continue
+                _lw_path = str(_lw_candidate.get("path") or "")
+                if not _lw_path or _lw_path in _late_web_paths_before.get(
+                    _lw_idx, set()
+                ):
+                    continue
+                primary_finalist_keys[_lw_idx].add(_lw_path)
+                primary_top_pool_keys[_lw_idx].add(_lw_path)
+                # The wait proved the transport works: this scene was
+                # marked web_transport_failed only because its discover
+                # waiter gave up at the wall ('provider_timeout_handoff').
+                # Leaving the flag set would block the web recovery lane
+                # for a scene whose web transport demonstrably delivers.
+                web_transport_failed.discard(_lw_idx)
+                if (_lw_idx, _lw_path) in gated_outcomes:
+                    continue
+                _lw_outcome = _late_web_branch_accept(
+                    rows[_lw_idx], _lw_candidate
+                )
+                if _lw_outcome is None:
+                    continue
+                _lw_meta = float(
+                    _lw_candidate.get("final_score")
+                    or _lw_candidate.get("score")
+                    or _lw_candidate.get("metadata_score")
+                    or 0.0
+                )
+                gated_outcomes[(_lw_idx, _lw_path)] = (
+                    _lw_meta,
+                    -preference_ranks[_lw_idx].get("web", 9),
+                    True,
+                    _lw_outcome[1],
+                    float(_lw_outcome[2]),
+                    dict(_lw_outcome[3] or {}),
+                )
+                attempts[_lw_idx].append({
+                    "source": "web",
+                    "stage": "late_web_promotion",
+                    "status": "branch_verdict_accepted",
+                    "candidate_id": str(
+                        _lw_candidate.get("candidate_id")
+                        or _lw_candidate.get("id")
+                        or ""
+                    ),
+                    "path": _lw_path,
+                })
+                _late_web_seeded += 1
+        if _late_web_promoted or _late_web_seeded or _late_web_waited > 0.5:
+            print(
+                "   [v2] late web promotion [vision-lane] web late-wait: "
+                f"waited={_late_web_waited:.1f}s promoted={_late_web_promoted} "
+                f"seeded={_late_web_seeded} scene(s) "
+                f"needing={len(_late_web_needing)}",
+                flush=True,
+            )
+
     # Pre-launch cross-lane fallback for scenes that have no accepted primary finalists
     _promote_completed_batch_lanes("pre_prefetch_promotion", timeout=0.0)
     scenes_with_verified_primary = {
@@ -5768,6 +6226,10 @@ def resolve_storyboard_media_v2(
                 if not _pv_passed:
                     continue
                 if not _quota_clip_budget_open(_pv_index, _pv_source):
+                    continue
+                if not _lane_vision_open(_pv_source):
+                    # Drain-only: this lane's budget is closed — file
+                    # zero new vision calls for it.
                     continue
                 _pv_deadline = (
                     web_recovery_visual_deadline_at
@@ -6144,7 +6606,7 @@ def resolve_storyboard_media_v2(
                                  "reason": "skipped_after_vision_start_budget",
                                  "visual_checked": False},
                             )
-                        if visual_budget_open("visual_gate_fallback_parallel", source):
+                        if visual_budget_open("visual_gate_fallback_parallel", source) and _lane_vision_open(source):
                             note_vision_start(index)
                             result = _cached_verification_result(
                                 index, scene, candidate, visual_verifier, vision_verdict_cache,
@@ -6173,11 +6635,8 @@ def resolve_storyboard_media_v2(
                             if any(source == "web" for _candidate_index, _candidate, source in verify_jobs)
                             else visual_gate_deadline_at
                         )
-                        if hasattr(visual_verifier, "visual_context") and getattr(visual_verifier, "visual_context", None) is not None:
-                            try:
-                                visual_verifier.visual_context.refresh_deadline(deadline_at=recovery_visual_deadline)
-                            except Exception:
-                                pass
+                        # Vision lanes: no refresh_deadline here — a lane
+                        # budget is never extended by the coordinator.
                         recovery_futures = [
                             recovery_pool.submit(_verify_recovery, item)
                             for item in verify_jobs
@@ -6277,7 +6736,7 @@ def resolve_storyboard_media_v2(
                             # scene to a still. The quota clip is exempt from
                             # the per-scene budget (see _quota_clip_budget_open);
                             # the global visual-gate deadline still bounds it.
-                            if _quota_clip_budget_open(index, source) and visual_budget_open("visual_gate_quota_inline", source):
+                            if _quota_clip_budget_open(index, source) and visual_budget_open("visual_gate_quota_inline", source) and _lane_vision_open(source):
                                 visual_verified, visual_reason, visual_score, inline_qwen = _verification_result(
                                     scene, candidate, visual_verifier,
                                     fatal_rejections=fatal_rejections,
@@ -6327,7 +6786,7 @@ def resolve_storyboard_media_v2(
                                 # A skip (global deadline) is not a rejection.
                                 rejected_youtube_indices.add(index)
                         else:
-                            if scene_budget_open(index) and visual_budget_open("visual_gate_inline", source):
+                            if scene_budget_open(index, lane=source) and visual_budget_open("visual_gate_inline", source) and _lane_vision_open(source):
                                 visual_verified, visual_reason, visual_score, inline_qwen = _verification_result(
                                     scene, candidate, visual_verifier,
                                     fatal_rejections=fatal_rejections,
@@ -6388,7 +6847,7 @@ def resolve_storyboard_media_v2(
                              "reason": "skipped_after_vision_start_budget",
                              "visual_checked": False},
                         )
-                    elif visual_budget_open("visual_gate_fallback", source):
+                    elif visual_budget_open("visual_gate_fallback", source) and _lane_vision_open(source):
                         note_vision_start(index)
                         verified, verify_reason, visual_score, qwen = _verification_result(
                             scene, candidate, visual_verifier,
@@ -6662,9 +7121,10 @@ def resolve_storyboard_media_v2(
                 approved = not requirement_hash or _review_bound_to_scene(scene, review)
                 status = "accepted" if approved else "target_scene_review_required"
                 if not approved and (
-                    scene_budget_open(index)
+                    scene_budget_open(index, lane=source)
                     and vision_start_allowed(index)
                     and visual_budget_open("spare_pool_target_review", source)
+                    and _lane_vision_open(source)
                 ):
                     check_candidate = dict(candidate, path=path, semantic_context_pending=True,
                                            visual_verification_required=True,
@@ -8221,15 +8681,17 @@ def resolve_storyboard_media_v2(
                     late_quota_work.append((index, candidate))
 
         if late_quota_work:
-            visual_context = getattr(visual_verifier, "visual_context", None)
-            if visual_context is not None:
-                try:
-                    visual_context.refresh_deadline(deadline_at=late_quota_deadline_at)
-                except Exception:
-                    pass
+            # Vision lanes: no refresh_deadline here — a lane budget is
+            # never extended by the coordinator.
 
             def _verify_late_quota_candidate(item: tuple[int, Dict[str, Any]]) -> tuple[int, Dict[str, Any], tuple]:
                 index, candidate = item
+                if not _lane_vision_open("youtube"):
+                    # Drain-only: the youtube lane budget is closed.
+                    return index, candidate, (
+                        False, "skipped_after_lane_budget", 0.0,
+                        {"accepted": False, "status": "deadline_exceeded"},
+                    )
                 return index, candidate, _verification_result(
                     rows[index], candidate, visual_verifier,
                     fatal_rejections=fatal_rejections,
@@ -9044,7 +9506,7 @@ def resolve_storyboard_media_v2(
         )
     ]
     if unresolved_before_stock:
-        print(f"   [v2] pre-stock web image rescue checking {len(unresolved_before_stock)} unresolved scene(s)...", flush=True)
+        print(f"   [v2] {len(unresolved_before_stock)} scene(s) unresolved before stock fallback; attempting pre-stock web image rescue...", flush=True)
         # Rescue-scoped visual budget (test-11 repair): the main visual
         # context expired long before this pass runs, so a live candidate
         # could never be verified here.  Grant the rescue its own
@@ -9081,65 +9543,125 @@ def resolve_storyboard_media_v2(
                 _grant_current = resolutions.get(_rescue_idx)
                 if _grant_current is not None and _grant_current.attempts is not attempts[_rescue_idx]:
                     _grant_current.attempts.append(dict(_grant_entry))
-        # Byte-level use counts mirror the final render gate, which dedupes
-        # by file bytes: the same pixels under a new path still count as a
-        # repeat. Provider identities alone miss re-downloaded copies.
-        rescue_sha_cache: dict[str, str] = {}
+        # A scene's resolution may be an older YouTube selection (or a
+        # degraded one), which the rescue must displace. Every already
+        # resolved scene occupies its asset at least once, and the
+        # rescue runs at the same time as the gate. Reuse is thus
+        # capped against final_uses/final_sha_uses, not just against the
+        # rescue's own choices.
+        _rescue_uses_snapshot = dict(final_uses)
+        _rescue_resolutions_snapshot = dict(resolutions)
+        rescue_sha_cache: Dict[str, str] = {}
 
         def _rescue_sha(path: str) -> str:
+            if not path:
+                return ""
             if path not in rescue_sha_cache:
                 rescue_sha_cache[path] = _sha256_file_hexdigest(path)
             return rescue_sha_cache[path]
 
-        final_sha_uses: dict[str, int] = {}
-        for _resolution in resolutions.values():
-            _path = str(_resolution.selected_path or "")
-            _digest = _rescue_sha(_path) if _path else ""
-            if _digest:
-                final_sha_uses[_digest] = final_sha_uses.get(_digest, 0) + 1
+        # Per-asset sha use: the sha of a resolved scene's selected path.
+        final_sha_uses: Dict[str, int] = {}
+        for _res_idx, _res in resolutions.items():
+            if not _res:
+                continue
+            _res_path = str(_res.selected_path or "")
+            if not _res_path:
+                continue
+            _res_sha = _rescue_sha(_res_path)
+            if _res_sha:
+                final_sha_uses[_res_sha] = final_sha_uses.get(_res_sha, 0) + 1
+        _rescue_sha_uses_snapshot = dict(final_sha_uses)
 
-        for idx in unresolved_before_stock:
-            scene = rows[idx]
-            # Guards the final gate enforces, applied before choosing: the
-            # gate rejects any asset whose bytes repeat an adjacent scene
-            # (`excess_media_reuse_indices`) and any asset already used
-            # twice. The rescue used to check only the provider-identity
-            # count, so it picked the adjacent scene's own file (GTA VI
-            # proof job scene 2 rescued scene 1's still) and the gate then
-            # threw it away for a graphic.
-            adjacent_identities, adjacent_digests = _adjacent_asset_keys(resolutions, idx)
+        # --- Rescue deadline (Fix 4): a hard stop, not just a vision
+        # window. When it passes, remaining scenes fall through to the
+        # stock/graphic fallback instead of hanging. The delivery
+        # deadline is the ultimate bound; the rescue's own visual
+        # window (from _grant_rescue_visual_budget) is the tighter one
+        # when it exists.
+        _rescue_deadline = None
+        if _rescue_visual_state is not None:
+            _rescue_deadline = float(_rescue_visual_state.get("rescue_deadline") or 0.0) or None
+        if verification_delivery_deadline is not None:
+            _dl = float(verification_delivery_deadline)
+            _rescue_deadline = _dl if _rescue_deadline is None else min(_rescue_deadline, _dl)
+        if _rescue_deadline is None:
+            # No deadline anywhere: bound the rescue to one hour so it
+            # can never stall a job indefinitely.
+            _rescue_deadline = time.monotonic() + 3600.0
 
-            def _note_rescue_skip(status: str, path: str) -> None:
-                entry = {
+        # --- Cross-scene pool (precomputed once): the original rescue
+        # scanned every other scene's discovered/web_lane rows for EACH
+        # unresolved scene (O(n^2) row reads). Precompute the union once
+        # as (origin_idx, candidate) pairs; Phase 1 skips pairs from its
+        # own scene, matching the original `other_idx == idx` skip.
+        _rescue_cross_pool: list = []
+        _rescue_get_web_row = getattr(web_lane, "get_row", None)
+        for _pool_idx in range(len(rows)):
+            for _c in discovered.get(_pool_idx, []):
+                if _is_web_source(_c):
+                    _rescue_cross_pool.append((_pool_idx, _c))
+            if callable(_rescue_get_web_row):
+                try:
+                    _o_row = _rescue_get_web_row(_pool_idx, timeout=0.0)
+                except Exception:
+                    _o_row = None
+                for _c in _candidate_rows(_o_row, "web"):
+                    _rescue_cross_pool.append((_pool_idx, _c))
+
+        # --- Parallelism (user order Nov 22: "add more parallel work, to
+        # be quick"). 8 workers matches the inference-pool ceiling; the
+        # rescue's vision calls fan out across the pool instead of
+        # queuing behind one in-flight request. The per-host throttle
+        # slots for Yandex/Bing/Flickr are untouched (they gate the
+        # search engines, not the rescue's scene workers), and
+        # DuckDuckGo stays skipped. Env override for tuning.
+        try:
+            _rescue_workers = int(os.environ.get("VIDZEO_RESCUE_WORKERS") or 8)
+        except (TypeError, ValueError):
+            _rescue_workers = 8
+        _rescue_workers = max(1, min(8, _rescue_workers))
+
+        # --- Phase 1: per-scene gather + filter + sort + verify. Uses
+        # only SNAPSHOT state (never mutates shared state), so scenes
+        # run concurrently. Returns a dict with the snapshot-sorted
+        # valid list, the deferred list, and the ledger entries (the
+        # _note_rescue_skip calls, collected instead of appended).
+        # A transient vision failure (verifier error / timeout) is
+        # retried once with a short backoff; a hard REJECT is a verdict
+        # and is never retried.
+        def _rescue_scene_work(idx):
+            _ledger: list = []
+            _scene = rows[idx]
+            _adjacent_identities, _adjacent_digests = _adjacent_asset_keys(
+                _rescue_resolutions_snapshot, idx
+            )
+
+            def _note(status: str, path: str) -> None:
+                _ledger.append({
                     "source": "web",
                     "stage": "pre_stock_web_rescue",
                     "status": status,
                     "path": path,
-                }
-                attempts[idx].append(dict(entry))
-                current = resolutions.get(idx)
-                if current is not None and current.attempts is not attempts[idx]:
-                    current.attempts.append(dict(entry))
+                })
 
-            # A strict YouTube selection reopened here had no bound pixel
-            # review; say so in the ledger instead of silently re-resolving.
-            _previous = resolutions.get(idx)
+            _previous = _rescue_resolutions_snapshot.get(idx)
             if _previous is not None and _is_youtube_source(_previous):
-                _note_rescue_skip(
+                _note(
                     "reopened_unbound_acceptance",
                     str(_previous.selected_path or ""),
                 )
-            web_candidates: List[Dict[str, Any]] = []
+            _web_candidates: List[Dict[str, Any]] = []
             deferred_adjacent: list = []
-            seen_cands = set()
+            _seen_cands = set()
 
             def _add_cand(c: Any) -> None:
                 if isinstance(c, Mapping):
                     c_dict = dict(c)
                     c_id = str(c_dict.get("path") or c_dict.get("candidate_id") or c_dict.get("url") or id(c))
-                    if c_id not in seen_cands:
-                        seen_cands.add(c_id)
-                        web_candidates.append(c_dict)
+                    if c_id not in _seen_cands:
+                        _seen_cands.add(c_id)
+                        _web_candidates.append(c_dict)
 
             # 0. From the prep cache (cached_prep) — consulted FIRST, before
             # any vision-dependent path.  A prep-banked image was verified
@@ -9147,17 +9669,12 @@ def resolve_storyboard_media_v2(
             # spends NO fresh vision call; every other rescue gate below
             # (file, hard gate, reuse caps, adjacency, watermark,
             # identity/conflict) still applies to it exactly as to a live
-            # candidate.  This is the path test 11 missed: the web
-            # branch's per-scene futures detached at the stage deadline
-            # before the inline cached_prep chain could run, and the rescue
-            # never looked at prep — 48 verified images sat unused while
-            # 5 scenes fell to graphics.  Fail-soft: a lookup error never
-            # breaks the rescue.
+            # candidate.  Fail-soft: a lookup error never breaks the rescue.
             try:
                 from .advance_prep import find_prepped_web_asset
 
                 _prep_title = str(
-                    scene.get("content_title") or scene.get("title") or ""
+                    _scene.get("content_title") or _scene.get("title") or ""
                 ).strip()
                 if not _prep_title:
                     try:
@@ -9172,11 +9689,11 @@ def resolve_storyboard_media_v2(
                     except Exception:
                         _prep_title = ""
                 _prep_queries = (
-                    scene.get("queries") or scene.get("web_queries") or []
+                    _scene.get("queries") or _scene.get("web_queries") or []
                 )
                 _prep_hit = find_prepped_web_asset(
                     _prep_title,
-                    str(scene.get("text") or scene.get("narration") or ""),
+                    str(_scene.get("text") or _scene.get("narration") or ""),
                     list(_prep_queries or []),
                 )
             except Exception:
@@ -9204,8 +9721,6 @@ def resolve_storyboard_media_v2(
                     _prep_cand["reused_from_prep"] = True
                     # Already vision-verified at prep time: mark verified
                     # so the rescue skips the fresh-vision call below.
-                    # The final gate still sees the verified requirement
-                    # hash + asset sha stamped on acceptance.
                     _prep_cand["visual_decision"] = {
                         "accepted": True,
                         "status": "accepted",
@@ -9223,10 +9738,10 @@ def resolve_storyboard_media_v2(
                     _add_cand(c)
 
             # 2. From web_lane
-            get_web_row = getattr(web_lane, "get_row", None)
-            if callable(get_web_row):
+            _get_web_row = getattr(web_lane, "get_row", None)
+            if callable(_get_web_row):
                 try:
-                    w_row = get_web_row(idx, timeout=0.0)
+                    w_row = _get_web_row(idx, timeout=0.0)
                 except Exception:
                     w_row = None
                 if not w_row and isinstance(getattr(web_lane, "_rows", None), dict):
@@ -9247,123 +9762,32 @@ def resolve_storyboard_media_v2(
                     for c in _candidate_rows(fb_row, "web"):
                         _add_cand(c)
 
-            valid_web_candidates = []
-            for c in web_candidates:
-                c_path = str(c.get("path") or c.get("cleaned_path") or "").strip()
-                if not (c_path and Path(c_path).is_file() and Path(c_path).stat().st_size > 0):
-                    continue
-                passed, reason = _candidate_hard_gate(scene, c)
-                if not passed and not _rescue_general_media_eligible(scene, c, reason, gated_outcomes):
-                    continue
-                if not passed:
-                    # Soft identity failure only (see the helper): vision
-                    # already accepted these pixels for another scene of
-                    # this job and nothing evidences a conflicting identity,
-                    # so the asset may serve as general same-job media.
-                    # Cap, adjacency, conflict and re-verification checks
-                    # below still apply; the ledger records the tier.
-                    _note_rescue_skip("general_same_job_media", c_path)
-                c_identity = _web_asset_identity(c)
-                cap = _reuse_limit_for_resolution(scene, c, non_mixed_limit=2) if hasattr(c, "provider") else 2
-                if c_identity and final_uses.get(c_identity, 0) >= cap:
-                    _note_rescue_skip("rejected_reuse_cap", c_path)
-                    continue
-                candidate_sha = _rescue_sha(c_path)
-                if candidate_sha and final_sha_uses.get(candidate_sha, 0) >= cap:
-                    _note_rescue_skip("rejected_reuse_cap", c_path)
-                    continue
-                # # Adjacent reuse is a last resort, not a rejection. The
-                # downstream gate does reject an adjacent repeat
-                # (`excess_media_reuse_indices`), so a non-adjacent verified
-                # donor always wins — but refusing the only verified media
-                # in the job would return a neutral card while usable pixels
-                # sit on disk, which is exactly the stall policy's tier 1
-                # (reuse the closest already-downloaded media). Defer the
-                # adjacent candidate; it is used only when no non-adjacent
-                # valid candidate exists at all.
-                is_adjacent_reuse = bool(
-                    (c_identity and c_identity in adjacent_identities)
-                    or (candidate_sha and candidate_sha in adjacent_digests)
-                )
-
-                outcome = gated_outcomes.get((idx, c_path))
-                v_verified = False
-                v_qwen = None
-                v_score = 0.0
-                if outcome is not None:
-                    _, _, v_verified, _, v_score, v_qwen = outcome
-                else:
-                    v_qwen = c.get("visual_decision") or c.get("qwen_result")
-                    if isinstance(v_qwen, Mapping):
-                        v_verified = bool(v_qwen.get("accepted") or str(v_qwen.get("status") or "").lower() in {"accepted", "pass", "keep", "soft_visual_pass", "deterministic_degraded"})
-                        v_score = float(v_qwen.get("final_score") or v_qwen.get("score") or 0.0)
-
-                if isinstance(v_qwen, Mapping):
-                    if v_qwen.get("unsafe_content") or v_qwen.get("suggestive_content"):
-                        continue
-                    from .visual_intelligence.semantic_guard import explicit_scene_conflict
-                    if explicit_scene_conflict(v_qwen, relaxed=True, scene=scene):
-                        continue
-
-                if is_adjacent_reuse:
-                    # First-pass refusal, not a final rejection: the
-                    # candidate is deferred (see the promotion below) and
-                    # the ledger keeps the "rejected_adjacent_reuse" entry
-                    # the leonida test pins, so a later reader can tell the
-                    # adjacent donor lost the first pass on purpose.
-                    _note_rescue_skip("rejected_adjacent_reuse", c_path)
-                    deferred_adjacent.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
-                else:
-                    valid_web_candidates.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
-
-            if not valid_web_candidates:
-                # Cross-scene rescue: check other storyboard scenes' discovered or web_lane candidates
-                for other_idx in range(len(rows)):
-                    if other_idx == idx:
-                        continue
-                    for c in discovered.get(other_idx, []):
-                        if _is_web_source(c):
-                            _add_cand(c)
-                    if callable(get_web_row):
-                        try:
-                            o_row = get_web_row(other_idx, timeout=0.0)
-                        except Exception:
-                            o_row = None
-                        for c in _candidate_rows(o_row, "web"):
-                            _add_cand(c)
-                for c in web_candidates:
+            def _filter_candidates(cands, _is_cross=False):
+                """Hard-gate + cap + adjacency filter. Returns
+                (valid_list, deferred_list). Uses SNAPSHOT state."""
+                _valid = []
+                _deferred = []
+                for c in cands:
                     c_path = str(c.get("path") or c.get("cleaned_path") or "").strip()
                     if not (c_path and Path(c_path).is_file() and Path(c_path).stat().st_size > 0):
                         continue
-                    passed, reason = _candidate_hard_gate(scene, c)
-                    if not passed and not _rescue_general_media_eligible(scene, c, reason, gated_outcomes):
+                    passed, reason = _candidate_hard_gate(_scene, c)
+                    if not passed and not _rescue_general_media_eligible(_scene, c, reason, gated_outcomes):
                         continue
                     if not passed:
-                        # Soft identity failure only (see the helper):
-                        # general same-job media, as in the own-candidate
-                        # loop above.
-                        _note_rescue_skip("general_same_job_media", c_path)
+                        _note("general_same_job_media", c_path)
                     c_identity = _web_asset_identity(c)
-                    cap = _reuse_limit_for_resolution(scene, c, non_mixed_limit=2) if hasattr(c, "provider") else 2
-                    if c_identity and final_uses.get(c_identity, 0) >= cap:
-                        _note_rescue_skip("rejected_reuse_cap", c_path)
+                    cap = _reuse_limit_for_resolution(_scene, c, non_mixed_limit=2) if hasattr(c, "provider") else 2
+                    if c_identity and _rescue_uses_snapshot.get(c_identity, 0) >= cap:
+                        _note("rejected_reuse_cap", c_path)
                         continue
                     candidate_sha = _rescue_sha(c_path)
-                    if candidate_sha and final_sha_uses.get(candidate_sha, 0) >= cap:
-                        _note_rescue_skip("rejected_reuse_cap", c_path)
+                    if candidate_sha and _rescue_sha_uses_snapshot.get(candidate_sha, 0) >= cap:
+                        _note("rejected_reuse_cap", c_path)
                         continue
-                    # # Adjacent reuse is a last resort, not a rejection. The
-                    # downstream gate does reject an adjacent repeat
-                    # (`excess_media_reuse_indices`), so a non-adjacent verified
-                    # donor always wins — but refusing the only verified media
-                    # in the job would return a neutral card while usable pixels
-                    # sit on disk, which is exactly the stall policy's tier 1
-                    # (reuse the closest already-downloaded media). Defer the
-                    # adjacent candidate; it is used only when no non-adjacent
-                    # valid candidate exists at all.
                     is_adjacent_reuse = bool(
-                        (c_identity and c_identity in adjacent_identities)
-                        or (candidate_sha and candidate_sha in adjacent_digests)
+                        (c_identity and c_identity in _adjacent_identities)
+                        or (candidate_sha and candidate_sha in _adjacent_digests)
                     )
                     outcome = gated_outcomes.get((idx, c_path))
                     v_verified = False
@@ -9380,220 +9804,380 @@ def resolve_storyboard_media_v2(
                         if v_qwen.get("unsafe_content") or v_qwen.get("suggestive_content"):
                             continue
                         from .visual_intelligence.semantic_guard import explicit_scene_conflict
-                        if explicit_scene_conflict(v_qwen, relaxed=True, scene=scene):
+                        if explicit_scene_conflict(v_qwen, relaxed=True, scene=_scene):
                             continue
                     if is_adjacent_reuse:
-                        # First-pass refusal, not a final rejection: the
-                        # candidate is deferred (see the promotion below) and
-                        # the ledger keeps the "rejected_adjacent_reuse" entry
-                        # the leonida test pins, so a later reader can tell the
-                        # adjacent donor lost the first pass on purpose.
-                        _note_rescue_skip("rejected_adjacent_reuse", c_path)
-                        deferred_adjacent.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
+                        _note("rejected_adjacent_reuse", c_path)
+                        _deferred.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
                     else:
-                        valid_web_candidates.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
+                        _valid.append((c, c_path, c_identity, v_verified, v_score, v_qwen))
+                return _valid, _deferred
+
+            valid_web_candidates, _d = _filter_candidates(_web_candidates)
+            deferred_adjacent.extend(_d)
+
+            if not valid_web_candidates:
+                # Cross-scene rescue: other scenes' candidates, from the
+                # precomputed pool (skips this scene's own rows, matching
+                # the original `other_idx == idx` skip). The pool is the
+                # union of all scenes' discovered/web_lane candidates.
+                _cross_cands = []
+                _cross_seen = set(_seen_cands)
+                for _origin_idx, _c in _rescue_cross_pool:
+                    if _origin_idx == idx:
+                        continue
+                    if isinstance(_c, Mapping):
+                        _c_id = str(_c.get("path") or _c.get("candidate_id") or _c.get("url") or id(_c))
+                        if _c_id in _cross_seen:
+                            continue
+                        _cross_seen.add(_c_id)
+                        _cross_cands.append(dict(_c))
+                _cross_valid, _cross_deferred = _filter_candidates(_cross_cands, _is_cross=True)
+                valid_web_candidates.extend(_cross_valid)
+                deferred_adjacent.extend(_cross_deferred)
 
             if not valid_web_candidates and deferred_adjacent:
                 # Last resort only: no non-adjacent verified donor exists,
                 # so reuse the adjacent scene's verified media rather than
-                # a neutral card or graphic. The promotion is logged under
-                # its own status so the earlier "rejected_adjacent_reuse"
-                # entry reads as the first-pass refusal it was. A deferred
-                # donor that would show the wrong named person stays
-                # refused: the promotion must not override the identity
-                # boundary the main loop's nearest-neighbour path enforces
-                # (a Butler photo is never Kearse media).
+                # a neutral card or graphic.
                 promotable = []
+                promoted_paths = set()
                 for _deferred in deferred_adjacent:
-                    if _rescue_donor_identity_compatible(scene, _deferred[0], resolutions):
-                        _note_rescue_skip("adjacent_reuse_last_resort", str(_deferred[1] or ""))
+                    if _rescue_donor_identity_compatible(_scene, _deferred[0], _rescue_resolutions_snapshot):
+                        _note("adjacent_reuse_last_resort", str(_deferred[1] or ""))
                         promotable.append(_deferred)
+                        promoted_paths.add(str(_deferred[1] or ""))
                     else:
-                        _note_rescue_skip("rejected_adjacent_identity_mismatch", str(_deferred[1] or ""))
+                        _note("rejected_adjacent_identity_mismatch", str(_deferred[1] or ""))
                 valid_web_candidates.extend(promotable)
-            if valid_web_candidates:
-                # Closest verified media first: an asset no scene uses yet
-                # outranks an already-selected one, whatever the raw score
-                # scales say (provider scores are 0-100 while alternate
-                # scores are 0-1; see _normalize_rescue_score). A graphic
-                # must never be chosen while an unused verified alternate
-                # sits in the same job's pool.
-                valid_web_candidates.sort(
-                    key=lambda item: (
-                        1 if final_uses.get(item[2], 0) == 0 else 0,
-                        1 if item[3] else 0,
-                        _normalize_rescue_score(item[4]),
-                        _normalize_rescue_score(
-                            item[0].get("final_score")
-                            or item[0].get("score")
-                            or item[0].get("metadata_score")
-                            or 0.0
-                        ),
-                    ),
-                    reverse=True,
-                )
-                # Ownership-watermark filter: the best-ranked candidate may
-                # carry a stock-agency credit line in the pixels (the
-                # Berlin Wall scene 2 photo did), which the late handoff
-                # gate rejects after this rescue has already accepted it.
-                # Walk the ranked list and take the first ownership-clean
-                # candidate instead of blindly taking [0].
-                chosen = None
-                for candidate_tuple in valid_web_candidates:
-                    candidate_path = str(candidate_tuple[1] or "")
-                    try:
-                        from .web_image.ownership_mark import inspect_ownership_mark
-                        watermarked = bool(inspect_ownership_mark(candidate_path).get("watermark"))
-                    except Exception:
-                        # Ownership OCR is best-effort and fails open.
-                        watermarked = False
-                    if watermarked:
-                        # Record on the resolution's own ledger: the
-                        # graphic-fallback resolution was built from a copy
-                        # of the module-level attempts, so appending there
-                        # alone would never reach the returned resolution.
-                        watermark_attempt = {
-                            "source": "web",
-                            "stage": "pre_stock_web_rescue",
-                            "status": "ownership_watermark_detected",
-                            "path": candidate_path,
-                        }
-                        if resolutions.get(idx) is not None:
-                            resolutions[idx].attempts.append(watermark_attempt)
-                        else:
-                            attempts[idx].append(watermark_attempt)
-                        continue
-                    chosen = candidate_tuple
-                    break
-                if chosen is None:
-                    continue
-                chosen_cand, chosen_path, chosen_identity, chosen_verified, chosen_score, chosen_qwen = chosen
+            else:
+                promoted_paths = set()
 
-                # If candidate not yet verified, try verifying with visual_verifier if available
-                if not chosen_verified and visual_verifier is not None:
+            if not valid_web_candidates:
+                return {
+                    "idx": idx,
+                    "valid": [],
+                    "deferred": deferred_adjacent,
+                    "ledger": _ledger,
+                    "previous": _previous,
+                    "promoted_paths": promoted_paths,
+                }
+
+            # Closest verified media first: an asset no scene uses yet
+            # outranks an already-selected one, whatever the raw score
+            # scales say. (Snapshot sort; Phase 2 re-sorts against the
+            # live counts before choosing.)
+            valid_web_candidates.sort(
+                key=lambda item: (
+                    1 if _rescue_uses_snapshot.get(item[2], 0) == 0 else 0,
+                    1 if item[3] else 0,
+                    _normalize_rescue_score(item[4]),
+                    _normalize_rescue_score(
+                        item[0].get("final_score")
+                        or item[0].get("score")
+                        or item[0].get("metadata_score")
+                        or 0.0
+                    ),
+                ),
+                reverse=True,
+            )
+
+            # Verify the top unverified candidate. The vision call is the
+            # slow part (~60-76s); it runs here, inside the parallel
+            # worker, so N scenes verify concurrently instead of one at
+            # a time. A transient failure (verifier error / timeout) is
+            # retried once with a short backoff; a hard REJECT is a
+            # verdict and is never retried.
+            _top = valid_web_candidates[0]
+            _top_cand, _top_path, _top_id, _top_verified, _top_score, _top_qwen = _top
+            if not _top_verified and visual_verifier is not None and _lane_vision_open("web"):
+                # Drain-only: the web lane budget is closed, so the
+                # rescue must not file a new web vision call either.
+                _attempts_left = 2  # 1 try + 1 bounded retry
+                while _attempts_left > 0:
+                    _attempts_left -= 1
                     try:
                         v_ok, v_reason, v_sc, v_qw = _verification_result(
-                            scene, chosen_cand, visual_verifier,
+                            _scene, _top_cand, visual_verifier,
                             fatal_rejections=fatal_rejections,
                             fatal_reject_verdicts=fatal_reject_verdicts)
                         if v_ok and isinstance(v_qw, Mapping):
-                            chosen_verified = True
-                            chosen_score = float(v_sc or 0.0)
+                            _top_verified = True
+                            _top_score = float(v_sc or 0.0)
+                            _top_qwen = v_qw
+                            valid_web_candidates[0] = (
+                                _top_cand, _top_path, _top_id,
+                                _top_verified, _top_score, _top_qwen,
+                            )
+                            break
+                        # A verdict (reject) is final; only a transient
+                        # verifier error / timeout earns a retry.
+                        _reason = str(v_reason or "").lower()
+                        if _attempts_left > 0 and (
+                            _reason.startswith("visual_verifier_error")
+                            or "timeout" in _reason
+                            or "timed out" in _reason
+                        ):
+                            _note("visual_verification_retry", _top_path)
+                            time.sleep(5.0)
+                            continue
+                        break
                     except Exception:
-                        pass
-                strict_scene = bool(
-                    (isinstance(scene.get("visual_requirement"), Mapping) and scene["visual_requirement"].get("strict_identity"))
-                    or scene_requires_visual_verification(scene)
+                        if _attempts_left > 0:
+                            _note("visual_verification_retry", _top_path)
+                            time.sleep(5.0)
+                            continue
+                        break
+            return {
+                "idx": idx,
+                "valid": valid_web_candidates,
+                "deferred": deferred_adjacent,
+                "ledger": _ledger,
+                "previous": _previous,
+                "promoted_paths": promoted_paths,
+            }
+
+        # --- Phase 1 driver: run _rescue_scene_work for all unresolved
+        # scenes concurrently. Bounded by the rescue deadline: futures
+        # still running when it passes are cancelled, and their scenes
+        # fall through to stock/graphic.
+        _rescue_results: Dict[int, Any] = {}
+        _rescue_executor = ThreadPoolExecutor(
+            max_workers=_rescue_workers, thread_name_prefix="rescue-scene"
+        )
+        try:
+            _rescue_futures = {
+                _rescue_executor.submit(_rescue_scene_work, _idx): _idx
+                for _idx in unresolved_before_stock
+            }
+            for _fut in _rescue_futures:
+                # Wait for each future with the remaining deadline budget.
+                _now = time.monotonic()
+                if _now >= _rescue_deadline:
+                    break
+                try:
+                    _res = _fut.result(timeout=max(0.0, _rescue_deadline - _now))
+                except Exception:
+                    _res = None
+                if isinstance(_res, dict) and _res.get("idx") is not None:
+                    _rescue_results[int(_res["idx"])] = _res
+        finally:
+            _rescue_executor.shutdown(wait=False, cancel_futures=True)
+
+        # --- Phase 2: sequential merge in scene order. Re-validates
+        # caps/adjacency against the LIVE counts (earlier merges may
+        # have claimed an asset), re-sorts, runs the ownership filter,
+        # applies the strict fallback, and builds the resolution. The
+        # output is deterministic (same scene -> same asset) because
+        # merges happen in scene order regardless of Phase 1 completion
+        # order.
+        for idx in unresolved_before_stock:
+            if time.monotonic() >= _rescue_deadline:
+                print(
+                    "   [v2] pre-stock web image rescue deadline reached; "
+                    f"{len(unresolved_before_stock) - len(_rescue_results)} scene(s) fall through to stock/graphic",
+                    flush=True,
                 )
-                if not chosen_verified and strict_scene:
-                    chosen_has_file = bool(chosen_path and Path(chosen_path).is_file() and Path(chosen_path).stat().st_size > 0)
-                    conflict = bool(chosen_cand.get("entity_conflict") or chosen_cand.get("fatal_mismatch"))
-                    if chosen_has_file and not conflict:
-                        chosen_verified = True
-                        chosen_score = max(chosen_score, 60.0)
+                break
+            work = _rescue_results.get(idx)
+            if work is None:
+                continue
+            # Replay the Phase 1 ledger onto the scene's attempts (and
+            # onto the old resolution's attempts when it is a different
+            # list, matching _note_rescue_skip).
+            for _entry in work.get("ledger") or []:
+                attempts[idx].append(dict(_entry))
+                _cur = resolutions.get(idx)
+                if _cur is not None and _cur.attempts is not attempts[idx]:
+                    _cur.attempts.append(dict(_entry))
+            valid_web_candidates = work.get("valid") or []
+            if not valid_web_candidates:
+                continue
+            scene = rows[idx]
+            adjacent_identities, adjacent_digests = _adjacent_asset_keys(resolutions, idx)
+            # Re-validate against LIVE counts: an asset an earlier merge
+            # claimed may now be at its reuse cap, or now adjacent to a
+            # claimed asset. Drop candidates that no longer pass. The
+            # cap still applies to every candidate, but the adjacency
+            # drop exempts donors Phase 1 promoted as last-resort
+            # adjacent reuse — the promotion already decided that asset
+            # is acceptable, and re-dropping it would undo the promotion
+            # (the adjacent-donor regression).
+            _promoted_paths = set(work.get("promoted_paths") or [])
+            _live_valid = []
+            for _t in valid_web_candidates:
+                _c, _c_path, _c_id, _v, _s, _q = _t
+                _cap = _reuse_limit_for_resolution(scene, _c, non_mixed_limit=2) if hasattr(_c, "provider") else 2
+                if _c_id and final_uses.get(_c_id, 0) >= _cap:
+                    continue
+                _c_sha = _rescue_sha(_c_path)
+                if _c_sha and final_sha_uses.get(_c_sha, 0) >= _cap:
+                    continue
+                if _c_path not in _promoted_paths and (
+                    (_c_id and _c_id in adjacent_identities)
+                    or (_c_sha and _c_sha in adjacent_digests)
+                ):
+                    continue
+                _live_valid.append(_t)
+            if not _live_valid:
+                continue
+            valid_web_candidates = _live_valid
+            valid_web_candidates.sort(
+                key=lambda item: (
+                    1 if final_uses.get(item[2], 0) == 0 else 0,
+                    1 if item[3] else 0,
+                    _normalize_rescue_score(item[4]),
+                    _normalize_rescue_score(
+                        item[0].get("final_score")
+                        or item[0].get("score")
+                        or item[0].get("metadata_score")
+                        or 0.0
+                    ),
+                ),
+                reverse=True,
+            )
+            # Ownership-watermark filter: the best-ranked candidate may
+            # carry a stock-agency credit line in the pixels, which the
+            # late handoff gate rejects after this rescue has already
+            # accepted it. Walk the ranked list and take the first
+            # ownership-clean candidate instead of blindly taking [0].
+            chosen = None
+            for candidate_tuple in valid_web_candidates:
+                candidate_path = str(candidate_tuple[1] or "")
+                try:
+                    from .web_image.ownership_mark import inspect_ownership_mark
+                    watermarked = bool(inspect_ownership_mark(candidate_path).get("watermark"))
+                except Exception:
+                    watermarked = False
+                if watermarked:
+                    watermark_attempt = {
+                        "source": "web",
+                        "stage": "pre_stock_web_rescue",
+                        "status": "ownership_watermark_detected",
+                        "path": candidate_path,
+                    }
+                    if resolutions.get(idx) is not None:
+                        resolutions[idx].attempts.append(watermark_attempt)
                     else:
-                        continue
+                        attempts[idx].append(watermark_attempt)
+                    continue
+                chosen = candidate_tuple
+                break
+            if chosen is None:
+                continue
+            chosen_cand, chosen_path, chosen_identity, chosen_verified, chosen_score, chosen_qwen = chosen
+            strict_scene = bool(
+                (isinstance(scene.get("visual_requirement"), Mapping) and scene["visual_requirement"].get("strict_identity"))
+                or scene_requires_visual_verification(scene)
+            )
+            if not chosen_verified and strict_scene:
+                chosen_has_file = bool(chosen_path and Path(chosen_path).is_file() and Path(chosen_path).stat().st_size > 0)
+                conflict = bool(chosen_cand.get("entity_conflict") or chosen_cand.get("fatal_mismatch"))
+                if chosen_has_file and not conflict:
+                    chosen_verified = True
+                    chosen_score = max(chosen_score, 60.0)
+                else:
+                    continue
 
-                source_provider = str(chosen_cand.get("provider") or chosen_cand.get("source") or "web").strip().lower()
-                if source_provider not in {"web", "web_image", "web_image_resolver", "web images"}:
-                    source_provider = "web"
-                source_url = str(chosen_cand.get("origin_url") or chosen_cand.get("source_url") or chosen_cand.get("url") or "")
+            source_provider = str(chosen_cand.get("provider") or chosen_cand.get("source") or "web").strip().lower()
+            if source_provider not in {"web", "web_image", "web_image_resolver", "web images"}:
+                source_provider = "web"
+            source_url = str(chosen_cand.get("origin_url") or chosen_cand.get("source_url") or chosen_cand.get("url") or "")
 
-                expected_req_hash = str((scene.get("visual_requirement") or {}).get("requirement_hash") or "")
-                chosen_qwen = dict(chosen_qwen or {})
-                from .visual_intelligence.decision import asset_fingerprint
-                cut_sha = asset_fingerprint(chosen_path) if chosen_path else ""
-                if chosen_verified:
-                    chosen_qwen.update({
-                        "accepted": True,
-                        "status": "accepted",
-                        "visual_checked": True,
-                        "semantic_verified": True,
-                        "visual_available": True,
-                        "verified_requirement_hash": expected_req_hash,
-                        "verified_asset_sha256": cut_sha,
-                        "visual_review_policy_version": 17,
-                    })
-
-                current_attempts = list(resolutions[idx].attempts) if resolutions.get(idx) else []
-                _accepted_entry = {
-                    "source": "web",
-                    "stage": "pre_stock_web_rescue",
+            expected_req_hash = str((scene.get("visual_requirement") or {}).get("requirement_hash") or "")
+            chosen_qwen = dict(chosen_qwen or {})
+            from .visual_intelligence.decision import asset_fingerprint
+            cut_sha = asset_fingerprint(chosen_path) if chosen_path else ""
+            if chosen_verified:
+                chosen_qwen.update({
+                    "accepted": True,
                     "status": "accepted",
-                    "candidate_path": chosen_path,
-                }
-                if bool(chosen_cand.get("prep_cache_hit")):
-                    # Tier audit: a replay must show this image came from
-                    # the prep cache, not a live vision pass.
-                    _accepted_entry.update({
-                        "source": "cached_prep",
-                        "prep_cache_hit": True,
-                        "prep_fuzzy_score": chosen_cand.get("prep_fuzzy_score"),
-                        "prep_manifest_hit": bool(chosen_cand.get("prep_manifest_hit")),
-                        "prep_cache_resolved": bool(chosen_cand.get("prep_cache_resolved")),
-                    })
-                current_attempts.append(_accepted_entry)
-                _rescue_ledger = _candidate_ledger(idx, chosen_path)
-                if bool(chosen_cand.get("prep_cache_hit")):
-                    _rescue_ledger.append({
-                        "path": chosen_path,
-                        "source": "cached_prep",
-                        "provider": "web",
-                        "selected": True,
-                        "verification_status": "accepted",
-                        "prep_cache_hit": True,
-                        "prep_fuzzy_score": chosen_cand.get("prep_fuzzy_score"),
-                        "web_fallback_layer": "cached_prep",
-                    })
-                resolutions[idx] = SceneResolution(
-                    scene_index=int(scene.get("scene_index", idx)),
-                    scene_id=str(scene.get("scene_id") or ""),
-                    container_id=str(scene.get("container_id") or ""),
-                    contract_hash=str(scene.get("contract_hash") or ""),
-                    final_scene_context=dict(scene),
-                    selected_path=chosen_path,
-                    media_type=str(chosen_cand.get("media_type") or "image"),
-                    provider=source_provider,
-                    source_url=source_url,
-                    rights_status=str(chosen_cand.get("rights_status") or "unknown"),
-                    rights_risk=str(chosen_cand.get("rights_risk") or "high"),
-                    rights_review_required=bool(chosen_cand.get("rights_review_required", True)),
-                    rights_evidence=str(chosen_cand.get("rights_evidence") or ""),
-                    metadata_score=float(chosen_cand.get("final_score") or chosen_cand.get("score") or 0.0),
-                    resolution_kind="pre_stock_web_rescue",
-                    query_used=str(chosen_cand.get("query") or chosen_cand.get("query_used") or ""),
-                    attempts=current_attempts,
-                    visual_decision=chosen_qwen,
-                    verification_status="verified" if chosen_verified else "deterministic_degraded",
-                    candidate_id=str(chosen_cand.get("candidate_id") or chosen_cand.get("id") or ""),
-                    asset_fingerprint=cut_sha or str(chosen_cand.get("asset_fingerprint") or chosen_cand.get("fingerprint") or ""),
-                    license=str(chosen_cand.get("license") or ""),
-                    license_url=str(chosen_cand.get("license_url") or ""),
-                    attribution=str(chosen_cand.get("attribution") or ""),
-                    creator=str(chosen_cand.get("creator") or chosen_cand.get("author") or ""),
-                    gate_outcomes=dict(chosen_cand.get("gate_outcomes") or {}),
-                    requirement_hash=expected_req_hash,
-                    candidate_evidence=dict(chosen_cand.get("candidate_evidence") or {}),
-                    candidate_ledger=_rescue_ledger,
-                    status="accepted",
-                    fallback_reason="web_image_rescued_before_stock_fallback",
-                )
-                if chosen_identity:
-                    final_uses[chosen_identity] = final_uses.get(chosen_identity, 0) + 1
-                chosen_sha = _rescue_sha(chosen_path)
-                if chosen_sha:
-                    final_sha_uses[chosen_sha] = final_sha_uses.get(chosen_sha, 0) + 1
-                # A replaced unbound YouTube selection no longer occupies
-                # its slot: release its counts so a later scene's rescue is
-                # not blocked by an asset this job no longer shows.
-                if _previous is not None and _is_youtube_source(_previous):
-                    old_identity = _resolution_asset_identity(_previous)
-                    if old_identity and final_uses.get(old_identity, 0) > 0:
-                        final_uses[old_identity] -= 1
-                    old_sha = _rescue_sha(str(_previous.selected_path or ""))
-                    if old_sha and final_sha_uses.get(old_sha, 0) > 0:
-                        final_sha_uses[old_sha] -= 1
-                print(f"   [v2] pre-stock web image rescue succeeded for scene {idx + 1} with {chosen_path}", flush=True)
+                    "visual_checked": True,
+                    "semantic_verified": True,
+                    "visual_available": True,
+                    "verified_requirement_hash": expected_req_hash,
+                    "verified_asset_sha256": cut_sha,
+                    "visual_review_policy_version": 17,
+                })
+
+            current_attempts = list(resolutions[idx].attempts) if resolutions.get(idx) else []
+            _accepted_entry = {
+                "source": "web",
+                "stage": "pre_stock_web_rescue",
+                "status": "accepted",
+                "candidate_path": chosen_path,
+            }
+            if bool(chosen_cand.get("prep_cache_hit")):
+                _accepted_entry.update({
+                    "source": "cached_prep",
+                    "prep_cache_hit": True,
+                    "prep_fuzzy_score": chosen_cand.get("prep_fuzzy_score"),
+                    "prep_manifest_hit": bool(chosen_cand.get("prep_manifest_hit")),
+                    "prep_cache_resolved": bool(chosen_cand.get("prep_cache_resolved")),
+                })
+            current_attempts.append(_accepted_entry)
+            _rescue_ledger = _candidate_ledger(idx, chosen_path)
+            if bool(chosen_cand.get("prep_cache_hit")):
+                _rescue_ledger.append({
+                    "path": chosen_path,
+                    "source": "cached_prep",
+                    "provider": "web",
+                    "selected": True,
+                    "verification_status": "accepted",
+                    "prep_cache_hit": True,
+                    "prep_fuzzy_score": chosen_cand.get("prep_fuzzy_score"),
+                    "web_fallback_layer": "cached_prep",
+                })
+            _previous = work.get("previous")
+            resolutions[idx] = SceneResolution(
+                scene_index=int(scene.get("scene_index", idx)),
+                scene_id=str(scene.get("scene_id") or ""),
+                container_id=str(scene.get("container_id") or ""),
+                contract_hash=str(scene.get("contract_hash") or ""),
+                final_scene_context=dict(scene),
+                selected_path=chosen_path,
+                media_type=str(chosen_cand.get("media_type") or "image"),
+                provider=source_provider,
+                source_url=source_url,
+                rights_status=str(chosen_cand.get("rights_status") or "unknown"),
+                rights_risk=str(chosen_cand.get("rights_risk") or "high"),
+                rights_review_required=bool(chosen_cand.get("rights_review_required", True)),
+                rights_evidence=str(chosen_cand.get("rights_evidence") or ""),
+                metadata_score=float(chosen_cand.get("final_score") or chosen_cand.get("score") or 0.0),
+                resolution_kind="pre_stock_web_rescue",
+                query_used=str(chosen_cand.get("query") or chosen_cand.get("query_used") or ""),
+                attempts=current_attempts,
+                visual_decision=chosen_qwen,
+                verification_status="verified" if chosen_verified else "deterministic_degraded",
+                candidate_id=str(chosen_cand.get("candidate_id") or chosen_cand.get("id") or ""),
+                asset_fingerprint=cut_sha or str(chosen_cand.get("asset_fingerprint") or chosen_cand.get("fingerprint") or ""),
+                license=str(chosen_cand.get("license") or ""),
+                license_url=str(chosen_cand.get("license_url") or ""),
+                attribution=str(chosen_cand.get("attribution") or ""),
+                creator=str(chosen_cand.get("creator") or chosen_cand.get("author") or ""),
+                gate_outcomes=dict(chosen_cand.get("gate_outcomes") or {}),
+                requirement_hash=expected_req_hash,
+                candidate_evidence=dict(chosen_cand.get("candidate_evidence") or {}),
+                candidate_ledger=_rescue_ledger,
+                status="accepted",
+                fallback_reason="web_image_rescued_before_stock_fallback",
+            )
+            if chosen_identity:
+                final_uses[chosen_identity] = final_uses.get(chosen_identity, 0) + 1
+            chosen_sha = _rescue_sha(chosen_path)
+            if chosen_sha:
+                final_sha_uses[chosen_sha] = final_sha_uses.get(chosen_sha, 0) + 1
+            # A replaced unbound YouTube selection no longer occupies
+            # its slot: release its counts so a later scene's rescue is
+            # not blocked by an asset this job no longer shows.
+            if _previous is not None and _is_youtube_source(_previous):
+                old_identity = _resolution_asset_identity(_previous)
+                if old_identity and final_uses.get(old_identity, 0) > 0:
+                    final_uses[old_identity] -= 1
+                old_sha = _rescue_sha(str(_previous.selected_path or ""))
+                if old_sha and final_sha_uses.get(old_sha, 0) > 0:
+                    final_sha_uses[old_sha] -= 1
+            print(f"   [v2] pre-stock web image rescue succeeded for scene {idx + 1} with {chosen_path}", flush=True)
 
         # The rescue's visual window ends here: restore the context the
         # rescue borrowed, so the stock stage and the terminal

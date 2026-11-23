@@ -89,12 +89,23 @@ class ClipIntelligencePipeline:
         emergency_threshold: float = DEFAULT_EMERGENCY_THRESHOLD,
         max_frames: int = MAX_FRAMES_PER_CLIP,
         visual_required: bool = False,
+        lane_budget=None,
+        lane_scheduler=None,
     ):
         self.vision_client = vision_client
         self.visual_required = bool(visual_required)
         self.accept_threshold = float(accept_threshold)
         self.emergency_threshold = float(emergency_threshold)
         self.max_frames = int(max_frames)
+        # Vision lanes: when a lane scheduler is supplied, batch vision
+        # is filed through it (per-lane in-flight caps + decided-set
+        # retry-only-missing) and charged to ``lane_budget``'s lane.
+        # The client itself is normally a _ContextClient bound to that
+        # lane's child context (see VisualDecisionContext.child), so
+        # _reserve_call enforces the lane's call budget too. Without a
+        # scheduler the pipeline behaves exactly as before.
+        self.lane_budget = lane_budget
+        self.lane_scheduler = lane_scheduler
 
     def analyze_clip(
         self,
@@ -216,11 +227,12 @@ class ClipIntelligencePipeline:
             batch_candidates.append({"candidate_id": candidate_id, "path": clip_path})
         if self.vision_client is None:
             return analyses
-        # SAFE BATCH: do NOT truncate to the per-batch size. The context
-        # layer splits the candidates into safe batches of 2 and files
-        # them in parallel; truncating here would silently drop candidates
-        # from vision (they would fail open instead of being judged).
-        # Cap the total at 8 candidates (4 safe batches) as a safety bound.
+        # Vision lanes: batches are 4 candidates x 2 frames (8 images)
+        # per request. The context layer splits by images-per-request
+        # (transport ceiling 16) and files chunks in parallel;
+        # truncating here would silently drop candidates from vision
+        # (they would fail open instead of being judged).
+        # Cap the total at 8 candidates (2 lane batches) as a safety bound.
         batch_candidates = batch_candidates[:8]
         if not batch_candidates:
             return analyses
@@ -253,11 +265,36 @@ class ClipIntelligencePipeline:
                 subject=subject,
                 candidate_ids=[c["candidate_id"] for c in judged],
             )
-            results = self.vision_client.analyze_clip_frames_batch(
-                judged,
-                user_prompt=prompt,
-                system_prompt=CLIP_BATCH_SYSTEM_PROMPT,
-            )
+            if self.lane_scheduler is not None:
+                # File through the lane scheduler: per-lane in-flight
+                # caps, and a partial batch retries only its missing
+                # candidates (never re-judges a decided one). The vision
+                # client call itself still goes through the lane child's
+                # _ContextClient, so calls are charged to the YT lane.
+                by_id = {c["candidate_id"]: c for c in judged}
+
+                def _file_batch(ids):
+                    subset = [by_id[cid] for cid in ids if cid in by_id]
+                    if not subset:
+                        return {}
+                    return self.vision_client.analyze_clip_frames_batch(
+                        subset,
+                        user_prompt=prompt,
+                        system_prompt=CLIP_BATCH_SYSTEM_PROMPT,
+                    )
+
+                results = self.lane_scheduler.file_batch(
+                    "youtube",
+                    f"yt-scene-{scene_index}",
+                    [c["candidate_id"] for c in judged],
+                    _file_batch,
+                )
+            else:
+                results = self.vision_client.analyze_clip_frames_batch(
+                    judged,
+                    user_prompt=prompt,
+                    system_prompt=CLIP_BATCH_SYSTEM_PROMPT,
+                )
             for cand in batch_candidates:
                 candidate_id = cand["candidate_id"]
                 if candidate_id not in extracted:

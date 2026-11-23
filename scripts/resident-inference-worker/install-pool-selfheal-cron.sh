@@ -22,6 +22,10 @@ Register the pool self-heal cron (parent/coordinator only):
   Then verify the first run (within ~2 min):
     - it runs pool_selfheal.py --check and reports the plan
     - with a healthy pool it spawns nothing and does nothing
+    - it NEVER spawns a worker: spawns are parent-only (cron-spawned
+      workers die at the 300s timeout, 2026-11-21) — a run with spawns
+      owed writes the scale-up signal and reports the spawn list to
+      the parent instead
     - do NOT test it by killing a worker during a render: the render
       gate forbids spawns while a render is ACTIVE, and the run must
       exit after the loop check.

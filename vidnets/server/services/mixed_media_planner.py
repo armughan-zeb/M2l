@@ -104,7 +104,11 @@ def _media_share(web, youtube, stock):
     return {"Web Images": web, "YouTube Clips": youtube, "Stock Media": stock, "AI Images": 0.0}
 
 _NICHE_MEDIA_PROFILES.update({
-    "crime": _media_share(.30, .55, .15), "history": _media_share(.45, .45, .10),
+    # Spec §5.1: crime/documentary 60% YouTube, history/royal 65%.
+    # History was 45% YouTube / 45% web — archival footage is the point
+    # of a history documentary, not stills. Crime was 55% YouTube / 15%
+    # stock; stock drops to the spec 10%.
+    "crime": _media_share(.30, .60, .10), "history": _media_share(.30, .65, .05),
     "royal": _media_share(.30, .65, .05), "documentary": _media_share(.30, .60, .10),
     "sports": _media_share(.20, .75, .05), "action": _media_share(.20, .75, .05),
     "gaming": _media_share(.15, .80, .05), "travel": _media_share(.20, .55, .25),
@@ -115,7 +119,10 @@ _NICHE_MEDIA_PROFILES.update({
     "business": _media_share(.35, .55, .10), "finance": _media_share(.35, .55, .10),
     "food": _media_share(.30, .60, .10), "architecture": _media_share(.30, .60, .10),
     "education": _media_share(.35, .55, .10), "health": _media_share(.35, .55, .10),
-    "lifestyle": _media_share(.30, .60, .10), "general": _media_share(.25, .55, .20),
+    # Spec §5.1: lifestyle/fitness is 20% YouTube / 80% web / 0% stock —
+    # clean stills, not footage. The old 60% YouTube weight was the
+    # fitness-lifestyle default leaking into every lifestyle job.
+    "lifestyle": _media_share(.80, .20, .00), "general": _media_share(.25, .55, .20),
     "disaster": _media_share(.35, .60, .05), "environment": _media_share(.30, .60, .10),
     "entertainment": _media_share(.30, .65, .05), "music": _media_share(.30, .65, .05),
 })
@@ -155,8 +162,32 @@ _NICHE_RETRIEVAL_POLICIES = {
         "yt_max_download_attempts_per_scene": 4,
         "mixed_yt_clip_max_seconds": 8.0,
         "max_still_hold_seconds": 3.2,
-        "max_visual_beat_seconds": 3.1,
+        # Spec §5.1: royal/history archival pans, 3.4s beats.
+        "max_visual_beat_seconds": 3.4,
         "intro_media_max_shots": 7,
+    },
+    "documentary": {
+        "web_max_candidate_downloads": 22,
+        "yt_download_candidate_limit": 5,
+        "yt_max_download_attempts_per_scene": 4,
+        "mixed_yt_clip_max_seconds": 8.0,
+        "max_still_hold_seconds": 3.0,
+        # Spec §5.1: documentary/crime evidence zooms, 3.0s beats.
+        # Previously fell through to the general 3.4s policy.
+        "max_visual_beat_seconds": 3.0,
+        "intro_media_max_shots": 7,
+    },
+    "lifestyle": {
+        "web_max_candidate_downloads": 20,
+        "yt_download_candidate_limit": 2,
+        "yt_max_download_attempts_per_scene": 3,
+        "mixed_yt_clip_max_seconds": 8.0,
+        "max_still_hold_seconds": 3.5,
+        # Spec §5.1: lifestyle/fitness clean stills, 3.5s beats.
+        # Previously fell through to the general policy with a 60%
+        # YouTube weight; the weight fix above makes this entry agree.
+        "max_visual_beat_seconds": 3.5,
+        "intro_media_max_shots": 6,
     },
     "gaming": {
         "web_max_candidate_downloads": 18,

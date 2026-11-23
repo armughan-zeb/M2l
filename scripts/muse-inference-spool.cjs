@@ -142,6 +142,45 @@ function heartbeatAgeByWorker(dir) {
   return ages;
 }
 
+// When a worker claimed a request (epoch ms), or null if it cannot be
+// established. A claim is an atomic RENAME of the request file, so the
+// claim file's mtime is the REQUEST's creation time and must never be
+// used as the claim's age. The claim time is the worker's LATEST
+// CLAIMED line for this (worker, request) in worker.log — written in
+// the same command as the rename, so it is the claim time; a previous
+// hold's old line is superseded because only the latest line counts.
+// The claim file's ctime (which the rename updates) is the fallback
+// for unlogged claims. A timestamp in the future (clock skew) is
+// discarded, not trusted.
+function claimTimeMs(dir, id, workerId, claimFile) {
+  const now = Date.now();
+  try {
+    const logPath = path.join(dir, 'worker.log');
+    const size = fs.statSync(logPath).size;
+    const fd = fs.openSync(logPath, 'r');
+    const start = Math.max(0, size - 200000);
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+    const needle = `[${workerId}] CLAIMED ${id}`;
+    let latest = null;
+    for (const line of buf.toString('utf8').split('\n')) {
+      const at = line.indexOf(needle);
+      if (at < 0) continue;
+      const after = line.slice(at + needle.length);
+      if (after !== '' && !/^\s/.test(after)) continue;
+      const stamp = Date.parse(line.slice(0, 19).replace(' ', 'T') + 'Z');
+      if (!Number.isNaN(stamp) && (latest === null || stamp > latest)) latest = stamp;
+    }
+    if (latest !== null && latest <= now + 5000) return latest;
+  } catch { /* no log line: fall back to ctime */ }
+  try {
+    const ctime = fs.statSync(claimFile).ctimeMs;
+    if (ctime <= now + 5000) return ctime;
+  } catch { /* unstatable: no claim time */ }
+  return null;
+}
+
 function rescueStaleClaim(dir, id, requestFile) {
   // A dead worker's claim strands the request: no other worker can claim
   // it, so it waits until expiry even though the pool is alive and idle.
@@ -163,8 +202,18 @@ function rescueStaleClaim(dir, id, requestFile) {
     }
   } catch { return; }
   if (!claimFile || !claimingWorker) return;
-  let claimAgeMs = Infinity;
-  try { claimAgeMs = Date.now() - fs.statSync(claimFile).mtimeMs; } catch { return; }
+  // Claim age, not request age (2026-11-21 rescue bug — same fix as
+  // pool_supervisor.py's sweep): a claim is an atomic RENAME of the
+  // request file, and a rename preserves mtime, so mtime is the
+  // REQUEST's creation time. A request created 1446s earlier but
+  // claimed 111s ago read as 1446s old and was rescued
+  // mid-composition. claimTimeMs() below takes the worker's latest
+  // CLAIMED log line for this (worker, request), falling back to the
+  // claim file's ctime (which the rename updates). Null when no claim
+  // time can be established: an unprovable age never rescues.
+  const claimTime = claimTimeMs(dir, id, claimingWorker, claimFile);
+  if (claimTime === null) return;
+  const claimAgeMs = Date.now() - claimTime;
   if (claimAgeMs < CLAIM_RESCUE_GRACE_MS) return;
   const ages = heartbeatAgeByWorker(dir);
   // A fresh legacy heartbeat cannot be attributed to a worker id, so it

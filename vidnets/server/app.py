@@ -1827,6 +1827,7 @@ def api_agent_access():
 @app.route('/api/agent/requests', methods=['GET'])
 @app.route('/api/agent/requests/<request_id>', methods=['GET'])
 @app.route('/api/agent/requests/<request_id>/complete', methods=['POST'])
+@app.route('/api/agent/requests/<request_id>/claim', methods=['POST'])
 @app.route('/api/agent/jobs/<job_id>', methods=['GET'])
 @app.route('/api/agent/jobs/<job_id>/retry', methods=['POST'])
 @require_active_access
@@ -1856,7 +1857,21 @@ def api_agent_bridge(request_id=None, job_id=None):
                 payload = request.get_json(silent=True)
                 if not isinstance(payload, dict):
                     return _json_error('Response must contain content or error.', 400)
-                result = agent_bridge.complete_request(request_id, owner, payload.get('content'), payload.get('error', ''))
+                if request.path.endswith('/claim'):
+                    # Claim a pending request for one answerer (bridge claim
+                    # race fix, 2026-11-21): the daemon's resident inbox,
+                    # the pool and hook-woken agents raced the same
+                    # requests and all but the fastest were refused with
+                    # "already answered". A claim makes the pickup visible
+                    # so the other answerers skip it instead of composing
+                    # a duplicate answer.
+                    lease = payload.get('lease_seconds')
+                    result = {'claimed': agent_bridge.claim_request(
+                        request_id, owner, payload.get('claimant') or owner,
+                        lease if lease is not None else 900),
+                        'request_id': request_id}
+                else:
+                    result = agent_bridge.complete_request(request_id, owner, payload.get('content'), payload.get('error', ''), payload.get('claimant'))
             else:
                 result = agent_bridge.read_request(request_id, owner)
         elif request.path.endswith('/requests'):
@@ -2183,8 +2198,26 @@ def _sanitize_user_progress_message_base(fraction, raw_msg):
         # baseline with a number no wave had reached. (Guarded on
         # "unresolved" only: a plain "retrying" label keeps its count
         # per test_progress_does_not_label_failed_image_searches_ready.)
+        #
+        # Two more counts are not job progress either, and showed the same
+        # lie in job d1ece590: a single-scene sub-batch reports "Web image
+        # scene 1/1 checked (1 resolved)" (a one-scene web handoff), which
+        # displayed as "Finding scene 1/1" at 61% of a 127-scene job and
+        # then stuck through the whole pre-stock rescue (the rescue emits
+        # no progress of its own) until the rescue-ready report arrived as
+        # "Preparing media 38/127". And a rescue subset count ("Mixed
+        # media rescue: Web image scene 5/12 checked ...") counts rescued
+        # scenes, not job scenes. Neither denominator is the job's scene
+        # list, so neither may be shown as "Finding scene N/M": show the
+        # stage without a count and let the job-level count ("Mixed media:
+        # rescue ready 38/127 scenes" -> "Preparing media 38/127") speak.
         if count_match and 'unresolved' not in msg_lower:
-            return f"Finding scene {count_match.group(1)}/{count_match.group(2)}"
+            try:
+                _scene_total = int(count_match.group(2))
+            except Exception:
+                _scene_total = 0
+            if _scene_total > 1 and 'rescue' not in msg_lower:
+                return f"Finding scene {count_match.group(1)}/{count_match.group(2)}"
         return "Finding YouTube footage" if any(k in msg_lower for k in ['youtube', 'yt-v2', 'yt clips']) else ("Finding stock media" if 'stock' in msg_lower else "Finding web images")
     if f >= 0.70 or any(k in msg_lower for k in ['rendering video', 'ffmpeg assembly', 'final mux', 'encoding final', 'finaliz']):
         if 'final' in msg_lower or f >= 0.94:
@@ -7703,7 +7736,7 @@ def _generate_source_query_bundle_parallel(
                 progress_value = 0.24 + min(0.04, elapsed / max(1.0, stage_seconds) * 0.04)
                 progress_callback(
                     progress_value,
-                    f"OpenRouter query repair: directing {len(subset_texts)} scenes "
+                    f"OpenRouter query planning: directing {len(subset_texts)} scenes "
                     f"({elapsed:.0f}s; ordered retries active)",
                 )
             except Exception:
@@ -9163,6 +9196,10 @@ def _build_audio_scene_plan(config, report_progress, expected_scene_plan=None, w
             or ''
         ),
         openrouter_tts_options=config.get('openrouter_tts_options') or {},
+        # Narration is the 10%→20% band: map per-chunk progress into it
+        # so the job percentage moves while chunks synthesize instead of
+        # sitting at 10% for the whole (previously ~280s) TTS stage.
+        progress_callback=lambda p, msg: report_progress(0.10 + 0.10 * p, msg),
     )
     if not audio_path or duration <= 0:
         raise RuntimeError("Audio generation failed")
@@ -10004,6 +10041,12 @@ def _run_web_media_branch(scene_texts, scene_durations, config, title, script,
             visual_context = _build_web_visual_context(config, len(scene_texts))
         if visual_context is not None:
             resolver_kwargs['visual_context'] = visual_context
+        # Vision lanes (§3.5): forward the adapter's per-scene publish
+        # callback so the web loader releases each scene's row as its
+        # verdict lands instead of only when the whole batch returns.
+        _web_on_scene_result = config.get('_web_on_scene_result')
+        if callable(_web_on_scene_result):
+            resolver_kwargs['on_scene_result'] = _web_on_scene_result
         web_result = resolve_web_images_for_video_fast(**resolver_kwargs)
     except Exception as exc:
         print(f"Warning: web image pipeline fallback: {exc}")
@@ -10580,7 +10623,24 @@ class _YoutubeProcessFuture:
             pass
 
     def _poll(self):
+        # Nov 22 (d1ece590 stall fix): liveness. The child relays progress
+        # only when a counter CHANGES (search complete, first transfer), so
+        # during the long selection phase (search -> transcript -> probe ->
+        # vision per candidate) the parent sees no new progress for 10+
+        # minutes and the 300s preparation-stall detector kills the attempt
+        # — run-0007 died at 650s with 408 candidates found and no genuine
+        # progress event since the search completed. New log output from the
+        # child IS real work: record it so the detector can tell "working
+        # slowly" from "stuck". A wedged child writes nothing, so a
+        # genuinely stuck branch still trips the detector.
+        before = self._progress_relay.offset
         self._progress_relay.poll()
+        if self._progress_relay.offset > before:
+            try:
+                from services.pipeline_activity import record_activity
+                record_activity("youtube")
+            except Exception:
+                pass
         if not self._finished and self._process.poll() is not None:
             self._progress_relay.poll(final=True)
             self._finish()
@@ -22482,10 +22542,20 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
         # Reporting 58% here caused every 30-55% YouTube/web update to be
         # discarded by the monotonic reporter, making the UI appear frozen or
         # out of order while retrieval was doing the expensive work.
-        # Captions are a parallel formatting task over Whisper's timestamped
-        # words. Keep their progress below the 0.24-0.28 OpenRouter planning
+        # Captions are a parallel formatting task over timestamped words.
+        # Keep their progress below the 0.24-0.28 OpenRouter planning
         # band so the monotonic reporter cannot mask scene-query/media status.
-        report_progress(0.20, "Generating captions from Whisper transcript...")
+        # Name the real word source: the TTS stage already aligns the words
+        # for most jobs (precomputed_words), so Whisper never runs there.
+        # Saying "Whisper" unconditionally misled the operator into
+        # blaming Whisper for a stall that was really media planning
+        # (Nov 22, 2026: captions done in seconds, label stuck 10+ min).
+        caption_source = (
+            "narration timing"
+            if audio_plan.get('whisper_words')
+            else "Whisper transcript"
+        )
+        report_progress(0.20, f"Generating captions from {caption_source}...")
         return generate_captions(
             audio_path=audio_plan['audio_path'],
             caption_style=job_config.get('caption_style', job_config.get('style')),
@@ -22679,6 +22749,18 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                     "   [flow] media: using script-derived scene contracts immediately "
                     f"({len(aligned_scene_texts)} scene(s)); Whisper will sync timings later"
                 )
+            # Report the media stage the moment it starts. The query
+            # planning that follows (topic anchor, niche policy, source
+            # query pre-bake) runs for minutes through the inference pool
+            # with no other progress call, so without this the display
+            # sits on the previous stage (narration/captions) for the
+            # whole window. 0.24 is the floor of the OpenRouter planning
+            # band; the message must carry no web/YouTube/stock word or
+            # the sanitizer labels it "Finding YouTube footage".
+            report_progress(
+                0.24,
+                f"OpenRouter query planning: directing {len(aligned_scene_texts)} scenes",
+            )
             # Resume reuse (Nov 20, 2026): when a previous attempt already
             # completed the media coordinator, its result is checkpointed
             # at checkpoints/media_plan.json (stage media_ready). Reuse it
@@ -22832,15 +22914,11 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                         f"{'audio-synced' if audio_plan_override is not None else 'script-derived'} scenes; "
                         f"web={_needs_web}, yt={_needs_yt_queries}, stock={_needs_stock})"
                     )
-                    active_query_sources = ", ".join(
-                        source for source, enabled in (
-                            ("web", _needs_web),
-                            ("YouTube", _needs_yt_queries),
-                            ("stock", _needs_stock),
-                        )
-                        if enabled
-                    )
-                    report_progress(0.24, f"LLM query planning: {active_query_sources} ({len(aligned_scene_texts)} scenes)")
+                    # The sources are already in the [query] print above;
+                    # naming them here (web/YouTube/stock) makes the
+                    # sanitizer label this "Finding YouTube footage"
+                    # while the job is still only planning queries.
+                    report_progress(0.24, f"LLM query planning for {len(aligned_scene_texts)} scenes")
                     query_bundle = _generate_source_query_bundle_parallel(
                         script,
                         query_title,
@@ -23052,7 +23130,12 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                         filename="storyboard.json",
                     )
                 if job_config.get('captions_enabled', False):
-                    print("   [flow] captions: formatting Whisper transcript in parallel; media retrieval does not wait for captions")
+                    _caption_words = (
+                        "narration-timed words"
+                        if audio_plan.get('whisper_words')
+                        else "Whisper transcript"
+                    )
+                    print(f"   [flow] captions: formatting {_caption_words} in parallel; media retrieval does not wait for captions")
                     caption_future = pipeline_executor.submit(_generate_subtitles, audio_plan)
 
                     def _log_caption_completion(completed_future):
@@ -23067,6 +23150,20 @@ def _run_video_pipeline_impl(config, progress_callback=None, cancellation=None):
                             print("   [flow] captions: subtitle file ready; media retrieval continues independently")
                         else:
                             print("   [flow] captions: subtitle file not requested; media retrieval continues independently")
+                        # Captions are done (or were not needed) — the job
+                        # is now in media retrieval. Say so here, or the
+                        # display keeps showing "Generating captions" for
+                        # the whole minutes-long media-planning window
+                        # (Nov 22, 2026: 10+ min stale while captions had
+                        # finished in seconds). The media stage reports
+                        # 0.30+ once retrieval starts and overwrites this.
+                        _caption_scene_count = len(audio_plan.get('scene_texts') or [])
+                        _handoff_message = (
+                            f"OpenRouter query planning: directing {_caption_scene_count} scenes"
+                            if _caption_scene_count else
+                            "OpenRouter query planning"
+                        )
+                        report_progress(0.24, _handoff_message)
 
                     caption_future.add_done_callback(_log_caption_completion)
                 if editorial_future is None and audio_plan:

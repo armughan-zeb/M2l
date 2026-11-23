@@ -16,7 +16,11 @@ respawn wake fired in the last 10 minutes — evidence the supervisor is
 dead; OR (b) liveness is fresh but live workers have been below target
 for > 300s with the gate idle — evidence the pool is empty while the
 loop ticks (fresh files prove the loop is alive, not that the pool is
-staffed). Neither is proof. Verify it yourself before acting.
+staffed); OR (c) a FRESH scale-up signal
+(`supervisor-scaleup-needed.json`, < 120s old) names owed workerIds
+while the gate is idle — evidence the loop found the pool short THIS
+tick and is summoning the parent (the fast path, 2026-11-21; no 300s
+wait). Neither is proof. Verify it yourself before acting.
 
 Spool dir: `~/workspace/vidnets-runtime/temp/inference-spool`
 (or `$MUSE_INFERENCE_SPOOL_DIR` if set).
@@ -31,14 +35,20 @@ Respawn-note template: `~/workspace/M2l/scripts/resident-inference-worker/POOL_S
      was stopped deliberately by the parent — do NOT spawn; report
      "supervisor parked" and stop.
    - `pool-status.json` and `supervisor-alive.json` `updatedAt` ages.
-     If EITHER is < 120s old, the supervisor is ALIVE — do NOT spawn;
-     report "supervisor alive" with the fresh age and stop. (A supervisor
-     that recovered between the hook poll and your check must not be
-     duplicated.)
+     If EITHER is < 120s old, the supervisor is ALIVE.
    - Fresh `worker-alive-<workerId>.json` heartbeats (< 90s old): these
      workers are LIVE and must be adopted, not replaced.
+   - `supervisor-scaleup-needed.json`: if present and fresh (< 120s),
+     read its `spawns` (owed workerIds) and `blocked` reasons. If the
+     wake reason was `pool_scaleup_needed`, a LIVE supervisor is
+     EXPECTED — do NOT stop on fresh liveness. Only escalate when the
+     signal is still fresh AND live workers are still below the target
+     from `pool_scaling.py` (idle 2, media floor 4, ceiling 8);
+     if the pool has recovered, report "pool recovered, signal stale"
+     and stop.
 2. Only if the supervisor is still dead (both files stale/missing) AND
-   no render is active AND not parked:
+   no render is active AND not parked — OR the scale-up signal is
+   still fresh and the pool is still short:
    - Do NOT spawn a supervisor subagent. A supervisor spawned as a
      subagent has NO subagent-spawn tool (`can_spawn=no`) and CANNOT
      spawn workers — proven 2026-11-20, when supervisor 761080e9 acked
@@ -58,12 +68,13 @@ Respawn-note template: `~/workspace/M2l/scripts/resident-inference-worker/POOL_S
    - ESCALATE the pending spawn actions to the parent: report the exact
      workerIds to spawn (lowest free slots up to target, from
      `pool-status.json` / `pool_scaling.py`: idle 2, media floor 4,
-     ceiling 8), the brief path, and the task line
-     `Your workerId is worker-N. Spool dir is <spool-dir>.` The parent
-     (a top-level agent) spawns the workers directly — or, if the
-     pool-selfheal cron (`POOL_SELFHEAL_CRON.md`) is registered, it
-     executes the queue within ~2 minutes and no parent action is
-     needed; say which applies.
+     ceiling 8 — or verbatim from the scale-up signal's `spawns` when
+     the wake was `pool_scaleup_needed`), the brief path, and the task
+     line `Your workerId is worker-N. Spool dir is <spool-dir>.` The
+     parent (a top-level agent) spawns the workers directly. The
+     pool-selfheal cron does NOT execute spawns — a cron run's workers
+     die at its 300s timeout (2026-11-21), so it only writes the
+     scale-up signal; a parent spawn is always needed, say so plainly.
    - Write `supervisor-agent-ack.json` ONLY for actions you are actually
      executing (list their `actionIds`): an ack is a 180-second lease,
      not a cure — a hollow ack silences the tripwire while the pool

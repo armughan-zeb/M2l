@@ -810,17 +810,84 @@ def kill_hung_child(pid: int) -> Dict[str, Any]:
     return {"ok": True, "pid": pid}
 
 
+def _restart_verify_port() -> int:
+    """TCP port the restarter verifies after a restart (default 5010).
+
+    ``headless_agent.start`` binds the first free port from 5010, so 5010
+    is the expected port. The env override exists so tests can verify
+    against a scratch port instead of the live server's port.
+    """
+    try:
+        port = int(os.environ.get("VIDZEO_JOB_DEBUGGER_RESTART_VERIFY_PORT", "") or 5010)
+    except (TypeError, ValueError):
+        port = 5010
+    return port if 1 <= port <= 65535 else 5010
+
+
 def restart_server(reason: str = "") -> Dict[str, Any]:
     """Restart this server process so the job auto-resumes from its
     checkpoint. A detached restarter shell (own session, survives this
     process) SIGTERMs the server PID, waits, SIGKILLs if needed, then runs
-    the documented start command. Callers must have verified no render is
-    in progress and the restart cap is not hit."""
-    vidnets_dir = Path(__file__).resolve().parent.parent
+    the documented start command and verifies :5010 answers before it
+    reports success. Callers must have verified no render is in progress
+    and the restart cap is not hit.
+
+    Regression (2026-11-21, 5x death loop): the restarter used to compute
+    the start directory as ``Path(__file__).parent.parent`` -- that is
+    ``vidnets/server/`` -- and then ran ``bash VIDNETS_AGENT.sh`` there.
+    The launcher lives in ``vidnets/`` (one level up), so the start
+    command failed with "No such file or directory" and the server never
+    came back. The failure was silent three ways over: the restarter's
+    own stderr went to DEVNULL, the start command was backgrounded with
+    ``&`` so its exit code was never checked, and nothing verified the
+    port afterwards. All three are fixed here: the directory is the repo
+    root (``parent.parent.parent``) and is preflight-checked, the
+    restarter's output goes to the restarter log, the start runs in the
+    foreground of the detached restarter, and the port is verified before
+    the restarter exits. The server is killed by exact PID only, and only
+    after a ``/proc/<pid>/cmdline`` check that the PID really is this
+    server's ``main.py`` -- never ``pkill -f``, which would match the
+    restarter's own shell.
+    """
+    # services/job_debugger.py -> server -> vidnets (repo root, where
+    # VIDNETS_AGENT.sh lives). parent.parent alone is vidnets/server/.
+    vidnets_dir = Path(__file__).resolve().parent.parent.parent
+    launcher = vidnets_dir / "VIDNETS_AGENT.sh"
     runtime = runtime_root()
     start_log = runtime / "logs" / "server-start.log"
+    restarter_log = runtime / "logs" / "job-debugger-restart.log"
     pid = os.getpid()
+    verify_port = _restart_verify_port()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    if not launcher.is_file():
+        message = (
+            f"restart aborted: VIDNETS_AGENT.sh not found at {launcher} "
+            f"(vidnets_dir={vidnets_dir}); server pid {pid} left running"
+        )
+        print(f"{LOG_PREFIX} {message}", flush=True)
+        try:
+            restarter_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(restarter_log, "a", encoding="utf-8") as log_handle:
+                log_handle.write(f"\n[{stamp}] {message}\n")
+        except OSError:
+            pass
+        return {"ok": False, "pid": pid, "reason": reason, "error": message}
+    # The restarter runs detached (own session) and logs EVERYTHING to the
+    # restarter log: a failed start must be loud, never a silent DEVNULL.
+    # The start command runs in the FOREGROUND of the restarter --
+    # headless_agent.start() already spawns main.py detached and waits up
+    # to 45s for /api/status -- so its exit code is meaningful, and the
+    # verify loop below confirms the port answers before declaring success.
     script = (
+        f'exec >> "{restarter_log}" 2>&1\n'
+        f'echo "[{stamp}] job-debugger restart: {reason} (server pid {pid})"\n'
+        f'echo "[{stamp}] launcher: {launcher} (vidnets_dir {vidnets_dir})"\n'
+        "# Kill by exact PID only, and only if that PID is this server:\n"
+        "# a reused PID (or a wrong one) must never be signalled.\n"
+        f'if ! tr "\\0" " " < "/proc/{pid}/cmdline" 2>/dev/null | grep -q "main.py"; then\n'
+        f'  echo "[{stamp}] ABORT: pid {pid} is not the Vidnets server (cmdline: $(tr "\\0" " " < "/proc/{pid}/cmdline" 2>/dev/null)); not killing anything"\n'
+        "  exit 1\n"
+        "fi\n"
         "sleep 3\n"
         f"kill -TERM {pid} 2>/dev/null || true\n"
         "for i in $(seq 1 10); do\n"
@@ -829,25 +896,56 @@ def restart_server(reason: str = "") -> Dict[str, Any]:
         "done\n"
         f"kill -KILL {pid} 2>/dev/null || true\n"
         "sleep 1\n"
-        f"cd {vidnets_dir} && setsid nohup bash VIDNETS_AGENT.sh "
-        f"--runtime-root {runtime} start "
-        f">> {start_log} 2>&1 < /dev/null &\n"
+        f'echo "[{stamp}] starting server: bash VIDNETS_AGENT.sh --runtime-root {runtime} start"\n'
+        f'bash "{launcher}" --runtime-root "{runtime}" start '
+        f'>> "{start_log}" 2>&1\n'
+        "start_rc=$?\n"
+        f'echo "[{stamp}] server start exited rc=$start_rc (full log: {start_log})"\n'
+        "if [ \"$start_rc\" -ne 0 ]; then\n"
+        f'  echo "[{stamp}] FATAL: server start failed (rc=$start_rc); server NOT back. See {start_log}"\n'
+        "  exit 1\n"
+        "fi\n"
+        f'echo "[{stamp}] verifying server answers on :{verify_port}..."\n'
+        f"for i in $(seq 1 60); do\n"
+        f"  if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{verify_port}' 2>/dev/null; then\n"
+        f'    echo "[{stamp}] VERIFIED: server responding on :{verify_port}"\n'
+        "    exit 0\n"
+        "  fi\n"
+        "  sleep 1\n"
+        "done\n"
+        f'echo "[{stamp}] FATAL: server did not respond on :{verify_port} within 60s; see {start_log}"\n'
+        "exit 1\n"
     )
-    restarter_log = runtime / "logs" / "job-debugger-restart.log"
     restarter_log.parent.mkdir(parents=True, exist_ok=True)
+    start_log.parent.mkdir(parents=True, exist_ok=True)
     with open(restarter_log, "a", encoding="utf-8") as log_handle:
-        log_handle.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] restart requested: {reason}\n")
+        log_handle.write(f"\n[{stamp}] restart requested: {reason}\n")
         log_handle.write(script)
-    subprocess.Popen(
-        ["bash", "-c", script],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
+    # Detached in its own session so killing the server cannot take the
+    # restarter down with it; its output goes to the restarter log file,
+    # not DEVNULL, so a spawn-level failure is visible too.
+    with open(restarter_log, "a", encoding="utf-8") as restarter_out:
+        subprocess.Popen(
+            ["bash", "-c", script],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=restarter_out,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+    print(
+        f"{LOG_PREFIX} restart requested ({reason}); restarter spawned, "
+        f"logging to {restarter_log}",
+        flush=True,
     )
-    print(f"{LOG_PREFIX} restart requested ({reason}); restarter spawned", flush=True)
-    return {"ok": True, "pid": pid, "reason": reason}
+    return {
+        "ok": True,
+        "pid": pid,
+        "reason": reason,
+        "restarter_log": str(restarter_log),
+        "start_log": str(start_log),
+        "verify_port": verify_port,
+    }
 
 
 # ---------------------------------------------------------------------------

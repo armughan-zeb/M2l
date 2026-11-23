@@ -127,11 +127,18 @@ class BaseSource(ABC):
         pass
 
     def is_available(self) -> bool:
-        """Health check — returns False if circuit breaker is open."""
+        """Health check — returns False if circuit breaker is open.
+
+        Round 4: the old code reset an expired circuit and then still
+        returned False, wasting one call per reset (the caller skipped
+        the source on the very call that healed it). A reset circuit
+        is available immediately.
+        """
         if self._circuit_open:
             if time.time() - self._last_failure_time > 60.0:
                 self._circuit_open = False
                 self._failure_count = 0
+                return True
             return False
         return True
 

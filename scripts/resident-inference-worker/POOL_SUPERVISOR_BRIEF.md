@@ -8,7 +8,7 @@ backlog, replace workers that die, and sweep up dead requests. You NEVER
 answer an inference request yourself — answering is the workers' job, and
 a supervisor that answers is a supervisor that stops supervising.
 
-## Who can spawn workers — read this first (2026-11-20)
+## Who can spawn workers — read this first (2026-11-20, corrected 2026-11-21)
 
 ONLY a top-level agent can spawn workers: the parent (main agent), or
 a top-level cron run such as the pool-selfheal cron (see
@@ -25,6 +25,16 @@ brief used to say. Proven 2026-11-20, twice in one day:
   workers for ~84 minutes (workers stopped 12:09 UTC for test 14's
   render; test 15's whole media stage ran with no vision) while
   liveness stayed fresh.
+
+And only a PARENT-DIRECT spawn survives (2026-11-21): a top-level cron
+run has the spawn tool, but workers it spawns DIE at the cron run's
+300s timeout — proven 2026-11-21, when self-heal run f0a5782e spawned
+worker-1 + worker-2 and both died at the timeout with 0 answers. So a
+cron run must NEVER execute a spawn: it writes the scale-up signal
+instead (see "Scale-up signal" below) and the parent spawns directly.
+There is no shell mechanism that makes a cron run's descendants
+survive the run — do not try to route around this with `setsid`,
+`nohup`, or a detached loop; the runtime reaps them anyway.
 
 If you are a subagent supervisor (you almost certainly are): NEVER
 claim you spawned a worker, and NEVER write an ack that implies work is
@@ -148,23 +158,30 @@ flap emptied it mid-media on Nov 21 while test 20 was at 62%.
    files (dead — the sweep below removes them).
 2. Target workers:
    - Render ACTIVE → 0 (above — workers stand down for renders).
-   - Media pending (`pending > 0`, gate idle) → target =
-     clamp(ceil(pending / 3), 4, 8). The floor while media is pending
-     is 4, not 2: batched vision files requests in parallel, so a
-     2-worker floor drains the batch too slowly. The ceiling stays 8
-     and the pending/3 slope above the floor is unchanged. Do NOT raise
-     the floor or the ceiling to 8-as-floor: the VM has 1.5 shared CPUs
-     and 7.7 GB RAM, so more than 4 workers mostly fight each other for
-     CPU — 4 is the sweet spot for draining a media burst.
-   - Idle with nothing pending (`pending == 0`, gate idle) → target 2.
-     Keep 2 warm — the next burst must not wait for a spawn — but do
-     not hold 4 warm when there is nothing to do.
+   - Media pending (`pending > 0`, gate idle) → target = 8 (the ceiling).
+     Vision is the bottleneck: each call is a ~60s worker round trip, the
+     visual gate issues up to 8 parallel checks, and a 4-worker pool
+     leaves half the gate queued until its deadline expires
+     (VisualBudgetExceeded). Any pending media work at all fills the pool
+     to the ceiling at once. The ceiling stays 8 — NOT raised: the VM has
+     1.5 shared CPUs and 7.7 GB RAM. (Changed 2026-11-22, user order:
+     vision is eating time, fastest optimizations. Supersedes the old
+     pending/3 slope, which needed 22+ pending to reach 8.)
+   - Idle with nothing pending (`pending == 0`, gate idle) → target 4.
+     Keep 4 warm — the next burst must not wait for a spawn — but do
+     not hold more than 4 warm when there is nothing to do.
    Executable form of this rule (same numbers, keep in sync):
    `scripts/resident-inference-worker/pool_scaling.py:scaling_target`.
 3. Scale up: if live workers < target, spawn the missing ones
-   (lowest free workerIds first). Spawn one at a time and confirm each
-   is running before the next — a burst of simultaneous spawns is the
-   slowest way to get a pool.
+   (lowest free workerIds first). The loop queues spawns for ALL
+   missing slots in a single 15s tick — there is no
+   one-worker-per-cycle limit — and writes the scale-up signal the
+   same tick (see "Scale-up signal" below), so the parent is summoned
+   within ~60s. Spawn one at a time and confirm each is running
+   before the next — a burst of simultaneous spawns is the slowest
+   way to get a pool. ONLY the parent spawns directly: a cron run's
+   spawns die at the 300s timeout, so the cron writes the signal and
+   reports the spawn list instead of spawning.
 4. Scale down: if live workers > target, pick an IDLE worker (one with
    no claim file of its own in the spool and no answer in progress —
    check its heartbeat `pending`/`answered` counts and the claim files)
@@ -216,6 +233,21 @@ at a time — never rotate the whole pool at once. A rotated worker
 re-reads the current brief, so rotation is also how brief fixes
 (one-claim rule, claim logging) reach live workers whose sessions
 predate them.
+
+The ~50-answer count is PER INCARNATION, not cumulative across
+respawns: a fresh worker starts at 0 answers. The loop tracks it as
+`answeredAtStart` (the heartbeat count when the incarnation was first
+seen) and rotates when `answered - answeredAtStart >= 50`. Two
+discontinuities reset the count instead of counting as gain: a DROP
+(count lower than last seen — a new incarnation) and an implausible
+UPWARD JUMP (more than 10 answers gained in one ~15s tick — a
+one-claim-at-a-time worker cannot gain that many that fast, so it is
+a stale/cumulative count leaking into a fresh heartbeat, e.g. a
+leftover loop or a reseeded count file). On 2026-11-21 a fresh
+worker-1 was rotated ~15s after starting because its heartbeat jumped
+0 -> 582 in one tick and the loop counted the whole jump as gain; the
+jump guard now re-baselines instead of rotating. Thresholds (~12h /
+~50) are unchanged.
 
 ## The action queue — how the loop asks you to act
 
@@ -270,6 +302,35 @@ pending until self-heal marks it done after the worker exits. A worker
 that exits on a seen stop is re-healed immediately (its death is
 confirmed on that tick, no 180s wait).
 
+## Scale-up signal — how the parent is summoned fast (2026-11-21)
+
+The action queue is durable, but nobody reads it until something wakes
+them — and the old wake paths were slow: the owner tripwire waits
+600s for an action to sit unacted, and the watch hook's shortfall
+watch waits 300s below target. Worse, on 2026-11-21 the loop queued
+NOTHING while live 2 / target 4 / pending 6 (one held slot + one
+sighted worker zeroed the need), so no tripwire could fire at all and
+the pool looked healthy while understaffed.
+
+So the loop writes a second file every tick the pool is short with the
+gate idle: `<spool>/supervisor-scaleup-needed.json`
+`{"updatedAt": <epoch-ms>, "supervisorAgentId": "<id>", "live": <n>,
+"target": <n>, "pending": <n>, "spawns": [{"action": "spawn"|"respawn",
+"actionId": "<id>", "workerId": "worker-N", "reason": "<why>"}],
+"blocked": ["<why the rest could not be queued>"]}`. It is written
+the SAME tick spawns are queued (or the shortfall cannot be queued —
+`blocked` then names the held / sighted / busy / claimed slots), and
+deleted the tick the pool is back at target or a render goes ACTIVE.
+The watch hook wakes the parent at once on a FRESH signal (< 120s)
+while the gate is idle — no 300s wait — and the wake payload carries
+the exact spawn list, so the parent spawns the workers directly. A
+stale signal is ignored (a dead loop cannot summon the parent
+forever); the 300s shortfall watch stays as the fallback for a dead
+loop, and the self-heal cron writes the same signal from its plan when
+the loop is dead. Latency from target rise to parent wake: ~15s (one
+loop tick) + ~60s (hook poll) — the spawn itself then takes as long as
+the parent needs to start the worker agents, which no code can shorten.
+
 ## Owner liveness tripwire
 
 Liveness files must be written by the thing that can act — not by a loop
@@ -287,7 +348,10 @@ explaining why. Both files stale is the watch hook's tripwire: the parent
 is woken and spawns a replacement supervisor, whose first job is to drain
 the queue (its entries carry the full context). When an ack arrives or
 the queue drains, the loop resumes writing both files and deletes the
-marker. Never "fix" a tripwire by deleting the marker or hand-writing
+marker. The tripwire is the BACKSTOP, not the fast path: the scale-up
+signal (above) summons the parent within ~60s of a shortfall, while
+the tripwire only fires after 600s of an action sitting unacted.
+Never "fix" a tripwire by deleting the marker or hand-writing
 fresh liveness files: act on the queue, or let the parent replace you.
 
 ## Loop handover
@@ -300,6 +364,20 @@ a different live pid on its next tick and exits cleanly. Never run two
 loops: if your loop exits immediately with a handover note, another loop
 is already live — do not start a second one.
 
+A loop started by a cron run dies ~1 minute after that run ends (the
+runtime reaps cron-run descendants, `setsid` or not). A loop started by
+the parent agent directly (its own exec) SURVIVES — that is the stable
+form. So after a VM reboot, the parent must start the loop directly;
+the pool-selfheal cron can restart a dead loop, but a cron-started loop
+will die again at the next cron timeout — a cron restart is a stopgap
+that re-queues actions and re-writes the scale-up signal, not a stable
+loop. The same applies to workers, and harder: parent-spawned workers
+survive; cron-spawned workers DIE at the cron run's 300s timeout
+(2026-11-21: self-heal run f0a5782e spawned worker-1 + worker-2, both
+dead at the timeout with 0 answers) — so the cron NEVER spawns
+workers, it only signals. Confirm the slot is actually empty
+(heartbeat stale) before spawning.
+
 ## Replacing dead workers
 
 A worker is dead when its `worker-alive-<workerId>.json` heartbeat is
@@ -307,12 +385,12 @@ older than 90 seconds AND it has no claim file in the spool (a worker
 with a live claim may just be slow on a big answer — do not respawn
 over it; its claim will expire and the sweep will clear it). On death,
 respawn a replacement with the SAME workerId and log the restart to
-`<spool>/worker.log` with a `[supervisor]` prefix — but only when the
-slot is within the CURRENT target (see the slot rule below). If a worker dies
-three times in a row within a few minutes, stop respawning it and keep
-the pool at target-minus-one — something is wrong with that slot, and
-a respawn loop helps nobody. (The parent investigates; your job is to
-keep the rest of the pool running.)
+`<spool>/worker.log` with a `[supervisor]` prefix — whenever the pool
+is short (live + incoming < target; see the slot rule below). If a worker dies
+three times in a row within a few minutes, stop respawning THAT slot
+and keep the pool at target via other slots — something is wrong with
+that slot, and a respawn loop helps nobody. (The parent investigates;
+your job is to keep the rest of the pool running.)
 
 Death confirmation grace (why the loop waits): a first sighting at >90s
 stale is only a sighting. A worker's poll loop ends every ~90s and its
@@ -324,19 +402,33 @@ is still stale 180s after the first sighting, and queues the `respawn`
 action then. A heartbeat that freshens in between clears the sighting
 and cancels nothing — no action was ever queued.
 
-Slot rule (standing policy — a stale heartbeat alone is NOT enough):
-only respawn a dead worker if its slot number is within the CURRENT
-target (target = clamp(ceil(pending/3), 2, 8)). At pending 0 the target
-is 2, so worker-3 (slot 3) is NOT respawned — its slot is reserved for
-scale-up, not for keeping every historical slot filled. Worker-3 died
-2026-11-18 ~02:38 UTC (26 answers) and was deliberately left unfilled
-at idle; when backlog grows and the target rises to 3+, the pool spawns
-worker-3 (lowest free slot inside the new target). The same rule cancels
-a queued respawn/spawn whose slot falls above the target when the
-backlog drains. A death above target is still counted toward the
-three-death hold — it just never queues an action nobody should act on
-(an unacted action would eventually, and wrongly, trip the owner
-tripwire).
+Slot rule (count-based, 2026-11-21 — the old slot-number rule is
+gone): a dead worker is respawned, and a scale-up spawn is queued,
+whenever the pool is SHORT — live workers + incoming (pending
+spawn/respawn actions) < target — regardless of the slot NUMBER.
+Slot numbers only order the choice (lowest free slot first); the
+COUNT is the invariant. A stale heartbeat alone is still NOT enough:
+when the pool is already at target, no respawn is queued — that is
+what the count check enforces, and queueing then would leave a
+pending action nobody should act on (an unacted action would
+eventually, and wrongly, trip the owner tripwire).
+
+Why the number rule died: it let a respawn cancelled at idle target 2
+("slot 3 above current target") stay cancelled after the target rose
+to 4 — the death path never re-queued a confirmed-dead slot, and the
+scale-up block was vetoed by the sightings / held subtraction — so on
+2026-11-21 the pool sat at live 2 / target 4 / pending 6 with ZERO
+queued actions and a happy ownerResponsive. A cancellation made at
+one target is re-evaluated every tick against the CURRENT target: when
+the target exceeds the live count, the spawn is re-queued. (Worker-3
+died 2026-11-18 ~02:38 UTC, 26 answers, and was deliberately left
+unfilled at idle under the old rule; under the count rule it is
+respawned whenever the pool is short, and scale-up fills the rest
+when the backlog grows.) A queued spawn/respawn is cancelled only
+when the pool is back at target (live >= target), never for its slot
+number — a held lower slot is exactly how a high slot becomes owed.
+A death at target is still counted toward the three-death hold — it
+just never queues an action nobody should act on.
 
 False-death guard: before confirming a death, cross-check `worker.log`
 for fresh ANSWERED lines from that worker (last 10 minutes). A
@@ -365,11 +457,18 @@ Rescue, best-effort, in the spool dir only (the spool transport does
 this too while it waits — this is the backup for requests no transport
 is currently waiting on):
 - A `*.request.json.claimed-<workerId>` file whose inner request is
-  still UNEXPIRED, whose claim file is older than ~5 minutes, and whose
+  still UNEXPIRED, whose CLAIM is older than ~5 minutes, and whose
   worker's `worker-alive-<workerId>.json` heartbeat is older than 90
   seconds (or missing) while ANOTHER worker's heartbeat is fresh: rename
   it back to `<id>.request.json` — do NOT delete it, the request is still
-  live and a live worker must be able to claim it. Never rescue a claim
+  live and a live worker must be able to claim it. Claim age is time
+  since the worker CLAIMED the request — the worker's latest
+  `[worker] CLAIMED <id>` line in `<spool>/worker.log`, falling back to
+  the claim file's ctime — NEVER the claim file's mtime: a claim is an
+  atomic RENAME and a rename preserves mtime, so mtime is the REQUEST's
+  creation time. A request created 1446s earlier but claimed 111s ago
+  read as 1446s old and was rescued mid-composition (2026-11-21). An
+  unprovable claim age never rescues. Never rescue a claim
   whose worker still heartbeats (a slow worker on a big answer is alive),
   and never rescue when no other worker is alive to take the work.
   The 5-minute threshold matches the spool's CLAIM_RESCUE_GRACE_MS:
@@ -454,3 +553,6 @@ for a crash or a reboot — only for a parent-ordered stop.
   worker runs a multi-day session.
 - Pending `*.request.json` files drain while jobs run; `worker.log`
   shows one line per answered request with its workerId.
+- While the pool is short with the gate idle,
+  `<spool>/supervisor-scaleup-needed.json` is fresh (< 120s) and names
+  the owed workerIds; it is gone once the pool is back at target.

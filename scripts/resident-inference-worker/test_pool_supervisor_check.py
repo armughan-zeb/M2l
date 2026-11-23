@@ -424,3 +424,89 @@ def test_wrapper_stays_silent_during_render(tmp_path, active_gate):
     kinds = [c[0] for c in calls]
     assert "WAKE" not in kinds
     assert "SILENT" in kinds
+
+
+# --- scale-up signal fast wake (2026-11-21) ------------------------------
+
+
+def _signal(spool, age_s=5, spawns=("worker-3", "worker-4"),
+            blocked=()):
+    _write(os.path.join(spool, "supervisor-scaleup-needed.json"),
+           {"updatedAt": time.time() * 1000 - age_s * 1000,
+            "supervisorAgentId": "test-supervisor",
+            "live": 2, "target": 4, "pending": 6,
+            "spawns": [{"action": "spawn", "actionId": "spawn-%s-1" % w,
+                        "workerId": w, "reason": "live=2 target=4 pending=6"}
+                       for w in spawns],
+            "blocked": list(blocked)})
+
+
+def test_scaleup_signal_wakes_immediately(tmp_path, idle_gate):
+    # Fresh signal + live 2 / target 4 + gate idle: wake at once with
+    # reason pool_scaleup_needed — no 300s shortfall wait, and no
+    # shortfall state file is even started.
+    spool = _spool(tmp_path, status_age=10, marker_age=10,
+                   workers=[("worker-1", 5), ("worker-2", 8)], pending=6)
+    _signal(spool)
+    state = tmp_path / "state"
+    result = _run_checker(spool, state, idle_gate)
+    assert result["decision"] == "wake"
+    assert result["reason"] == "pool_scaleup_needed"
+    assert result["payload"]["action"] == "spawn_missing_workers"
+    assert [s["workerId"] for s in
+            result["payload"]["scaleup_spawns"]] == ["worker-3", "worker-4"]
+    assert result["payload"]["live_workers"] == ["worker-1", "worker-2"]
+    assert result["payload"]["target"] == 4
+    assert not (state / "pool-shortfall.json").exists()
+    # Cooldown suppresses the next wake.
+    second = _run_checker(spool, state, idle_gate)
+    assert second["decision"] == "silent"
+    assert second["reason"] == "respawn_cooldown"
+
+
+def test_stale_scaleup_signal_does_not_wake_fast(tmp_path, idle_gate):
+    # Signal 600s old: ignored — the first poll is a shortfall watch,
+    # not a wake (the 300s shortfall path is the fallback).
+    spool = _spool(tmp_path, status_age=10, marker_age=10,
+                   workers=[("worker-1", 5), ("worker-2", 8)], pending=6)
+    _signal(spool, age_s=600)
+    state = tmp_path / "state"
+    result = _run_checker(spool, state, idle_gate)
+    assert result["decision"] == "silent"
+    assert result["reason"] == "pool_shortfall_watch"
+    assert result["checks"]["scaleup_signal"] is None
+
+
+def test_scaleup_signal_no_wake_when_at_target(tmp_path, idle_gate):
+    # Fresh signal, but the pool already recovered to target: silent.
+    spool = _spool(tmp_path, status_age=10, marker_age=10,
+                   workers=[("worker-1", 5), ("worker-2", 8),
+                            ("worker-3", 5), ("worker-4", 8)], pending=6)
+    _signal(spool)
+    result = _run_checker(spool, tmp_path / "state", idle_gate)
+    assert result["decision"] == "silent"
+    assert result["reason"] == "supervisor_alive"
+
+
+def test_scaleup_signal_no_wake_during_render(tmp_path, active_gate):
+    # Fresh signal, but a render is ACTIVE: never wake (target 0).
+    spool = _spool(tmp_path, status_age=10, marker_age=10,
+                   workers=[("worker-1", 5), ("worker-2", 8)], pending=6)
+    _signal(spool)
+    result = _run_checker(spool, tmp_path / "state", active_gate)
+    assert result["decision"] == "silent"
+    assert result["reason"] == "render_active"
+
+
+def test_scaleup_signal_blocked_shortfall_still_wakes(tmp_path, idle_gate):
+    # Signal with NO spawns but a blocked reason (every free slot held
+    # / sighted): the pool is short and the parent must be told anyway.
+    spool = _spool(tmp_path, status_age=10, marker_age=10,
+                   workers=[("worker-1", 5), ("worker-2", 8)], pending=6)
+    _signal(spool, spawns=(), blocked=["held slots (3 deaths): worker-3"])
+    result = _run_checker(spool, tmp_path / "state", idle_gate)
+    assert result["decision"] == "wake"
+    assert result["reason"] == "pool_scaleup_needed"
+    assert result["payload"]["scaleup_spawns"] == []
+    assert result["payload"]["scaleup_blocked"] == [
+        "held slots (3 deaths): worker-3"]

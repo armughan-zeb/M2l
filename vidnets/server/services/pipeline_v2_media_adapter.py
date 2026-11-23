@@ -646,12 +646,16 @@ def _web_candidate_is_explicitly_pending_visual(candidate: Mapping[str, Any]) ->
 def _mixed_web_scene_worker_limit(config: Mapping[str, Any] | None = None) -> int:
     """Return the bounded Mixed Media web fan-out.
 
-    GTA fix (Nov 16): 6 parallel scene workers × 12 sources × the
-    universal four-engine fan-out stampeded one egress proxy and every
-    engine died on stacked 15s timeouts. The fan-out is now 2 workers by
-    default, and the code default carries the behavior (the live .env is
-    not in git). The operator raises it only via
-    VIDZEO_MIXED_WEB_SCENE_WORKERS; a higher packaged
+    Spec (Vidzeo Local thread pools): Web Retrieval 6-12 workers.
+    The default is 8, inside the spec range. (Nov 16: 6 scene workers
+    × 12 sources × the universal four-engine fan-out stampeded one
+    egress proxy; Nov 19 measured 10-way slower than 4-way through the
+    shared proxy — the user ordered the spec values applied verbatim
+    over those local measurements, and the proof run will show the
+    measured result.) The per-host throttle in the universal scraper
+    (per (host, route) slots with bounded queue-timeout) is what
+    protects the sources. The operator still raises or lowers it only
+    via VIDZEO_MIXED_WEB_SCENE_WORKERS; a higher packaged
     ``web_max_scene_workers`` is stale legacy and no longer overrides the
     env default — the most restrictive value wins.
     """
@@ -659,12 +663,12 @@ def _mixed_web_scene_worker_limit(config: Mapping[str, Any] | None = None) -> in
     try:
         env_raw = os.environ.get("VIDZEO_MIXED_WEB_SCENE_WORKERS")
         env_workers = (
-            2
+            8
             if env_raw is None or str(env_raw).strip() == ""
             else int(env_raw)
         )
     except (TypeError, ValueError):
-        env_workers = 2
+        env_workers = 8
     try:
         configured_workers = int(settings.get("web_max_scene_workers") or 0)
     except (TypeError, ValueError):
@@ -2367,6 +2371,34 @@ def build_qwen_verifier(
                 context.deadline_at = float(_media_total_deadline_at)
                 if context.degraded_reason == "visual_deadline_exceeded":
                     context.degraded_reason = ""
+    # Vision lanes: per-lane call/time budgets partition the V2 total
+    # (6N+8 calls: YT 3N+4, web 2N+4, reserve N) and give each lane its
+    # own clock, starting at that lane's first vision submission. The
+    # shared context's deadline and max_calls remain the outer wall and
+    # total; lane children share its decision cache and USD ledger.
+    lane_budgets: dict[str, Any] = {}
+    lane_contexts: dict[str, Any] = {}
+    lane_scheduler = None
+    try:
+        from .visual_intelligence.lane_budget import create_lane_budgets, LaneScheduler
+        _created = create_lane_budgets(
+            scene_count,
+            outer_wall_seconds=(allowance if allowance is not None else None),
+        )
+        # create_lane_budgets returns {"budgets": {...}, "reserve": ...};
+        # the lane map itself is what children and the gate consume.
+        lane_budgets = _created["budgets"]
+        for _lane in ("youtube", "web"):
+            lane_contexts[_lane] = context.child(_lane, lane_budgets[_lane])
+        lane_scheduler = LaneScheduler()
+        context.lane_budgets = lane_budgets
+        context.lane_visual_contexts = lane_contexts
+        context.lane_scheduler = lane_scheduler
+    except Exception as exc:
+        lane_budgets = {}
+        lane_contexts = {}
+        lane_scheduler = None
+        print(f"   [vision] lane budgets unavailable ({exc}); gate keeps shared budget", flush=True)
     if mixed_media:
         # ``_web_visual_context`` is created earlier by the app and reused
         # here. Normalize that existing object as well; otherwise its .env
@@ -2843,12 +2875,21 @@ def build_qwen_verifier(
         path = str(candidate.get("path") or "")
         if not path or not Path(path).is_file():
             return {"accepted": False, "status": "missing_asset", "final_score": 0.0}
+        # Vision lanes: judge this candidate through its own lane's
+        # child context (its own clock + call budget), not the shared
+        # parent. Lane from the candidate's source fields; anything
+        # that is not a web still goes through the YouTube lane.
+        _lane_src = str(
+            candidate.get("source") or candidate.get("provider") or previous_source or ""
+        ).strip().lower()
+        _lane = "web" if _lane_src in {"web", "web_image", "web_image_resolver", "web images"} else "youtube"
+        verify_ctx = lane_contexts.get(_lane) or context
         try:
-            client = context.get_client()
+            client = verify_ctx.get_client()
         except Exception as exc:
             client = None
-            if not context.degraded_reason:
-                context.degraded_reason = f"vision_client_error:{type(exc).__name__}"
+            if not verify_ctx.degraded_reason:
+                verify_ctx.degraded_reason = f"vision_client_error:{type(exc).__name__}"
         if client is None:
             metadata_score = _score(
                 candidate.get("final_score")
@@ -2878,7 +2919,7 @@ def build_qwen_verifier(
                 "accepted": deterministic_accept,
                 "status": "accepted" if cand_accepted else ("deterministic_degraded" if deterministic_accept else "vision_unavailable"),
                 "final_score": max(metadata_score, float(cand_prev.get("final_score") or cand_prev.get("relevance") or 0.0) if isinstance(cand_prev, Mapping) else metadata_score),
-                "reason": ("previously_accepted_candidate" if cand_accepted else (context.degraded_reason or "vision_unavailable")),
+                "reason": ("previously_accepted_candidate" if cand_accepted else (verify_ctx.degraded_reason or "vision_unavailable")),
                 "schema_valid": cand_accepted or deterministic_accept,
                 "prior_schema_errors": previous_schema_errors,
             }
@@ -3041,7 +3082,7 @@ def build_qwen_verifier(
                     primary_result.update({
                         "schema_valid": True,
                         "verification_attempt": "primary",
-                        "verification_model": str(getattr(client, "model", context.model) or ""),
+                        "verification_model": str(getattr(client, "model", verify_ctx.model) or ""),
                         "visual_checked": True,
                         "visual_available": True,
                     })
@@ -3057,7 +3098,7 @@ def build_qwen_verifier(
             # client, so it reserves its own call/concurrency slot and keeps
             # the OpenRouter client's Retry-After behavior.
             try:
-                fallback_client = context.get_fallback_client()
+                fallback_client = verify_ctx.get_fallback_client()
             except Exception as exc:
                 fallback_client = None
                 primary_errors.append(f"fallback_client_error:{type(exc).__name__}")
@@ -3088,12 +3129,12 @@ def build_qwen_verifier(
                     "schema_valid": False,
                     "primary_schema_errors": list(dict.fromkeys(primary_errors)),
                     "schema_errors": list(dict.fromkeys(fallback_errors)),
-                    "verification_model": str(getattr(fallback_client, "model", context.fallback_model) or ""),
+                    "verification_model": str(getattr(fallback_client, "model", verify_ctx.fallback_model) or ""),
                 }
             fallback_result.update({
                 "schema_valid": True,
                 "verification_attempt": "fallback",
-                "verification_model": str(getattr(fallback_client, "model", context.fallback_model) or ""),
+                "verification_model": str(getattr(fallback_client, "model", verify_ctx.fallback_model) or ""),
                 "primary_schema_errors": list(dict.fromkeys(primary_errors)),
                 "visual_checked": True,
                 "visual_available": True,
@@ -3207,10 +3248,12 @@ def build_qwen_verifier(
         return by_path
 
     def verify_batch(scene: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-        """Judge up to 4 image finalists for one scene in SAFE batches of 2.
+        """Judge up to 4 image finalists for one scene in batches of up to 8 images.
 
-        SAFE BATCH: at most 2 images per vision request. The context layer
-        splits the finalists into chunks of 2 and files them in parallel;
+        VISION LANES: one request carries up to 8 images (web stills: 8
+        scenes x 1 candidate; video: 4 candidates x 2 frames). The context
+        layer splits the finalists into chunks of at most 8 images and files
+        them in parallel;
         each chunk returns one verdict row per candidate. Each row is then
         scored by the full single-candidate verify() — same validation,
         same subject-level acceptance, same fatal ledger, same verdict
@@ -3252,7 +3295,17 @@ def build_qwen_verifier(
         if len(eligible) < 2:
             return {}
         try:
-            client = context.get_client()
+            _batch_lane = (
+                "web"
+                if any(
+                    str(c.get("source") or c.get("provider") or "").strip().lower()
+                    in {"web", "web_image", "web_image_resolver", "web images"}
+                    for c in eligible
+                )
+                else "youtube"
+            )
+            _batch_ctx = lane_contexts.get(_batch_lane) or context
+            client = _batch_ctx.get_client()
         except Exception:
             return {}
         if client is None:
@@ -3279,6 +3332,9 @@ def build_qwen_verifier(
 
     verify.verify_batch = verify_batch
     verify.visual_context = context
+    verify.lane_budgets = lane_budgets
+    verify.lane_visual_contexts = lane_contexts
+    verify.lane_scheduler = lane_scheduler
     return verify, context
 
 
@@ -4411,11 +4467,21 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
     # 300s). A 1s wall terminalises every scene as a graphic fallback and
     # silently produces a footage-free video. The delivery budget is a soft
     # target; real footage matters more than the clock.
+    # The old default here was 3600s, contradicting the comment above:
+    # for an external-agent job the coordinator wall was floored at one
+    # hour, so test 22's 13-scene coordinator ran with a 3300s working
+    # deadline (3600s wall minus the 300s vision reserve) against a 412s
+    # discovery+tail budget — the wall never bound anything, and a
+    # stalled run could crawl for an hour before the budget caught it.
+    # The floor is now 300s (one inbox round trip, same value as the
+    # query-brain per-wave wall): the wall for a 1-minute job becomes
+    # the computed/delivery-allowance value (~1470s), and for a 66-scene
+    # job the delivery budget, not this floor, is the bound.
     if str(config.get('llm_provider') or '') == 'external_agent':
         try:
-            media_floor = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+            media_floor = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "300") or 300))
         except (TypeError, ValueError):
-            media_floor = 3600.0
+            media_floor = 300.0
     else:
         media_floor = 300.0
     if delivery_budget is not None:
@@ -4591,6 +4657,39 @@ def _gaming_stock_blocked(scene: Mapping[str, Any], title: str = "") -> bool:
         (subject_type in {"gaming", "video_game", "game"} or domain_category in {"gaming", "video_game", "game"})
         and (is_game_title or any(t in title_lower for t in ("gta", "grand theft auto")))
     )
+
+
+def _web_lane_visual_context(verifier, transport_visual_context, site: str):
+    """Resolve the web lane child context for a web loader (design §5).
+
+    ``transport_visual_context`` is a deliberately DISABLED context
+    (transport vision is off by design; the coordinator owns the gate),
+    so silently falling back to it when lane-budget creation failed
+    ships 0 web with no error. Raise loudly instead — but only when a
+    lane child was expected: ``verifier is not None`` means the job has
+    a final gate. When ``verifier is None`` there is no final gate at
+    all (the no-key/metadata-only path) and existing behaviour is
+    preserved. The raise surfaces through the existing
+    ``LazyBatchLane._error`` → coordinator lane-error channel.
+
+    The raise fires only when the verifier actually carries a
+    ``lane_visual_contexts`` map (the real ``build_qwen_verifier``
+    always sets it — populated, or emptied when lane creation failed).
+    A verifier without the attribute at all (a legacy caller or a test
+    double that bypasses the builder) keeps the old fallback: no lane
+    child was demonstrably expected there.
+    """
+    lane_contexts = getattr(verifier, "lane_visual_contexts", None)
+    web_child = (lane_contexts or {}).get("web") if lane_contexts is not None else None
+    if verifier is not None and lane_contexts is not None and web_child is None:
+        raise RuntimeError(
+            "web lane visual context missing: lane budgets unavailable; "
+            "refusing to run web retrieval with a disabled vision context "
+            f"(site={site})"
+        )
+    if web_child is not None:
+        return web_child
+    return transport_visual_context
 
 
 def resolve_existing_provider_branches_v2(
@@ -5363,15 +5462,19 @@ def resolve_existing_provider_branches_v2(
     youtube_primary_attempted_indices: set[int] = set()
     youtube_indices_ref = {"indices": primary_youtube_scene_indices}
     youtube_fallback_mode = {"enabled": False}
-    # Two-track YouTube discovery (user order, Nov 21 2026): the discovery
-    # budget is 5 minutes per minute of video (300s/min, configurable via
-    # config key yt_discovery_seconds_per_minute or env
-    # VIDZEO_YT_DISCOVERY_SECONDS_PER_MINUTE), NO cap. It bounds ONLY
-    # discovery (search, rank, transcript, probe, vision). Downloads are
-    # exempt: the branch's soft timeout stops new discovery at the budget
-    # while in-flight downloads drain until the hard timeout (budget +
-    # drain below). Track B (general pool) runs in parallel with Track A
-    # (scene-by-scene) from the same budget; neither waits for the other.
+    # Two-track YouTube discovery (user order, Nov 21 2026, capped Nov 22
+    # 2026 to the spec §3.3 branch wall): the discovery budget is 5 minutes
+    # per minute of video (300s/min, configurable via config key
+    # yt_discovery_seconds_per_minute or env
+    # VIDZEO_YT_DISCOVERY_SECONDS_PER_MINUTE), capped at the branch wall
+    # (default 1200s, override via yt_branch_wall_timeout_seconds). It
+    # bounds ONLY discovery (search, rank, transcript, probe, vision).
+    # Downloads are exempt: the branch's soft timeout stops new discovery
+    # at the budget while in-flight downloads drain until the hard timeout
+    # (budget + drain below). Track B (general pool) is disabled by
+    # default (Nov 21 decision, 0 verified clips in tests 18/19) and runs
+    # in parallel with Track A (scene-by-scene) from the same budget when
+    # explicitly enabled; neither waits for the other.
     from .youtube_discovery_budget import (
         discovery_budget_seconds,
         media_tail_seconds,
@@ -5655,6 +5758,9 @@ def resolve_existing_provider_branches_v2(
             )
         lane_config["visual_understanding"] = False
         lane_config["visual_required"] = False
+        # Vision lanes: the YouTube lane keeps the disabled transport
+        # context — YT lane vision stays off here by design; the YT lane
+        # budget is enforced at the coordinator gate instead.
         lane_config["_web_visual_context"] = youtube_transport_context
         if is_youtube_fallback:
             # Recovery must explore other masters, not redownload the exact
@@ -6959,6 +7065,11 @@ def resolve_existing_provider_branches_v2(
     web_fallback_scene_retry_attempted: set[int] = set()
     web_fallback_retry_slots = threading.BoundedSemaphore(3)
 
+    # Vision lanes (§3.5): the web loader publishes each scene's row as
+    # its verdict lands. The holder is filled when fresh_web_lane is
+    # created below; load_web runs after that.
+    _web_lane_holder: dict[str, Any] = {}
+
     def load_web(active_indices: Sequence[int] | None = None) -> Mapping[int, Any]:
         nonlocal primary_web_rows, primary_web_failed
         active_indices = list(
@@ -6985,7 +7096,20 @@ def resolve_existing_provider_branches_v2(
         if broad_anchor and provider_topic_title != valid_topic_anchor:
             lane_config['_topic_anchor'] = provider_topic_title
         lane_config["visual_required"] = False
-        lane_config["_web_visual_context"] = transport_visual_context
+        # Vision lanes: the web resolver receives the web lane child
+        # (its own clock + 2N+4 call budget), not the disabled transport
+        # context — that is what lets it file cross-scene batches.
+        lane_config["_web_visual_context"] = _web_lane_visual_context(
+            verifier, transport_visual_context, "primary"
+        )
+        def _publish_web_scene_row(idx, row):
+            _holder_lane = _web_lane_holder.get("lane")
+            if _holder_lane is not None and hasattr(_holder_lane, "publish_row"):
+                try:
+                    _holder_lane.publish_row(int(idx), row)
+                except Exception:
+                    pass
+        lane_config["_web_on_scene_result"] = _publish_web_scene_row
         lane_config["_final_visual_gate_required"] = True
         lane_config["_semantic_query_rows"] = local_query_rows
         lane_config["_semantic_query_lock"] = True
@@ -7026,10 +7150,10 @@ def resolve_existing_provider_branches_v2(
         )
         # The V2 caller often receives a legacy ``web_max_scene_workers``
         # value (the packaged app historically defaulted this to six).  That
-        # value must not silently widen the Mixed Media fan-out: six scene
-        # workers stampeded the egress proxy on GTA VI. The bounded limit
-        # (2 by default, VIDZEO_MIXED_WEB_SCENE_WORKERS to raise it) wins
-        # over the packaged value; see _mixed_web_scene_worker_limit.
+        # value must not silently widen the Mixed Media fan-out beyond the
+        # spec range. The bounded limit (8 by default per the spec's
+        # Web Retrieval 6-12, VIDZEO_MIXED_WEB_SCENE_WORKERS to raise it)
+        # wins over the packaged value; see _mixed_web_scene_worker_limit.
         if lane_policy.get("mode") == "Mixed Media":
             configured_scene_workers = int(lane_config.get("web_max_scene_workers") or 0)
             lane_config["web_max_scene_workers"] = _mixed_web_scene_worker_limit(lane_config)
@@ -7109,7 +7233,9 @@ def resolve_existing_provider_branches_v2(
             )
             # Do not spend a second paid visual wave in a recovery callback;
             # the outer V2 coordinator will verify the returned candidates.
-            lane_config["_web_visual_context"] = transport_visual_context
+            lane_config["_web_visual_context"] = _web_lane_visual_context(
+                verifier, transport_visual_context, "recovery"
+            )
         elif lane_policy.get("mode") == "Mixed Media" and not lane_config.get("web_wait_until_complete"):
             # A process-level .env may carry a legacy 240s ceiling. That is
             # long enough for a stalled provider to starve the coordinator and
@@ -7537,6 +7663,9 @@ def resolve_existing_provider_branches_v2(
                         alt_row["qwen_result"]["visual_verification_required"] = True
                     candidate_rows.append(alt_row)
             rows[index] = candidate_rows
+            # Vision lanes backstop: publish the row as built so scene
+            # waiters wake even if the resolver callback never fires.
+            _publish_web_scene_row(index, candidate_rows)
         ready_count = sum(
             1 for row in rows.values()
             if bool((row[0] if isinstance(row, (list, tuple)) and row else row).get('path'))
@@ -7798,6 +7927,7 @@ def resolve_existing_provider_branches_v2(
         youtube_fallback_lane.retry_rejected_primary = True
         youtube_fallback_lane.retry_missing_primary = youtube_only
     fresh_web_lane = LazyBatchLane(load_web) if lane_policy['web_enabled'] and web_indices_ref['indices'] else disabled_lane
+    _web_lane_holder["lane"] = fresh_web_lane
     def web_lane(scene, cancel_event):
         if not lane_policy['web_enabled']:
             return None
@@ -7881,7 +8011,9 @@ def resolve_existing_provider_branches_v2(
         lane_config["scene_contracts"] = [dict(scene)]
         lane_config["visual_understanding"] = False
         lane_config["visual_required"] = False
-        lane_config["_web_visual_context"] = transport_visual_context
+        lane_config["_web_visual_context"] = _web_lane_visual_context(
+            verifier, transport_visual_context, "stock"
+        )
         # Stock search/download can legitimately take tens of seconds on a
         # slow connection. Publish the stage transition before entering the
         # provider call so the queue/UI does not remain on the previous web
@@ -8599,10 +8731,40 @@ def _visual_requirement_issue(
             if decision.get('accepted') is False or decision.get('fatal_mismatch') or decision.get('entity_conflict'):
                 return 'visual_verdict_rejected'
             if bool(requirement.get('strict_identity')):
-                if not visual_checked or decision.get('accepted') is not True:
-                    return 'visual_verification_pending'
-                if requirement.get('requirement_hash') and not _has_bound_pixel_review(requirement, row):
-                    return 'visual_verification_pending'
+                # Fail-open quota acceptance (test 23, job 1e78cf53 scenes
+                # 5/9/10): the coordinator deliberately accepted the clip
+                # after the media deadline killed its inline vision check
+                # — decision accepted=True, deterministic_only=True, and a
+                # transport/deadline status — on hard-gate + container-guard
+                # checks alone (Nov 17 fail-open rule: a clip may be
+                # accepted on deterministic checks alone when vision is
+                # down or the budget runs out). The final gate must honour
+                # that mint instead of re-pending the scene: the
+                # coord_accepted evaluation below already admits YT
+                # deterministic statuses, and the hard-rejection / fatal /
+                # entity-conflict vetoes above still apply. A bare
+                # deterministic verdict with no deadline signature (no
+                # transport status) is NOT a fail-open mint and still
+                # pends — see test_youtube_quota_cannot_certify_unseen_pixels.
+                deterministic_fail_open = bool(
+                    decision.get("deterministic_only")
+                    and decision.get("accepted") is True
+                    and str(decision.get("status") or "").strip().lower()
+                    in {
+                        "deadline_exceeded",
+                        "vision_unavailable",
+                        "visual_verifier_unavailable",
+                        "timeout",
+                        "missing_verdict",
+                    }
+                    and not decision.get("fatal_mismatch")
+                    and not decision.get("entity_conflict")
+                )
+                if not deterministic_fail_open:
+                    if not visual_checked or decision.get('accepted') is not True:
+                        return 'visual_verification_pending'
+                    if requirement.get('requirement_hash') and not _has_bound_pixel_review(requirement, row):
+                        return 'visual_verification_pending'
         dec_status = str(decision.get("status") or "").strip().casefold()
         dec_is_accepted = bool(decision.get("accepted") is True or dec_status in {"accepted", "verified"})
         coord_accepted = bool(

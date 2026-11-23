@@ -16,11 +16,16 @@
 # Wake conditions (all must hold):
 #   - pool-status.json AND supervisor-alive.json both stale (>120s) or
 #     missing (supervisor writes status every 30s; either fresh = alive)
+#     — OR a fresh scale-up signal (supervisor-scaleup-needed.json,
+#     <120s) names owed workerIds while live workers are below target
+#     (2026-11-21 fast path: the loop summons the parent the same tick
+#     it queues scale-up spawns, no 300s shortfall wait)
 #   - no render ACTIVE (render-gate.js status exit 2 -> silent, retry later)
 #   - no supervisor-parked.json (deliberate stop by the parent)
 #   - no wake in the last 600s (cooldown — a slow spawn must not storm)
 # The wake payload lists live workers (fresh heartbeats <90s) so the
-# respawned supervisor ADOPTS them instead of spawning duplicates.
+# respawned supervisor ADOPTS them instead of spawning duplicates, and
+# for a scale-up wake it lists the owed spawn workerIds verbatim.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 

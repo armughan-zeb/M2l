@@ -66,7 +66,29 @@ query plans expired while still queued behind it).
    at once). The loop never ends while you live: if it finishes, start
    the next one immediately, back-to-back with no gap — a worker whose
    poll loop has ended and is waiting for its next turn is a worker
-   that is not claiming. On every poll iteration, also read
+   that is not claiming. Run the loop in FINITE chunks (~120–150s each),
+   never one long-running exec: a background exec's stdout reaches you
+   only when the exec exits, so a loop that runs for hours gives you zero
+   turns and your own claims sit held and unseen while you look idle
+   (on 2026-11-22 worker-4 lost 3 claims this way, and worker-1 lost
+   e60022be the same way). Run ONE chunk per exec call: never wrap the
+   loop in a shell while-true loop, and never pipe its stdout through
+   tail or head — a pipe buffers the CLAIMED line until the process
+   exits, so you stay blind to your own claim (on 2026-11-22 worker-5
+   lost claim 2e7ef06a exactly this way). Each chunk must exit on its
+   own (~120s) so you get a turn. When a chunk ends, on that turn FIRST check
+   the spool yourself for `*.request.json.claimed-<your workerId>` and
+   answer any claim you hold, THEN immediately restart the loop
+   back-to-back with no gap — if the loop is not restarted, your
+   heartbeat goes stale in 90s. For a short-fuse claim (under ~180s left
+   when you claim it), compose the answer in the SAME exec call as the
+   claim — a claim expired unanswered on 2026-11-22 while its draft was
+   being written in a separate step. Read a claimed request's payload in
+   ONE fast exec call (a single cat/python read), never through slow
+   repeated file reads: on 2026-11-23 worker-6 lost claim 0f6c2031
+   (53 KB request) because the fuse ran out while the payload was still
+   being read in small pieces — the answer was composed but never
+   delivered. On every poll iteration, also read
    `<spool>/supervisor-actions.json` and look for an entry with
    `status` `pending`, `workerId` equal to yours, and `action` one of
    `rotate`, `stop_graceful`, `stop_idle`, `replace_stuck` — that is the
@@ -115,6 +137,14 @@ query plans expired while still queued behind it).
    `worker-alive-<workerId>.json`:
    `{"updatedAt": <epoch-ms>, "worker": "resident-inference",
    "workerId": "<your workerId>", "pending": <count>, "answered": <count>}`.
+   Start your `answered` count at 0 for each new session and increment
+   it by 1 after each answer you deliver. NEVER seed it from a
+   persistent file, from `worker.log`, or from a previous heartbeat —
+   those are cumulative across incarnations, and a stale high count
+   (e.g. 582 from an old session) will make the supervisor rotate you
+   on sight (it counts answers gained since your session started; a
+   jump of more than 10 in one tick is treated as a counter error, but
+   starting at the true 0 is what keeps the count honest).
    The heartbeat is the pool's liveness contract, not a nicety: the spool
    treats a worker with no fresh heartbeat as dead, the supervisor
    respawns over it, and its unexpired claims are rescued back to the
@@ -194,6 +224,13 @@ query plans expired while still queued behind it).
      run): do NOT deliver. Delete the tmp file, write
      `<id>.error.json` as `{"error": "<short reason>"}`, log the failure
      (request id, operation, issue), delete your claim file, move on.
+   - Simple web-gate requests list a SHORT verdict schema in the prompt,
+     but the validator enforces the FULL batch schema on top of the
+     requested fields: write the full set from the start — identity /
+     action / context scores, `visible_overlays`, `subject_box`,
+     `safe_text_regions`, `final_score`, `source_presentation_type`,
+     `has_text`. (First attempt on 2026-11-22 failed validation on the
+     short set; the full set passed.)
    - The rename MUST be gated on a 0 exit: run validation and rename in
      one shell command with `set -euo pipefail`, or check the exit code
      before running `mv`. A failed validation must NEVER be followed by

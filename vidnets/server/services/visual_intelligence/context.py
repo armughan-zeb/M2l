@@ -203,6 +203,18 @@ class _ContextClient:
         self.model = client.model
         self.api_key = client.api_key
 
+    def _live_cache(self):
+        """The decision cache this client reads/writes right now.
+
+        A lane child shares its parent's cache — the parent's CURRENT
+        cache, not the object snapshotted when the child was built
+        (callers may replace the parent's cache afterwards).
+        """
+        parent = getattr(self._context, "_parent", None)
+        if parent is not None:
+            return parent.cache
+        return self._context.cache  # noqa: direct read — _live_cache() itself
+
     def _run(self, operation: str, paths: List[str], prompt: str, callback, cache_lookup=None):
         cacheable = True
         try:
@@ -215,7 +227,7 @@ class _ContextClient:
             cacheable = False
             cache_key = "uncached-" + uuid.uuid4().hex
 
-        cached = self._context.cache.get(cache_key)
+        cached = self._live_cache().get(cache_key)
         if valid_cached_decision(operation, cached):
             self._context._record(operation, 0.0, 0.0, True, cached)
             from ..openrouter_usage import record_cache_hit
@@ -226,7 +238,7 @@ class _ContextClient:
             reused = cache_lookup()
             if valid_cached_decision(operation, reused):
                 self._context._record(operation, 0., 0., True, reused)
-                if cacheable: self._context.cache.put(cache_key, operation, self.model, reused)
+                if cacheable: self._live_cache().put(cache_key, operation, self.model, reused)
                 return reused
 
         with self._context._lock:
@@ -249,7 +261,7 @@ class _ContextClient:
                 + 15.0,
             )
             inflight.wait(timeout=min(wait_timeout, max(0., self._context.deadline_at - time.monotonic())))
-            cached = self._context.cache.get(cache_key)
+            cached = self._live_cache().get(cache_key)
             if valid_cached_decision(operation, cached):
                 self._context._record(operation, 0.0, 0.0, True, cached)
                 from ..openrouter_usage import record_cache_hit
@@ -272,11 +284,25 @@ class _ContextClient:
                     reused = cache_lookup()
                     if valid_cached_decision(operation, reused):
                         self._context._record(operation, 0., 0., True, reused)
-                        if cacheable: self._context.cache.put(cache_key, operation, self.model, reused)
+                        if cacheable: self._live_cache().put(cache_key, operation, self.model, reused)
                         return reused
                 self._context._reserve_call()
                 started = time.perf_counter()
-                result = callback()
+                # Vision lanes (C8): tag this thread's in-flight vision
+                # call with the lane so the filed bridge row carries it.
+                _lane = getattr(self._context, "_lane", None)
+                _set_lane = None
+                try:
+                    from .vision_client import set_vision_lane as _set_lane
+                except Exception:
+                    _set_lane = None
+                if _set_lane is not None and _lane:
+                    _set_lane(_lane)
+                try:
+                    result = callback()
+                finally:
+                    if _set_lane is not None:
+                        _set_lane(None)
             finally:
                 if global_acquired:
                     _GLOBAL_SEMAPHORE.release()
@@ -297,7 +323,7 @@ class _ContextClient:
                     unchanged_key = decision_cache_key(operation=operation, model=self.model, prompt=prompt, paths=paths,
                         account_scope=policy["account"], policy=policy)
                     if unchanged_key == cache_key:
-                        self._context.cache.put(cache_key, operation, self.model, result)
+                        self._live_cache().put(cache_key, operation, self.model, result)
                 except (OSError, ValueError, TypeError):
                     pass
             return result
@@ -329,27 +355,47 @@ class _ContextClient:
             cache_lookup=lambda: self._lookup_raw("analyze_clip_frames", frame_paths, user_prompt, system_prompt),
         )
 
-    def analyze_clip_frames_batch(self, candidates: list, user_prompt: str, system_prompt: str) -> dict:
-        """Judge a scene's clip candidates in SAFE batches of 2, in parallel.
+    def analyze_clip_frames_batch(self, candidates: list, user_prompt: str, system_prompt: str, scene_tags: list = None) -> dict:
+        """Judge a scene's clip candidates in batches of up to 4 x 2 frames.
 
-        SAFE BATCH: at most 2 candidates x 1 frame each (2 images) per
-        vision request. A scene's candidates are split into chunks of 2 and
-        each chunk is filed as its own ``_run`` (operation ``clip_batch``)
-        — one batch counts as one vision call — filed in parallel via a
-        small thread pool, then merged. Each chunk gets its own semaphore /
-        budget / deadline accounting, so the call-count stays exact. No
-        context-cache lookup: a batch verdict is scene-specific and the
-        per-candidate sequential fallback still benefits from its own cache.
+        Vision lanes: a batch is at most 4 candidates x 2 frames each
+        (8 images) per vision request — the transport ceiling is 16
+        images per request (``SAFE_VISION_BATCH_IMAGES``), chunked here
+        by images-per-request (candidates x frames <= 16), not by
+        candidate count. Each chunk is filed as its own ``_run``
+        (operation ``clip_batch``) — one batch counts as one vision
+        call — filed in parallel via a small thread pool, then merged.
+        Partial results are returned with their missing ids: a chunk
+        failure never raises away good rows (raise only when zero
+        usable verdicts survive). ``scene_tags`` (per-candidate scene
+        indices, for cross-scene batches) only scopes the cache key;
+        the transport still keys rows by ``candidate_id``.
         """
         from concurrent.futures import ThreadPoolExecutor
 
         from .vision_client import SAFE_VISION_BATCH_IMAGES
 
+        # Chunk by images-per-request, not by candidate count.
         chunks: list = []
-        for start in range(0, len(candidates or []), SAFE_VISION_BATCH_IMAGES):
-            chunks.append(list((candidates or [])[start:start + SAFE_VISION_BATCH_IMAGES]))
+        current: list = []
+        current_images = 0
+        for cand in (candidates or []):
+            frames = len(cand.get("frame_paths") or []) if isinstance(cand, dict) else 0
+            images = max(1, frames)
+            if current and current_images + images > SAFE_VISION_BATCH_IMAGES:
+                chunks.append(current)
+                current, current_images = [], 0
+            current.append(cand)
+            current_images += images
+        if current:
+            chunks.append(current)
         if not chunks:
             return {}
+        cache_prompt = json.dumps(
+            {"system_prompt": system_prompt, "user_prompt": user_prompt,
+             "scene_tags": list(scene_tags or [])},
+            sort_keys=True, ensure_ascii=False,
+        )
         if len(chunks) == 1:
             chunk = chunks[0]
             paths: list = []
@@ -359,10 +405,11 @@ class _ContextClient:
             return self._run(
                 "clip_batch",
                 paths,
-                json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                cache_prompt,
                 lambda: self._client.analyze_clip_frames_batch(chunk, user_prompt, system_prompt),
             )
         merged: dict = {}
+        errors: list = []
         with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
             futures = []
             for chunk in chunks:
@@ -374,11 +421,16 @@ class _ContextClient:
                     self._run,
                     "clip_batch",
                     paths,
-                    json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                    cache_prompt,
                     lambda _c=chunk: self._client.analyze_clip_frames_batch(_c, user_prompt, system_prompt),
                 ))
             for future in futures:
-                merged.update(future.result())
+                try:
+                    merged.update(future.result())
+                except Exception as exc:  # keep good rows; retry only missing
+                    errors.append(exc)
+        if not merged and errors:
+            raise errors[0]
         return merged
 
     def compare_images(self, image_paths: list, user_prompt: str) -> dict:
@@ -390,16 +442,21 @@ class _ContextClient:
             cache_lookup=lambda: self._lookup_raw("compare_images", image_paths[:4], user_prompt),
         )
 
-    def analyze_images_batch(self, image_paths: list, user_prompt: str, system_prompt: str, candidate_ids: list = None) -> dict:
-        """Judge a scene's image candidates in SAFE batches of 2, in parallel.
+    def analyze_images_batch(self, image_paths: list, user_prompt: str, system_prompt: str, candidate_ids: list = None, scene_tags: list = None) -> dict:
+        """Judge image candidates in batches of up to 16 images, in parallel.
 
-        SAFE BATCH: at most 2 images per vision request. A scene's
-        candidates are split into chunks of 2 and each chunk is filed as
-        its own ``_run`` (one call-count slot, one semaphore slot, one
-        cache entry) — filed in parallel via a small thread pool, then
-        merged into {candidate_id: normalised verdict}, as
-        QwenVisionClient.analyze_images_batch does. Each chunk gets its own
-        reservation so the budget accounting stays exact.
+        Vision lanes: the transport ceiling is 16 images per request
+        (``SAFE_VISION_BATCH_IMAGES``); the operating size (8 images,
+        8 scenes x 1 candidate) is enforced by the caller / raw client.
+        Each chunk is filed as its own ``_run`` (one call-count slot,
+        one semaphore slot, one cache entry) — filed in parallel via a
+        small thread pool, then merged into {candidate_id: normalised
+        verdict}, as QwenVisionClient.analyze_images_batch does. Each
+        chunk gets its own reservation so the budget accounting stays
+        exact. Partial results are returned with their missing ids:
+        a chunk failure never raises away good rows (raise only when
+        zero usable verdicts survive). ``scene_tags`` (per-image scene
+        indices, for cross-scene batches) only scopes the cache key.
         """
         from concurrent.futures import ThreadPoolExecutor
 
@@ -409,22 +466,31 @@ class _ContextClient:
         ids = list(candidate_ids or [])
         while len(ids) < len(paths):
             ids.append(str(paths[len(ids)]))
+        tags = list(scene_tags or [])
+        while len(tags) < len(paths):
+            tags.append(None)
         chunks: list = []
         for start in range(0, len(paths), SAFE_VISION_BATCH_IMAGES):
             chunks.append((paths[start:start + SAFE_VISION_BATCH_IMAGES],
                            ids[start:start + SAFE_VISION_BATCH_IMAGES]))
         if not chunks:
             return {}
+        cache_prompt = json.dumps(
+            {"system_prompt": system_prompt, "user_prompt": user_prompt,
+             "scene_tags": [str(tag) for tag in tags]},
+            sort_keys=True, ensure_ascii=False,
+        )
         if len(chunks) == 1:
             chunk_paths, chunk_ids = chunks[0]
             return self._run(
                 "image_batch",
                 list(chunk_paths),
-                json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                cache_prompt,
                 lambda: self._client.analyze_images_batch(chunk_paths, user_prompt, system_prompt, chunk_ids),
                 cache_lookup=lambda: self._lookup_raw("analyze_images_batch", chunk_paths, user_prompt, system_prompt, chunk_ids),
             )
         merged: dict = {}
+        errors: list = []
         with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
             futures = []
             for chunk_paths, chunk_ids in chunks:
@@ -432,12 +498,17 @@ class _ContextClient:
                     self._run,
                     "image_batch",
                     list(chunk_paths),
-                    json.dumps({"system_prompt": system_prompt, "user_prompt": user_prompt}, sort_keys=True, ensure_ascii=False),
+                    cache_prompt,
                     lambda _p=chunk_paths, _i=chunk_ids: self._client.analyze_images_batch(_p, user_prompt, system_prompt, _i),
                     cache_lookup=lambda _p=chunk_paths, _i=chunk_ids: self._lookup_raw("analyze_images_batch", _p, user_prompt, system_prompt, _i),
                 ))
             for future in futures:
-                merged.update(future.result())
+                try:
+                    merged.update(future.result())
+                except Exception as exc:  # keep good rows; retry only missing
+                    errors.append(exc)
+        if not merged and errors:
+            raise errors[0]
         return merged
 
 
@@ -500,13 +571,94 @@ class VisualDecisionContext:
         self._inflight: Dict[str, threading.Event] = {}
         self._client: Optional[_ContextClient] = None
         self._fallback_client: Optional[_ContextClient] = None
+        # Lane split (vision lanes, 2026-11-22): a lane child shares the
+        # decision cache and the USD cost ledger with its parent, but has
+        # its own deadline / call counter / semaphore. ``_lane_budget``
+        # is None on a shared (legacy) context.
+        self._lane_budget = None
+        self._lane: Optional[str] = None
+        self._parent: Optional["VisualDecisionContext"] = None
+        self._lane_children: Dict[str, "VisualDecisionContext"] = {}
+        self._shared_cost: List[float] = [0.0]
+
+    def child(self, lane: str, lane_budget=None) -> "VisualDecisionContext":
+        """Return the lane-scoped child context for ``lane``.
+
+        The child shares the parent's decision cache (dedup) and USD
+        cost ledger (a job-level backstop, never a lane cut-off), but
+        owns its own ``deadline_at`` / ``max_calls`` / ``_semaphore``.
+        Its clock starts at its first vision submission through its
+        ``LaneVisionBudget`` — never at construction. Children are
+        cached per lane: exactly one child per lane per job. The raw
+        transport client is shared with the parent (one probe, one
+        model), wrapped in a ``_ContextClient`` bound to the child so
+        ``_reserve_call`` / ``_acquire_before_deadline`` enforce the
+        LANE budget.
+        """
+        lane = str(lane or "").strip().lower()
+        with self._lock:
+            existing = self._lane_children.get(lane)
+            if existing is not None:
+                return existing
+            budget = lane_budget
+            if budget is None:
+                from .lane_budget import (
+                    LaneVisionBudget,
+                    lane_budget_seconds,
+                    split_call_budgets,
+                )
+
+                split = split_call_budgets(self.scene_count)
+                budget = LaneVisionBudget(
+                    lane,
+                    scene_count=self.scene_count,
+                    budget_seconds=lane_budget_seconds(lane, self.scene_count),
+                    max_calls=split.get(lane, 4),
+                )
+            child = VisualDecisionContext(
+                enabled=self.enabled,
+                api_key=self.api_key,
+                model=self.model,
+                scene_count=self.scene_count,
+                max_calls=int(getattr(budget, "max_calls", 1) or 1),
+                budget_usd=self.budget_usd,
+                deadline_at=float("inf"),
+                visual_required=self.visual_required,
+                fail_closed=self.fail_closed,
+                max_concurrent=int(getattr(budget, "max_inflight", self.max_concurrent) or self.max_concurrent),
+                fallback_model=self.fallback_model,
+                fallback_models=self.fallback_models,
+                call_timeout_seconds=self.call_timeout_seconds,
+                call_max_attempts=self.call_max_attempts,
+                fast_mode=self.fast_mode,
+                cache=self.cache,
+            )
+            child._lane_budget = budget
+            child._lane = lane
+            child._parent = self
+            child._shared_cost = self._shared_cost
+            child._semaphore = threading.BoundedSemaphore(max(1, child.max_concurrent))
+            self._lane_children[lane] = child
+            return child
+
+    def _lane_deadline_remaining(self) -> float:
+        budget = getattr(self, "_lane_budget", None)
+        if budget is None:
+            return max(0.0, self.deadline_at - time.monotonic())
+        return float(budget.remaining())
 
     def refresh_deadline(
         self,
         deadline_seconds: Optional[float] = None,
         deadline_at: Optional[float] = None,
     ) -> None:
-        """Extend or refresh the context deadline and clear deadline-based degradation."""
+        """Extend or refresh the context deadline and clear deadline-based degradation.
+
+        A lane budget is never extended by refreshing a shared deadline
+        (vision lanes): refreshes on a lane child are a no-op.
+        """
+        if getattr(self, "_lane_budget", None) is not None:
+            return
         with self._lock:
             now = time.monotonic()
             if deadline_at is not None:
@@ -756,6 +908,35 @@ class VisualDecisionContext:
     def get_client(self) -> Optional[_ContextClient]:
         if not self.enabled or not self.api_key or (self.degraded_reason and not str(self.api_key).startswith("external-agent:")):
             return None
+        # Lane child: share the parent's raw transport client (one probe,
+        # one model) but bind it to THIS child, so _run() reserves calls
+        # and semaphore slots against the LANE budget, not the parent's.
+        # §7(3) resolution: YT clip vision already reaches vision through
+        # visual_context.get_client() -> _ContextClient._run -> this
+        # reservation; the clip pipeline receives the context client, not
+        # a raw Qwen client, so there is no raw-client bypass to close —
+        # the lane child is what re-homes the charge per lane.
+        if getattr(self, "_lane_budget", None) is not None and self._parent is not None:
+            with self._lock:
+                if self._client is not None:
+                    return self._client
+            # Call the parent WITHOUT holding the child lock: the parent
+            # takes its own lock, and summary() takes parent-then-child,
+            # so holding child-then-parent here could deadlock.
+            parent_client = self._parent.get_client()
+            if parent_client is None:
+                return None
+            raw = getattr(parent_client, "_client", None)
+            if raw is None:
+                # A test double / foreign client without a raw transport:
+                # reuse it as-is; accounting falls back to the parent.
+                with self._lock:
+                    self._client = parent_client
+                return self._client
+            with self._lock:
+                if self._client is None:
+                    self._client = _ContextClient(self, raw)
+                return self._client
         with self._lock:
             if self._client is None:
                 # Client construction is followed by a live provider probe.
@@ -893,6 +1074,27 @@ class VisualDecisionContext:
         return self._fallback_client
 
     def _reserve_call(self) -> None:
+        budget = getattr(self, "_lane_budget", None)
+        if budget is not None:
+            # The lane clock starts at this lane's first submission; the
+            # lane deadline (not a shared one) is the only time cut-off.
+            if budget.expired():
+                with self._lock:
+                    self.degraded_reason = "visual_deadline_exceeded"
+                raise VisualBudgetExceeded(self.degraded_reason)
+            if self.budget_usd and float(getattr(self, "_shared_cost", [0.0])[0]) >= self.budget_usd:
+                with self._lock:
+                    self.degraded_reason = "visual_cost_budget_exceeded"
+                raise VisualBudgetExceeded(self.degraded_reason)
+            if not budget.try_record_call():
+                with self._lock:
+                    self.degraded_reason = "visual_call_budget_exceeded"
+                raise VisualBudgetExceeded(self.degraded_reason)
+            with self._lock:
+                self.calls = int(getattr(budget, "calls", 0) or 0) + int(
+                    getattr(budget, "reserve_calls", 0) or 0
+                )
+            return
         with self._lock:
             if not math.isinf(self.deadline_at) and time.monotonic() >= self.deadline_at:
                 self.degraded_reason = "visual_deadline_exceeded"
@@ -906,7 +1108,16 @@ class VisualDecisionContext:
             self.calls += 1
 
     def _acquire_before_deadline(self, semaphore: threading.BoundedSemaphore) -> None:
-        """Acquire an execution slot without waiting past the shared wall."""
+        """Acquire an execution slot without waiting past the lane/shared wall."""
+        budget = getattr(self, "_lane_budget", None)
+        if budget is not None:
+            budget.start_if_needed()
+            remaining = float(budget.remaining())
+            if remaining <= 0.0 or not semaphore.acquire(timeout=remaining):
+                with self._lock:
+                    self.degraded_reason = "visual_deadline_exceeded"
+                raise VisualBudgetExceeded(self.degraded_reason)
+            return
         if math.isinf(self.deadline_at):
             semaphore.acquire()
             return
@@ -930,7 +1141,14 @@ class VisualDecisionContext:
         with self._lock:
             if cache_hit:
                 self.cache_hits += 1
-            self.cost_usd += max(0.0, float(cost_usd or 0.0))
+            cost = max(0.0, float(cost_usd or 0.0))
+            # USD is a job-level backstop shared by lane children: every
+            # record lands in the shared ledger, never a per-lane pot.
+            try:
+                self._shared_cost[0] += cost
+                self.cost_usd = float(self._shared_cost[0])
+            except Exception:
+                self.cost_usd += cost
             decision = {
                 "operation": operation,
                 "latency_ms": round(latency_ms, 1),
@@ -956,8 +1174,14 @@ class VisualDecisionContext:
 
     def summary(self) -> Dict[str, Any]:
         with self._lock:
+            children = list(getattr(self, "_lane_children", {}).values())
+            child_calls = sum(int(getattr(c, "calls", 0) or 0) for c in children)
+            child_decisions: List[Dict[str, Any]] = []
+            for child in children:
+                with child._lock:
+                    child_decisions.extend(list(child.decisions))
             completed_checks = sum(
-                1 for decision in self.decisions
+                1 for decision in list(self.decisions) + child_decisions
                 if not decision.get("cache_hit")
                 and decision.get("operation") in {"image", "clip", "compare"}
             )
@@ -980,7 +1204,7 @@ class VisualDecisionContext:
                 "vision_checks_completed": completed_checks,
                 "vision_budget_exhausted": budget_exhausted,
                 "model": self.model if self.enabled else "",
-                "calls": self.calls,
+                "calls": int(self.calls) + child_calls,
                 "cache_hits": self.cache_hits,
                 "cost_usd": round(self.cost_usd, 8),
                 "max_calls": self.max_calls,
@@ -992,7 +1216,11 @@ class VisualDecisionContext:
                 "call_max_attempts": self.call_max_attempts,
                 "fast_mode": self.fast_mode,
                 "degraded_reason": self.degraded_reason,
-                "decisions": list(self.decisions),
+                "decisions": list(self.decisions) + child_decisions,
+                "lanes": {
+                    str(getattr(c, "_lane", "")): c.summary()
+                    for c in children
+                } if children else {},
             }
 
     def is_usable(self) -> bool:

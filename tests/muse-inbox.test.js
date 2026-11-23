@@ -128,6 +128,11 @@ test('concurrent dispatch handles unknown kinds, skips expired and foreign rows 
   let peak = 0;
   const stop = startResidentInbox({
     root, concurrency: 3, pollMs: 10, logger,
+    // The claim is stubbed here (like complete): this test measures
+    // dispatch concurrency, and a real python claim would add startup
+    // jitter that staggers the answers.
+    claim: async () => true,
+    release: async () => {},
     complete: async (root, row, reply) => writeJsonAtomic(path.join(root, row.id, 'response.json'), reply),
     answer: async row => {
       seen.set(row.id, (seen.get(row.id) || 0) + 1);
@@ -162,6 +167,9 @@ test('shutdown aborts in-flight composition and the next dispatcher takes the st
       return 'stale';
     }
   });
+  // Pickup now claims the row (async) before composing, so the answer —
+  // and its signal — only exist after the claim resolves.
+  await until(() => signal);
   stop();
   assert.equal(signal.aborted, true);
   const stopNext = startResidentInbox({ ...options, answer: async () => 'fresh' });
@@ -329,10 +337,11 @@ test('transport-unavailable leaves the request pending for the hook and retries 
   try {
     // The first attempt must NOT record a failure: no response file, and
     // the bridge row stays pending so the host hook can still answer it.
+    // The claim release is async, so wait for the row to settle back to
+    // pending instead of assuming it after a fixed sleep.
     await until(() => calls >= 1);
-    await sleep(50);
+    await until(() => JSON.parse(fs.readFileSync(path.join(root, row.id, 'request.json'))).state === 'pending', 8000);
     assert.equal(fs.existsSync(path.join(root, row.id, 'response.json')), false);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(root, row.id, 'request.json'))).state, 'pending');
     // After the cooldown the same request is picked up again and answered.
     await until(() => calls >= 2, 8000);
     await until(() => JSON.parse(fs.readFileSync(path.join(root, row.id, 'request.json'))).state === 'answered', 8000);
@@ -414,9 +423,10 @@ test('readiness closes after the spool reports the pool dead, even with a fresh 
   });
   try {
     await until(() => calls >= 1);
-    await sleep(50);
+    // The claim release is async, so wait for the row to settle back to
+    // pending instead of assuming it after a fixed sleep.
+    await until(() => JSON.parse(fs.readFileSync(path.join(root, row.id, 'request.json'))).state === 'pending', 8000);
     assert.equal(fs.existsSync(path.join(root, row.id, 'response.json')), false);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(root, row.id, 'request.json'))).state, 'pending');
     let probes = 0;
     const ready = createInboxReadiness({
       spoolDir: spool,

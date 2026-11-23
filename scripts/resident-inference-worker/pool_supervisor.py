@@ -52,10 +52,35 @@ acts through a durable ACTION QUEUE instead of prose in a log:
   10 minutes is busy, not dead. And one continuous outage counts as ONE
   death (confirmed_dead): without that, a 31h-dead worker re-confirms
   every ~3 min and trips the three-death hold on a single outage.
-* Slot rule (standing policy): a dead worker is respawned only if its
-  slot number is within the CURRENT target (target =
-  clamp(ceil(pending/3), 2, 8)). At idle target 2, worker-3 is not
-  respawned; its slot is reserved for scale-up.
+* Slot rule (2026-11-21, count-based — the old slot-number rule is
+  gone): a dead worker is respawned, and a scale-up spawn is queued,
+  whenever the pool is SHORT — live + incoming (pending spawn/respawn
+  actions) < target — regardless of the slot NUMBER. The old rule
+  ("only respawn a slot within the CURRENT target") let a respawn
+  cancelled at idle target 2 ("slot 3 above current target") stay
+  cancelled after the target rose to 4, and let one flapping worker's
+  unconfirmed-death sighting plus one held slot zero out scale-up
+  entirely (live 2 / target 4 / pending 6 with ZERO queued actions and
+  a happy ownerResponsive). Slot numbers now only ORDER the choice
+  (lowest free slot first); the COUNT is the invariant. A held slot
+  (3 deaths in 30 min) is still never respawned — but it no longer
+  shrinks the target: the pool fills to the FULL target via higher
+  free slots. An unconfirmed-death sighting still reserves ITS slot
+  (never spawn into it) and counts as capacity for that one slot, so
+  it cannot veto scale-up of the OTHER free slots; if the sighted
+  worker revives, the pool lands at most one over target and the
+  300s scale-down grace trims it when quiet. A busy slot (false-death
+  guard: ANSWERED in the last 10 min) likewise counts as capacity.
+* Scale-up signal: the same tick the loop queues scale-up spawns (or
+  finds the pool short with pending work and no spawn possible) it
+  writes ``supervisor-scaleup-needed.json`` into the spool (see
+  ``pool_scaling.build_scaleup_signal``): live/target/pending, the
+  owed workerIds, and what blocks the rest. The watch hook wakes the
+  parent on a fresh signal within ~60s — the parent is the ONLY
+  spawner whose workers survive (cron-spawned workers die at the 300s
+  timeout), so the signal, not the 600s owner tripwire, is the fast
+  path to a staffed pool. The loop deletes the signal once the pool is
+  back at target or a render goes ACTIVE.
 
 * Loop handover. The loop writes ``supervisor-loop.pid`` (its pid, owner
   agent id, start time) into the state dir at startup. Each tick it
@@ -73,8 +98,9 @@ deleted, stale claims of dead workers rescued after the 300s grace);
 30s status writes (this loop ticks every 15s, so both liveness files are
 rewritten every tick); supervisor never answers inference requests
 (this file contains no inference code at all); a slot that dies three
-times within 30 minutes is held (pool runs at target-minus-one) until a
-live heartbeat reappears or an hour passes.
+times within 30 minutes is held (never respawned; the pool fills to
+target via other slots) until a live heartbeat reappears or an hour
+passes.
 
 Run:  python3 pool_supervisor.py [--once] [--shadow]
   --once    run a single tick then exit (tests / dry runs).
@@ -133,6 +159,14 @@ OWNER_ACK_LEASE_S = float(
 STUCK_FROZEN_S = 600
 ROTATE_AGE_S = 12 * 3600
 ROTATE_ANSWERS = 50
+# Max plausible answers gained in one ~15s tick. A worker holds one
+# claim at a time and an answer takes >10s to compose, validate and
+# deliver, so it cannot gain more than a handful of answers per tick.
+# A bigger jump is a counter discontinuity (a stale/cumulative count
+# leaking into a fresh incarnation's heartbeat — 2026-11-21: a fresh
+# worker-1's heartbeat jumped 0 -> 582 in one tick and was rotated at
+# once), not work done. See the rotation block below.
+MAX_ANSWERED_JUMP_PER_TICK = 10
 THREE_DEATHS_WINDOW_S = 30 * 60
 HOLD_S = 3600
 # Scale-down grace: do not stop an idle worker merely because pending
@@ -145,14 +179,21 @@ HOLD_S = 3600
 # the very vision the 4-worker floor is meant to speed up.
 SCALE_DOWN_GRACE_S = 300
 MAX_WORKERS = 8
-MIN_WORKERS = 2
+MIN_WORKERS = 4
 
 # Scaling rule: pool_scaling.py is the single testable statement of the
 # rule (media floor 4, idle floor 2, ceiling 8). Raised 2 -> 4 for the
 # media phase on 2026-11-20 (batched vision files requests in parallel).
-# Falls back to the old floor-2 rule if the module cannot be imported.
+# The module's OWN directory goes on sys.path FIRST, ahead of
+# BRIEF_DIR: BRIEF_DIR defaults to the live checkout, so without this
+# a worktree/dev copy of this file would import the LIVE pool_scaling
+# (2026-11-21: that silently downgraded the floor to 2 via the
+# fallback below, because the live copy lacked the new signal names).
+# Each import has its OWN fallback: a missing signal helper must never
+# nuke the scaling rule itself.
 try:
     sys.path.insert(0, BRIEF_DIR)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from pool_scaling import scaling_target as _scaling_target
 except Exception:
     def _scaling_target(pending, render_active):
@@ -162,6 +203,42 @@ except Exception:
         if pending == 0:
             return MIN_WORKERS
         return max(MIN_WORKERS, min(MAX_WORKERS, -(-pending // 3)))
+
+# Scale-up signal helpers ride the same module (same fallback shape).
+try:
+    from pool_scaling import (build_scaleup_signal as _build_scaleup_signal,
+                              clear_scaleup_signal as _clear_scaleup_signal,
+                              write_scaleup_signal as _write_scaleup_signal)
+except Exception:
+    def _build_scaleup_signal(live, target, pending, spawns, blocked=None,
+                              supervisor_id=None, now_ms=None):
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        return {"updatedAt": int(now_ms), "supervisorAgentId": supervisor_id,
+                "live": int(live), "target": int(target),
+                "pending": int(pending),
+                "spawns": [{"action": s.get("action"),
+                            "actionId": s.get("id") or s.get("actionId"),
+                            "workerId": s.get("workerId"),
+                            "reason": s.get("reason")}
+                           for s in (spawns or [])],
+                "blocked": list(blocked or [])}
+
+    def _write_scaleup_signal(spool_dir, payload):
+        path = os.path.join(spool_dir,
+                            "supervisor-scaleup-needed.json")
+        tmp = "%s.tmp-scaleup-%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+        return path
+
+    def _clear_scaleup_signal(spool_dir):
+        try:
+            os.remove(os.path.join(
+                spool_dir, "supervisor-scaleup-needed.json"))
+        except OSError:
+            pass
 
 LOOP_LOG = os.path.join(STATE_DIR, "supervisor-loop.log")
 STATE_FILE = os.path.join(STATE_DIR, "supervisor-state.json")
@@ -336,6 +413,70 @@ class Supervisor:
         lines is a busy worker, not a dead one."""
         return self.worker_log_recent(worker_id, since_s, needle="ANSWERED")
 
+    def claim_logged_at(self, worker_id, request_id):
+        """Epoch seconds of the LATEST ``[worker] CLAIMED <request>``
+        line in worker.log (tail scan, like worker_log_recent), or
+        None. The worker logs CLAIMED in the same command as the
+        rename that claims the request, so the line's timestamp is the
+        claim time when present. The match must end the id: a line for
+        a longer id that merely starts with this one does not count."""
+        path = os.path.join(self.spool, "worker.log")
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - 200000))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            return None
+        import calendar
+        needle = "[%s] CLAIMED %s" % (worker_id, request_id)
+        latest = None
+        for line in tail.splitlines():
+            at = line.find(needle)
+            if at < 0:
+                continue
+            after = line[at + len(needle):]
+            if after != "" and not after[0].isspace():
+                continue
+            try:
+                ts = time.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+            except (ValueError, OverflowError):
+                continue
+            stamp = calendar.timegm(ts)
+            if latest is None or stamp > latest:
+                latest = stamp
+        return latest
+
+    def claim_age_s(self, path, request_id, worker_id, now):
+        """Age in seconds of a claim — time since the worker CLAIMED
+        the request, NOT since the request was created.
+
+        2026-11-21 rescue bug: the sweep used the claim file's mtime,
+        but a claim is an atomic RENAME of the request file, and a
+        rename preserves mtime — so the "age" was the request's age,
+        not the claim's. A request created 1446s earlier but claimed
+        111s ago read as 1446s old and was rescued mid-composition.
+        Claim time is the worker's LATEST CLAIMED line for this
+        (worker, request) in worker.log — written in the same command
+        as the rename, so it is the claim time; a previous hold's old
+        line is superseded because only the latest line counts. The
+        claim file's ctime (which the rename updates) is the fallback
+        for unlogged claims. A timestamp in the future (clock skew, or
+        a fake test clock older than the real ctime) is discarded, not
+        trusted. Returns None when no claim time can be established —
+        an unprovable age never rescues.
+        """
+        logged = self.claim_logged_at(worker_id, request_id)
+        if logged is not None and logged <= now + 5:
+            return now - logged
+        try:
+            ctime = os.stat(path).st_ctime
+        except OSError:
+            return None
+        if ctime is None or ctime > now + 5:
+            return None
+        return now - ctime
+
     def _worker_log_has_stop(self, worker_id, action_id=None,
                              since_s=STUCK_FROZEN_S):
         """True if worker.log has a STOP/STOPPED line for this worker in
@@ -394,8 +535,10 @@ class Supervisor:
 
     @staticmethod
     def slot_number(worker_id):
-        """worker-N -> N, else None. Slots are the scale-up currency: the
-        pool fills lowest free slots first, up to the current target."""
+        """worker-N -> N, else None. Slot numbers only ORDER the choice
+        (lowest free slot first); the COUNT is the scale-up invariant
+        (2026-11-21: a slot number above target is owed whenever the
+        pool is short). Kept as a utility for ordering and logging."""
         try:
             if worker_id.startswith("worker-"):
                 return int(worker_id[len("worker-"):])
@@ -496,21 +639,12 @@ class Supervisor:
                                % wid)
                 continue
             if act in ("respawn",) and len(live) >= target:
-                # Pool recovered to target (e.g. scale-up filled the slot):
-                # a respawn for a slot above target is not owed.
+                # Pool recovered to target (e.g. scale-up filled the
+                # slot): the respawn is not owed — for the COUNT, not
+                # the slot number.
                 self.spool_log("ACTION CANCELLED respawn %s: pool back "
                                "at target" % wid)
                 continue
-            if act in ("respawn", "spawn"):
-                # Slot rule: a slot above the CURRENT target is reserved
-                # for scale-up. If the target fell (backlog drained), a
-                # queued action for that slot is no longer owed.
-                slot = self.slot_number(wid)
-                if slot is not None and slot > target:
-                    self.spool_log("ACTION CANCELLED %s %s: slot %d above "
-                                   "current target %d (reserved for "
-                                   "scale-up)" % (act, wid, slot, target))
-                    continue
             if act in ("stop_idle", "stop_graceful") and not active \
                     and act == "stop_graceful":
                 if self._worker_log_has_stop(wid, a.get("id")):
@@ -553,6 +687,66 @@ class Supervisor:
                 continue  # worker already gone; rotation moot
             out.append(a)
         return out
+
+    def _update_scaleup_signal(self, live, target, pending, active,
+                               actions, held_ids, sightings, claimed_by):
+        """Write (or clear) the scale-up signal file
+        (``supervisor-scaleup-needed.json`` in the spool).
+
+        Written the same tick the pool is found short with the gate
+        idle: either spawns are queued (the parent must execute them —
+        only a top-level parent spawn survives) or the shortfall cannot
+        be queued at all (every free slot held / sighted / busy /
+        claimed), in which case ``blocked`` says why, so the parent is
+        summoned anyway instead of the loop looking healthy while
+        understaffed. Cleared when the pool is at target, when a
+        render is ACTIVE (no spawns during a render), or when nothing
+        is owed. A failed write is logged, never fatal: the owner
+        tripwire and the 300s shortfall watch remain as backstops.
+        Returns True when the signal is live after this tick.
+        """
+        if active or len(live) >= target:
+            _clear_scaleup_signal(self.spool)
+            return False
+        now_ms = self.now_ms()
+        pending_spawns = [
+            a for a in actions
+            if a.get("status") == "pending"
+            and a.get("action") in ("spawn", "respawn")]
+        shortfall = target - len(live) - len(pending_spawns)
+        blocked = []
+        if shortfall > 0:
+            if held_ids:
+                blocked.append("held slots (3 deaths in 30 min): %s"
+                               % ", ".join(sorted(held_ids)))
+            sighted = sorted(w for w in (sightings or {})
+                             if w not in live)
+            if sighted:
+                blocked.append("unconfirmed-death sightings: %s"
+                               % ", ".join(sighted))
+            busy = sorted(
+                wid for wid, until in
+                self.state.get("busy_until", {}).items()
+                if now_ms < until and wid not in live)
+            if busy:
+                blocked.append("busy slots (answered recently): %s"
+                               % ", ".join(busy))
+            claimed = sorted(w for w in (claimed_by or {})
+                             if w not in live)
+            if claimed:
+                blocked.append("slots holding a live claim: %s"
+                               % ", ".join(claimed))
+        try:
+            _write_scaleup_signal(
+                self.spool,
+                _build_scaleup_signal(
+                    len(live), target, pending, pending_spawns,
+                    blocked=blocked, supervisor_id=self.supervisor_id,
+                    now_ms=now_ms))
+        except OSError as e:
+            self.log("scale-up signal write failed: %s" % e)
+            return False
+        return True
 
     # -- owner responsiveness ------------------------------------------
     def owner_ack_doc(self):
@@ -632,9 +826,16 @@ class Supervisor:
                 continue
             if exp is None:
                 continue
-            try:
-                age = now - os.path.getmtime(path)
-            except OSError:
+            # Claim age, not request age (2026-11-21 rescue bug): the
+            # claim file's mtime is the REQUEST's creation time — a
+            # rename preserves mtime — so a request created long ago
+            # but claimed recently read as old and was rescued
+            # mid-composition. claim_age_s() uses the claim time (the
+            # worker's CLAIMED log line, or the file's ctime, which
+            # the rename updates). An unprovable age never rescues.
+            request_id = base.rsplit(".request.json", 1)[0]
+            age = self.claim_age_s(path, request_id, wid, now)
+            if age is None:
                 continue
             if age < CLAIM_RESCUE_GRACE_S:
                 continue
@@ -806,9 +1007,9 @@ class Supervisor:
                         held_ids.add(wid)
                         self.spool_log(
                             "WORKER HELD %s: 3 deaths in %d min — no more "
-                            "respawns for this slot for 1h; pool runs at "
-                            "target-minus-one" % (wid,
-                                                 THREE_DEATHS_WINDOW_S // 60))
+                            "respawns for this slot for 1h; pool fills to "
+                            "target via other slots" % (wid,
+                                                       THREE_DEATHS_WINDOW_S // 60))
                         self.log("worker %s held after 3 deaths" % wid)
                     elif wid not in held_ids:
                         pending_spawn = any(
@@ -816,30 +1017,41 @@ class Supervisor:
                             and a.get("action") == "spawn"
                             and a.get("workerId") == wid
                             for a in actions)
-                        # Slot rule (standing policy): only respawn a dead
-                        # worker whose slot number is within the CURRENT
-                        # target (target = clamp(ceil(pending/3), 2, 8)).
-                        # A stale heartbeat alone is NOT reason to respawn
-                        # a slot above target — that slot is reserved for
-                        # scale-up, not for keeping every historical slot
-                        # filled. Queueing for it would leave a pending
-                        # action nobody should act on, which would
-                        # eventually (and wrongly) trip the owner tripwire.
-                        # The death is still counted (3-death hold above).
-                        slot = self.slot_number(wid)
-                        if (not pending_spawn and len(live) < target
-                                and slot is not None and slot <= target):
+                        # Slot rule (2026-11-21, count-based): respawn
+                        # whenever the pool is SHORT — live + incoming
+                        # (pending spawn/respawn actions) < target —
+                        # regardless of the slot NUMBER. The old
+                        # slot-number rule ("only respawn a slot within
+                        # the CURRENT target") left a respawn cancelled
+                        # at idle target 2 ("slot 3 above current
+                        # target") cancelled forever after the target
+                        # rose to 4: the death path never re-queued it
+                        # (confirmed_dead skips re-sighting) and the
+                        # scale-up block was vetoed by the sightings /
+                        # held subtraction. A stale heartbeat alone is
+                        # still NOT reason to respawn when the pool is
+                        # already at target — that is what the count
+                        # check enforces, and queueing then would leave
+                        # a pending action nobody should act on, which
+                        # would eventually (and wrongly) trip the owner
+                        # tripwire. The death is still counted
+                        # (3-death hold above).
+                        incoming_now = sum(
+                            1 for a in actions
+                            if a.get("status") == "pending"
+                            and a.get("action") in ("spawn", "respawn"))
+                        if (not pending_spawn
+                                and len(live) + incoming_now < target):
                             self.queue_action(
                                 actions, "respawn", wid,
                                 "heartbeat stale >%ds, no claim (death #%d)"
                                 % (HEARTBEAT_STALE_S, d["count"]))
                             queued = True
                         else:
-                            self.log("worker %s dead (#%d) but slot %s "
-                                     "above target / pool at target "
-                                     "(%d/%d) — death counted, no respawn "
-                                     "queued"
-                                     % (wid, d["count"], wid,
+                            self.log("worker %s dead (#%d) but pool at "
+                                     "target (%d/%d) — death counted, no "
+                                     "respawn queued"
+                                     % (wid, d["count"],
                                         len(live), target))
                     if queued:
                         self.spool_log(
@@ -955,6 +1167,32 @@ class Supervisor:
                                    "answeredLastSeen": answered}
                 rotate_done.pop(wid, None)
                 continue
+            # Upward-jump guard (2026-11-21 rotation misfire): the
+            # mirror image of the drop above. A fresh worker-1 was
+            # rotated ~15s after its first heartbeat because its
+            # heartbeat answered count jumped 0 -> 582 in one tick —
+            # a stale/cumulative count (leftover loop, reseeded count
+            # file) leaking into the fresh incarnation's heartbeat.
+            # The drop check cannot catch it (582 is not below the
+            # last-seen 0), so without this guard the whole jump counts
+            # as gain (582 >= 50) and the worker is rotated at once.
+            # A jump bigger than MAX_ANSWERED_JUMP_PER_TICK in one
+            # ~15s tick is physically impossible for a one-claim-at-a-
+            # time worker, so it is a counter discontinuity, not work
+            # done: re-baseline (new answeredAtStart, fresh clock)
+            # instead of rotating — exactly like the drop case, in the
+            # other direction. Thresholds unchanged.
+            last_seen = rec.get("answeredLastSeen",
+                                rec.get("answeredAtStart", answered))
+            if answered - last_seen > MAX_ANSWERED_JUMP_PER_TICK:
+                self.log("worker %s answered count jumped %s -> %s in "
+                         "one tick — counter discontinuity, rotation "
+                         "age reset" % (wid, last_seen, answered))
+                first_seen[wid] = {"firstSeenMs": now_ms,
+                                   "answeredAtStart": answered,
+                                   "answeredLastSeen": answered}
+                rotate_done.pop(wid, None)
+                continue
             rec["answeredLastSeen"] = answered
             age = now_ms - rec["firstSeenMs"]
             gained = answered - rec.get("answeredAtStart", answered)
@@ -1006,26 +1244,38 @@ class Supervisor:
         else:
             # Render ended (or never active): clear the confirmation.
             self.state.pop("render_active_since_ms", None)
-            # Needed slots, net of workers already coming (pending spawn /
-            # respawn), slots reserved for unconfirmed deaths (they will be
-            # respawned, not replaced by another id), and held slots (the
-            # brief: a held slot runs the pool at target-minus-one).
+            # Needed slots (2026-11-21, count-based scale-up): the pool
+            # is short by target - live - incoming (pending spawn /
+            # respawn actions already coming). An unconfirmed-death
+            # sighting counts as capacity for ITS slot only — a sighted
+            # worker may revive, so one slot is held back for it — but
+            # it no longer vetoes scale-up of the OTHER free slots
+            # (2026-11-21: one sighted worker + one held slot zeroed
+            # the need to 0 and the loop queued nothing while live 2 /
+            # target 4 / pending 6). A busy slot (false-death guard:
+            # ANSWERED in the last 10 min) likewise counts as capacity:
+            # that worker is proven working and will heartbeat again.
+            # A held slot is never spawned into, but it no longer
+            # shrinks the target either: the pool fills to the FULL
+            # target via higher free slots. Slot numbers only order the
+            # choice (lowest free first); the COUNT is the invariant,
+            # so a target rise queues spawns for ALL missing slots in
+            # this one tick — there is no one-worker-per-cycle limit.
             incoming = sum(
                 1 for a in actions
                 if a.get("status") == "pending"
                 and a.get("action") in ("spawn", "respawn"))
-            eff_target = max(0, target - len(held_ids))
-            needed = (eff_target - len(live) - incoming
-                      - len(sightings))
+            busy = {wid for wid, until in
+                    self.state.get("busy_until", {}).items()
+                    if now_ms < until and wid not in live}
+            sighted = {wid for wid in sightings if wid not in live}
+            reserved = sighted | busy
+            needed = target - len(live) - incoming - len(reserved)
             if needed > 0:
                 acted_on = {a.get("workerId") for a in actions
                             if a.get("status") == "pending"}
-                busy = {wid for wid, until in
-                        self.state.get("busy_until", {}).items()
-                        if now_ms < until}
                 free = [("worker-%d" % i) for i in range(1, MAX_WORKERS + 1)
-                        if i <= target
-                        and ("worker-%d" % i) not in live
+                        if ("worker-%d" % i) not in live
                         and ("worker-%d" % i) not in held_ids
                         and ("worker-%d" % i) not in sightings
                         and ("worker-%d" % i) not in claimed_by
@@ -1036,8 +1286,10 @@ class Supervisor:
                                       "live=%d target=%d pending=%d"
                                       % (len(live), target, pending))
                 if not free and needed > 0:
-                    self.log("scale-up needed but no free slot (held: %s)"
-                             % sorted(held_ids))
+                    self.log("scale-up needed but no free slot "
+                             "(held: %s, sighted: %s, busy: %s)"
+                             % (sorted(held_ids), sorted(sighted),
+                                sorted(busy)))
             elif len(live) > target:
                 # Scale-down grace: only stop an idle worker when the
                 # pool has been truly quiet (no worker answered in the
@@ -1064,6 +1316,9 @@ class Supervisor:
         actions = self.reconcile_actions(actions, live, target, active,
                                          held_ids)
         self.save_actions(actions)
+        scaleup_signalled = self._update_scaleup_signal(
+            live, target, pending, active, actions, held_ids,
+            sightings, claimed_by)
 
         unresponsive = self.owner_unresponsive(actions)
         status_payload = {
@@ -1137,6 +1392,7 @@ class Supervisor:
         return True, {"live": len(live), "target": target,
                       "pending": pending, "render_active": active,
                       "actions_pending": status_payload["pendingActions"],
+                      "scaleup_signalled": scaleup_signalled,
                       "owner_unresponsive": unresponsive}
 
 

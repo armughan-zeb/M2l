@@ -403,6 +403,12 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   let lastDetail = '';
   const renderStartedAt = Date.now();
   let lastReportAt = 0;
+  // A user-cancelled video job is terminal: the server never retries it
+  // and `retry` refuses it. The CMS job itself is the same job, so a
+  // resume must keep going with a FRESH video job for this attempt — never
+  // loop on the dead id. Guarded to once per render call so a second
+  // cancellation still fails loudly instead of re-submitting forever.
+  let resubmittedAfterCancel = false;
   // A long silent phase (same % and same detail, e.g. the relevance check
   // sitting at 61% for ~28 min on Broken Rail attempt 3) sends no advancing
   // progress, and the CMS stall timer kills the job after 20 min — the
@@ -478,6 +484,33 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     }
     const cleanupPending = item.status === 'shutdown_timeout' && item.retryable === true && !item.cancel_requested;
     if (!cleanupPending && ['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
+      // Same CMS job, fresh video job: the old video job was cancelled by
+      // the user, so it can never be resumed. Back up its receipt (the old
+      // id is never lost), submit a fresh video job for this CMS attempt,
+      // and keep following — the CMS job, its script and its work-dir
+      // checkpoints stay exactly where they were.
+      if (item.status === 'cancelled' && !resubmittedAfterCancel) {
+        resubmittedAfterCancel = true;
+        const deadId = vidnetsJobId;
+        try {
+          fs.copyFileSync(jobFile, `${jobFile}.bak-${deadId}`);
+        } catch { /* backup is best-effort; the fresh submit below is what matters */ }
+        log.warn(`Vidnets job ${deadId} was cancelled; starting a fresh video job for the same CMS job ${job.jobId} (attempt ${cmsAttempt})`);
+        await ensureReady({ signal });
+        vidnetsJobId = await submitRender({
+          jobId: job.jobId,
+          filePath: requestFile,
+          request: buildRequest(job, scriptText, packageDir),
+          signal,
+          submit: file => vidnets(`submit ${quoteArg(file)}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets generation submit' })
+        });
+        saveReceipt({ cmsAttempt, submittedAt: new Date().toISOString(), pausedRetries: 0, resubmittedFrom: deadId });
+        log.info(`Following Vidnets job ${vidnetsJobId} for "${job.title}" (fresh video job after ${deadId} was cancelled)`);
+        lastProgress = -1;
+        lastDetail = '';
+        onProgress?.(2, 'Starting a fresh video job — the previous one was cancelled');
+        continue;
+      }
       if (item.status !== 'cancelled' && cmsAttempt > Number(receipt.cmsAttempt || 1)) {
         await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
         saveReceipt({ cmsAttempt, pausedRetries: 0 });

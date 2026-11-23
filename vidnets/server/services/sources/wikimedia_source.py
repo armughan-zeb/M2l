@@ -22,16 +22,42 @@ def _plain_text(value: object, limit: int = 500) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
+def wikimedia_timeout_seconds() -> float:
+    """Per-request timeout for the Commons API.
+
+    Round 4 (test 31 fix): the egress proxy answers Wikimedia in
+    ~6 s at best and ~23 s when degrading, so the old 5 s timeout
+    died ~1 s before the response arrived. Default 55 s (env
+    ``VIDZEO_WIKIMEDIA_TIMEOUT_SECONDS``, clamped 5–120 s).
+
+    Round 5 (test 32 fix): test 32's wave died at the 30 s timeout
+    twice while the proxy was degraded past 30 s TTFB — the response
+    may just be slow, not absent. Default 55 s, fitting inside the
+    60 s wave wall with room for the Openverse grace; the wave's
+    transport retry (see muse_search) covers TTFB past 55 s with an
+    extended wall. Healthy responses still arrive in ~4–7 s, so the
+    timeout only bounds the worst case.
+    """
+    try:
+        return max(
+            5.0,
+            min(120.0, float(os.environ.get("VIDZEO_WIKIMEDIA_TIMEOUT_SECONDS", "55") or 55)),
+        )
+    except (TypeError, ValueError):
+        return 55.0
+
+
 class WikimediaSource(BaseSource):
     name = "wikimedia"
     trust_score = 0.95
     tier = 1
     max_results_per_query = 30
-    timeout = 5.0
+    timeout = 55.0
     API_URL = "https://commons.wikimedia.org/w/api.php"
 
     def __init__(self):
         super().__init__()
+        self.timeout = wikimedia_timeout_seconds()
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": os.environ.get(
@@ -47,6 +73,7 @@ class WikimediaSource(BaseSource):
         limit: int = 20,
         filters: Optional[Dict] = None,
         direct: bool = False,
+        timeout: Optional[float] = None,
     ) -> List[ImageCandidate]:
         clean = self._clean_query(query, max_words=8)
         if not clean:
@@ -67,7 +94,11 @@ class WikimediaSource(BaseSource):
         }
         try:
             response = self.session.get(
-                self.API_URL, params=params, timeout=self.timeout,
+                self.API_URL, params=params,
+                # Round 5: the wave's transport retry passes a longer
+                # timeout so one slow-proxy call can ride out a TTFB
+                # past the default; None keeps the instance default.
+                timeout=float(timeout) if timeout is not None else self.timeout,
                 proxies=request_proxies(direct),
             )
             response.raise_for_status()
@@ -103,6 +134,10 @@ class WikimediaSource(BaseSource):
                     "page_id": page_id,
                     "foreign_url": page_url,
                     "provider": self.name,
+                    # The 1280 px thumburl is the download URL (CDN,
+                    # small); keep the full-res original for provenance
+                    # and as a download fallback (muse-search §3.4).
+                    "original_url": self._normalize_url(info.get("url") or ""),
                 },
             ))
         self.record_success()

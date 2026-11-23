@@ -20,6 +20,19 @@ function minimumWords(job) {
   return minimumScriptWords(job.targetDurationMinutes || 8);
 }
 
+// Which narration engine generateScript uses. The DEFAULT is muse-search
+// (lib/museScript.js): direct web research through ScriptIT's research
+// pipeline plus chunked parallel bridge narration. ScriptIT's own CLI
+// stays available behind MUSE_SCRIPT_ENGINE=scriptit for fallback, and
+// an explicit MUSE_SCRIPT_COMMAND always wins (the sanctioned bypass
+// seam for a replacement command complying with the stdin/stdout
+// contract). The template fallback above stays opt-in only.
+function resolveScriptEngine(env = process.env) {
+  if (String(env.MUSE_SCRIPT_COMMAND || '').trim()) return 'command';
+  if (String(env.MUSE_SCRIPT_ENGINE || '').trim().toLowerCase() === 'scriptit') return 'scriptit';
+  return 'muse-search';
+}
+
 function normalizeScriptResult(parsed) {
   if (typeof parsed === 'string') return { scriptText: parsed.trim(), meta: {} };
   if (!parsed || typeof parsed !== 'object') return null;
@@ -237,7 +250,33 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
   // another provider, and the template fallback below stays opt-in only.
   assertNoOpenRouterKey(process.env);
 
-  // Default engine: the ScriptIT headless CLI. In agent-bridge mode it needs
+  // Default engine: muse-search (lib/museScript.js). Direct web research
+  // through ScriptIT's research pipeline, then the narration in ~500-word
+  // sections minted as parallel bridge requests — each fits inside the
+  // 900s inbox wall that ScriptIT's single 2100-word request kept
+  // hitting (Nov 21 2026: three consecutive narration requests cancelled
+  // at the wall, then the 2700s budget fired and the CMS job failed).
+  // ScriptIT stays available behind MUSE_SCRIPT_ENGINE=scriptit; a
+  // custom MUSE_SCRIPT_COMMAND still wins (see resolveScriptEngine).
+  if (resolveScriptEngine() === 'muse-search') {
+    onProgress?.(10, 'Generating narration with Muse search (chunked sections)');
+    const { generateMuseScript } = require('../lib/museScript');
+    const result = await generateMuseScript(job, workDir, { signal, onDetail, onProgress });
+    const check = validateScript(result.scriptText, job);
+    if (result.meta?.publishable === false) onDetail?.('Narration retained with editorial warnings: ' + (result.meta?.quality?.issues || []).slice(0, 3).join('; '));
+    if (check.warnings.length) onDetail?.(check.warnings.join('; '));
+    if (!check.ok) {
+      throw new Error(
+        `${check.error}. The job needs complete narration for the requested runtime; ` +
+        'shorten the requested runtime in the CMS or generate more narration. No rendered master was produced.'
+      );
+    }
+    saveScript(workDir, result.scriptText, { engine: 'muse-search', meta: result.meta || {}, words: check.words });
+    onDetail?.(`Muse-search narration ready (${check.words} words${result.meta?.grounded ? '' : ', UNGROUNDED'})`);
+    return { ...result, meta: { ...(result.meta || {}), engine: 'muse-search' }, words: check.words, resumed: false };
+  }
+
+  // Fallback engine: the ScriptIT headless CLI. In agent-bridge mode it needs
   // no OpenRouter key — Muse answers its inference requests through the
   // Vidnets inbox. A custom MUSE_SCRIPT_COMMAND still wins when set.
   const scriptitCli = path.join(__dirname, '..', 'scriptit', 'cli', 'generate.js');
@@ -303,6 +342,7 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
 
 module.exports = {
   minimumScriptWords: minimumWords,
+  resolveScriptEngine,
   validateScript,
   generateScript,
   synthesizeNarration,

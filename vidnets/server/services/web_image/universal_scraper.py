@@ -132,10 +132,52 @@ _URL_RE = re.compile(r"https?://[^\"'<>\\\s]+", re.I)
 # philosophy (per-host caps + backoff) for the search path, which
 # previously had no throttle at all.
 def _universal_per_host() -> int:
+    """Max concurrent search fetches per (host, route).
+
+    Round 6 (test 33): the old default of 2 turned 13 scene queries
+    into a 2-slot queue — the tail call waited ~40 s for a slot (repro
+    repro-yandex-queue.py: 13 concurrent calls, wall 41.3 s, tail 39.6 s).
+    4 concurrent fetches with the 0.5 s min-delay between starts is
+    still polite to the host (and the user ordered the sources kept safe:
+    do not raise this above 4 without measuring). Env override
+    VIDZEO_UNIVERSAL_PER_HOST still wins (clamped 1-8).
+    """
     try:
-        return max(1, min(8, int(os.environ.get("VIDZEO_UNIVERSAL_PER_HOST", "2") or 2)))
+        return max(1, min(8, int(os.environ.get("VIDZEO_UNIVERSAL_PER_HOST", "4") or 4)))
     except (TypeError, ValueError):
-        return 2
+        return 4
+
+
+def _universal_socket_timeout_seconds(timeout) -> float:
+    """Full socket timeout (seconds) for one throttled fetch.
+
+    Round 6 (test 33): once a throttle slot is held, the socket gets a
+    FULL timeout — never whatever is left of the queue budget. The floor
+    (default 5 s, env VIDZEO_UNIVERSAL_SOCKET_TIMEOUT_FLOOR_SECONDS)
+    protects callers that pass a tiny timeout: a socket handed 0.7 s
+    against a host that needs 5-7 s fails as a ReadTimeout and looks
+    like a slow host, when the real fault was the queue.
+    """
+    try:
+        floor = max(
+            0.5,
+            min(
+                30.0,
+                float(
+                    os.environ.get(
+                        "VIDZEO_UNIVERSAL_SOCKET_TIMEOUT_FLOOR_SECONDS", "5"
+                    )
+                    or 5
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        floor = 5.0
+    try:
+        value = float(timeout or 15)
+    except (TypeError, ValueError):
+        value = 15.0
+    return max(floor, value)
 
 
 def _universal_min_delay() -> float:
@@ -171,7 +213,19 @@ def _universal_fetch_timeout_seconds() -> float:
     never predict this. 30s lets the direct route (22s) and the proxy
     Yandex fetch (21.8s) complete; the batch wall and the route fallback
     still bound a dead route (2 routes x 30s max per engine call).
+
+    Nov 22 (slow-network adaptation): when the manager has recorded
+    consecutive all-timeout batches, _run_engine sets a thread-local
+    override here, so the fetch timeout grows by the same factor as the
+    batch deadline instead of cutting the engine at the same 30s wall
+    the batch just died on. The override is capped at the same 120s.
     """
+    override = getattr(_fetch_timeout_override_local, "seconds", None)
+    if override is not None:
+        try:
+            return max(5.0, min(120.0, float(override)))
+        except (TypeError, ValueError):
+            pass
     try:
         return max(
             5.0,
@@ -229,6 +283,127 @@ def _universal_empty_retry_backoff_seconds() -> float:
         return 2.0
 
 
+def _empty_streak_key(query: str) -> str:
+    """Normalised key for the per-query empty-streak counter.
+
+    Test 29: the counter was a single global int, so one query's
+    failures zeroed 21 other queries' retries and rescues. Queries
+    that differ only in case or whitespace are the same query.
+    """
+    return re.sub(r"\s+", " ", str(query or "")).strip().lower()
+
+
+def _universal_empty_streak_cap() -> int:
+    """Consecutive all-empty stalled batches before retries stop (§2.1).
+
+    Default 3, clamp 1–6 (env VIDZEO_UNIVERSAL_EMPTY_STREAK_CAP).
+    When the counter has already reached the cap, the next batch's
+    retry waves are skipped and its rescue attempts are 0 — retries
+    only, never the first attempt of a batch. Any batch returning
+    >= 1 row resets the counter.
+    """
+    try:
+        return max(
+            1,
+            min(
+                6,
+                int(
+                    os.environ.get(
+                        "VIDZEO_UNIVERSAL_EMPTY_STREAK_CAP", "3"
+                    )
+                    or 3
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 3
+
+
+def _universal_empty_retry_waves() -> int:
+    """Retry waves after an all-empty timed-out batch (Nov 22).
+
+    A single slow-hour timeout must not zero the lane: the timed-out
+    engines get up to this many more waves, alternating route, each with
+    backoff. Bounded to 1-2 waves (2-3 attempts total): more waves would
+    just re-pay the same wall while the resolver's own retry/rescue is
+    the outer bound. Concurrency is NOT raised — retries reuse the same
+    throttled path, they just try again after a backoff.
+    """
+    try:
+        return max(
+            1,
+            min(
+                2,
+                int(
+                    os.environ.get(
+                        "VIDZEO_UNIVERSAL_EMPTY_RETRY_WAVES", "2"
+                    )
+                    or 2
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 2
+
+
+def _universal_slow_network_step() -> float:
+    """Timeout multiplier per consecutive all-timeout batch (Nov 22).
+
+    Job d1ece590: Yandex, Bing and Flickr ALL timed out together in a slow
+    egress hour — a shared-network signal, not a per-engine failure. Each
+    consecutive all-timeout batch multiplies the effective engine and fetch
+    timeouts by this much, up to _universal_slow_network_max_factor().
+    """
+    try:
+        return max(
+            1.0,
+            min(
+                2.0,
+                float(
+                    os.environ.get("VIDZEO_UNIVERSAL_SLOW_NETWORK_STEP", "1.5")
+                    or 1.5
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 1.5
+
+
+def _universal_slow_network_max_factor() -> float:
+    """Cap on the slow-network timeout multiplier (Nov 22).
+
+    Capped at 1.5x (muse-search design §2.4): the old 2.0x cap grew
+    engine timeouts to 120–180 s in test 30 and deepened slot
+    saturation. Operators can still raise it via
+    VIDZEO_UNIVERSAL_SLOW_NETWORK_MAX_FACTOR (clamped 1–4x).
+    """
+    try:
+        return max(
+            1.0,
+            min(
+                4.0,
+                float(
+                    os.environ.get(
+                        "VIDZEO_UNIVERSAL_SLOW_NETWORK_MAX_FACTOR", "1.5"
+                    )
+                    or 1.5
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 1.5
+
+
+# Thread-local override for the per-route fetch timeout, set by
+# UniversalScraperManager._run_engine around each engine call so the
+# slow-network adaptation reaches the pool worker threads (the same shape
+# as the explicit direct= parameter: a caller-thread flag would never
+# reach them). _universal_fetch_timeout_seconds() reads it first, and it
+# is cleared when the call returns so a later call on the same reused
+# worker thread falls back to the env default.
+_fetch_timeout_override_local = threading.local()
+
+
 _universal_host_state: Dict[str, Dict[str, object]] = {}
 _universal_host_guard = threading.Lock()
 
@@ -238,8 +413,9 @@ def _universal_host_slot(host: str, route: str = "proxy") -> Dict[str, object]:
     # queue behind the abandoned proxied attempt's held slots (Nov 18:
     # "throttled request to yandex.com exceeded its 15s budget waiting for
     # a host slot" x7 in the Panama log). Each route keeps its own
-    # 2-concurrent cap and 0.5s min delay, so the retry still respects the
-    # per-host limit instead of bypassing it.
+    # per-host cap (default 4, see _universal_per_host) and 0.5s min
+    # delay, so the retry still respects the per-host limit instead of
+    # bypassing it.
     key = f"{host}|{route}"
     with _universal_host_guard:
         state = _universal_host_state.get(key)
@@ -379,6 +555,22 @@ def _route_name(direct: bool) -> str:
     return "direct" if direct else "proxy"
 
 
+# Engines whose hosts answer direct faster than via the egress proxy
+# (live route table, Nov 23 round 6): yandex.com direct 3.9 s vs proxy
+# 7.4 s; bing.com 2.6 s vs 7.1 s; flickr.com 6.0 s vs 11.3 s;
+# api.openverse.org direct 9.9 s vs proxy 9.6 s (a wash — direct is
+# fine). The Wikimedia API host is NOT here: direct to
+# commons.wikimedia.org is dead, it stays proxy-only (muse_search).
+# Route health still adapts: a route failing transport 3x is skipped
+# for 120 s, so if direct degrades the proxy takes over by itself.
+_DIRECT_FIRST_ENGINES = frozenset({"yandex", "bing", "flickr", "openverse"})
+
+
+def _engine_prefers_direct(engine_name: str) -> bool:
+    """True when this engine's host is proven direct-capable (see above)."""
+    return str(engine_name or "").strip().lower() in _DIRECT_FIRST_ENGINES
+
+
 def _route_order(engine: str, prefer_direct: bool) -> List[str]:
     """Routes to try for one engine fetch, best first, dead routes skipped."""
     order = ["direct", "proxy"] if prefer_direct else ["proxy", "direct"]
@@ -416,10 +608,19 @@ def _note_route_result(engine: str, route: str, ok: bool) -> None:
 
 
 def _timeout_kind(exc: BaseException) -> str:
-    """Classify a transport exception as queue-wait vs socket-timeout."""
+    """Classify a transport exception as queue-wait vs socket-timeout.
+
+    Round 6: ANY throttle-budget failure is a queue-timeout. The three
+    queue messages ("budget before starting", "budget in queue",
+    "budget waiting for a host slot") all say "budget"; the old check
+    also required "queue" or "host slot", so "budget before starting"
+    was misclassified as a socket-timeout and struck the route. A
+    socket ReadTimeout never mentions "budget", so matching on it alone
+    is safe.
+    """
     name = type(exc).__name__.lower()
     text = str(exc).lower()
-    if "budget" in text and ("queue" in text or "host slot" in text):
+    if "budget" in text:
         return "queue-timeout"
     if "timeout" in name:
         return "socket-timeout"
@@ -451,14 +652,22 @@ def _throttled_get(client, url: str, *, headers, timeout, direct: bool = False):
     than repeat a refusal for every scene. Other non-200 responses are
     returned as-is and recorded as per-engine failures.
 
-    Queue time counts INSIDE ``timeout`` (GTA fix, Nov 16): the old code
-    waited on the min-delay gap and the per-host semaphore outside the
-    socket timeout, so one engine call cost 53–200s of stacked 15s
-    timeouts plus queueing. A call that cannot even start inside its
-    budget now fails fast with TimeoutError instead of burning the batch.
-    Queue-wait and socket-timeout failures are logged separately
-    (kind=queue-timeout vs kind=socket-timeout) so the next outage is
-    diagnosable from the log alone.
+    Round 6 (test 33): the queue wait and the socket call have SEPARATE
+    budgets. The old code counted queue time INSIDE ``timeout`` (GTA fix,
+    Nov 16) and handed the socket whatever was left:
+    ``request_timeout = max(0.5, min(timeout, _remaining()))``. A call
+    that queued 44 s of a 45 s budget got a 0.7 s socket timeout against
+    a host that needs 5-7 s — test 33's log proves it ("ReadTimeout read
+    timeout=0.707s"), and the 45 s failure was queue-wait, not a slow
+    host. Now the queue may wait up to ``timeout`` for a slot (failing
+    fast as kind=queue-timeout past that), and once the slot is held the
+    socket gets a FULL timeout (see
+    ``_universal_socket_timeout_seconds``), never leftover crumbs. The
+    caller's batch wall still bounds the whole call; each 429 retry
+    re-queues under its own fresh queue budget. Queue-wait and
+    socket-timeout failures are logged separately (kind=queue-timeout vs
+    kind=socket-timeout) so the next outage is diagnosable from the log
+    alone.
     """
     host = (urlparse(url).netloc or "").lower()
     route = _route_name(bool(direct) or _web_bypass_proxy_enabled())
@@ -484,13 +693,20 @@ def _throttled_get(client, url: str, *, headers, timeout, direct: bool = False):
         budget = max(0.5, float(timeout or 15))
     except (TypeError, ValueError):
         budget = 15.0
-    started = time.monotonic()
-
-    def _remaining() -> float:
-        return budget - (time.monotonic() - started)
+    # Round 6: the socket timeout is a FULL budget of its own, computed
+    # once here — never the leftover of the queue wait (see docstring).
+    socket_timeout = _universal_socket_timeout_seconds(timeout)
 
     response = None
     for attempt in range(_universal_retry_count() + 1):
+        # Each attempt gets its own fresh queue budget: a 429 retry
+        # re-queues rather than inheriting whatever the first attempt's
+        # queue wait left behind.
+        attempt_started = time.monotonic()
+
+        def _remaining() -> float:
+            return budget - (time.monotonic() - attempt_started)
+
         if _remaining() <= 0:
             LOGGER.debug(
                 "[universal] throttled GET route=%s host=%s kind=queue-timeout "
@@ -539,7 +755,7 @@ def _throttled_get(client, url: str, *, headers, timeout, direct: bool = False):
             )
         acquired_at = time.monotonic()
         try:
-            request_timeout = max(0.5, min(float(timeout or 15), _remaining()))
+            request_timeout = socket_timeout
             # Proxy bypass (Nov 18 retry, fixed Nov 18 web-resilience):
             # the route is an explicit parameter now, not a thread-local
             # flag — the worker thread that issues the request sees it.
@@ -556,7 +772,7 @@ def _throttled_get(client, url: str, *, headers, timeout, direct: bool = False):
             else:
                 response = client.get(url, headers=headers, timeout=request_timeout)
         except Exception as exc:
-            queue_ms = int((acquired_at - started) * 1000)
+            queue_ms = int((acquired_at - attempt_started) * 1000)
             socket_ms = int((time.monotonic() - acquired_at) * 1000)
             LOGGER.debug(
                 "[universal] throttled GET route=%s host=%s kind=%s "
@@ -751,7 +967,17 @@ class _Engine:
         requests is now the only transport and the ROUTE (proxy vs
         direct) is the fallback dimension instead.
         """
-        routes = _route_order(self.name, bool(direct) or _web_bypass_proxy_enabled())
+        # Round 6: engines whose hosts are proven direct-capable try
+        # direct first (direct is 2-3x faster than the proxy for them),
+        # with the proxy as fallback. An explicit direct=True or the
+        # bypass shim also prefers direct; any other engine stays
+        # proxy-first.
+        prefer_direct = (
+            bool(direct)
+            or _web_bypass_proxy_enabled()
+            or _engine_prefers_direct(self.name)
+        )
+        routes = _route_order(self.name, prefer_direct)
         last_exc: Optional[BaseException] = None
         tried: List[str] = []
         for route in routes:
@@ -764,13 +990,25 @@ class _Engine:
                 )
             except Exception as exc:
                 last_exc = exc
-                _note_route_result(self.name, route, False)
+                kind = _timeout_kind(exc)
                 LOGGER.debug(
                     "[universal] %s: route=%s transport failed "
                     "kind=%s error=%s: %s",
-                    self.name, route, _timeout_kind(exc),
+                    self.name, route, kind,
                     type(exc).__name__, str(exc)[:120],
                 )
+                if kind == "queue-timeout":
+                    # Round 6: the call never reached the socket — the
+                    # route is not sick, the throttle queue is full.
+                    # Counting it as a route failure poisons route
+                    # health: after 3 queued calls both routes look dead
+                    # and _route_order skips them for 120 s (test 33's
+                    # log shows routes_tried=proxy only because direct
+                    # had been struck out by queue waits, not because
+                    # direct was down). No strike, and no session drop —
+                    # the connection was never used.
+                    continue
+                _note_route_result(self.name, route, False)
                 # Drop the poisoned session for THIS route only, so the
                 # next route gets a fresh one instead of reusing a broken
                 # connection. (The other route's session is untouched.)
@@ -1192,6 +1430,47 @@ def is_bot_gate_error(exc: BaseException) -> bool:
     )
 
 
+# Transport-stall markers for the slow-network streak (Nov 22, test 25).
+# A stalled engine is one whose failure is the SHARED egress being slow,
+# not the provider refusing us: socket/read/connect timeouts, host-slot
+# waits inside the throttle budget, connection resets, HTTP 5xx. Refusals
+# (bot gates, HTTP 403/429) are excluded with the same markers
+# is_bot_gate_error uses — a provider saying "no" must never arm the
+# longer deadline.
+_TRANSPORT_STALL_MARKERS = (
+    "timeout", "timed out", "read timeout", "connect", "connection",
+    "slot", "budget", "network", "reset", "unreachable", "refused",
+    "eof", "dns", "temporar",
+)
+
+
+def _is_transport_stall_error_text(error: str) -> bool:
+    """True when an engine failure text is a transport stall, not a refusal.
+
+    Test 25 (job 655e40d8): every engine failed with a transport error —
+    Bing/Flickr ReadTimeout at 30s/route, Yandex a 30s host-slot wait —
+    yet the slow-network streak never moved, because the old trigger
+    required every engine to still be RUNNING past its staggered batch
+    deadline. Fetch failures complete at ~60s (2 routes x 30s) while the
+    staggered deadlines are 60/65/70s, so engines 2-3 finish BEFORE their
+    deadline with 0 rows and never land in ``timed_out``. The trigger was
+    structurally unreachable. Count the failure TEXT instead: a batch is
+    stalled when it returns 0 rows and every selected engine either timed
+    out or failed with a transport error. A clean empty page (success,
+    0 rows) or a refusal (403/429/bot-gate) never counts.
+    """
+    text = str(error or "").lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _BOT_GATE_MARKERS):
+        return False
+    if re.search(r"\b(?:http(?: status)?\s*|status\s*)(?:403|429)\b", text):
+        return False
+    if any(marker in text for marker in _TRANSPORT_STALL_MARKERS):
+        return True
+    return bool(re.search(r"\b(?:500|502|503|504)\b", text))
+
+
 class UniversalScraperManager:
     """Run the supplied three-engine search strategy as a resolver lane.
 
@@ -1295,6 +1574,26 @@ class UniversalScraperManager:
         # Wall of the most recent batch (max per-engine deadline), exposed
         # so the resolver wave knows how long a working batch may take.
         self._last_batch_max_deadline_seconds = 0.0
+        # Slow-network state (Nov 22, job d1ece590): consecutive batches
+        # in which EVERY non-gated engine timed out — a shared-network
+        # signal, not a per-engine failure. While it persists, the
+        # effective engine and fetch timeouts grow by
+        # _universal_slow_network_step() per batch, capped at
+        # _universal_slow_network_max_factor(). Any batch that returns
+        # rows resets it: the network recovered. Concurrency is NOT
+        # raised (per-host throttle slots untouched) and DuckDuckGo stays
+        # skipped; only the deadline adapts.
+        self._slow_network_streak = 0
+        # Fail-faster (§2.1): consecutive all-empty stalled batches,
+        # PER QUERY (test 29: a single global counter let one query's
+        # failures zero 21 other queries' retries and rescues — the
+        # streak hit 33 while rows still arrived intermittently for
+        # other queries, and the run's only 60-row batch came from a
+        # retry wave the cap had disabled). Keyed by the normalised
+        # query string; a batch returning >= 1 row clears its own
+        # query's entry. The slow-network streak stays global: it is
+        # a transport-health signal, not a per-query one.
+        self._consecutive_empty_stalled_by_query: Dict[str, int] = {}
         try:
             # 900s lost a bot-gated engine for the whole run; 300s plus the
             # halfway re-probe keeps the engine recoverable within one job.
@@ -1344,17 +1643,34 @@ class UniversalScraperManager:
         with self._lock:
             return self._last_progress_at
 
-    def progress_snapshot(self) -> Dict[str, object]:
+    def progress_snapshot(self, query: Optional[str] = None) -> Dict[str, object]:
         """Liveness + gate state for the resolver wave / driver (worker D).
 
         ``last_progress_at`` is a monotonic timestamp; ``gated_engines``
         maps engine → {"until": monotonic expiry, "kind": gate kind}.
+
+        ``consecutive_empty_stalled_batches`` is per-query when
+        ``query`` is given (test 29: the rescue gate must read only
+        the current query's streak); without a query it reports the
+        worst streak across queries, for backward compatibility.
         """
         now = time.monotonic()
         with self._lock:
             return {
                 "last_progress_at": self._last_progress_at,
                 "last_batch_max_deadline_seconds": self._last_batch_max_deadline_seconds,
+                "slow_network_streak": self._slow_network_streak,
+                "slow_network_factor": self._slow_network_factor_locked(),
+                "consecutive_empty_stalled_batches": (
+                    self._consecutive_empty_stalled_by_query.get(
+                        _empty_streak_key(query), 0
+                    )
+                    if query is not None
+                    else max(
+                        self._consecutive_empty_stalled_by_query.values(),
+                        default=0,
+                    )
+                ),
                 "gated_engines": {
                     engine: {
                         "until": until,
@@ -1370,6 +1686,38 @@ class UniversalScraperManager:
         """Max per-engine deadline (seconds) of the most recent batch."""
         with self._lock:
             return self._last_batch_max_deadline_seconds
+
+    @property
+    def slow_network_streak(self) -> int:
+        """Consecutive all-timeout batches (shared-network signal)."""
+        with self._lock:
+            return self._slow_network_streak
+
+    @property
+    def slow_network_factor(self) -> float:
+        """Current timeout multiplier from the slow-network streak."""
+        with self._lock:
+            return self._slow_network_factor_locked()
+
+    @property
+    def consecutive_empty_stalled_batches(self) -> int:
+        """Consecutive all-empty stalled batches (§2.1 fail-faster).
+
+        Per-query since test 29: this reports the worst (max) streak
+        across queries, for backward compatibility with callers that
+        have no query in hand. The retry/rescue gates read the
+        per-query value via progress_snapshot(query).
+        """
+        with self._lock:
+            return max(
+                self._consecutive_empty_stalled_by_query.values(), default=0
+            )
+
+    def _slow_network_factor_locked(self) -> float:
+        """Timeout multiplier for the current streak; call with _lock held."""
+        step = _universal_slow_network_step()
+        cap = _universal_slow_network_max_factor()
+        return min(cap, step ** self._slow_network_streak)
 
     def _spool_late_results(
         self, query: str, engine: str, rows: Sequence[UniversalImageResult]
@@ -1506,8 +1854,16 @@ class UniversalScraperManager:
         safe_search: bool,
         batch_finished: threading.Event,
         direct: bool = False,
+        fetch_timeout: Optional[float] = None,
     ) -> Tuple[str, List[UniversalImageResult], UniversalEngineStat]:
         started = time.perf_counter()
+        # Slow-network adaptation (Nov 22): the per-route fetch timeout
+        # for THIS engine call, set thread-locally so it reaches the pool
+        # worker thread that issues the request. Cleared in the finally
+        # below so a later call on the same reused worker thread falls
+        # back to the env default.
+        if fetch_timeout is not None:
+            _fetch_timeout_override_local.seconds = fetch_timeout
         try:
             try:
                 rows = self._engines[engine_name].search(
@@ -1595,6 +1951,9 @@ class UniversalScraperManager:
             else:
                 self._log(f"[universal] {engine_name}: failed in {duration}ms ({error}, routes_tried={routes_label})")
             return engine_name, [], UniversalEngineStat(engine_name, 0, duration, False, error)
+        finally:
+            if fetch_timeout is not None:
+                _fetch_timeout_override_local.seconds = None
 
     def _collect_batch(
         self,
@@ -1697,6 +2056,7 @@ class UniversalScraperManager:
         engine to the other route on a transport error.
         """
         clean = re.sub(r"\s+", " ", str(query or "")).strip()
+        _streak_key = _empty_streak_key(clean)
         selected = [str(e).strip().lower() for e in (engine_ids or self.DEFAULT_ENGINES)]
         selected = list(dict.fromkeys(e for e in selected if e in self._engines))
         # Skip engines that hit a definitive bot/robot challenge earlier in
@@ -1729,10 +2089,27 @@ class UniversalScraperManager:
         limit = max(1, min(50, int(limit_per_engine or 20)))
         if not clean or not selected:
             return UniversalSearchResponse(clean, 0, [], [])
-        engine_timeout = max(
+        base_engine_timeout = max(
             0.5,
             min(300.0, float(timeout_seconds or self.engine_timeout_seconds or 6.0))
         )
+        # Slow-network adaptation (Nov 22, job d1ece590): when the previous
+        # batch(es) ended with EVERY non-gated engine timing out — the
+        # shared egress is slow, not one engine — the batch deadline grows
+        # by the streak factor (1.5x per consecutive all-timeout batch,
+        # capped at 2x the base), so engines that need 60-90s in a slow
+        # hour can complete instead of being cut at the same wall. The
+        # per-route fetch timeout grows by the same factor: an engine call
+        # is at most two routes, so the fetch timeout and the batch wall
+        # keep their existing 1:2 ratio (30s/route against a 60s batch).
+        # Both stay bounded — the adapted engine timeout is capped at
+        # 300s, the fetch timeout at 120s — and the factor resets the
+        # moment any batch returns rows. Concurrency is NOT raised.
+        with self._lock:
+            slow_factor = self._slow_network_factor_locked()
+        base_fetch_timeout = _universal_fetch_timeout_seconds()
+        engine_timeout = min(300.0, base_engine_timeout * slow_factor)
+        fetch_timeout = min(120.0, base_fetch_timeout * slow_factor)
         # No forced 6s cap here: wait_until_complete means wait for every
         # engine up to the batch timeout. A 6s cap discarded every engine
         # that needed longer than 6s under proxy load (Bing/Yandex return
@@ -1761,10 +2138,15 @@ class UniversalScraperManager:
         with self._lock:
             self._last_batch_max_deadline_seconds = max_deadline
         timeout_label = f"{engine_timeout:.1f}s+{stagger:.1f}s/engine"
+        slow_label = (
+            f" slow_network={slow_factor:.2f}x"
+            if slow_factor > 1.0
+            else ""
+        )
         self._log(
             f"[universal] batch start query='{clean[:72]}' engines={','.join(selected)} "
             f"parallel={len(selected)} timeout={timeout_label} max={max_deadline:.1f}s "
-            f"route={'direct' if direct else 'proxy'}"
+            f"route={'direct' if direct else 'proxy'}{slow_label}"
         )
         # Re-check the spool first: a previous batch's late engines may
         # have landed after that batch gave up.  Those rows are real
@@ -1779,60 +2161,170 @@ class UniversalScraperManager:
                 self._executor.submit(
                     self._run_engine, engine, clean, limit,
                     max(1, int(page)), bool(safe_search), batch_finished,
-                    direct,
+                    direct, fetch_timeout,
                 ): engine
                 for engine in selected
             }
             buckets, stats_by_engine, timed_out = self._collect_batch(
                 futures, deadlines, clean
             )
-            # Retry with backoff: an all-empty batch where at least one
-            # engine timed out (a transport stall, not a bot gate) gets one
-            # more wave at 1.5x timeout — on the OTHER route, so the retry
-            # does not re-queue behind the dead attempt's held throttle
-            # slots (separate per-route namespace) or the same dead route.
-            # A batch with any rows at all does not retry — partial success
-            # is a result, not a failure.
-            if not any(buckets.values()) and timed_out:
+            # Slow-network signal (Nov 22): zero rows AND every selected
+            # (non-gated) engine stalled on transport — the shared egress
+            # is slow, not one engine. Record it now so the retry wave
+            # below — and the next batch — get the longer deadline. A
+            # bot-gated engine never counts (it is skipped before the
+            # wave, or fails fast with a gate error), so a gate cannot arm
+            # this; a partial success does not arm it either.
+            #
+            # Test 25: the old trigger (every engine still RUNNING past
+            # its staggered deadline) never fired in 154 batches. Fetch
+            # failures complete at ~60s (2 routes x 30s) while the
+            # staggered deadlines are 60/65/70s, so engines 2-3 finish
+            # BEFORE their deadline with 0 rows and never land in
+            # timed_out — only yandex (deadline 60s, failing at ~60.0s)
+            # ever did. Count the failure text instead: a batch is
+            # stalled when it returns 0 rows and every selected engine
+            # either timed out or failed with a transport error (see
+            # _is_transport_stall_error_text). A clean empty page
+            # (success, 0 rows) or a refusal never arms this.
+            stalled_engines = [
+                engine
+                for engine in selected
+                if engine in timed_out
+                or _is_transport_stall_error_text(
+                    (
+                        stats_by_engine.get(engine)
+                        or UniversalEngineStat(engine, 0, 0, False, "")
+                    ).error
+                )
+            ]
+            if (
+                not any(buckets.values())
+                and selected
+                and len(stalled_engines) == len(selected)
+            ):
+                # Fail-faster (§2.1): count this consecutive all-empty
+                # stalled batch FOR THIS QUERY. The cap gates RETRIES
+                # only: it is read below from the pre-batch value, so
+                # this batch still gets its own retry waves and only
+                # the next batch for the SAME query at the cap skips
+                # them. Other queries keep their own counters (test 29).
+                _empty_streak_before = self._consecutive_empty_stalled_by_query.get(
+                    _streak_key, 0
+                )
+                with self._lock:
+                    self._slow_network_streak += 1
+                    self._consecutive_empty_stalled_by_query[_streak_key] = (
+                        _empty_streak_before + 1
+                    )
+                    slow_factor = self._slow_network_factor_locked()
+                fetch_timeout = min(120.0, base_fetch_timeout * slow_factor)
+                self._log(
+                    f"[universal] slow network: all {len(selected)} engine(s) "
+                    f"stalled (transport); timeout factor now {slow_factor:.2f}x "
+                    f"(streak {self._slow_network_streak})"
+                )
+            else:
+                _empty_streak_before = self._consecutive_empty_stalled_by_query.get(
+                    _streak_key, 0
+                )
+            # Retries with backoff (Nov 22 user order): an all-empty batch
+            # where at least one engine stalled on transport (a transport
+            # stall, not a bot gate) gets up to _universal_empty_retry_waves()
+            # more waves at 1.5x timeout — alternating route each wave, so a
+            # retry does not re-queue behind the dead attempt's held
+            # throttle slots (separate per-route namespace) or the same
+            # dead route. A batch with any rows at all does not retry —
+            # partial success is a result, not a failure. Bounded: at most
+            # 2 retry waves (3 waves total), then the batch settles empty
+            # and the resolver's own retry/rescue takes over.
+            #
+            # Test 25: the old retry list (``timed_out`` only) retried
+            # yandex 7 times and never bing/flickr — they failed with
+            # ReadTimeouts before their staggered deadlines, so they never
+            # landed in timed_out. Retry every stalled engine instead.
+            retry_waves = _universal_empty_retry_waves()
+            # Fail-faster (§2.1): when the consecutive all-empty
+            # stalled-batch counter had already reached the cap before
+            # this batch, skip the remaining retry waves for this query
+            # and return empty immediately, so the resolver's per-scene
+            # chain moves to its next query / inline fallback instead of
+            # re-paying the wall. Retries only — the first attempt above
+            # always runs.
+            if _empty_streak_before >= _universal_empty_streak_cap():
+                self._log(
+                    "[universal] empty-batch streak at cap "
+                    f"({_empty_streak_before}>={_universal_empty_streak_cap()}); "
+                    "skipping retry waves for this query"
+                )
+                retry_waves = 0
+            retry_direct = not direct
+            for _wave in range(retry_waves):
+                if any(buckets.values()) or not stalled_engines:
+                    break
                 retry_engines = [
-                    engine for engine in timed_out
+                    engine for engine in stalled_engines
                     if engine in self._engines
                     and self._bot_gated.get(engine, 0.0) <= time.monotonic()
                 ]
-                if retry_engines:
-                    backoff = _universal_empty_retry_backoff_seconds()
-                    retry_direct = not direct
-                    self._log(
-                        f"[universal] empty batch with timed-out engine(s) "
-                        f"{','.join(retry_engines)}; retrying once after "
-                        f"{backoff:.1f}s backoff "
-                        f"(route={'direct' if retry_direct else 'proxy'})"
-                    )
-                    if backoff:
-                        time.sleep(backoff)
-                    retry_deadlines = {
-                        engine: engine_timeout * 1.5 + index * stagger
-                        for index, engine in enumerate(retry_engines)
+                if not retry_engines:
+                    break
+                backoff = _universal_empty_retry_backoff_seconds()
+                # The retry keeps its 1.5x on top of the (possibly
+                # just-bumped) slow-network factor, capped at the 300s
+                # engine ceiling so a single batch stays bounded.
+                retry_engine_timeout = min(
+                    300.0, base_engine_timeout * 1.5 * slow_factor
+                )
+                self._log(
+                    f"[universal] empty batch with stalled engine(s) "
+                    f"{','.join(retry_engines)}; retrying "
+                    f"({_wave + 1}/{retry_waves}) after "
+                    f"{backoff:.1f}s backoff "
+                    f"(route={'direct' if retry_direct else 'proxy'}, "
+                    f"timeout={retry_engine_timeout:.1f}s)"
+                )
+                if backoff:
+                    time.sleep(backoff)
+                retry_deadlines = {
+                    engine: retry_engine_timeout + index * stagger
+                    for index, engine in enumerate(retry_engines)
+                }
+                retry_finished = threading.Event()
+                try:
+                    retry_futures = {
+                        self._executor.submit(
+                            self._run_engine, engine, clean, limit,
+                            max(1, int(page)), bool(safe_search), retry_finished,
+                            retry_direct, fetch_timeout,
+                        ): engine
+                        for engine in retry_engines
                     }
-                    retry_finished = threading.Event()
-                    try:
-                        retry_futures = {
-                            self._executor.submit(
-                                self._run_engine, engine, clean, limit,
-                                max(1, int(page)), bool(safe_search), retry_finished,
-                                retry_direct,
-                            ): engine
-                            for engine in retry_engines
-                        }
-                        retry_buckets, retry_stats, _retry_timed = self._collect_batch(
-                            retry_futures, retry_deadlines, clean
-                        )
-                    finally:
-                        retry_finished.set()
-                    for engine, rows in retry_buckets.items():
-                        if rows:
-                            buckets[engine] = rows
-                    stats_by_engine.update(retry_stats)
+                    retry_buckets, retry_stats, timed_out = self._collect_batch(
+                        retry_futures, retry_deadlines, clean
+                    )
+                finally:
+                    retry_finished.set()
+                for engine, rows in retry_buckets.items():
+                    if rows:
+                        buckets[engine] = rows
+                stats_by_engine.update(retry_stats)
+                # Recompute the stalled set from the retry's own stats for
+                # the next wave: engines that just failed with a transport
+                # error get another wave; engines that returned rows or
+                # failed with a refusal do not.
+                stalled_engines = [
+                    engine
+                    for engine in retry_engines
+                    if engine in timed_out
+                    or _is_transport_stall_error_text(
+                        (
+                            retry_stats.get(engine)
+                            or UniversalEngineStat(engine, 0, 0, False, "")
+                        ).error
+                    )
+                ]
+                retry_direct = not retry_direct
         finally:
             # Do not shut down the shared pool after each batch. Running HTTP
             # calls cannot be force-cancelled by Future.cancel(); closing the
@@ -1871,6 +2363,23 @@ class UniversalScraperManager:
                     continue
                 seen.add(key)
                 merged.append(row)
+        # Slow-network recovery (Nov 22): any rows at all — fresh or
+        # salvaged from the late spool — prove the network is delivering
+        # again, so the streak resets instead of holding the longer
+        # deadline for the next scene. A still-empty batch keeps the
+        # streak it earned (one bump per batch, at most).
+        if merged:
+            with self._lock:
+                if self._slow_network_streak:
+                    self._log(
+                        "[universal] slow network: batch returned "
+                        f"{len(merged)} result(s); timeout factor reset to 1.00x"
+                    )
+                    self._slow_network_streak = 0
+                # Fail-faster (§2.1): any rows reset this query's
+                # empty-streak entry — the network is delivering again.
+                # Other queries keep their own streaks (test 29).
+                self._consecutive_empty_stalled_by_query.pop(_streak_key, None)
         stats = [stats_by_engine.get(e, UniversalEngineStat(e, 0, 0, False, "engine timeout")) for e in selected]
         # Host learning (no reordering: engine round-robin order and relevance
         # are untouched). Tag each row with whether its image host is already
