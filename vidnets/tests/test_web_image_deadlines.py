@@ -358,14 +358,21 @@ def test_scene_wall_never_cuts_progressing_wave(monkeypatch, tmp_path):
     assert resolver.web_wave_stalled_for_scene(5) is False
 
 
-def test_mixed_web_scene_worker_limit_defaults_to_two(monkeypatch):
-    """(d) The stampede cap: 2 scene workers by default; legacy 6/12 no longer wins."""
+def test_mixed_web_scene_worker_limit_defaults_to_four(monkeypatch):
+    """(d) The stampede cap: 4 scene workers by default; legacy 6/12 no longer wins.
+
+    Nov 22 (d1ece590 stall fix): the default rose 2 -> 4 — 2 workers
+    resolved only 10/124 scenes inside the 1800s stage deadline, so the
+    lane was the bottleneck, not the sources. The per-host throttle in the
+    universal scraper is what protects the sources now, and the parallel
+    rescue already runs 8 workers against the same engines.
+    """
     from services.pipeline_v2_media_adapter import _mixed_web_scene_worker_limit
 
     monkeypatch.delenv("VIDZEO_MIXED_WEB_SCENE_WORKERS", raising=False)
-    assert _mixed_web_scene_worker_limit({}) == 2
-    assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 2
-    assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 12}) == 2
+    assert _mixed_web_scene_worker_limit({}) == 4
+    assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 4
+    assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 12}) == 4
     # An explicit operator raise via env still wins.
     monkeypatch.setenv("VIDZEO_MIXED_WEB_SCENE_WORKERS", "6")
     assert _mixed_web_scene_worker_limit({}) == 6

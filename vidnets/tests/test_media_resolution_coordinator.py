@@ -3706,3 +3706,329 @@ def test_verdict_arbitration_live_branch_reject_beats_later_live_accept(tmp_path
     assert accepted is False
     assert verdict.get("final_score") == 32.0
     assert verdict.get("fatal_mismatch") is False
+
+
+class _LateWebLane:
+    """Shared-batch web lane whose loader finishes after the wall.
+
+    Mirrors ``LazyBatchLane``'s protocol: rows appear atomically when
+    the loader returns, never incrementally. ``__call__`` waits for its
+    scene's row or the cancel event; ``get_row`` waits up to ``timeout``
+    for the batch to become ready.
+    """
+
+    shared_batch = True
+
+    def __init__(self, rows, delay):
+        self._rows_to_publish = dict(rows)
+        self._delay = delay
+        self._rows = {}
+        self._ready = threading.Event()
+        self._started = False
+        self._lock = threading.Lock()
+
+    def __call__(self, scene, cancel_event):
+        with self._lock:
+            if not self._started:
+                self._started = True
+                threading.Thread(target=self._load, daemon=True).start()
+        index = int(scene.get("scene_index", 0))
+        while index not in self._rows and not cancel_event.is_set():
+            time.sleep(0.01)
+        return self._rows.get(index)
+
+    def _load(self):
+        time.sleep(self._delay)
+        self._rows.update(self._rows_to_publish)
+        self._ready.set()
+
+    def get_row(self, index, timeout=0.0):
+        self._ready.wait(timeout=timeout)
+        return self._rows.get(index)
+
+
+def _late_web_scene(requirement_hash):
+    return {
+        "scene_id": "late-web-scene",
+        "scene_index": 0,
+        "container_id": "late-web-container",
+        "text": "Grand Theft Auto VI official artwork scene",
+        "visual_requirement": {"requirement_hash": requirement_hash},
+        "source_policy": {"mixed_media": True},
+    }
+
+
+def _late_web_row(image_path, sha, requirement_hash, *, scene_index=0,
+                  verification_status=None, visual_checked=True):
+    """A web row in the shape the real lane returns for a live verdict.
+
+    The verdict's ``verified_requirement_hash`` is the resolver's own
+    scene_context_hash — never equal to the pipeline requirement_hash;
+    the row is bound to the scene through
+    ``candidate_evidence.requirement_hash`` instead.
+    """
+    verdict = {
+        "accepted": True,
+        "status": "accepted",
+        "visual_checked": visual_checked,
+        "semantic_verified": visual_checked,
+        "visual_available": visual_checked,
+        "relevance": 92.0,
+        "final_score": 92.0,
+        "scene_index": scene_index,
+        "verified_requirement_hash": "resolver-scene-context-hash",
+        "verified_asset_sha256": sha,
+    }
+    if verification_status is not None:
+        verdict["verification_status"] = verification_status
+    return {
+        "path": str(image_path),
+        "source": "web",
+        "provider": "web",
+        "media_type": "image",
+        "candidate_id": "web:late-still",
+        "title": "Grand Theft Auto VI official artwork",
+        "final_score": 92.0,
+        "qwen_result": dict(verdict),
+        "visual_decision": dict(verdict),
+        "candidate_evidence": {
+            "requirement_hash": requirement_hash,
+            "identity_proof": "Grand Theft Auto VI",
+        },
+    }
+
+
+def _never_called_verifier(_scene, _candidate):
+    raise AssertionError("late web promotion must not spend a live vision call")
+
+
+def test_late_web_verdict_joins_plan_after_discovery_wall(tmp_path, monkeypatch):
+    """Regression: test 26 (job ffe90224) — the shared web batch returned
+    at 754.68s, after the coordinator's ~715s discovery wall and the
+    722.7s plan lock, with 13 resolved scenes; the plan shipped 0 web
+    and 7 graphics because every consumption point is non-blocking and
+    the web loader never publishes rows incrementally.
+
+    The batch here finishes 1s after the discovery wall but inside the
+    bounded late wait; its row carries a paid live verdict. The image
+    must be selected, with no live vision call spent.
+    """
+    import hashlib
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    image = tmp_path / "web_still.jpg"
+    image.write_bytes(b"late-web-image-bytes")
+    sha = hashlib.sha256(b"late-web-image-bytes").hexdigest()
+    requirement_hash = "late-web-scene-hash-001"
+    row = _late_web_row(image, sha, requirement_hash)
+    web_lane = _LateWebLane({0: [row]}, delay=3.0)
+
+    started = time.monotonic()
+    monkeypatch.setenv("VIDZEO_WEB_LATE_WAIT_SECONDS", "30")
+    result = resolve_storyboard_media_v2(
+        [_late_web_scene(requirement_hash)],
+        youtube_lane=lambda *_args: [],
+        web_lane=web_lane,
+        visual_verifier=_never_called_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=2.0,
+        verification_deadline_seconds=1.0,
+    )
+    elapsed = time.monotonic() - started
+    assert result[0].provider == "web"
+    assert result[0].selected_path == str(image)
+    assert result[0].verification_status == "verified"
+    assert any(
+        a.get("stage") == "late_web_promotion"
+        and a.get("status") == "branch_verdict_accepted"
+        for a in result[0].attempts
+    )
+    # Bounded: the batch landed ~2s after the wall; the run must not
+    # have waited out the whole late-wait budget.
+    assert elapsed < 15
+
+
+def test_late_web_verdict_never_arrives_falls_back_bounded(tmp_path, monkeypatch, capsys):
+    """The late wait must not stall the job: a web batch whose verdicts
+    never arrive still falls back to graphic/neutral, and the wait ends
+    at the bounded cap instead of hanging.
+    """
+    import hashlib
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    image = tmp_path / "web_still.jpg"
+    image.write_bytes(b"late-web-image-bytes")
+    sha = hashlib.sha256(b"late-web-image-bytes").hexdigest()
+    requirement_hash = "late-web-scene-hash-002"
+    row = _late_web_row(image, sha, requirement_hash)
+    web_lane = _LateWebLane({0: [row]}, delay=3600.0)
+
+    started = time.monotonic()
+    monkeypatch.setenv("VIDZEO_WEB_LATE_WAIT_SECONDS", "3")
+    result = resolve_storyboard_media_v2(
+        [_late_web_scene(requirement_hash)],
+        youtube_lane=lambda *_args: [],
+        web_lane=web_lane,
+        visual_verifier=_never_called_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=2.0,
+        verification_deadline_seconds=1.0,
+    )
+    elapsed = time.monotonic() - started
+    assert result[0].provider in {"graphic", "neutral"}
+    assert result[0].selected_path != str(image)
+    # The wait ran (it is what separates this run from clean HEAD) and
+    # it ended at the cap: ~2s wall + ~3s wait, never an open-ended hang.
+    assert "late web promotion" in capsys.readouterr().out
+    assert elapsed < 15
+
+
+def test_late_web_verdict_for_another_scene_is_not_seeded(tmp_path, monkeypatch):
+    """A late verdict created for a DIFFERENT scene (shared cache image
+    reused across scenes, as in test 26 scenes 3/8) must not be seeded
+    into the primary selection: the row is promoted into the ledger,
+    but no ``branch_verdict_accepted`` outcome is minted for it.
+
+    The final provider is deliberately NOT asserted here: the pre-stock
+    rescue tier below the primary selection trusts any accepted verdict
+    on its own looser rule and may still admit the image as a degraded
+    rescue. The seeding tier is the strict one — a primary "verified"
+    stamp must mean vision passed for THIS scene.
+    """
+    import hashlib
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    image = tmp_path / "web_still.jpg"
+    image.write_bytes(b"late-web-image-bytes")
+    sha = hashlib.sha256(b"late-web-image-bytes").hexdigest()
+    requirement_hash = "late-web-scene-hash-003"
+    # Evidence binds the ROW to this scene; the VERDICT was created for
+    # scene 5, so only the scene-index half refuses it.
+    row = _late_web_row(image, sha, requirement_hash, scene_index=5)
+    web_lane = _LateWebLane({0: [row]}, delay=3.0)
+
+    monkeypatch.setenv("VIDZEO_WEB_LATE_WAIT_SECONDS", "30")
+    result = resolve_storyboard_media_v2(
+        [_late_web_scene(requirement_hash)],
+        youtube_lane=lambda *_args: [],
+        web_lane=web_lane,
+        visual_verifier=_never_called_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=2.0,
+        verification_deadline_seconds=1.0,
+    )
+    # The row WAS promoted (it is in the candidate ledger) — the refusal
+    # is the scene binding, not a missed batch — but the primary
+    # selection never seeded its verdict.
+    assert any(
+        str(ledger_row.get("path") or "") == str(image)
+        for ledger_row in (result[0].candidate_ledger or [])
+    )
+    assert not any(
+        a.get("stage") == "late_web_promotion"
+        and a.get("status") == "branch_verdict_accepted"
+        for a in result[0].attempts
+    )
+
+
+def test_late_web_deterministic_stamp_is_not_seeded(tmp_path, monkeypatch):
+    """The adapter's synthesized ``deterministic_web_image`` stamp proves
+    only that the file decoded — it is not a live verdict and must not
+    be seeded as one. Same tier note as the cross-scene test above:
+    the rescue tier below may still admit the image on its own looser
+    rule; the assertion here is that the primary selection never seeds
+    the stamp.
+    """
+    import hashlib
+
+    from services.media_resolution_coordinator import resolve_storyboard_media_v2
+
+    image = tmp_path / "web_still.jpg"
+    image.write_bytes(b"late-web-image-bytes")
+    sha = hashlib.sha256(b"late-web-image-bytes").hexdigest()
+    requirement_hash = "late-web-scene-hash-004"
+    row = _late_web_row(
+        image, sha, requirement_hash,
+        verification_status="deterministic_web_image",
+        visual_checked=False,
+    )
+    web_lane = _LateWebLane({0: [row]}, delay=3.0)
+
+    monkeypatch.setenv("VIDZEO_WEB_LATE_WAIT_SECONDS", "30")
+    result = resolve_storyboard_media_v2(
+        [_late_web_scene(requirement_hash)],
+        youtube_lane=lambda *_args: [],
+        web_lane=web_lane,
+        visual_verifier=_never_called_verifier,
+        neutral_factory=lambda _s: None,
+        deadline_seconds=2.0,
+        verification_deadline_seconds=1.0,
+    )
+    assert any(
+        str(ledger_row.get("path") or "") == str(image)
+        for ledger_row in (result[0].candidate_ledger or [])
+    )
+    assert not any(
+        a.get("stage") == "late_web_promotion"
+        and a.get("status") == "branch_verdict_accepted"
+        for a in result[0].attempts
+    )
+
+
+def test_late_web_branch_accept_rules(tmp_path):
+    """Unit tests for the seeding rule: a paid live verdict bound to
+    this scene and these bytes is accepted; anything weaker is refused.
+    """
+    import hashlib
+
+    from services.media_resolution_coordinator import _late_web_branch_accept
+
+    image = tmp_path / "web_still.jpg"
+    image.write_bytes(b"late-web-image-bytes")
+    sha = hashlib.sha256(b"late-web-image-bytes").hexdigest()
+    requirement_hash = "late-web-scene-hash-005"
+    scene = _late_web_scene(requirement_hash)
+
+    bound = _late_web_row(image, sha, requirement_hash)
+    assert _late_web_branch_accept(scene, bound) is not None
+    assert _late_web_branch_accept(scene, bound)[0] is True
+
+    # Verdict created for another scene.
+    other_scene = _late_web_row(image, sha, requirement_hash, scene_index=5)
+    assert _late_web_branch_accept(scene, other_scene) is None
+
+    # Row the resolver did not choose for this scene.
+    other_evidence = _late_web_row(image, sha, "some-other-scene-hash")
+    assert _late_web_branch_accept(scene, other_evidence) is None
+
+    # Deterministic stamp: no live vision evidence.
+    deterministic = _late_web_row(
+        image, sha, requirement_hash,
+        verification_status="deterministic_web_image",
+        visual_checked=False,
+    )
+    assert _late_web_branch_accept(scene, deterministic) is None
+
+    # No verdict at all.
+    no_verdict = _late_web_row(image, sha, requirement_hash)
+    no_verdict.pop("qwen_result")
+    no_verdict.pop("visual_decision")
+    assert _late_web_branch_accept(scene, no_verdict) is None
+
+    # Verdict for different bytes.
+    wrong_bytes = _late_web_row(image, "0" * 64, requirement_hash)
+    assert _late_web_branch_accept(scene, wrong_bytes) is None
+
+    # Live rejection / veto flags.
+    rejected = _late_web_row(image, sha, requirement_hash)
+    rejected["qwen_result"] = dict(rejected["qwen_result"], accepted=False, status="rejected")
+    rejected["visual_decision"] = dict(rejected["qwen_result"])
+    assert _late_web_branch_accept(scene, rejected) is None
+    conflicted = _late_web_row(image, sha, requirement_hash)
+    conflicted["qwen_result"] = dict(conflicted["qwen_result"], entity_conflict=True)
+    conflicted["visual_decision"] = dict(conflicted["qwen_result"])
+    assert _late_web_branch_accept(scene, conflicted) is None
+

@@ -572,8 +572,13 @@ def test_shared_batch_waits_for_slow_provider(prep_env, monkeypatch):
         source_health=None,
         batch_seconds_override=3.0,
     )
-    assert warm["candidates"] >= 8, warm
-    assert warm["providers_completed"] >= 8, warm
+    # Muse-search (Nov 22, test-30 fix): the warm pool fans out to 7
+    # providers, not 8 — openverse/wikimedia are folded into the single
+    # muse_search lane, so one provider returns the merged rows of two.
+    # The wall behaviour under test is unchanged: a 1.0s provider is
+    # collected with a 3s wall, and missed with a 0.5s wall.
+    assert warm["candidates"] >= 7, warm
+    assert warm["providers_completed"] >= 7, warm
     missed = resolver._warm_shared_discovery_pool(
         query=_SHORT_TITLE,
         scene_count=9,

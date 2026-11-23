@@ -288,6 +288,30 @@ def test_caption_progress_cannot_mask_openrouter_planning():
     ]
 
 
+def test_caption_handoff_names_planning_stage_after_precomputed_words():
+    """Nov 22, 2026: a job whose words came from narration timing (no
+    Whisper) sat at "Generating captions" for 10+ min after captions
+    finished in seconds, because nothing reported the media-planning
+    stage that followed. The caption completion now hands the display
+    to query planning at 0.24, and the captions message names its real
+    word source. Both messages must sanitize to the stage actually
+    running, and the handoff must not be masked by the captions report.
+    The repair loop's message must also read as planning, not narration."""
+    from app import _make_progress_reporter
+
+    events = []
+    report = _make_progress_reporter(lambda fraction, message: events.append((fraction, message)))
+    report(0.20, "Generating captions from narration timing...")
+    report(0.24, "OpenRouter query planning: directing 127 scenes")
+    report(0.25, "OpenRouter query planning: directing 3 scenes (12s; ordered retries active)")
+
+    assert events == [
+        (0.20, "Generating captions"),
+        (0.24, "Planning visual searches"),
+        (0.25, "Planning visual searches"),
+    ]
+
+
 @patch("services.openrouter_llm.requests.post")
 def test_openrouter_retries_without_response_format_on_provider_400(post):
     rejected = Mock(status_code=400)

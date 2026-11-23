@@ -173,9 +173,13 @@ class SourceBrokerTests(unittest.TestCase):
         ):
             enabled_names = [name for name, _kind in resolver._enabled_fast_sources()]
 
+        # Muse-search (Nov 22, test-30 fix): openverse/wikimedia are
+        # folded INTO the muse_search wave (same APIs, one call per
+        # query), so the standalone lanes are no longer in the default
+        # wave — muse_search is the default lane that covers them.
         expected = {
             "universal_scraper", "yandex", "bing_hybrid", "flickr_api",
-            "openverse", "wikimedia", "library_of_congress",
+            "muse_search", "library_of_congress",
             "google_images", "getty_bing",
         }
         self.assertTrue(expected.issubset(default_names))

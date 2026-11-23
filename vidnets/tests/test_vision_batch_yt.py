@@ -216,7 +216,13 @@ def test_validate_answer_accepts_eight_candidate_batch(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_batch_sends_one_safe_request_for_two_candidates(tmp_path, monkeypatch):
-    """SAFE BATCH: 2 candidates x 1 frame each = 2 images in ONE request."""
+    """VISION LANES: 2 candidates x 2 frames each = 4 images in ONE request.
+
+    Two frames (first + last sample of the probe window) bracket the
+    transcript-matched moment, so the verdict sees the subject persist
+    across the cut. 4 candidates x 2 frames = 8 images is the operating
+    batch size; 16 images stays the hard transport ceiling.
+    """
     frames_a = [_frame(tmp_path, "a1.jpg"), _frame(tmp_path, "a2.jpg", (200, 30, 30))]
     frames_b = [_frame(tmp_path, "b1.jpg", (30, 200, 30)), _frame(tmp_path, "b2.jpg", (30, 30, 200))]
     payload = _batch_payload([_batch_row("clipA", score=82.0), _batch_row("clipB", "reject", 12.0,
@@ -244,7 +250,7 @@ def test_batch_sends_one_safe_request_for_two_candidates(tmp_path, monkeypatch):
     assert any("Candidate clipA" in t for t in text_parts)
     assert any("Candidate clipB" in t for t in text_parts)
     image_parts = [c for c in content if c.get("type") == "image_url"]
-    assert len(image_parts) == 2, "SAFE BATCH: 1 frame per candidate, 2 images total"
+    assert len(image_parts) == 4, "VISION LANES: 2 frames per candidate, 4 images total"
     assert set(out) == {"clipA", "clipB"}
     assert out["clipA"]["batch_verdict"] == "accept"
     assert out["clipA"]["batch_score"] == 82.0
@@ -257,8 +263,11 @@ def test_batch_never_sends_more_than_sixteen_images(tmp_path, monkeypatch):
     """REGRESSION (max-parallel, 2026-11-20): a batch carries at most 16 images.
 
     The cap was raised from 2 to 16 after the live test proved 16 images in
-    one request judges fine. 17 candidates become 2 requests (16 + 1),
-    never 1 request of 17.
+    one request judges fine. Vision lanes (2026-11-22) set the OPERATING
+    size to 4 candidates x 2 frames (8 images) per request, while 16 stays
+    the hard transport ceiling. 17 candidates become 5 requests
+    (4 + 4 + 4 + 4 + 1), never 1 request of 17, and never more than 16
+    images in one request.
     """
     frames = [[_frame(tmp_path, f"c{i}f1.jpg")] for i in range(17)]
     payload = _batch_payload([_batch_row(f"clip{i}", score=80.0) for i in range(17)])
@@ -278,7 +287,7 @@ def test_batch_never_sends_more_than_sixteen_images(tmp_path, monkeypatch):
             user_prompt=build_clip_batch_prompt("t", "n", "s", [f"clip{i}" for i in range(17)]),
             system_prompt=CLIP_BATCH_SYSTEM_PROMPT,
         )
-    assert len(calls) == 2, "17 candidates split into 2 batches (16 + 1)"
+    assert len(calls) == 5, "17 candidates split into 5 batches (4 + 4 + 4 + 4 + 1)"
     for content, _kwargs in calls:
         image_parts = [c for c in content if c.get("type") == "image_url"]
         assert len(image_parts) <= 16, "at most 16 images per request"

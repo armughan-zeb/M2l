@@ -1517,11 +1517,12 @@ def _hard_block_reason(candidate: Dict[str, Any]) -> str:
     # (for example, ``20.0``).  Do not let a formatting detail abort the whole
     # retrieval branch before any candidate is downloaded.
     try:
+        # Spec (Vidzeo Local): YouTube min source duration 20s.
         min_source_duration = float(
-            os.environ.get("VIDZEO_YT_MIN_SOURCE_DURATION", "12") or 12
+            os.environ.get("VIDZEO_YT_MIN_SOURCE_DURATION", "20") or 20
         )
     except (TypeError, ValueError):
-        min_source_duration = 12.0
+        min_source_duration = 20.0
     if duration and duration < min_source_duration:
         return "too_short"
     package_reason = _captioned_source_reason(candidate)
@@ -4539,8 +4540,9 @@ def _ranged_download_worker_limit(requested: int, available_mb: int, total_bytes
 
     Tiers are therefore set by total RAM: under 6 GiB stays at 2, 6-12 GiB
     gets 6, 12 GiB and up gets 8 (the requested count still caps it, and
-    ``_requested_download_workers`` caps at 8). Only genuine starvation —
-    available memory below one worker's 320 MB reserve — drops to 1.
+    ``_requested_download_workers`` caps at 4 per the spec's YT Clip
+    Workers 2-4). Only genuine starvation — available memory below one
+    worker's 320 MB reserve — drops to 1.
     ``available_mb`` is kept in the signature for its callers; it no longer
     drives the fit.
     """
@@ -4571,13 +4573,14 @@ def mixed_youtube_download_worker_capacity(config=None) -> int:
     delegate here): budget transfer waves with the same worker count the
     downloader itself uses. The old "<12 GB -> 1" branch priced the wall for
     serial transfers the downloader never runs: on this 7.7 GB host the fit
-    is 6 ranged workers (total-RAM tiers; a running job holding memory no
-    longer collapses the fit to 1), so the wall tracks real parallelism.
-    Falls back to 1 when memory is unknown.
+    is 4 ranged workers (spec: YT Clip Workers 2-4; total-RAM tiers, and a
+    running job holding memory no longer collapses the fit to 1), so the
+    wall tracks real parallelism. Falls back to 1 when memory is unknown.
     """
     settings = config if isinstance(config, dict) else {}
     try:
-        requested = max(1, min(6, int(
+        # Spec (Vidzeo Local thread pools): YT Clip Workers 2-4.
+        requested = max(1, min(4, int(
             settings.get('yt_download_concurrency')
             or os.environ.get('VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY', '4')
             or 4
@@ -4601,27 +4604,28 @@ def mixed_youtube_download_worker_capacity(config=None) -> int:
 def _requested_download_workers(download_concurrency=None) -> int:
     """Requested ranged-download worker count, before the memory fit.
 
-    Default 6, hard cap 8. Env override ``VIDZEO_YT_DOWNLOAD_CONCURRENCY``
-    wins; an explicit ``download_concurrency`` wins over the env.
+    Spec (Vidzeo Local thread pools): YT Clip Workers 2-4. Default 4,
+    hard cap 4. Env override ``VIDZEO_YT_DOWNLOAD_CONCURRENCY`` wins;
+    an explicit ``download_concurrency`` wins over the env.
     """
     try:
         configured = int(
             download_concurrency
             if download_concurrency is not None
-            else os.environ.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY", "6")
-            or 6
+            else os.environ.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY", "4")
+            or 4
         )
     except (TypeError, ValueError):
-        configured = 6
-    return max(1, min(configured, 8))
+        configured = 4
+    return max(1, min(configured, 4))
 
 
 def _ranged_download_workers(download_concurrency=None, *, available_mb=None, total_bytes=None) -> int:
     """How many ranged YouTube downloads run in parallel.
 
-    Default 6, hard cap 8 (was default 4, cap 6). The memory fit from
-    ``_ranged_download_worker_limit`` still applies when host memory is
-    known, so a tight host scales down on its own.
+    Spec (Vidzeo Local thread pools): YT Clip Workers 2-4. The memory
+    fit from ``_ranged_download_worker_limit`` still applies when host
+    memory is known, so a tight host scales down on its own.
     """
     workers = _requested_download_workers(download_concurrency)
     if available_mb is not None and total_bytes is not None:
@@ -4717,6 +4721,27 @@ def _yt_ranged_transcript_deadline_seconds() -> float:
     except (TypeError, ValueError):
         configured = 120.0
     return max(30.0, min(120.0, configured))
+
+
+def _yt_pool_transcript_deadline_seconds() -> float:
+    """Ceiling for the pool-first transcript fetch (seconds).
+
+    Same 120s ceiling as the ranged-moment deadline above: the runtime
+    .env used to pin VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS=300, and the
+    old call-site cap was also 300s, so one slow transcript batch could
+    hold the whole YT lane for 5 minutes — longer than the 292s
+    discovery budget for a 1-minute video. A 120s batch still covers
+    the measured cost (per-video ~8s good hour / ~45s slow hour at 6
+    workers) and the lane proceeds with heuristic moments for the
+    videos that did not answer in time — the designed fallback, not a
+    skipped check: transcripts pick cut moments, vision still verifies
+    every clip. An explicit per-call deadline below 120s still wins.
+    """
+    try:
+        configured = float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "120") or 120)
+    except (TypeError, ValueError):
+        configured = 120.0
+    return max(0.05, min(120.0, configured))
 
 
 def _youtube_quality_formats(*, source: bool = False, max_filesize: Optional[int] = None) -> List[str]:
@@ -6558,11 +6583,16 @@ def _search_container_pools(
     # Panama run 3 it never ran in either worker run (no retry line in
     # either log). Give it its own budget inside the hard cap instead:
     # it only fires when the first pass timed out with 0 candidates,
-    # i.e. when there is nothing downstream to protect.
+    # i.e. when there is nothing downstream to protect. The budget is
+    # 30s, not 60s: a cache-served retry (the Panama recovery case —
+    # repeat queries served from the local search cache) answers in
+    # seconds, while a retry that is itself throttled recovers nothing
+    # in test 22 (60s, 0 candidates) and only burns discovery time the
+    # downloads and transcripts still need.
     try:
-        _retry_budget = max(0.0, float(os.environ.get("VIDZEO_YT_SEARCH_ANON_RETRY_SECONDS", "60") or 60))
+        _retry_budget = max(0.0, float(os.environ.get("VIDZEO_YT_SEARCH_ANON_RETRY_SECONDS", "30") or 30))
     except (TypeError, ValueError):
-        _retry_budget = 60.0
+        _retry_budget = 30.0
     _retry_timeout = min(_retry_budget, max(0.0, _hard_cap - search_timeout))
     timed_out, pools = _run_pool_search_pass(
         jobs,
@@ -8327,11 +8357,11 @@ def get_youtube_clips(
         download_cancellation = CancellationContext(job_id="youtube-v2")
     pass_download_cancellation = cancellation is not None
     results: List[Optional[str]] = [None] * requested_scene_count
-    # Ranged clips are network bound. Default 6 workers, cap 8; the memory
-    # fit inside _ranged_download_workers still scales a tight host down on
-    # its own (see _ranged_download_worker_limit). A mixed-media job may
-    # raise the count through download_concurrency / the env override.
-    # Keep the pre-fit requested count for the telemetry receipt below.
+    # Ranged clips are network bound. Spec (Vidzeo Local): YT Clip
+    # Workers 2-4; the memory fit inside _ranged_download_workers still
+    # scales a tight host down on its own (see
+    # _ranged_download_worker_limit). Keep the pre-fit requested count
+    # for the telemetry receipt below.
     configured_download_workers = _requested_download_workers(download_concurrency)
     download_workers = _ranged_download_workers(download_concurrency)
     try:
@@ -10108,11 +10138,13 @@ def _prepare_pool_transcript_moments(
         # generous (120s): caption fetches on throttled egress routinely
         # need tens of seconds per video, and a 25s default turned the
         # transcript step into a heuristic fallback for most scenes.
-        # The 300s ceiling still bounds it.
+        # The 120s ceiling (see _yt_pool_transcript_deadline_seconds)
+        # bounds it: the old 300s ceiling let one slow batch hold the
+        # whole YT lane longer than the 292s discovery budget.
         transcript_deadline = max(
             0.05,
             min(
-                300.0,
+                _yt_pool_transcript_deadline_seconds(),
                 float(deadline_seconds)
                 if deadline_seconds is not None
                 else float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "120") or 120),
@@ -10383,6 +10415,55 @@ def _verdict_from_clip_analysis(
     return verdict == "keep", score, True, reason
 
 
+def _lane_visual_client(visual_context: Any, lane: str = "youtube") -> Any:
+    """Return the vision client charged to ``lane`` for a context.
+
+    Vision lanes (§7.3 resolution): every YT vision call already flows
+    through ``visual_context.get_client()`` -> ``_ContextClient._run``
+    -> ``_reserve_call`` — the clip pipeline receives the context
+    client, not a raw Qwen client, so there is no raw-client bypass to
+    close. What the lane split re-homes is *which context* is charged:
+    when the passed context is a verifier parent that already carries
+    lane children (built by the adapter), YT vision uses the YT lane
+    child's client, so its calls/deadline/semaphore are the YT lane's.
+    Otherwise the context's own client is returned unchanged — in the
+    V2 adapter flow the YT lane's transport context is disabled, so
+    this returns None and lane vision stays off there by design (the
+    coordinator gate is where YT vision happens in V2).
+    """
+    if visual_context is None:
+        return None
+    children = getattr(visual_context, "_lane_children", None)
+    if isinstance(children, dict) and str(lane) in children:
+        try:
+            return children[str(lane)].get_client()
+        except Exception:
+            pass
+    try:
+        if not bool(getattr(visual_context, "enabled", False)):
+            return None
+        return visual_context.get_client()
+    except Exception:
+        return None
+
+
+def _lane_budget_for(visual_context: Any, lane: str = "youtube") -> Any:
+    """Return the LaneVisionBudget for ``lane`` on a context or its child."""
+    children = getattr(visual_context, "_lane_children", None)
+    if isinstance(children, dict) and str(lane) in children:
+        return getattr(children[str(lane)], "_lane_budget", None)
+    return getattr(visual_context, "_lane_budget", None)
+
+
+def _lane_scheduler_for(visual_context: Any) -> Any:
+    """Return the lane scheduler attached to a context (or its parent)."""
+    for obj in (visual_context, getattr(visual_context, "_parent", None)):
+        scheduler = getattr(obj, "lane_scheduler", None) if obj is not None else None
+        if scheduler is not None:
+            return scheduler
+    return None
+
+
 def _visual_verdict_scored(
     path: str,
     scene_index: int,
@@ -10408,13 +10489,15 @@ def _visual_verdict_scored(
         client = None
         if getattr(visual_context, "enabled", False):
             try:
-                client = visual_context.get_client()
+                client = _lane_visual_client(visual_context, "youtube")
             except Exception:
                 client = None
         clip_pipeline = ClipIntelligencePipeline(
             client,
             max_frames=_visual_gate_frames(),
             visual_required=visual_required,
+            lane_budget=_lane_budget_for(visual_context, "youtube"),
+            lane_scheduler=_lane_scheduler_for(visual_context),
         )
     except Exception:
         # The clip has already passed metadata, FFmpeg integrity, overlay and
@@ -10498,7 +10581,7 @@ def _batched_visual_verdicts(
         client = None
         if getattr(visual_context, "enabled", False):
             try:
-                client = visual_context.get_client()
+                client = _lane_visual_client(visual_context, "youtube")
             except Exception:
                 client = None
         if client is None:
@@ -10515,6 +10598,8 @@ def _batched_visual_verdicts(
             client,
             max_frames=_visual_gate_frames(),
             visual_required=visual_required,
+            lane_budget=_lane_budget_for(visual_context, "youtube"),
+            lane_scheduler=_lane_scheduler_for(visual_context),
         )
     except Exception:
         return _parallel_visual_verdicts_by_id(

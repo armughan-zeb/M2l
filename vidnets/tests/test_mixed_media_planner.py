@@ -147,9 +147,11 @@ class MixedMediaPlannerTests(unittest.TestCase):
 
         youtube_count = plan.final_counts["YouTube Clips"]
         self.assertEqual(plan.topic_policy, "history")
-        self.assertEqual(plan.final_counts["Stock Media"], 1)
-        self.assertEqual(plan.final_counts["Web Images"], 5)
-        self.assertAlmostEqual(youtube_count / len(scenes), 0.40)
+        # Spec §5.1 history weights 30% web / 65% YouTube / 5% stock:
+        # 10 scenes -> Hamilton-Hare gives 3 web / 7 YouTube / 0 stock.
+        self.assertEqual(plan.final_counts["Stock Media"], 0)
+        self.assertEqual(plan.final_counts["Web Images"], 3)
+        self.assertAlmostEqual(youtube_count / len(scenes), 0.70)
         self.assertTrue(all(
             "Web Images" in decision.fallback_sources
             for decision in plan.decisions
@@ -188,8 +190,8 @@ class MixedMediaPlannerTests(unittest.TestCase):
             scene_media_mode="automatic",
         )
 
-        self.assertEqual(plan.requested_weights["Web Images"], 0.45)
-        self.assertEqual(plan.requested_weights["YouTube Clips"], 0.45)
+        self.assertEqual(plan.requested_weights["Web Images"], 0.30)
+        self.assertEqual(plan.requested_weights["YouTube Clips"], 0.65)
         self.assertGreater(plan.final_counts["YouTube Clips"], 4)
         self.assertEqual(sum(plan.final_counts.values()), len(scenes))
 
@@ -334,9 +336,19 @@ class MixedMediaPlannerTests(unittest.TestCase):
             script="A historical documentary about an ancient battle and its archives.",
         )
         self.assertEqual(crime["niche"], "crime")
-        self.assertAlmostEqual(crime["weights"]["YouTube Clips"], 0.55, places=4)
+        # Spec §5.1: crime/documentary 60% YouTube / 30% web / 10% stock.
+        self.assertAlmostEqual(crime["weights"]["YouTube Clips"], 0.60, places=4)
         self.assertEqual(history["niche"], "history")
-        self.assertAlmostEqual(history["weights"]["Web Images"], 0.45, places=4)
+        # Spec §5.1: history/royal 65% YouTube / 30% web / 5% stock.
+        self.assertAlmostEqual(history["weights"]["Web Images"], 0.30, places=4)
+        self.assertAlmostEqual(history["weights"]["YouTube Clips"], 0.65, places=4)
+
+    def test_lifestyle_uses_mostly_web_stills(self):
+        # Spec §5.1: lifestyle/fitness 20% YouTube / 80% web / 0% stock.
+        weights = planner._automatic_mode_weights("lifestyle")
+        self.assertAlmostEqual(weights["YouTube Clips"], 0.20, places=4)
+        self.assertAlmostEqual(weights["Web Images"], 0.80, places=4)
+        self.assertAlmostEqual(weights["Stock Media"], 0.00, places=4)
 
 
 if __name__ == "__main__":

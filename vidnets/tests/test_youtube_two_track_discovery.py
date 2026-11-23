@@ -1,8 +1,9 @@
 """Two-track YouTube discovery: budget, general pool, background downloads.
 
 Covers the user-ordered discovery system:
-* discovery budget = 5 min per minute of video (300s/min), NO cap, rate is
-  a configurable setting (config key wins, env next, 300s default);
+* discovery budget = 5 min per minute of video (300s/min), capped by the
+  spec §3.3 branch wall (default 1200s), rate is a configurable setting
+  (config key wins, env next, 300s default);
 * the budget bounds discovery only — downloads are exempt and run in the
   background download queue;
 * Track B general pool: broad topic queries, vision-verified entries, a
@@ -90,21 +91,32 @@ def test_loop_decision_soft_disabled_never_stops_discovery():
 
 
 # ---------------------------------------------------------------------------
-# Discovery budget: 5 minutes per minute of video, no cap, shiftable rate
+# Discovery budget: 5 minutes per minute of video, capped by the branch
+# wall (spec §3.3: 480–1200s), shiftable rate
 # ---------------------------------------------------------------------------
 
 
 def test_budget_five_minutes_per_minute_of_video():
     assert discovery_budget_seconds(1) == 300.0
-    assert discovery_budget_seconds(5) == 1500.0
-    assert discovery_budget_seconds(15) == 4500.0
+    assert discovery_budget_seconds(4) == 1200.0
     assert discovery_budget_seconds(0.5) == 150.0
 
 
-def test_budget_has_no_cap_for_long_videos():
-    # 15 min -> 75 min of discovery. The old 20-min plan capped; this one
-    # must not: the rate scales linearly with duration by design.
-    assert discovery_budget_seconds(60) == 18000.0
+def test_budget_capped_by_branch_wall_for_long_videos():
+    # 5 min -> 1500s at the rate, capped at the 1200s branch wall; 15 min
+    # and 60 min are capped the same way instead of growing to 4500s /
+    # 18000s. A long video fails open to the parallel web lane instead
+    # of spending its whole delivery budget on YouTube discovery.
+    assert discovery_budget_seconds(5) == 1200.0
+    assert discovery_budget_seconds(15) == 1200.0
+    assert discovery_budget_seconds(60) == 1200.0
+
+
+def test_budget_cap_is_raisable_via_branch_wall_config(monkeypatch):
+    monkeypatch.delenv("VIDZEO_MIXED_YT_BRANCH_WALL_TIMEOUT_SECONDS", raising=False)
+    assert discovery_budget_seconds(
+        15, config={"yt_branch_wall_timeout_seconds": 3600}
+    ) == 3600.0
 
 
 def test_budget_rate_is_configurable_via_config(monkeypatch):

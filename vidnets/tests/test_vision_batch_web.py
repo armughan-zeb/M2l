@@ -263,8 +263,11 @@ def test_analyze_images_batch_never_sends_more_than_sixteen_images(tmp_path):
 
     The cap was raised from 2 to 16 after the live test proved 16 images in
     one request judges fine; the token budget (6000) is the binding limit,
-    not the image count. 17 candidates become 2 requests (16 + 1), never
-    1 request of 17.
+    not the image count. Vision lanes (2026-11-22) set the OPERATING size
+    to 8 images per request (8 scenes x 1 candidate) — a 16-verdict web
+    answer risks truncation mid-list — while 16 stays the hard transport
+    ceiling. 17 candidates become 3 requests (8 + 8 + 1), never 1 request
+    of 17, and never more than 16 images in one request.
     """
     client = _raw_client()
     candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(17)]
@@ -286,8 +289,8 @@ def test_analyze_images_batch_never_sends_more_than_sixteen_images(tmp_path):
         client, paths, "judge these", "system prompt",
         [c["candidate_id"] for c in candidates],
     )
-    assert len(posted) == 2, "17 candidates split into 2 batches (16 + 1)"
-    assert [p["images"] for p in posted] == [16, 1]
+    assert len(posted) == 3, "17 candidates split into 3 batches (8 + 8 + 1)"
+    assert [p["images"] for p in posted] == [8, 8, 1]
     assert set(result) == set(paths)
     assert all(result[p]["identity_score"] == 90 for p in paths)
 
@@ -366,11 +369,12 @@ def test_post_json_full_budget_lifts_fast_mode_cap(tmp_path):
 
 
 def test_analyze_images_batch_splits_into_batches(tmp_path):
-    """MAX BATCH: 17 candidates -> 2 _post_json calls, each at most 16 images.
+    """MAX BATCH: 17 candidates -> 3 _post_json calls, each at most 16 images.
 
-    A scene's candidates are split into chunks of SAFE_VISION_BATCH_IMAGES
-    (16); each chunk is one vision request; verdicts are merged, one row
-    per candidate.
+    Vision lanes (2026-11-22): a scene's candidates are split into
+    chunks of 8 images (the web operating size); 16 stays the hard
+    transport ceiling. Each chunk is one vision request; verdicts are
+    merged, one row per candidate.
     """
     client = _raw_client()
     candidates = [_candidate(tmp_path, f"cand-{i}.png") for i in range(17)]
@@ -383,8 +387,9 @@ def test_analyze_images_batch_splits_into_batches(tmp_path):
         assert len(images) <= 16, "max batch: at most 16 images per request"
         posted.append({"images": len(images), "json_schema": json_schema, "budget": budget,
                        "full_budget": full_budget})
-        # The raw client chunks sequentially: call 1 carries paths[0:16],
-        # call 2 carries paths[16:17]. Return one verdict per image in order.
+        # The raw client chunks sequentially: call 1 carries paths[0:8],
+        # call 2 carries paths[8:16], call 3 carries paths[16:17]. Return
+        # one verdict per image in order.
         start = sum(p["images"] for p in posted[:-1])
         rows = []
         for j in range(len(images)):
@@ -403,8 +408,8 @@ def test_analyze_images_batch_splits_into_batches(tmp_path):
         client, paths, "judge these", "system prompt",
         [c["candidate_id"] for c in candidates],
     )
-    assert len(posted) == 2, "17 candidates split into 2 batches (16 + 1)"
-    assert [p["images"] for p in posted] == [16, 1]
+    assert len(posted) == 3, "17 candidates split into 3 batches (8 + 8 + 1)"
+    assert [p["images"] for p in posted] == [8, 8, 1]
     assert all(p["json_schema"] == VISION_BATCH_VERDICT_SCHEMA for p in posted)
     assert all(p["full_budget"] is True for p in posted)
     assert set(result) == set(paths)
@@ -608,7 +613,11 @@ def test_verify_batch_agrees_with_sequential_on_same_verdicts(tmp_path):
     verifier_s, _ctx_s, client_s = _build_verifier(tmp_path / "seq")
     calls_s = {"batch": 0, "single": 0}
     _stub_raw_client(client_s, accept_map, calls_s)
-    client_s.analyze_images_batch = None  # no batch method: sequential path
+    # Vision lanes: verify_batch files through the candidate's lane
+    # child, which wraps the same raw transport client — so "no batch
+    # method" is simulated at the transport level, not on the parent
+    # context client (setting it there no longer reaches the prefetch).
+    client_s._client.analyze_images_batch = None  # no batch method: sequential path
     sequential = verifier_s.verify_batch(SCENE, candidates)
 
     assert calls_b == {"batch": 1, "single": 0}, calls_b  # 3 candidates = 1 batch

@@ -41,7 +41,7 @@ def test_generate_audio_chunked_falls_back_to_edge_when_muse_tts_fails(monkeypat
     chunks = ["Chunk one here.", "Chunk two here."]
     attempts = []
 
-    def failing_linux(_script):
+    def failing_linux(_script, progress_callback=None):
         attempts.append(_script)
         raise RuntimeError("muse tts down")
 
@@ -254,3 +254,72 @@ def test_synthesize_linux_chunk_writes_script_timing_sidecar(tmp_path):
     assert rows[0]["start"] == 0.0
     assert rows[-1]["end"] == 1.0
     assert all(row["timing_source"] == "tts_script_timing" for row in rows)
+
+
+def test_narration_chunk_stall_seconds_default_and_env(monkeypatch):
+    # No-progress watchdog knob: 300s default, clamped to [60, 3600].
+    monkeypatch.delenv("VIDZEO_NARRATION_CHUNK_STALL_SECONDS", raising=False)
+    assert tts._narration_chunk_stall_seconds() == 300.0
+    monkeypatch.setenv("VIDZEO_NARRATION_CHUNK_STALL_SECONDS", "120")
+    assert tts._narration_chunk_stall_seconds() == 120.0
+    monkeypatch.setenv("VIDZEO_NARRATION_CHUNK_STALL_SECONDS", "5")
+    assert tts._narration_chunk_stall_seconds() == 60.0
+    monkeypatch.setenv("VIDZEO_NARRATION_CHUNK_STALL_SECONDS", "not-a-number")
+    assert tts._narration_chunk_stall_seconds() == 300.0
+
+
+def test_linux_tts_chunked_stall_raises_when_no_chunk_completes(monkeypatch, tmp_path):
+    # REGRESSION (2026-11-21 narration stall): chunks that never complete
+    # used to block the worker thread forever with no progress callback,
+    # so the heartbeat died while the worker stayed deaf inside the call.
+    # Now the stage fails loudly once no chunk completes within the stall.
+    import pytest
+
+    monkeypatch.setattr(tts, "TEMP_DIR", tmp_path)
+    monkeypatch.setenv("VIDZEO_LINUX_TTS_COMMAND", "tts --output {output}")
+    monkeypatch.setenv("VIDZEO_LINUX_TTS_WORKERS", "2")
+    monkeypatch.setattr(tts, "_narration_chunk_stall_seconds", lambda: 1.0)
+    chunks = ["First sentence here.", "Second sentence here.", "Third sentence here."]
+    reported = []
+
+    def stalled_chunk(text, cache_dir, identity, work_dir, index, total, chunk_start, **_kwargs):
+        time.sleep(3)
+        path = work_dir / f"chunk-{index}.mp3"
+        path.write_bytes(text.encode() * 40)
+        return [str(path)]
+
+    with mock.patch.object(tts, "_split_script_for_parallel_tts", return_value=chunks), \
+         mock.patch.object(tts, "_synthesize_linux_chunk", side_effect=stalled_chunk):
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="no chunk completed in 1s"):
+            tts._generate_linux_tts_chunked(
+                "narration",
+                progress_callback=lambda fraction, message: reported.append((fraction, message)),
+            )
+        elapsed = time.monotonic() - started
+    assert elapsed < 10, f"stall watchdog took {elapsed:.1f}s to fail loudly"
+    assert reported == []  # no chunk ever completed, so no progress was reported
+
+
+def test_edge_tts_ladder_stall_raises_when_lane_produces_nothing(monkeypatch, tmp_path):
+    # Same watchdog on the Edge fallback lane: a lane that returns with
+    # zero completed chunks and then sits past the stall fails loudly
+    # instead of grinding through the remaining lanes against a dead
+    # websocket (Edge is blocked by the egress proxy on this host).
+    import pytest
+
+    monkeypatch.setattr(tts, "TEMP_DIR", tmp_path)
+    monkeypatch.setattr(tts, "linux_tts_config", lambda: None)  # Edge lane only
+    monkeypatch.setattr(tts, "_EDGE_TTS_AVAILABLE", True)
+    monkeypatch.setattr(tts, "_narration_chunk_stall_seconds", lambda: 1.0)
+    chunks = ["Chunk one here.", "Chunk two here."]
+    script = " ".join(["The coal train rolls through the valley at dawn."] * 40)
+
+    def stalled_batch(coro):
+        time.sleep(2)
+        return []  # lane finished with zero completed chunks
+
+    with mock.patch.object(tts, "_split_script_for_parallel_tts", return_value=chunks), \
+         mock.patch.object(tts, "_run_async", side_effect=stalled_batch):
+        with pytest.raises(TimeoutError, match="Edge TTS narration stalled"):
+            tts.generate_audio_chunked(script)

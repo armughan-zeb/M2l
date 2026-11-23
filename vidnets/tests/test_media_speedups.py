@@ -1,10 +1,12 @@
 """Tests for the Nov 10, 2026 media speedups.
 
-1. Parallel YT downloads: ranged-download workers (default 6, cap 8, with
-   a tiered small-host memory fit instead of the flat 2-worker cap under
-   12 GB), pool probe workers (default 10, cap 12), shared-source batch
-   workers (default 6, cap 8) and batch deadline (default 300s, was 120s).
-2. Vision gate pool 6 -> 12 (env VIDZEO_VISUAL_GATE_WORKERS wins).
+1. Parallel YT downloads: ranged-download workers (spec: YT Clip
+   Workers 2-4, default 4, with a tiered small-host memory fit instead
+   of the flat 2-worker cap under 12 GB), pool probe workers (default
+   10, cap 12), shared-source batch workers (default 6, cap 8) and
+   batch deadline (default 300s, was 120s).
+2. Vision gate pool spec 4-8 (default 8, env VIDZEO_VISUAL_GATE_WORKERS
+   wins, clamped to the spec range).
 3. Tighter pre-filter: the per-scene top-12 pool drops entries scoring below
    VIDZEO_VISUAL_RELATIVE_FLOOR (default 0.5) times the best metadata score,
    while always keeping at least the finalist count — vision never receives
@@ -57,19 +59,20 @@ class TestRangedDownloadWorkers(unittest.TestCase):
         )
 
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_ranged_download_workers(), 6)
+            # Spec (Vidzeo Local thread pools): YT Clip Workers 2-4 —
+            # default 4, hard cap 4, even when the caller asks for more.
+            self.assertEqual(_ranged_download_workers(), 4)
             self.assertEqual(_ranged_download_workers(download_concurrency=3), 3)
-            # Hard cap 8, even when the caller asks for more.
-            self.assertEqual(_ranged_download_workers(download_concurrency=20), 8)
+            self.assertEqual(_ranged_download_workers(download_concurrency=20), 4)
             # Memory fit still applies when host memory is known.
             self.assertEqual(
                 _ranged_download_workers(available_mb=1759, total_bytes=8 * 1024**3),
-                6,
+                4,
             )
             # Requested count (pre-fit, used by the telemetry receipt)
             # is the same parsing without the memory clamp.
-            self.assertEqual(_requested_download_workers(), 6)
-            self.assertEqual(_requested_download_workers(download_concurrency=20), 8)
+            self.assertEqual(_requested_download_workers(), 4)
+            self.assertEqual(_requested_download_workers(download_concurrency=20), 4)
             self.assertEqual(
                 _requested_download_workers(download_concurrency=3), 3)
         with mock.patch.dict(
@@ -119,11 +122,13 @@ class TestPoolDownloadHelpers(unittest.TestCase):
 
 
 class TestVisionGateWorkers(unittest.TestCase):
-    def test_gate_workers_default_twelve(self):
+    def test_gate_workers_default_eight(self):
+        # Spec (Vidzeo Local thread pools): Vision 4-8. The Nov 22 local
+        # tuning ran 12; the user ordered the spec values applied verbatim.
         from services.media_resolution_coordinator import _visual_gate_workers
 
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_visual_gate_workers(38), 12)
+            self.assertEqual(_visual_gate_workers(38), 8)
             self.assertEqual(_visual_gate_workers(3), 3)
             self.assertEqual(_visual_gate_workers(0), 1)
         with mock.patch.dict(
@@ -133,7 +138,7 @@ class TestVisionGateWorkers(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"VIDZEO_VISUAL_GATE_WORKERS": "99"}, clear=True
         ):
-            self.assertEqual(_visual_gate_workers(38), 24)
+            self.assertEqual(_visual_gate_workers(38), 8)
 
     def test_relative_floor_default_and_clamp(self):
         from services.media_resolution_coordinator import _visual_relative_floor

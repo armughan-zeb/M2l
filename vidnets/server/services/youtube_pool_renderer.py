@@ -2531,6 +2531,25 @@ def _prefetch_probe_transcript_moments(
     return audit
 
 
+def _pool_slice_seconds(scene_durations, scene_index: int) -> float:
+    """FFmpeg slice length for one pool scene, in seconds.
+
+    Spec (Vidzeo Local): 4-8s slice around the matched moment. Scene
+    durations (narration beats, ~2.6-3.4s) are shorter than the spec
+    slice; the cut is clamped to the spec range and the renderer trims
+    any excess to the scene slot.
+    """
+    try:
+        raw = float(
+            scene_durations[scene_index]
+            if scene_index < len(scene_durations)
+            else 4.0
+        )
+    except (TypeError, ValueError, IndexError):
+        raw = 4.0
+    return min(8.0, max(4.0, raw))
+
+
 def resolve_pool_first(
     pipeline,
     pools,
@@ -3019,7 +3038,7 @@ def resolve_pool_first(
     }
     multi_topic_pool = len(topic_keys) > 1
     for scene_index, row in enumerate(pools.rows):
-        duration = float(pools.scene_durations[scene_index] if scene_index < len(pools.scene_durations) else 4.0)
+        duration = _pool_slice_seconds(pools.scene_durations, scene_index)
         # Per-scene game check. The shared shortlist is global — a source's
         # metadata_score is its BEST scene fit — so a source that is right
         # for one scene can be wrong-game for another (a GTA V clip in a

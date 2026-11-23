@@ -1,3 +1,4 @@
+import hashlib
 import sys
 import threading
 import time
@@ -57,10 +58,16 @@ def test_strong_same_query_result_keeps_twelve_unique_candidates_for_vision(
         output_dir.mkdir(parents=True, exist_ok=True)
         result = []
         for index, url in enumerate(urls):
-            path = output_dir / f"jaguar-e-type-{index}.jpg"
+            # Name + noise derive from the URL, like the real downloader's
+            # hash-based filenames: chunked sub-batches (muse-search §3.2)
+            # re-enumerate each chunk from 0, so a chunk-local index would
+            # collide across chunks and collapse the pool by path.
+            tag = hashlib.md5(url.encode()).hexdigest()[:12]
+            path = output_dir / f"jaguar-e-type-{tag}.jpg"
+            seed = 64 + int(hashlib.md5(url.encode()).hexdigest()[:4], 16) % 192
             # Noise keeps each fixture above the resolver's minimum byte size
             # and gives the content/visual deduplication code distinct pixels.
-            Image.effect_noise((800, 450), 64 + index).convert("RGB").save(
+            Image.effect_noise((800, 450), seed).convert("RGB").save(
                 path, format="JPEG", quality=92
             )
             result.append((url, path, ""))

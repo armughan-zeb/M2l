@@ -717,7 +717,8 @@ class WebImageModularTests(unittest.TestCase):
     @mock.patch("services.web_image.resolver._discover_hybrid_urls")
     @mock.patch("services.web_image.resolver._discover_flickr_api_urls")
     @mock.patch("services.web_image.resolver._pre_score_candidate")
-    def test_adaptive_download_limit_excellent_match(self, mock_pre_score, mock_flickr_api, mock_hybrid, mock_api):
+    @mock.patch("services.web_image.resolver.search_muse_sources", return_value=[])
+    def test_adaptive_download_limit_excellent_match(self, mock_muse, mock_pre_score, mock_flickr_api, mock_hybrid, mock_api):
         mock_flickr_api.return_value = [
             {"url": "https://example.com/1.jpg", "title": "A", "source": "flickr_api", "query": "test"},
             {"url": "https://example.com/2.jpg", "title": "B", "source": "flickr_api", "query": "test"},

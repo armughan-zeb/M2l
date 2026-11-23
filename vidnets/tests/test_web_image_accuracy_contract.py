@@ -484,7 +484,10 @@ def test_default_web_resolver_keeps_all_bounded_provider_lanes_enabled():
     from services.web_image.resolver import _enabled_fast_sources
 
     names = {name for name, _kind in _enabled_fast_sources()}
-    assert {"flickr_api", "yandex", "bing_hybrid", "openverse", "wikimedia"}.issubset(names)
+    # Muse-search (Nov 22, test-30 fix): openverse/wikimedia are folded
+    # into the muse_search wave — the standalone lanes no longer appear
+    # in the default wave, muse_search covers both APIs.
+    assert {"flickr_api", "yandex", "bing_hybrid", "muse_search"}.issubset(names)
     assert {"getty_bing"}.issubset(names)
     assert "ddg_hybrid" not in names and "getty_ddg" not in names
 

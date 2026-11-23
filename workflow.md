@@ -175,12 +175,16 @@ claims, delivers, or restarts a job mid-render.
    # scratch clone (no .env, no live Vidnets/hook from that path) —
    # that is expected. In the live repo it must PASS.
    ```
-4. Give the user the exact two push commands:
-   ```bash
-   git fetch <bundle> HEAD:<branch> && git push origin <branch>:main
-   ```
-   (branch name = the bundle name; push order matters if earlier
-   bundles are still unpushed — oldest first.)
+4. The VM CANNOT push to GitHub: SSH egress is blocked and there are
+   no git credentials on the VM, so `git push origin` fails from here.
+   Do NOT keep retrying it. The push goes through the GitHub connector
+   snapshot push (another session runs it — it pushes only the files
+   changed since the last snapshot, in ~2.5 MiB batches; a full-repo
+   snapshot is impossible at 135 MiB). Hand off the commit hash + the
+   bundle from step 2 and report that the push is pending that session.
+   (The 3 stub files deleted locally are still on origin/main — the
+   connector delete fails on them; they need the user's PC git or the
+   GitHub website.)
 5. Report: commit hash, bundle path, test results, what changed, what
    is still not perfect. Point the next agent at `rules.md` first.
 

@@ -1,3 +1,5 @@
+import pytest
+
 from server.services.delivery_budget import DeliveryBudget, install_delivery_budget
 
 
@@ -107,13 +109,17 @@ def test_production_worst_case_stage_chain_keeps_safety_margin():
 
 
 def test_agent_job_budget_scales_with_scene_count(monkeypatch):
-    """Cooper got 3037s from the audio formula and its tail fell back.
+    """Spec §3.1: T_total = max(900, min(7200, 2.5*T_audio + 600)).
 
-    Agent preparation is per-scene inbox round trips, so the budget must
-    scale with scene count: a 1600-word script (~100 scenes) lifts the
-    agent floor to 2400 + 100*90 = 11400s, while the same script without
-    an agent provider keeps the audio-formula total (~2339s). Cooper
-    (2243 words, ~140 scenes) would need ~15017s and is capped at 14400s.
+    The old agent floor (2400 + scenes*90, capped at 14400s) assumed
+    vision was sequential, so a 1600-word script (~100 scenes) got
+    11400s and Cooper (2243 words, ~140 scenes) got the 14400s cap.
+    Vision is now parallel (8 Muse workers, 12-call gate), so a wave
+    costs ~90s for 8 scenes, not 90s per scene: the parallel allowance
+    (900 + ceil(scenes/8)*90) is 2070s for 100 scenes and 2520s for
+    140 scenes, both below the audio-formula totals (2339s / 3038s),
+    so agent and plain jobs now share the audio-formula budget, capped
+    at 7200s. A short agent job still gets the 1800s floor.
     """
     monkeypatch.delenv("VIDZEO_VIDEO_DELIVERY_BUDGET_SECONDS", raising=False)
     monkeypatch.delenv("VIDZEO_RENDER_RESERVE_SECONDS", raising=False)
@@ -122,13 +128,13 @@ def test_agent_job_budget_scales_with_scene_count(monkeypatch):
         {"script": ("word " * 1600).strip(), "llm_provider": "external_agent"},
         clock=FakeClock(),
     )
-    assert agent.total_seconds == 11400.0
+    assert agent.total_seconds == pytest.approx(2339.13, abs=1.0)
 
     cooper_like = install_delivery_budget(
         {"script": ("word " * 2243).strip(), "llm_provider": "external_agent"},
         clock=FakeClock(),
     )
-    assert cooper_like.total_seconds == 14400.0
+    assert cooper_like.total_seconds == pytest.approx(3038.04, abs=1.0)
 
     plain = install_delivery_budget(
         {"script": ("word " * 1600).strip()},
@@ -136,12 +142,21 @@ def test_agent_job_budget_scales_with_scene_count(monkeypatch):
     )
     assert 2300.0 < plain.total_seconds < 2400.0
 
+    short_agent = install_delivery_budget(
+        {"script": ("word " * 270).strip(), "llm_provider": "external_agent"},
+        clock=FakeClock(),
+    )
+    assert short_agent.total_seconds == 1800.0
+
 
 def test_wright_replay_progressing_job_survives_old_budget(monkeypatch):
     """Wright Brothers (270 words, 14 scenes) died at 2419s under the old
     1800 + scenes*35 formula (~2395s). A media stage that keeps progressing
     must NOT be cancelled when the old budget would have fired; only a true
-    stall (no progress for the grace window) lets the deadline expire."""
+    stall (no progress for the grace window) lets the deadline expire.
+    Spec §3.1: the short agent job now gets the 1800s floor (not the old
+    2400 + scenes*90 = 3918.75s), and progress still extends it past
+    that total up to the 7200s absolute cap."""
     monkeypatch.delenv("VIDZEO_VIDEO_DELIVERY_BUDGET_SECONDS", raising=False)
     monkeypatch.delenv("VIDZEO_RENDER_RESERVE_SECONDS", raising=False)
     clock = FakeClock(0)
@@ -149,7 +164,8 @@ def test_wright_replay_progressing_job_survives_old_budget(monkeypatch):
         {"script": ("word " * 270).strip(), "llm_provider": "external_agent"},
         clock=clock,
     )
-    assert budget.total_seconds == 3918.75
+    assert budget.total_seconds == 1800.0
+    assert budget.absolute_cap_seconds == 7200.0
 
     # Genuine progress every 300s (a scene resolving, a fraction advancing).
     for step in range(14):

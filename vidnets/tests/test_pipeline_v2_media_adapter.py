@@ -976,7 +976,8 @@ def test_mixed_media_lane_does_not_reopen_stock_after_validated_policy_disables_
 def test_mixed_web_scene_workers_promote_legacy_packaged_cap():
     # GTA fix (Nov 16): the most restrictive value wins — a stale packaged
     # ``web_max_scene_workers`` can no longer raise the fan-out above the
-    # bounded env default (2), which is what stops the egress stampede.
+    # bounded env default (4 since the Nov 22 d1ece590 stall fix; 2 before),
+    # which is what stops the egress stampede.
     # An explicit higher operator value is still honoured up to the cap.
     with mock.patch.dict(
         os.environ,
@@ -986,8 +987,8 @@ def test_mixed_web_scene_workers_promote_legacy_packaged_cap():
         assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 6
         assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 20}) == 12
     with mock.patch.dict(os.environ, {}, clear=True):
-        assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 2
-        assert _mixed_web_scene_worker_limit({}) == 2
+        assert _mixed_web_scene_worker_limit({"web_max_scene_workers": 6}) == 4
+        assert _mixed_web_scene_worker_limit({}) == 4
 
 
 def test_explicit_stock_opt_out_overrides_cached_mixed_plan_weights():

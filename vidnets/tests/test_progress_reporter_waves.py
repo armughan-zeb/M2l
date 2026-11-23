@@ -35,6 +35,51 @@ def test_sanitizer_does_not_count_retrying_scenes_as_completed():
     assert result == "Finding web images"
 
 
+def test_sanitizer_does_not_present_sub_batch_count_as_job_progress():
+    """d1ece590: a one-scene web handoff reported "Web image scene 1/1
+    checked (1 resolved)" while the 127-scene job was in pre-stock
+    rescue; the sanitizer showed "Finding scene 1/1" at 61% and the
+    stale count stuck until the rescue-ready report arrived. A 1/1
+    count is a sub-batch denominator, not the job's scene list, and a
+    rescue subset count (5/12 rescued scenes) is not job progress
+    either: both must show the stage without a count, so the rescue's
+    real job-level count is the one the user sees."""
+    assert (
+        app._sanitize_user_progress_message(
+            0.61, "Web image scene 1/1 checked (1 resolved)"
+        )
+        == "Finding web images"
+    )
+    assert (
+        app._sanitize_user_progress_message(
+            0.61, "Mixed media rescue: Web image scene 5/12 checked (4 resolved)"
+        )
+        == "Finding web images"
+    )
+    # The rescue's real job-level count still shows unchanged.
+    assert (
+        app._sanitize_user_progress_message(
+            0.61, "Mixed media: rescue ready 38/127 scenes"
+        )
+        == "Preparing media 38/127"
+    )
+    # Primary-wave counts are unaffected.
+    assert (
+        app._sanitize_user_progress_message(
+            0.60, "Web image scene 50/121 checked (40 resolved)"
+        )
+        == "Finding scene 50/121"
+    )
+
+
+def test_reporter_does_not_let_single_scene_sub_batch_overwrite_job_label():
+    report, calls = _reporter()
+    report(0.60, "Web image scene 50/121 checked (40 resolved)")
+    assert calls[-1][1] == "Finding scene 50/121"
+    report(0.61, "Web image scene 1/1 checked (1 resolved)")
+    assert calls[-1][1] == "Finding web images"
+
+
 def test_reporter_forwards_new_wave_with_different_total():
     report, calls = _reporter()
     report(0.60, "Web image scene 50/121 checked (40 resolved)")

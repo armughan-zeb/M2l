@@ -72,17 +72,23 @@ def test_ranged_workers_hold_parallelism_while_job_holds_ram():
     # Panama ran at 637 MB available and fitted 1 worker under the old rule.
     assert ytv2._ranged_download_workers(
         4, available_mb=637, total_bytes=8 * 1024 ** 3) == 4
+    # Spec (Vidzeo Local thread pools): YT Clip Workers 2-4 — an
+    # explicit request for 6 clamps to 4 (the memory fit itself still
+    # allows 6 on this host; see _ranged_download_worker_limit tests).
     assert ytv2._ranged_download_workers(
-        6, available_mb=637, total_bytes=8 * 1024 ** 3) == 6
-    assert ytv2._ranged_download_workers() == 6
+        6, available_mb=637, total_bytes=8 * 1024 ** 3) == 4
+    # The no-arg default is 4, not 6.
+    assert ytv2._ranged_download_workers() == 4
 
 
 def test_mixed_capacity_uses_total_ram_tiers(monkeypatch):
     fake_memory = SimpleNamespace(
         available=637 * 1024 * 1024, total=8 * 1024 ** 3)
     with mock.patch("psutil.virtual_memory", return_value=fake_memory):
+        # Spec (Vidzeo Local thread pools): YT Clip Workers 2-4 — a
+        # requested 6 clamps to 4.
         monkeypatch.setenv("VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY", "6")
-        assert ytv2.mixed_youtube_download_worker_capacity({}) == 6
+        assert ytv2.mixed_youtube_download_worker_capacity({}) == 4
 
 
 # ---------------------------------------------------------------------------
