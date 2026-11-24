@@ -1,5 +1,7 @@
 import React from 'react';
-import { AbsoluteFill, Img, OffthreadVideo, interpolate, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AbsoluteFill, Img, interpolate, useCurrentFrame, useVideoConfig } from 'remotion';
+// @remotion/media Video decodes faster than OffthreadVideo (Remotion 4); aliased to the old name so call sites stay unchanged.
+import { Video as OffthreadVideo } from '@remotion/media';
 import { documentaryTypography } from '../engine/DocumentaryTypography';
 import { cueProgress, safeFadeOutRange } from '../engine/DirectorMotion';
 

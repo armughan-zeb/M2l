@@ -150,29 +150,9 @@ def _recover_image_slots_from_local_clips(
             )
             if not frames:
                 return index, "", None
-            comparison = client.compare_images(
-                frames[:4],
-                (
-                    f"Scene narration: {target_text[:500]}\n"
-                    f"Documentary topic: {title}\n"
-                    f"Required subject: {target_subject or title}\n"
-                    "Select a frame only if it accurately depicts the narration, is "
-                    "sharp, and has no ownership watermark, subtitle, title card, or "
-                    "large text. Return selected_index, confidence, reason, and a "
-                    "candidates array with relevance, fatal_mismatch, "
-                    "ownership_watermark, and text_overlay for every frame. If none "
-                    "qualifies, set confidence below 50."
-                ),
-            )
-            chosen = max(
-                0,
-                min(len(frames) - 1, int(comparison.get("selected_index") or 0)),
-            )
-            rows = comparison.get("candidates")
-            rows = rows if isinstance(rows, list) else []
-            row = rows[chosen] if chosen < len(rows) and isinstance(rows[chosen], dict) else {}
-
-            def number(*keys, default=0.0):
+            # P4: no compare_images. Verify frames one at a time with the
+            # single-frame verifier; the first frame that passes wins.
+            def number(row, *keys, default=0.0):
                 for key in keys:
                     try:
                         if row.get(key) is not None:
@@ -181,29 +161,56 @@ def _recover_image_slots_from_local_clips(
                         pass
                 return float(default)
 
-            def flag(*keys):
+            def flag(row, *keys):
                 return any(
                     value is True
                     or str(value or "").strip().lower() in {"1", "true", "yes", "on"}
                     for value in (row.get(key) for key in keys)
                 )
 
-            confidence = float(comparison.get("confidence") or 0.0)
-            relevance = number(
-                "relevance",
-                "scene_relevance",
-                "score",
-                default=confidence if not rows else 0.0,
+            single_prompt = (
+                f"Scene narration: {target_text[:500]}\n"
+                f"Documentary topic: {title}\n"
+                f"Required subject: {target_subject or title}\n"
+                "Judge this ONE frame: accept it only if it accurately depicts the narration, is "
+                "sharp, and has no ownership watermark, subtitle, title card, or "
+                "large text. Return JSON with relevance, fatal_mismatch, "
+                "ownership_watermark, text_overlay, confidence, and reason. If it does "
+                "not qualify, set confidence below 50."
             )
-            dirty = flag(
-                "fatal_mismatch",
-                "ownership_watermark",
-                "watermark",
-                "subtitle",
-                "text_overlay",
-                "has_text",
+            system_prompt = (
+                "You select documentary visuals. Return JSON only. Reject exact-entity, "
+                "event, action, era, ownership-watermark, or unsafe mismatches."
             )
-            if confidence < 60.0 or relevance < 55.0 or dirty:
+            chosen = None
+            row = {}
+            confidence = 0.0
+            relevance = 0.0
+            for frame_index, frame_path in enumerate(frames[:4]):
+                try:
+                    candidate_row = client.analyze_image(frame_path, single_prompt, system_prompt)
+                except Exception:
+                    continue
+                candidate_row = candidate_row if isinstance(candidate_row, dict) else {}
+                candidate_confidence = float(candidate_row.get("confidence") or 0.0)
+                candidate_relevance = number(candidate_row, "relevance", "scene_relevance", "score", default=candidate_confidence)
+                candidate_dirty = flag(
+                    candidate_row,
+                    "fatal_mismatch",
+                    "ownership_watermark",
+                    "watermark",
+                    "subtitle",
+                    "text_overlay",
+                    "has_text",
+                )
+                if candidate_confidence < 60.0 or candidate_relevance < 55.0 or candidate_dirty:
+                    continue
+                chosen = frame_index
+                row = candidate_row
+                confidence = candidate_confidence
+                relevance = candidate_relevance
+                break
+            if chosen is None:
                 return index, "", None
             target = (
                 Path(clip_path).parent
@@ -221,7 +228,7 @@ def _recover_image_slots_from_local_clips(
                     "recovered_from_clip": clip_path,
                     "confidence": confidence,
                     "relevance": relevance,
-                    "reason": str(comparison.get("reason") or ""),
+                    "reason": str(row.get("reason") or ""),
                 },
                 "verdict": "keep",
                 "recovery": "qwen_local_youtube_frame",

@@ -76,7 +76,12 @@ class RedditSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
+        # Route-switching retry passes direct=; Reddit is disabled by
+        # default and its session calls keep the env proxy (deliberate:
+        # no direct leg for a disabled lane).
+        del direct
         filters = filters or {}
         subreddits = filters.get('subreddits', [])
         sort = filters.get('sort', 'top')

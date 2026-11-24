@@ -225,6 +225,11 @@ def test_scene_query_director_uses_compact_valid_schema(monkeypatch):
         "subject_evidence": "A cargo ship enters a Panama Canal lock.",
         "visible_target": "Cargo ship entering a canal lock",
         "identity_scope": "subject",
+        "domain_category": "travel",
+        "scene_subject_type": "place",
+        "retrieval_positive_terms": ["Panama Canal", "cargo ship", "canal lock", "lock transit"],
+        "retrieval_negative_terms": [],
+        "youtube_query_intents": ["raw footage", "lock transit", "ship entering"],
         "youtube": {
             "primary": "Panama Canal cargo ship entering lock raw footage",
             "supporting": "Panama Canal ship lock transit footage",
@@ -280,6 +285,30 @@ def test_caption_progress_cannot_mask_openrouter_planning():
     assert events == [
         (0.20, "Generating captions"),
         (0.24, "Planning visual searches"),
+    ]
+
+
+def test_caption_handoff_names_planning_stage_after_precomputed_words():
+    """Nov 22, 2026: a job whose words came from narration timing (no
+    Whisper) sat at "Generating captions" for 10+ min after captions
+    finished in seconds, because nothing reported the media-planning
+    stage that followed. The caption completion now hands the display
+    to query planning at 0.24, and the captions message names its real
+    word source. Both messages must sanitize to the stage actually
+    running, and the handoff must not be masked by the captions report.
+    The repair loop's message must also read as planning, not narration."""
+    from app import _make_progress_reporter
+
+    events = []
+    report = _make_progress_reporter(lambda fraction, message: events.append((fraction, message)))
+    report(0.20, "Generating captions from narration timing...")
+    report(0.24, "OpenRouter query planning: directing 127 scenes")
+    report(0.25, "OpenRouter query planning: directing 3 scenes (12s; ordered retries active)")
+
+    assert events == [
+        (0.20, "Generating captions"),
+        (0.24, "Planning visual searches"),
+        (0.25, "Planning visual searches"),
     ]
 
 

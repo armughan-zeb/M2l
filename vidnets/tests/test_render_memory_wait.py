@@ -117,6 +117,43 @@ def test_wait_fails_fast_once_no_worker_can_free_memory():
     assert 10 <= elapsed <= 13, f"failed fast after {elapsed}s, not 120s"
 
 
+def test_never_recovers_exits_with_driver_visible_low_memory_signal():
+    """The strengthened bar (Nov 16, 2026): memory pinned below the bar
+    with no worker left to free it must exit boundedly with the retryable
+    low-memory signal — never spin in the wait loop forever. The raised
+    error is what the queue manager parks as a low_memory pause
+    (retryable=True, memory_snapshot with the measured RAM), which the
+    driver then retries from checkpoint and escalates after the streak
+    bound — the attempt always moves forward or fails loudly, never
+    sits stuck."""
+    clock = FakeClock()
+
+    def prepare():
+        # GTA VI steady state that never recovers: 400 MB available,
+        # no swap headroom — below the 512 MB floor, forever.
+        raise resources.RenderMemoryLowError(
+            "Waiting for memory: 400 MB available; 512 MB needed to attempt serial rendering.",
+            {"available_mb": 400, "swap_free_mb": 0, "total_mb": 7880},
+        )
+
+    with pytest.raises(resources.RenderMemoryLowError) as excinfo:
+        resources.wait_for_render_memory(
+            prepare,
+            wait_deadline=clock.now + 900,
+            base_wait_seconds=120,  # must NOT burn the whole base wait
+            poll_seconds=0.5,
+            no_worker_grace_seconds=10,
+            live_workers=lambda: [],
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+    elapsed = clock.now - 1000.0
+    assert 10 <= elapsed <= 13, f"never-recovers wait must fail fast, took {elapsed}s"
+    assert excinfo.value.retryable is True
+    assert excinfo.value.memory_snapshot.get("available_mb") == 400
+    assert "512 MB needed" in str(excinfo.value)
+
+
 def test_wait_never_passes_the_delivery_budget_deadline():
     clock = FakeClock()
 

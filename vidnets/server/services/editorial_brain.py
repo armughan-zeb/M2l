@@ -564,6 +564,60 @@ def _normalize_beat(raw: Dict[str, Any], text: str, index: int, total: int, sour
     return beat
 
 
+def _beat_phrase_words(phrase: str) -> List[str]:
+    """Lowercased word tokens of a beat phrase, for grounding checks."""
+    return re.findall(r"[a-z0-9]+", str(phrase or "").lower())
+
+
+def _beat_phrase_is_grounded(phrase: str, text: str) -> bool:
+    """True when the phrase's words appear as one contiguous run in the text."""
+    words = _beat_phrase_words(phrase)
+    if not words:
+        return True
+    haystack = _beat_phrase_words(text)
+    width = len(words)
+    return any(haystack[start:start + width] == words for start in range(len(haystack) - width + 1))
+
+
+def validate_editorial_beat(beat: Dict[str, Any], text: str) -> Optional[str]:
+    """Contract error for one editorial beat, or None when it is servable.
+
+    A beat is valid when its enums are in the known sets, its emphasis and
+    sound_anchor (when present) are contiguous word-runs of the narration
+    — the investigation found 14/36 non-empty agent emphases were not
+    substrings of their scene — and a visible beat carries an emphasis.
+    Deterministic beats pass by construction; this is the gate that routes
+    only invalid beats to the LLM.
+    """
+    if not isinstance(beat, dict):
+        return "not a beat"
+    for field, allowed in (
+        ("role", EDITORIAL_ROLES),
+        ("treatment", TREATMENTS),
+        ("animation", ANIMATIONS),
+        ("background", BACKGROUNDS),
+        ("transition", TRANSITIONS),
+        ("energy", ENERGIES),
+        ("highlight_kind", HIGHLIGHT_KINDS),
+        ("sound_intent", SOUND_INTENTS),
+    ):
+        if field == "sound_intent" and "sound_intent" not in beat:
+            continue  # deterministic beats carry no sound fields
+        value = str(beat.get(field) or "none").strip().lower()
+        if value not in allowed:
+            return f"{field} {value!r} is not a known editorial value"
+    emphasis = str(beat.get("emphasis") or "").strip()
+    if emphasis and not _beat_phrase_is_grounded(emphasis, text):
+        return "emphasis is not a phrase from the narration"
+    sound_anchor = str(beat.get("sound_anchor") or "").strip()
+    if sound_anchor and not _beat_phrase_is_grounded(sound_anchor, text):
+        return "sound_anchor is not a phrase from the narration"
+    if (beat.get("treatment") not in {"none", "chapter"}
+            and beat.get("highlight_kind") != "none" and not emphasis):
+        return "visible beat carries no emphasis"
+    return None
+
+
 def _chunk_prompt(rows: List[Dict[str, Any]]) -> str:
     recovery_target = 0
     for row in rows:
@@ -1054,8 +1108,28 @@ def plan_editorial_beats(
     ).strip()
     if not texts:
         return []
+    # Mechanical-first: deterministic beats that already pass the contract
+    # validator are served as-is with no LLM call; only the invalid scenes
+    # go to the LLM chunks below and the bounded repair/recovery.
+    invalid = [
+        index for index, beat in enumerate(fallback)
+        if validate_editorial_beat(beat, texts[index]) is not None
+    ]
+    if not invalid:
+        return _select_sparse_beats(fallback, config)
     if not api_key:
         return _select_sparse_beats(fallback, config)
+
+    def _is_llm_beat(beat: Dict[str, Any]) -> bool:
+        source = str(beat.get("source") or "").strip().lower()
+        return source == source_provider or source.startswith(source_provider + "+")
+
+    def is_visible(beat: Dict[str, Any]) -> bool:
+        return bool(
+            beat.get("treatment") not in {"none", "chapter"}
+            and beat.get("highlight_kind") != "none"
+            and beat.get("emphasis")
+        )
     model = str(
         config.get("scene_brain_model")
         or config.get("llm_model")
@@ -1087,20 +1161,21 @@ def plan_editorial_beats(
     chunk_size = 24
     chunks = []
     narrative_context = re.sub(r"\s+", " ", " ".join(texts)).strip()[:5000]
-    for start in range(0, total, chunk_size):
-        rows = [{"scene_index": i, "text": texts[i][:420]} for i in range(start, min(total, start + chunk_size))]
+    for start_pos in range(0, len(invalid), chunk_size):
+        chunk_indices = invalid[start_pos:start_pos + chunk_size]
+        rows = [{"scene_index": i, "text": texts[i][:420]} for i in chunk_indices]
         if rows:
             rows[0]["narrative_context"] = narrative_context
-        chunks.append((start, rows))
+        chunks.append((chunk_indices, rows))
 
     raw_by_index: Dict[int, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=min(5, len(chunks)), thread_name_prefix="edit-brain") as executor:
         futures = {
-            executor.submit(_compat_plan_chunk, rows, timeout): start
-            for start, rows in chunks
+            executor.submit(_compat_plan_chunk, rows, timeout): chunk_indices
+            for chunk_indices, rows in chunks
         }
         for future in as_completed(futures):
-            start = futures[future]
+            chunk_indices = futures[future]
             try:
                 for local_index, raw in enumerate(future.result()):
                     # OpenRouter occasionally returns a malformed array/object
@@ -1110,46 +1185,43 @@ def plan_editorial_beats(
                     # for that scene instead.
                     if not isinstance(raw, dict):
                         continue
-                    requested = int(raw.get("scene_index", start + local_index))
-                    index = requested if start <= requested < min(total, start + chunk_size) else start + local_index
-                    if 0 <= index < total:
-                        raw_by_index[index] = raw
+                    try:
+                        requested = int(raw.get("scene_index"))
+                    except (TypeError, ValueError):
+                        requested = chunk_indices[local_index] if local_index < len(chunk_indices) else -1
+                    if requested not in chunk_indices:
+                        requested = chunk_indices[local_index] if local_index < len(chunk_indices) else -1
+                    if requested in chunk_indices:
+                        raw_by_index[requested] = raw
             except Exception as exc:
-                print(f"   [edit] OpenRouter editorial chunk {start + 1}-{min(total, start + chunk_size)} fallback: {exc}")
+                print(f"   [edit] OpenRouter editorial chunk {chunk_indices[0] + 1}-{chunk_indices[-1] + 1} fallback: {exc}")
 
-    normalized = [
-        _normalize_beat(raw_by_index.get(index, {}), text, index, total, source_provider=source_provider)
-        if index in raw_by_index else fallback[index]
-        for index, text in enumerate(texts)
-    ]
-    def _is_llm_beat(beat: Dict[str, Any]) -> bool:
-        source = str(beat.get("source") or "").strip().lower()
-        return source == source_provider or source.startswith(source_provider + "+")
-
-    def is_visible(beat: Dict[str, Any]) -> bool:
-        return bool(
-            beat.get("treatment") not in {"none", "chapter"}
-            and beat.get("highlight_kind") != "none"
-            and beat.get("emphasis")
-        )
+    normalized = list(fallback)
+    for index, raw in raw_by_index.items():
+        candidate = _normalize_beat(raw, texts[index], index, total, source_provider=source_provider)
+        if (is_visible(candidate) and _is_llm_beat(candidate)
+                and validate_editorial_beat(candidate, texts[index]) is None):
+            normalized[index] = candidate
 
     # The LLM remains the decision maker when its first response is valid JSON
     # but editorially under-filled. Give OpenRouter one small, focused correction
     # request before invoking any local grounded safety net. This is a logical
     # quality retry (not an unbounded transport retry) and only includes scenes
-    # that do not already have a usable LLM-authored decision.
-    recovery_threshold = min(total, max(2, int(math.ceil(total * 0.34))))
+    # that do not already have a usable LLM-authored decision. Both the
+    # threshold and the repair set are scoped to the invalid scenes only:
+    # mechanically valid beats are never re-filed.
+    recovery_threshold = min(len(invalid), max(2, int(math.ceil(len(invalid) * 0.34))))
     llm_visible_before = sum(
-        1 for beat in normalized
-        if is_visible(beat) and _is_llm_beat(beat)
+        1 for index in invalid
+        if is_visible(normalized[index]) and _is_llm_beat(normalized[index])
     )
     openrouter_repair_count = 0
     if llm_visible_before < recovery_threshold:
         repair_indices = [
-            index for index, beat in enumerate(normalized)
+            index for index in invalid
             if not (
-                is_visible(beat)
-                and _is_llm_beat(beat)
+                is_visible(normalized[index])
+                and _is_llm_beat(normalized[index])
             )
         ]
         repair_rows = [
@@ -1185,37 +1257,39 @@ def plan_editorial_beats(
                     if requested not in allowed_indices:
                         continue
                     candidate = _normalize_beat(raw, texts[requested], requested, total, source_provider=source_provider)
-                    if is_visible(candidate) and _is_llm_beat(candidate):
+                    if (is_visible(candidate) and _is_llm_beat(candidate)
+                            and validate_editorial_beat(candidate, texts[requested]) is None):
                         normalized[requested] = candidate
                         openrouter_repair_count += 1
                 print(
-                    f"   [edit] OpenRouter editorial first pass {llm_visible_before}/{total}; " 
+                    f"   [edit] OpenRouter editorial first pass {llm_visible_before}/{len(invalid)}; "
                     f"bounded focused repair added {openrouter_repair_count} candidate(s) "
                     f"(target={recovery_threshold})"
                 )
             except Exception as exc:
                 print(f"   [edit] bounded OpenRouter editorial repair unavailable: {exc}")
 
-    visible_before_recovery = sum(1 for beat in normalized if is_visible(beat))
+    visible_before_recovery = sum(1 for index in invalid if is_visible(normalized[index]))
     recovery_count = 0
     # Only after the bounded OpenRouter correction has failed to provide enough real
     # candidates do we recover exact narration phrases locally. The global
     # selector gives LLM-authored moments a ranking advantage, so this fallback
-    # fills gaps instead of replacing sound OpenRouter decisions.
+    # fills gaps instead of replacing sound OpenRouter decisions. Scoped to
+    # the invalid scenes: mechanically valid beats are never re-processed.
     if visible_before_recovery < recovery_threshold:
-        recovered = []
-        for index, text in enumerate(texts):
+        recovered = list(normalized)
+        for index in invalid:
             existing = normalized[index]
             existing_visible = is_visible(existing)
-            beat = existing if existing_visible else _semantic_fallback_beat(text, index, total)
+            beat = existing if existing_visible else _semantic_fallback_beat(texts[index], index, total)
             if beat.get("treatment") != "none" and beat.get("emphasis"):
                 if not existing_visible:
                     recovery_count += 1
-            recovered.append(beat)
+            recovered[index] = beat
         normalized = recovered
         if recovery_count:
             print(
-                f"   [edit] post-retry editorial coverage was {visible_before_recovery}/{total}; grounded recovery "
+                f"   [edit] post-retry editorial coverage was {visible_before_recovery}/{len(invalid)}; grounded recovery "
                 f"generated {recovery_count}/{total} grounded candidates"
             )
     selected = _select_sparse_beats(normalized, config)
@@ -1227,3 +1301,66 @@ def plan_editorial_beats(
         )
         print(f"   [edit] grounded recovery supplied {fallback_selected} selected sparse cue(s)")
     return selected
+
+
+def _beat_number(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def beats_from_direction(
+    decisions: Iterable[Dict[str, Any]],
+    scene_texts: Iterable[str],
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """Derive editorial beats from the director's per-scene decisions (P1).
+
+    The director returns editorial_role / editorial_treatment /
+    editorial_emphasis / editorial_highlight_kind / editorial_importance
+    for each scene in the same turn as the direction, so no separate
+    vidzeo_editorial_beats_v1 request is needed. Each decision's fields
+    are normalized through _normalize_beat with source_provider
+    "direction" — the same grounding rules as the standalone planner
+    (ungrounded emphasis and dangling fragments fall back to the
+    deterministic beat). A decision without editorial fields falls back
+    to the deterministic beat for that scene. The sparse budget is the
+    same _select_sparse_beats pass the standalone planner uses.
+
+    Returns None when the decisions do not cover the film (missing or
+    out-of-range scene indices); the caller then falls back to the
+    standalone planner.
+    """
+    texts = [str(text or "") for text in scene_texts or []]
+    total = len(texts)
+    if total == 0:
+        return None
+    by_index: Dict[int, Dict[str, Any]] = {}
+    for decision in decisions or []:
+        if not isinstance(decision, dict):
+            continue
+        index = _beat_number(decision.get("scene_index"), -1)
+        if 0 <= index < total:
+            by_index[index] = decision
+    if len(by_index) != total:
+        return None
+    beats: List[Dict[str, Any]] = []
+    for index, text in enumerate(texts):
+        decision = by_index[index]
+        raw = {
+            "role": decision.get("editorial_role") or "",
+            "treatment": decision.get("editorial_treatment") or "",
+            "emphasis": decision.get("editorial_emphasis") or "",
+            "highlight_kind": decision.get("editorial_highlight_kind") or "",
+            "importance": decision.get("editorial_importance"),
+        }
+        # A single short highlight overlay carries its own text; the
+        # director may nominate it by policy instead of by emphasis.
+        if not raw["emphasis"] and decision.get("overlay_policy") == "single_short_highlight":
+            raw["emphasis"] = decision.get("display_text") or ""
+        if not any((raw["role"], raw["treatment"], raw["emphasis"], raw["highlight_kind"])) and raw["importance"] is None:
+            beats.append(deterministic_editorial_beat(text, index, total))
+        else:
+            beats.append(_normalize_beat(raw, text, index, total, source_provider="direction"))
+    return _select_sparse_beats(beats, config)

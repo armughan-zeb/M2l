@@ -22,8 +22,16 @@ classification, editorial beats, vision — goes through the agent-bridge
 inbox with `llm_provider: external_agent`. No OpenRouter, no Qwen, no
 other provider, no other key — anywhere, including tests and fallback
 chains. `node muse-agent.js doctor` must pass before any job runs.
-`MUSE_INFERENCE_COMMAND` stays UNSET (the hook operator answers inbox
-requests; a second answerer double-answers and fails).
+`MUSE_INFERENCE_COMMAND` points at the shipped spool transport
+(`node scripts/muse-inference-spool.cjs`) and the resident inference
+worker pool answers it — the supervisor brief is
+`scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md`, workers
+follow `scripts/resident-inference-worker/WORKER_BRIEF.md` and claim one
+request each by atomic rename.
+That is the ONLY transport: never set `MUSE_INFERENCE_URL` alongside it,
+never point the command at a stub, and never run a second answerer (the
+host hook is the fallback, not a parallel answerer — a double answer
+fails the loser with a 400).
 
 ## 3. No AI-generated footage, ever
 
@@ -68,7 +76,11 @@ server while a job is running.
 Daemon: `nohup ./start-daemon.sh >> daemon.log 2>&1 &` (detached —
 foreground runs die with the shell). Vidnets server: `VIDNETS_AGENT.sh
 start` (reuses a live server; a real restart needs SIGTERM first).
-Never `kill -9` a running render. Verify both come back healthy after
+Never `kill -9` a running render. Exception (proven Nov 21, 2026,
+test 20): SIGTERM may NOT stop a render node — the node stayed alive
+and respawned Chrome, so a user-ordered stop required `kill -9` on the
+render node + its Chrome parent. Use `kill -9` only on a user-ordered
+stop, never casually. Verify both come back healthy after
 any restart (doctor + `:5010` status + daemon connected).
 
 ## 9. Secrets only via secure entry, never in the repo

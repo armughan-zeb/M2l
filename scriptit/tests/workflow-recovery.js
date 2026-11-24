@@ -221,10 +221,18 @@ async function main() {
       return { content: priorDraft };
     }
   };
-  await assert.rejects(generateScript({ ...options,
+  // Empty research no longer throws RESEARCH_INSUFFICIENT (Nov 15, 2026 —
+  // user order): generation continues without research and the script is
+  // labelled ungrounded (P4). The evidence ledger still reports
+  // insufficient; only the blocking behaviour is gone.
+  const callsBeforeEmpty = writingCalls;
+  const emptyResult = await generateScript({ ...options,
     research: { query: 'Historical subject', official: [] }
-  }), /research is insufficient/i);
-  assert.equal(writingCalls, 0);
+  });
+  assert.ok(writingCalls > callsBeforeEmpty, 'empty research must still attempt writing instead of throwing');
+  assert.equal(emptyResult.meta.ungrounded, true, 'empty research must be labelled ungrounded (P4)');
+  assert.ok(String(emptyResult.script || '').trim().length > 0, 'ungrounded run must still produce narration');
+  const callsBeforeValid = writingCalls;
   await generateScript({ ...options, research: {
     query: 'Historical subject', gatheredAt: new Date().toISOString(), official: [{
       title: 'Historical subject archive',
@@ -233,7 +241,7 @@ async function main() {
       source: 'The National Archives', hasArticleBody: true
     }]
   } });
-  assert.equal(writingCalls, 1);
+  assert.ok(writingCalls > callsBeforeValid, 'grounded research must write');
 
   const rejectedDraft = { script: 'Preserve this rejected narration exactly.', meta: { publishable: false, quality: { passes: false, issues: ['Specific factual rejection'] } } };
   let syntheses = 0;

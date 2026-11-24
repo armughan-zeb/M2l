@@ -230,9 +230,11 @@ async function main() {
   const totalDeadlineMs = bridgeMode
     ? Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 2700000)
     : Number(process.env.SCRIPTIT_TOTAL_DEADLINE_MS || 600000);
-  // Each Muse inbox request has a 120s hard wall (60s answer SLO). The
-  // separate total deadline bounds the complete research + narration run.
-  const timeoutMs = 120000;
+  // Was 300000 in bridge mode: the CLI's per-request cap expired the
+  // writer/synthesis requests at 5 minutes while the 3600s bridge wall
+  // still allowed the operator to answer. Now 3600000 to match the wall.
+  // Total job deadline above (2700000) is unchanged.
+  const timeoutMs = bridgeMode ? 3600000 : 120000;
 
   let result;
   try {
@@ -282,12 +284,10 @@ async function main() {
         log(`Could not save draft file: ${err.message}`);
       }
     }
-    // Keep the explicit quality verdict and issues in the result, but let the
-    // worker use a nonempty draft rather than discard the Muse response.
-    log('Continuing with the saved draft; editorial warnings remain attached.');
+    log('Refusing to present a failed draft as a finished script. Returning it with publishable=false so the worker can decide.');
     return finish({ scriptText, meta: { ...meta, publishable: false } });
   }
-  log(`done: ${meta.quality?.words || scriptText.split(/\s+/).length} words, quality score ${meta.quality?.score ?? 'n/a'}, hook=${meta.quality?.hook === true}`);
+  log(`done: ${meta.quality?.words || scriptText.split(/\s+/).length} words, quality score ${meta.quality?.score ?? 'n/a'}, hook=${meta.quality?.hook === true}${meta.ungrounded ? ' — UNGROUNDED (P4): no verified research; verify facts before production' : ''}`);
   finish({ scriptText, meta });
 }
 

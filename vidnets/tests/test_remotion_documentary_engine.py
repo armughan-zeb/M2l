@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -361,11 +362,43 @@ def test_external_agent_director_calls_last_at_least_the_agent_wall(monkeypatch)
     monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
     with job_scope({"llm_provider": "external_agent"}):
         budget = director_planning_budget(15)
-    # The phase scope must allow a full inbox request.
-    assert budget["scene_call_seconds"] >= 120
-    assert budget["art_seconds"] >= 120
-    assert budget["composition_seconds"] >= 120
-    assert budget["repair_seconds"] >= 120
+    # The phase scope caps the agent request wall, so a shorter director
+    # call budget expires the answer mid-composition (the inbox watcher
+    # alone needs ~4.5 min to wake a worker).
+    assert budget["scene_call_seconds"] >= 600
+    assert budget["art_seconds"] >= 600
+    assert budget["composition_seconds"] >= 600
+    assert budget["repair_seconds"] >= 600
+
+
+def test_external_agent_director_uses_eight_scene_four_worker_batches(monkeypatch):
+    # Nov 15 2026 speedup (item b): the external-agent override was 4 scenes
+    # / 2 workers; the response schema caps at maxItems 8
+    # (_DIRECTOR_RESPONSE_SCHEMA scenes), so 8 scenes / 4 workers is the
+    # widest batch the model may return — fewer waves, fewer bridge requests.
+    # 57 scenes: 8 waves at 4x2, 2 waves at 8x4.
+    from services.job_context import job_scope
+
+    monkeypatch.delenv("VIDZEO_AGENT_MIN_WALL_SECONDS", raising=False)
+    monkeypatch.setenv("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")
+    with job_scope({"llm_provider": "external_agent"}):
+        budget = director_planning_budget(57)
+    assert budget["scene_batch_size"] == 8
+    assert budget["scene_workers"] == 4
+    assert budget["waves"] == 2
+    assert budget["agent_wall_seconds"] == 3600.0
+    # The 3600s wall must not zero the scene stage: with the default 3600s
+    # total cap, total - repair - 5 went negative and every scene batch was
+    # cancelled before it started. The cap now fits art + one scene wave +
+    # repair at the wall, so the stage keeps at least one full wave.
+    assert budget["scene_stage_seconds"] > 0
+    assert budget["scene_stage_seconds"] >= 3600.0
+    with job_scope({"llm_provider": "external_agent"}):
+        small = director_planning_budget(15)
+    assert small["scene_batch_size"] == 8
+    assert small["scene_workers"] == 4
+    assert small["waves"] == 1
+    assert small["scene_stage_seconds"] > 0
 
 
 def test_director_budget_exposes_agent_wall_seconds(monkeypatch):
@@ -376,7 +409,7 @@ def test_director_budget_exposes_agent_wall_seconds(monkeypatch):
 
     with job_scope({"llm_provider": "external_agent"}):
         budget = director_planning_budget(15)
-    assert budget["agent_wall_seconds"] == 120.0
+    assert budget["agent_wall_seconds"] == 600.0
 
 
 def test_director_call_budget_floor_is_the_agent_wall():
@@ -646,7 +679,23 @@ def test_scene_batches_keep_full_story_context_and_isolate_a_timed_out_chunk(mon
     scene_prompts = [call["user_prompt"] for call in client.call_options
                      if call.get("json_schema_name") == "vidnets_scene_direction_v1"]
     assert len(scene_prompts) == 3
-    assert all("The opening question leads through evidence" in prompt for prompt in scene_prompts)
+    # P2: batch 0 returns the film-level art direction in the same turn as
+    # its scenes, so its prompt cannot yet carry the LLM's story arc — it
+    # carries the fallback art plus the same-turn art instruction instead.
+    # Batches 1+ are built lazily at call time and prompt with the art
+    # batch 0 resolved, so only they carry the LLM story arc. The
+    # full-film story map itself (script-derived) is in every prompt.
+    batch_starts = []
+    for prompt in scene_prompts:
+        match = re.search(r"preserving their global indices (\d+)-(\d+)", prompt)
+        assert match is not None
+        batch_starts.append(int(match.group(1)))
+    assert sorted(batch_starts) == [0, 2, 4]
+    batch0 = scene_prompts[batch_starts.index(0)]
+    later = [prompt for prompt, start in zip(scene_prompts, batch_starts) if start > 0]
+    assert len(later) == 2
+    assert "FILM ART DIRECTION (this batch only, same turn)" in batch0
+    assert all("The opening question leads through evidence" in prompt for prompt in later)
     assert all("Full-film story map" in prompt for prompt in scene_prompts)
     assert all("Immediate setup just before this window" in prompt for prompt in scene_prompts)
     assert all("Immediate narrative handoff after this window" in prompt for prompt in scene_prompts)

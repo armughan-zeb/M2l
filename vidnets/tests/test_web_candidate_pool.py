@@ -1,3 +1,4 @@
+import hashlib
 import sys
 import threading
 import time
@@ -57,10 +58,16 @@ def test_strong_same_query_result_keeps_twelve_unique_candidates_for_vision(
         output_dir.mkdir(parents=True, exist_ok=True)
         result = []
         for index, url in enumerate(urls):
-            path = output_dir / f"jaguar-e-type-{index}.jpg"
+            # Name + noise derive from the URL, like the real downloader's
+            # hash-based filenames: chunked sub-batches (muse-search §3.2)
+            # re-enumerate each chunk from 0, so a chunk-local index would
+            # collide across chunks and collapse the pool by path.
+            tag = hashlib.md5(url.encode()).hexdigest()[:12]
+            path = output_dir / f"jaguar-e-type-{tag}.jpg"
+            seed = 64 + int(hashlib.md5(url.encode()).hexdigest()[:4], 16) % 192
             # Noise keeps each fixture above the resolver's minimum byte size
             # and gives the content/visual deduplication code distinct pixels.
-            Image.effect_noise((800, 450), 64 + index).convert("RGB").save(
+            Image.effect_noise((800, 450), seed).convert("RGB").save(
                 path, format="JPEG", quality=92
             )
             result.append((url, path, ""))
@@ -140,15 +147,16 @@ def test_library_of_congress_is_wired_into_fast_sources(monkeypatch):
     assert rows[0]["url"].startswith("https://tile.loc.gov/")
 
 
-def test_fast_sources_try_yandex_before_bing_flickr_and_ddg():
-    """Yandex bot-walls least, so it is first; Bing, Flickr and DDG are
-    fallbacks in that order (WEB_ENGINE_PRIORITY in source_broker.py)."""
+def test_fast_sources_try_yandex_before_bing_and_flickr():
+    """Yandex bot-walls least, so it is first; Bing and Flickr are
+    fallbacks in that order (WEB_ENGINE_PRIORITY in source_broker.py).
+    DuckDuckGo was removed Nov 19, 2026 — it bot-gates this egress."""
     from services.web_image import resolver
 
     names = [name for name, _kind in resolver._FAST_SOURCES]
     assert names.index("yandex") < names.index("bing_hybrid")
     assert names.index("bing_hybrid") < names.index("flickr_api")
-    assert names.index("flickr_api") < names.index("ddg_hybrid")
+    assert "ddg_hybrid" not in names
 
 
 def test_five_hundred_px_stays_out_of_slow_sources():
@@ -442,7 +450,6 @@ def test_exhaustive_recovery_cascades_into_secondary_sources(
         ("yandex", "api"),
         ("flickr_api", "flickr_api"),
         ("bing_hybrid", "hybrid"),
-        ("ddg_hybrid", "hybrid"),
         ("openverse", "api"),
     ]
     monkeypatch.setattr(resolver, "_FAST_SOURCES", source_rows)
@@ -509,7 +516,7 @@ def test_exhaustive_recovery_cascades_into_secondary_sources(
     # concrete query gets the fast tier; later queries get recovery sources.
     first_query = provider_calls[0][1]
     assert {source for source, query in provider_calls if query == first_query} == {
-        "universal_scraper", "yandex", "flickr_api", "bing_hybrid", "ddg_hybrid"
+        "universal_scraper", "yandex", "flickr_api", "bing_hybrid"
     }
     assert ('openverse', 'Prince Harry photo') in provider_calls
 

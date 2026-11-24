@@ -101,10 +101,13 @@ function buildRequest(job, scriptText, packageDir) {
   // auto-degrade it from CPU / available memory at render start
   // (vidnets/scripts/render-remotion-manifest.js adaptiveConcurrency).
   const concurrency = readRequestedWorkers(process.env);
-  const coverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET);
-  // Use the documented 0.8 production target consistently. An explicit
-  // lower value remains available for constrained media experiments.
-  const coverageTarget = Number.isFinite(coverage) ? Math.max(0.3, Math.min(1, coverage > 1 ? coverage / 100 : coverage)) : 0.8;
+  const explicitCoverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET || options.youtubeCoverageTarget);
+  // Respect explicit operator/job coverage target when supplied; when omitted,
+  // let Vidnets resolve the dynamic mixed-media niche policy (e.g. 80% YouTube
+  // for gaming / GTA VI, 75% for sports, 65% for entertainment, 55% for doc).
+  const coverageTarget = Number.isFinite(explicitCoverage)
+    ? Math.max(0.3, Math.min(1, explicitCoverage > 1 ? explicitCoverage / 100 : explicitCoverage))
+    : undefined;
   // FILTER-BEST (Nov 9, 2026): Vidnets' native mixed-media design ranks
   // candidates and keeps the best real media per scene — vision is ADVISORY
   // by default ("an uncertain verdict must not prevent video delivery",
@@ -117,13 +120,18 @@ function buildRequest(job, scriptText, packageDir) {
   // hard-reject. With both flags false, vision still RUNS (visual_
   // understanding + final_visual_gate_mode) and still RANKS (final_score);
   // only named-entity scenes (strict_identity) still require a live
-  // verdict, per scene_requires_visual_verification. If real-media recovery
-  // is exhausted, Vidnets keeps the checkpoint for retry. MUSE_MEDIA_STRICT=1
-  // requires visual verification for every scene.
+  // verdict, per scene_requires_visual_verification. The ONE hard rule
+  // lives in the render wrapper, not here: never DELIVER a video with 0
+  // real-media scenes. If real-media recovery is exhausted, Vidnets keeps
+  // the checkpoint for retry. MUSE_MEDIA_STRICT=1 restores the old strict
+  // flags (visual verification for every scene).
   const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
+  // Render budget scales with the job (lib/vidnetsSubmission.renderBudgetMs:
+  // configured MUSE_RENDER_TIMEOUT_MS with a 600s floor, else duration-scaled
+  // with a 6h floor) instead of a fixed ceiling.
   const deliveryBudget = Math.ceil(renderBudgetMs(job) / 1000);
 
-  return {
+  const request = {
     title: job.title,
     name: job.title,
     content_title: job.title,
@@ -139,23 +147,18 @@ function buildRequest(job, scriptText, packageDir) {
     vo_mode: 'Use Audiogram',
     tts_model: 'audiogram',
     edge_tts_options: { rate: 0, pitch: 0, volume: 0 },
-    image_source: 'Mixed Media',
-    media_source_priority: ['youtube', 'web', 'stock'],
-    media_mode: 'automatic',
+    image_source: options.imageSource || 'Mixed Media',
+    media_source_priority: options.mediaSourcePriority || ['youtube', 'web'],
+    media_mode: options.mediaMode || 'automatic',
     pipeline_v2_mode: 'on',
     youtube_rights_mode: 'all_public',
-    youtube_accepted_coverage_target: coverageTarget,
-    yt_stop_when_coverage_target_met: true,
-    allow_relevant_stock: true,
-    allow_stock_last_resort: true,
-    stock_last_resort_in_coordinator: true,
+    allow_relevant_stock: false,
+    allow_stock_last_resort: false,
+    stock_last_resort_in_coordinator: false,
     stock_video_only: false,
     visual_understanding: true,
     visual_required: strictMedia,
     final_visual_gate_mode: 'run',
-    media_sources: ['pexels', 'pixabay'],
-    pexels_api_key: String(process.env.PEXELS_API_KEY || '').trim(),
-    pixabay_api_key: String(process.env.PIXABAY_API_KEY || '').trim(),
     // Muse inference is compulsory: never send an OpenRouter key to
     // Vidnets. llm_provider=external_agent is the only provider, and the
     // server must never select Qwen for an external_agent job.
@@ -165,6 +168,7 @@ function buildRequest(job, scriptText, packageDir) {
     allow_emergency_media: false,
     allow_grounded_graphic_fallback: true,
     allow_grounded_graphic_fallback_strict: true,
+    global_media_guarantee: true,
     media_fallback_policy: process.env.MUSE_MEDIA_FALLBACK_POLICY || 'grounded_graphic',
     scene_mode: 'Every Beat',
     captions_enabled: options.captionsEnabled !== false,
@@ -188,6 +192,15 @@ function buildRequest(job, scriptText, packageDir) {
     delivery_budget_seconds: deliveryBudget,
     delivery_budget_max_cap_seconds: deliveryBudget
   };
+
+  if (coverageTarget !== undefined) {
+    request.youtube_accepted_coverage_target = coverageTarget;
+    request.yt_stop_when_coverage_target_met = true;
+  }
+  if (options.mixedMediaWeights || options.mediaWeights) {
+    request.mixed_media_weights = options.mixedMediaWeights || options.mediaWeights;
+  }
+  return request;
 }
 
 function requestId(value) {
@@ -390,6 +403,12 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   let lastDetail = '';
   const renderStartedAt = Date.now();
   let lastReportAt = 0;
+  // A user-cancelled video job is terminal: the server never retries it
+  // and `retry` refuses it. The CMS job itself is the same job, so a
+  // resume must keep going with a FRESH video job for this attempt — never
+  // loop on the dead id. Guarded to once per render call so a second
+  // cancellation still fails loudly instead of re-submitting forever.
+  let resubmittedAfterCancel = false;
   // A long silent phase (same % and same detail, e.g. the relevance check
   // sitting at 61% for ~28 min on Broken Rail attempt 3) sends no advancing
   // progress, and the CMS stall timer kills the job after 20 min — the
@@ -465,6 +484,33 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     }
     const cleanupPending = item.status === 'shutdown_timeout' && item.retryable === true && !item.cancel_requested;
     if (!cleanupPending && ['error', 'cancelled', 'shutdown_timeout'].includes(item.status)) {
+      // Same CMS job, fresh video job: the old video job was cancelled by
+      // the user, so it can never be resumed. Back up its receipt (the old
+      // id is never lost), submit a fresh video job for this CMS attempt,
+      // and keep following — the CMS job, its script and its work-dir
+      // checkpoints stay exactly where they were.
+      if (item.status === 'cancelled' && !resubmittedAfterCancel) {
+        resubmittedAfterCancel = true;
+        const deadId = vidnetsJobId;
+        try {
+          fs.copyFileSync(jobFile, `${jobFile}.bak-${deadId}`);
+        } catch { /* backup is best-effort; the fresh submit below is what matters */ }
+        log.warn(`Vidnets job ${deadId} was cancelled; starting a fresh video job for the same CMS job ${job.jobId} (attempt ${cmsAttempt})`);
+        await ensureReady({ signal });
+        vidnetsJobId = await submitRender({
+          jobId: job.jobId,
+          filePath: requestFile,
+          request: buildRequest(job, scriptText, packageDir),
+          signal,
+          submit: file => vidnets(`submit ${quoteArg(file)}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets generation submit' })
+        });
+        saveReceipt({ cmsAttempt, submittedAt: new Date().toISOString(), pausedRetries: 0, resubmittedFrom: deadId });
+        log.info(`Following Vidnets job ${vidnetsJobId} for "${job.title}" (fresh video job after ${deadId} was cancelled)`);
+        lastProgress = -1;
+        lastDetail = '';
+        onProgress?.(2, 'Starting a fresh video job — the previous one was cancelled');
+        continue;
+      }
       if (item.status !== 'cancelled' && cmsAttempt > Number(receipt.cmsAttempt || 1)) {
         await vidnets(`retry ${vidnetsJobId}`, { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets job resume' });
         saveReceipt({ cmsAttempt, pausedRetries: 0 });

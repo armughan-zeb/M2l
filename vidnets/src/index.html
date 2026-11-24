@@ -581,7 +581,6 @@
                                             <option value="Web Images">🖼️ Web Images</option>
                                             <option value="YouTube Clips">▶️ YouTube Clips (strict relevance)</option>
                                             <option value="Mixed Media" selected>🧩 Mixed Media (automatic, relevance-first)</option>
-                                            <option value="Stock Media">📷 Stock Media</option>
                                             <option value="Custom Images">📁 Upload Custom</option>
                                         </select>
                                         <div id="webImagesNotice"
@@ -592,7 +591,7 @@
                                         <div id="mixedMediaNotice"
                                             class="hidden"
                                             style="margin-top:10px; padding:8px; background:rgba(110,168,254,0.08); border-radius:8px; border:1px solid rgba(110,168,254,0.24); font-size:12px; color:#b6d4fe;">
-                                            Mixed Media searches YouTube clips and web images as primary sources, selects the most relevant verified result per scene, and uses relevant stock only after both primary lanes fail. Public YouTube reuse remains your responsibility.
+                                            Mixed Media selects relevant YouTube clips and web images. Script-grounded graphics can support the footage when needed.
                                         </div>
                                         <div id="stockMediaSourcesV2"
                                             style="display:none; margin-top:10px; padding:8px; background:rgba(5,160,129,0.1); border-radius:8px; border:1px solid rgba(5,160,129,0.2);">
@@ -1155,7 +1154,7 @@
                                 </div>
                             </div>
 
-                            <div class="input-row">
+                            <div class="input-row hidden">
                                 <div class="input-field">
                                     <label for="pexelsKey">Pexels key</label>
                                     <input type="password" id="pexelsKey" placeholder="Optional Pexels API key">
@@ -1363,12 +1362,10 @@
                         <div class="guide-grid">
                             <article class="panel-card guide-card guide-card-wide">
                                 <div class="guide-card-heading"><span class="guide-number">1</span><div><p class="section-kicker">First-time setup</p><h3>Connect your accounts</h3></div></div>
-                                <p>Open <strong>Settings</strong>. Add your OpenRouter key for scene intelligence. Pexels and Pixabay keys are optional, but they give the app more stock-footage choices.</p>
+                                <p>Open <strong>Settings</strong>. Add your OpenRouter key for scene intelligence.</p>
                                 <div class="guide-link-list">
                                     <button type="button" class="guide-link" onclick="openGuideLink('https://openrouter.ai/')"><span>OpenRouter</span><span>↗</span></button>
                                     <button type="button" class="guide-link" onclick="openGuideLink('https://openrouter.ai/keys')"><span>OpenRouter keys</span><span>↗</span></button>
-                                    <button type="button" class="guide-link" onclick="openGuideLink('https://www.pexels.com/api/')"><span>Pexels API key</span><span>↗</span></button>
-                                    <button type="button" class="guide-link" onclick="openGuideLink('https://pixabay.com/api/docs/')"><span>Pixabay API key</span><span>↗</span></button>
                                 </div>
                                 <p class="guide-note">Keep keys private. Vidnets stores them in the desktop app settings and never asks you to paste them into a script.</p>
                             </article>
@@ -1403,7 +1400,7 @@
 
                             <article class="panel-card guide-card">
                                 <div class="guide-card-heading"><span class="guide-number">?</span><div><p class="section-kicker">Quick help</p><h3>When something is not right</h3></div></div>
-                                <ul class="guide-list"><li>No YouTube clips: reconnect cookies from the banner or Settings.</li><li>Missing stock: add a Pexels or Pixabay key.</li><li>Want another attempt: use Queue → Resume.</li><li>Need older exports: open Projects and select any thumbnail.</li></ul>
+                                <ul class="guide-list"><li>No YouTube clips: reconnect cookies from the banner or Settings.</li><li>Want another attempt: use Queue → Resume.</li><li>Need older exports: open Projects and select any thumbnail.</li></ul>
                             </article>
                         </div>
                     </div>

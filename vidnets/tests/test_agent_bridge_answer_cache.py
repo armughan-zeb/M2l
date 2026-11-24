@@ -2,6 +2,8 @@ import json
 import os
 import time
 
+import pytest
+
 from services import agent_bridge
 
 
@@ -126,3 +128,84 @@ def test_prune_removes_only_terminal_old_dirs(tmp_path, monkeypatch):
     cache = json.loads((tmp_path / '_answer_cache.json').read_text(encoding='utf-8'))
     fingerprint = agent_bridge.payload_fingerprint(_payload())
     assert cache[fingerprint]['content'] == '{"score": 85}'
+
+
+def test_complete_caches_late_answer_for_expired_request(tmp_path, monkeypatch):
+    # A parent answer that arrives after the wait expired used to be lost:
+    # complete_request refused it, nothing was cached, and the pipeline
+    # re-filed the identical payload on the next attempt and waited again.
+    monkeypatch.setenv('VIDNETS_AGENT_BRIDGE_DIR', str(tmp_path))
+    payload = _payload()
+    first = 'a' * 32
+    _make_request(tmp_path, first, payload, state='expired')
+    with pytest.raises(ValueError, match='expired'):
+        agent_bridge.complete_request(first, 'owner', '{"score": 85}')
+    # The late answer is cached anyway: a re-issue reuses it immediately.
+    second = 'b' * 32
+    _make_request(tmp_path, second, payload)
+    assert agent_bridge.cached_answer_for(second, 'owner') == '{"score": 85}'
+    assert agent_bridge.reuse_cached_answer(second) == {'reused': True, 'request_id': second}
+
+
+def test_complete_does_not_cache_late_error_or_empty_answer(tmp_path, monkeypatch):
+    monkeypatch.setenv('VIDNETS_AGENT_BRIDGE_DIR', str(tmp_path))
+    payload = _payload()
+    _make_request(tmp_path, 'a' * 32, payload, state='expired')
+    with pytest.raises(ValueError, match='expired'):
+        agent_bridge.complete_request('a' * 32, 'owner', '', error='boom')
+    _make_request(tmp_path, 'b' * 32, payload)
+    assert agent_bridge.cached_answer_for('b' * 32, 'owner') is None
+
+
+def test_agent_post_reuses_cached_answer_without_waiting(tmp_path, monkeypatch):
+    # A re-issued request (same payload, new id) must return at once from
+    # the cache instead of waiting out its wall for a fresh answer.
+    monkeypatch.setenv('VIDNETS_AGENT_BRIDGE_DIR', str(tmp_path))
+    monkeypatch.setenv('VIDZEO_AGENT_MIN_WALL_SECONDS', '0')
+    from services.job_context import job_scope
+    payload = _payload()
+    _make_request(tmp_path, 'a' * 32, payload)
+    agent_bridge.complete_request('a' * 32, 'owner', '{"score": 85}')
+    start = time.monotonic()
+    with job_scope({'agent_owner_id': 'owner', 'job_id': 'job-1'}):
+        response = agent_bridge.agent_post(
+            {'messages': payload['messages'],
+             'response_format': payload['response_format']},
+            timeout=2, operation='visual_review', kind='vision')
+    assert time.monotonic() - start < 5
+    assert json.loads(response.json()['choices'][0]['message']['content']) == {'score': 85}
+
+
+def test_agent_post_reuses_twin_answer_cached_mid_wait(tmp_path, monkeypatch):
+    # The director and the query planner file identical payloads
+    # concurrently. If the twin is answered while this request waits, the
+    # wait loop must pick the cached answer up instead of waiting out the
+    # wall for a second copy.
+    monkeypatch.setenv('VIDNETS_AGENT_BRIDGE_DIR', str(tmp_path))
+    monkeypatch.setenv('VIDZEO_AGENT_MIN_WALL_SECONDS', '0')
+    monkeypatch.setattr(agent_bridge, '_ACTIVITY_RECORD_SECONDS', 0.2)
+    import threading
+    from services.job_context import job_scope
+    payload = _payload()
+    results = {}
+
+    def _wait():
+        with job_scope({'agent_owner_id': 'owner', 'job_id': 'job-1'}):
+            try:
+                results['response'] = agent_bridge.agent_post(
+                    {'messages': payload['messages'],
+                     'response_format': payload['response_format']},
+                    timeout=120, operation='visual_review', kind='vision')
+            except Exception as exc:  # noqa: BLE001 - record the failure
+                results['error'] = exc
+
+    thread = threading.Thread(target=_wait, daemon=True)
+    thread.start()
+    time.sleep(0.5)
+    # Twin filed under another id with the identical payload, then answered.
+    _make_request(tmp_path, 'a' * 32, payload)
+    agent_bridge.complete_request('a' * 32, 'owner', '{"score": 85}')
+    thread.join(timeout=10)
+    assert not thread.is_alive(), 'agent_post did not reuse the twin answer'
+    assert 'response' in results, results.get('error')
+    assert json.loads(results['response'].json()['choices'][0]['message']['content']) == {'score': 85}

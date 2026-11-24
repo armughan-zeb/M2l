@@ -275,3 +275,518 @@ def test_pool_matcher_assigns_shared_sources_with_distinct_ranges():
     second = result[1][0]
     assert first.video_id == second.video_id == "video-4"
     assert first.start != second.start
+
+
+# --- run-2 transcript failure regressions ---------------------------------
+# Job 55f091bd kept 1/12 transcripts: the ranged-moments caller passed a
+# 60 s deadline that the callee silently clamped to 25 s, and every
+# per-video provider chain burned ~15 s on yt-dlp legs that could never
+# succeed (storyboard-only player response, android carries no captions)
+# before the API leg ran — then re-ran the same extraction as a fallback
+# even after the API had answered definitively.
+
+
+def _test_jar():
+    import http.cookiejar
+
+    jar = http.cookiejar.CookieJar()
+    for name in ("SAPISID", "LOGIN_INFO"):
+        jar.set_cookie(http.cookiejar.Cookie(
+            version=0, name=name, value="test-value", port=None, port_specified=False,
+            domain=".youtube.com", domain_specified=True, domain_initial_dot=True,
+            path="/", path_specified=True, secure=True,
+            expires=int(time.time()) + 3600, discard=False,
+            comment=None, comment_url=None, rest={"HttpOnly": None}, rfc2109=False,
+        ))
+    return jar
+
+
+class _StoryboardYDL:
+    """Fake yt-dlp that mimics the no-JS-solver player response.
+
+    Real yt-dlp raises "Requested format is not available" during
+    extract_info when the only formats are storyboards — unless
+    ignore_no_formats_error is set, in which case the info dict (with its
+    caption tracks) is returned.
+    """
+
+    instances = []
+
+    def __init__(self, opts):
+        self.opts = opts
+        self.cookiejar = None
+        _StoryboardYDL.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, video_id, download=False):
+        if not self.opts.get("ignore_no_formats_error"):
+            raise RuntimeError(
+                "Requested format is not available. "
+                "Use --list-formats for a list of available formats"
+            )
+        return {
+            "subtitles": {},
+            "automatic_captions": {
+                "en": [{"ext": "json3", "url": "https://example.test/captions"}]
+            },
+        }
+
+
+class _StoryboardYtDlpModule:
+    def YoutubeDL(self, opts):
+        return _StoryboardYDL(opts)
+
+
+class _CaptionResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        import json
+
+        payload = {"events": [
+            {"tStartMs": 1000, "dDurationMs": 2000,
+             "segs": [{"utf8": "Panama Canal crossing "}]},
+        ]}
+        return json.dumps(payload).encode("utf-8")
+
+
+class _CaptionOpener:
+    def open(self, url, timeout=None):
+        return _CaptionResponse()
+
+
+def test_transcript_ytdlp_returns_captions_despite_storyboard_only_formats(tmp_path):
+    from unittest import mock
+
+    from services import youtube_transcript_index as transcript_index
+
+    _StoryboardYDL.instances.clear()
+    index = YouTubeTranscriptIndex(
+        str(tmp_path / "storyboard-transcripts.sqlite3"), session_jar=_test_jar()
+    )
+    with mock.patch(
+        "services.yt_dlp_runtime.load_yt_dlp", return_value=_StoryboardYtDlpModule()
+    ), mock.patch(
+        "youtube_transcript_api.YouTubeTranscriptApi",
+        side_effect=RuntimeError("api down"),
+    ), mock.patch.object(
+        transcript_index, "_cookie_opener", return_value=_CaptionOpener()
+    ):
+        document = index.fetch("dQw4w9WgXcQ")
+    assert document.available
+    assert document.source == "yt-dlp-authenticated"
+    assert document.segments and "Panama Canal" in document.segments[0].text
+    assert _StoryboardYDL.instances
+    assert _StoryboardYDL.instances[0].opts["ignore_no_formats_error"] is True
+    # ``web`` is tried first (it is faster live and never takes yt-dlp's
+    # embedded-ytcfg path); ``web_embedded`` remains the fallback client
+    # for videos whose ``web`` response carries no caption tracks.
+    assert _StoryboardYDL.instances[0].opts["extractor_args"]["youtube"]["player_client"] == ["web"]
+
+
+class _FailingYDL:
+    instances = []
+
+    def __init__(self, opts):
+        self.opts = opts
+        self.cookiejar = None
+        _FailingYDL.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, video_id, download=False):
+        raise RuntimeError("primary provider down")
+
+
+class _FailingYtDlpModule:
+    def YoutubeDL(self, opts):
+        return _FailingYDL(opts)
+
+
+class _FallbackCountingYDL:
+    instances = []
+
+    def __init__(self, opts):
+        self.opts = opts
+        self.cookiejar = None
+        _FallbackCountingYDL.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, video_id, download=False):
+        return {
+            "subtitles": {},
+            "automatic_captions": {
+                "en": [{"ext": "json3", "url": "https://example.test/captions"}]
+            },
+        }
+
+
+class _FallbackCountingModule:
+    def YoutubeDL(self, opts):
+        return _FallbackCountingYDL(opts)
+
+
+class TranscriptsDisabled(Exception):
+    """Name-matched stand-in for youtube_transcript_api.TranscriptsDisabled.
+
+    The provider classifies definitive answers by exception type name, so
+    this exercises the exact production branch without importing the
+    library's error surface in the test. The class name must match the
+    library's exactly — that is the contract under test.
+    """
+
+
+def test_transcript_fallback_skipped_after_definitive_api_error(tmp_path):
+    from unittest import mock
+
+    from services import youtube_transcript_index as transcript_index
+
+    _FailingYDL.instances.clear()
+    _FallbackCountingYDL.instances.clear()
+    index = YouTubeTranscriptIndex(
+        str(tmp_path / "definitive-transcripts.sqlite3"), session_jar=_test_jar()
+    )
+    with mock.patch(
+        "services.yt_dlp_runtime.load_yt_dlp", return_value=_FailingYtDlpModule()
+    ), mock.patch(
+        "youtube_transcript_api.YouTubeTranscriptApi",
+        side_effect=TranscriptsDisabled("Subtitles are disabled for this video"),
+    ), mock.patch.dict(
+        sys.modules, {"yt_dlp": _FallbackCountingModule()}
+    ), mock.patch.object(
+        transcript_index, "_cookie_opener", return_value=_CaptionOpener()
+    ):
+        document = index.fetch("dQw4w9WgXcQ")
+    assert not document.available
+    assert document.status == "error"
+    assert "TranscriptsDisabled" in document.error
+    # Round 13: the auth and API legs now race, so a definitive API
+    # answer can end the race before the auth leg's thread starts (the
+    # pending auth future is cancelled) — the auth leg running is no
+    # longer guaranteed, and it does not need to be: TranscriptsDisabled
+    # is authoritative about the video itself, so no leg could succeed
+    # after it. The contract that matters is the next assert: the
+    # fallback must never re-run the same extraction after a definitive
+    # no-transcript answer.
+    assert not _FallbackCountingYDL.instances, (
+        "fallback re-ran the same extraction after a definitive no-transcript answer"
+    )
+
+
+def test_transcript_fallback_still_runs_after_transport_failures(tmp_path):
+    """The gating must not remove the retry the cookie-wiring test pins.
+
+    Primary transport failure + API transport failure still reaches the
+    yt-dlp fallback (with the session jar attached).
+    """
+    from unittest import mock
+
+    from services import youtube_transcript_index as transcript_index
+
+    _FailingYDL.instances.clear()
+    _FallbackCountingYDL.instances.clear()
+    index = YouTubeTranscriptIndex(
+        str(tmp_path / "transport-transcripts.sqlite3"), session_jar=_test_jar()
+    )
+    with mock.patch(
+        "services.yt_dlp_runtime.load_yt_dlp", return_value=_FailingYtDlpModule()
+    ), mock.patch(
+        "youtube_transcript_api.YouTubeTranscriptApi",
+        side_effect=RuntimeError("api blocked"),
+    ), mock.patch.dict(
+        sys.modules, {"yt_dlp": _FallbackCountingModule()}
+    ), mock.patch.object(
+        transcript_index, "_cookie_opener", return_value=_CaptionOpener()
+    ):
+        document = index.fetch("dQw4w9WgXcQ")
+    assert document.available
+    assert _FallbackCountingYDL.instances, "fallback YoutubeDL was never built"
+    assert _FallbackCountingYDL.instances[-1].cookiejar is not None
+
+
+def test_transcript_api_client_bounds_requests_with_default_timeout():
+    import requests
+    from unittest import mock
+
+    from services.youtube_transcript_index import _transcript_api_client
+
+    client = _transcript_api_client(_test_jar())
+    assert client is not None
+    # Round 12 raised the transcript API timeout default 30s -> 60s
+    # (YT per-call timeouts 15s -> 60s); the old 30.0 expectation is
+    # stale. The bound itself is unchanged: one default timeout for
+    # every request the client issues.
+    assert client._vidzeo_default_timeout == 60.0
+    with mock.patch.object(
+        requests.Session, "request",
+        return_value=mock.Mock(status_code=200, text=""),
+    ) as fake_request:
+        client.get("https://example.test/watch?v=dQw4w9WgXcQ")
+    assert fake_request.call_args.kwargs.get("timeout") == 60.0
+
+
+def test_ranged_moments_honors_caller_deadline():
+    from services.youtube_ranged_moments import prepare_ranged_moments
+
+    seen = {}
+
+    class _FakeIndex:
+        def fetch_many(self, video_ids, workers=None, deadline_seconds=None):
+            seen["deadline_seconds"] = deadline_seconds
+            seen["workers"] = workers
+            return {}
+
+    moments, audit = prepare_ranged_moments(
+        [{"pool_key": "p1", "scene_text": "Cross the Panama Canal.",
+          "candidate_subject": "Panama Canal", "section_subject": "Panama Canal",
+          "scene_subject": "Panama Canal"}],
+        [{"id": "dQw4w9WgXcQ"}],
+        {},
+        [4.0],
+        deadline_seconds=60.0,
+        index=_FakeIndex(),
+    )
+    assert moments == {}
+    assert audit["sources_requested"] == 1
+    assert seen["deadline_seconds"] == 60.0
+    assert seen["workers"] == 6
+
+
+# --- YT-lane speed fix (Nov 20, 2026): overlapped ranged transcripts ---
+#
+# Measured live (tests 12/14/15): the synchronous transcript phase is a hard
+# barrier of ~130-175 s between "search complete" and the first download,
+# most of it waiting on one slow/erroring transcript while scenes with
+# verified timestamps waited too. The fixes below overlap that phase with
+# the download wave and skip re-fetching transcripts for prep cuts whose
+# moment is already verified.
+
+
+def _prep_assignment(video_id, timestamp, scene):
+    return {
+        "id": video_id,
+        "video_id": video_id,
+        "prep_manifest_injected": True,
+        "prep_best_timestamp": timestamp,
+        "prep_live_scene": scene,
+        "prep_cache_path": f"/tmp/prep/{video_id}.mp4",
+        "best_timestamp": timestamp,
+    }
+
+
+def test_ranged_moments_skips_prep_injected_top_candidate():
+    from services.youtube_ranged_moments import prepare_ranged_moments
+
+    requested = []
+
+    class _FakeIndex:
+        def fetch_many(self, video_ids, workers=None, deadline_seconds=None):
+            requested.extend(video_ids)
+            return {}
+
+    moments, audit = prepare_ranged_moments(
+        [{"pool_key": "p1", "scene_text": "Vice City was back.",
+          "candidate_subject": "Grand Theft Auto VI",
+          "section_subject": "Grand Theft Auto VI",
+          "scene_subject": "Grand Theft Auto VI"}],
+        [_prep_assignment("c5qhgwwLY50", 167.99, 0)],
+        {"p1": [{"id": "NrAZnO_QPhM", "video_id": "NrAZnO_QPhM"}]},
+        [9.0],
+        deadline_seconds=60.0,
+        index=_FakeIndex(),
+    )
+    # The prep video's verified moment needs no fresh transcript; only the
+    # reserve video (the fallback if the prep cut fails) is fetched.
+    assert requested == ["NrAZnO_QPhM"]
+    assert audit["sources_requested"] == 1
+    assert audit["prep_moment_skipped"] == 1
+    assert moments == {}
+
+
+def test_ranged_moments_skips_own_prep_reserve_but_not_other_scene_prep():
+    from services.youtube_ranged_moments import prepare_ranged_moments
+
+    requested = []
+
+    class _FakeIndex:
+        def fetch_many(self, video_ids, workers=None, deadline_seconds=None):
+            requested.extend(video_ids)
+            return {}
+
+    rows = [
+        {"pool_key": "p0", "scene_text": "Vice City was back.",
+         "candidate_subject": "Grand Theft Auto VI", "section_subject": "Grand Theft Auto VI",
+         "scene_subject": "Grand Theft Auto VI"},
+        {"pool_key": "p1", "scene_text": "Lucia and Jason run from the law.",
+         "candidate_subject": "Grand Theft Auto VI", "section_subject": "Grand Theft Auto VI",
+         "scene_subject": "Grand Theft Auto VI"},
+    ]
+    assignments = [
+        _prep_assignment("c5qhgwwLY50", 167.99, 0),
+        {"id": "Bhwj-_9Xz6M", "video_id": "Bhwj-_9Xz6M"},
+    ]
+    pools = {
+        # Scene 0's only pool entry is its own prep cut: nothing to fetch.
+        "p0": [_prep_assignment("c5qhgwwLY50", 167.99, 0)],
+        # Scene 1's reserve is a prep cut mapped to scene 0: scene 1 has no
+        # verified moment for it, so it stays eligible as scene 1's fallback.
+        "p1": [_prep_assignment("TgtfearX668", 42.0, 0)],
+    }
+    moments, audit = prepare_ranged_moments(
+        rows, assignments, pools, [9.0, 9.0],
+        deadline_seconds=60.0, index=_FakeIndex(),
+    )
+    assert requested == ["Bhwj-_9Xz6M", "TgtfearX668"]
+    assert audit["sources_requested"] == 2
+    assert audit["prep_moment_skipped"] == 2
+
+
+def test_ranged_moments_still_fetches_prep_candidate_without_timestamp():
+    from services.youtube_ranged_moments import prepare_ranged_moments
+
+    requested = []
+
+    class _FakeIndex:
+        def fetch_many(self, video_ids, workers=None, deadline_seconds=None):
+            requested.extend(video_ids)
+            return {}
+
+    # prep_manifest_injected but no verified moment: the transcript is the
+    # only way to place the cut, so it must still be fetched.
+    moments, audit = prepare_ranged_moments(
+        [{"pool_key": "p1", "scene_text": "Vice City was back.",
+          "candidate_subject": "Grand Theft Auto VI",
+          "section_subject": "Grand Theft Auto VI",
+          "scene_subject": "Grand Theft Auto VI"}],
+        [{"id": "c5qhgwwLY50", "video_id": "c5qhgwwLY50",
+          "prep_manifest_injected": True}],
+        {},
+        [9.0],
+        deadline_seconds=60.0,
+        index=_FakeIndex(),
+    )
+    assert requested == ["c5qhgwwLY50"]
+    assert audit["prep_moment_skipped"] == 0
+
+
+def _fake_prepare_factory(release, moments, audit=None):
+    def _fake_prepare(rows, assignments, pools, durations, *, session_jar=None,
+                      deadline_seconds=None, cancellation=None):
+        release.wait(timeout=30.0)
+        return moments, dict(audit or {"status": "completed",
+                                       "sources_requested": len(moments),
+                                       "scenes_with_moments": len(moments)})
+    return _fake_prepare
+
+
+def test_ranged_overlap_scene_with_timestamp_does_not_wait():
+    from services.youtube_pipeline_v2 import _RangedMomentOverlap
+
+    release = threading.Event()
+    overlap = _RangedMomentOverlap(
+        _fake_prepare_factory(release, {1: [{"video_id": "Bhwj-_9Xz6M", "start": 10.0}]}),
+        [{}], [{"best_timestamp": 167.99}, {"id": "Bhwj-_9Xz6M"}], {}, [9.0, 9.0],
+        deadline_seconds=30.0)
+    try:
+        overlap.start()
+        started = time.monotonic()
+        # Scene 0 already has a provider timestamp: it must not wait for the
+        # transcript phase that is still blocked on `release`.
+        assert overlap.moments_for_scene(0) == []
+        assert time.monotonic() - started < 2.0
+        release.set()
+        # Once transcripts land, the scene without a timestamp sees them.
+        assert overlap.moments_for_scene(1) == [{"video_id": "Bhwj-_9Xz6M", "start": 10.0}]
+        # The timestamped scene still has no moments of its own.
+        assert overlap.moments_for_scene(0) == []
+    finally:
+        release.set()
+        overlap.resolve()
+
+
+def test_ranged_overlap_scene_without_timestamp_waits_for_moments():
+    from services.youtube_pipeline_v2 import _RangedMomentOverlap
+
+    release = threading.Event()
+    overlap = _RangedMomentOverlap(
+        _fake_prepare_factory(release, {0: [{"video_id": "Bhwj-_9Xz6M", "start": 10.0}]}),
+        [{}], [{"id": "Bhwj-_9Xz6M"}], {}, [9.0],
+        deadline_seconds=30.0)
+    try:
+        overlap.start()
+        threading.Timer(0.5, release.set).start()
+        started = time.monotonic()
+        # No usable timestamp: the scene waits for transcripts, then gets
+        # the moment instead of a heuristic timestamp.
+        assert overlap.moments_for_scene(0) == [{"video_id": "Bhwj-_9Xz6M", "start": 10.0}]
+        assert 0.4 < time.monotonic() - started < 10.0
+    finally:
+        release.set()
+        overlap.resolve()
+
+
+def test_ranged_overlap_resolve_never_blocks_on_slow_transcripts():
+    from services.youtube_pipeline_v2 import _RangedMomentOverlap
+
+    release = threading.Event()
+    overlap = _RangedMomentOverlap(
+        _fake_prepare_factory(release, {}),
+        [{}], [{"best_timestamp": 5.0}], {}, [9.0],
+        deadline_seconds=120.0)
+    try:
+        overlap.start()
+        started = time.monotonic()
+        moments, audit = overlap.resolve()
+        assert time.monotonic() - started < 2.0
+        assert moments == {}
+        assert audit.get("partial") is True
+    finally:
+        release.set()
+
+
+def test_ranged_overlap_failed_prepare_never_stalls_downloads():
+    from services.youtube_pipeline_v2 import _RangedMomentOverlap
+
+    def _boom(rows, assignments, pools, durations, **kwargs):
+        raise RuntimeError("transcript provider down")
+
+    overlap = _RangedMomentOverlap(
+        _boom, [{}], [{"best_timestamp": 5.0}], {}, [9.0],
+        deadline_seconds=30.0)
+    overlap.start()
+    assert overlap.moments_for_scene(0) == []
+    moments, audit = overlap.resolve()
+    assert audit["status"] == "unavailable"
+    assert audit["error_type"] == "RuntimeError"
+
+
+def test_assignment_usable_timestamp_predicate():
+    from services.youtube_pipeline_v2 import _yt_assignment_has_usable_timestamp
+
+    assert _yt_assignment_has_usable_timestamp({"best_timestamp": 167.99}) is True
+    assert _yt_assignment_has_usable_timestamp({"prep_best_timestamp": 0.0}) is True
+    assert _yt_assignment_has_usable_timestamp({"best_timestamp": "12.5"}) is True
+    assert _yt_assignment_has_usable_timestamp({"best_timestamp": None}) is False
+    assert _yt_assignment_has_usable_timestamp({"best_timestamp": "soon"}) is False
+    assert _yt_assignment_has_usable_timestamp({"best_timestamp": -1}) is False
+    assert _yt_assignment_has_usable_timestamp({}) is False
+    assert _yt_assignment_has_usable_timestamp(None) is False
+    assert _yt_assignment_has_usable_timestamp("c5qhgwwLY50") is False

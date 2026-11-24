@@ -140,7 +140,7 @@ export function TransitionOverlay({ id = 'cut', durationFrames = 12, theme, seed
 
   // ── Push Blur / Whip Pan (high-speed camera whip streaks) ──
   if (id === 'push_blur' || id === 'whip_pan') {
-    const blurPx = (p * 14).toFixed(1);
+    const blurPx = (p * 8).toFixed(1);
     const dirSign = seed % 2 === 0 ? 1 : -1;
     const offsetPx = dirSign * (1 - p) * 160;
     const accentCol = theme?.palette?.accent || '#ffd166';
@@ -182,7 +182,7 @@ export function TransitionOverlay({ id = 'cut', durationFrames = 12, theme, seed
 
   // ── Cinematic Cross-Dissolve / Luma Blooming Fade ──
   if (id === 'cross_dissolve' || id === 'luma_dissolve') {
-    const blurPx = (p * 12).toFixed(1);
+    const blurPx = (p * 8).toFixed(1);
     const accentCol = theme?.palette?.accent || '#ffd166';
     return (
       <AbsoluteFill style={{

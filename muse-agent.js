@@ -443,9 +443,19 @@ async function claimCommand(args) {
   } else {
     const steps = [
       `1. SCRIPT: Write complete source-grounded narration matching channel style to scriptPath (${scriptPath}). Target: ~${summary.targetWordCount} words (at least ${summary.minimumWords} words required for ${summary.targetDurationMinutes}min duration).`,
-      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`,
-      `3. DELIVER: Once the script and master exist in workDir, run: node muse-agent.js deliver --job ${job.jobId} --skip-thumbnail (thumbnails are generated locally by Pikgen; do not generate or upload a thumbnail)`
+      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`
     ];
+    // Thumbnails are skipped by this worker — no thumbnail step, and the
+    // deliver step carries --skip-thumbnail (Nov 10, 2026). Thumbnails are
+    // generated locally by Pikgen; do not generate or upload one.
+    if (jobRunner.thumbnailsSkipped()) {
+      steps.push('3. DELIVER: Once the script and master exist in workDir, run: node muse-agent.js deliver --job ' + job.jobId + ' --skip-thumbnail');
+    } else {
+      steps.push(
+        `3. THUMBNAIL: Create a high-CTR 16:9 thumbnail styled after the reference (${summary.thumbnailStyle.referenceImageUrl || summary.thumbnailStyle.referenceUrl || 'see concept'}) executing concept "${summary.thumbnailStyle.concept}" to thumbnailPath (${thumbnailPath}).`,
+        `4. DELIVER: Once all files exist in workDir, run: node muse-agent.js deliver --job ${job.jobId}`
+      );
+    }
     instructions = steps;
   }
 
@@ -664,6 +674,36 @@ async function startCommand(args) {
 
   log.info(`Muse worker ${VERSION} starting for "${saved.agentName || 'Muse agent'}" at ${config.cmsUrl(saved)}`);
   await heartbeat();
+  if (fatal) throw fatal;
+
+  // A deferred resume means the CMS was unreachable while probing the
+  // saved job: the marker is kept and the poll loop below re-attempts
+  // the resume (single probe per iteration, backing off) instead of
+  // claiming a new job or exiting. See lib/jobRunner.js resumeActiveJob.
+  // The initial probe is guarded like the loop's: only a 401 is fatal —
+  // any other throw defers instead of killing the daemon on boot.
+  let resumed = null;
+  try {
+    resumed = await jobRunner.resumeActiveJob({
+      client,
+      signal: abort.signal,
+      onBusy: (jobId, stage, progress, detail) => { current = { jobId, stage, progress, detail }; }
+    });
+  } catch (error) {
+    if (error.status === 401) {
+      fatal = new Error('This worker credential was revoked. Run "node muse-agent.js pair".');
+      throw fatal;
+    }
+    const savedJob = config.readActiveJob();
+    log.warn(`Saved-job resume probe failed at startup (${error.message}); daemon keeps polling and will resume it when the CMS answers`);
+    resumed = { deferred: true, jobId: savedJob?.jobId };
+  }
+  if (resumed?.deferred) {
+    log.warn(`Resume of saved job ${resumed.jobId} deferred (CMS unavailable); daemon keeps polling and will resume it when the CMS answers`);
+  } else if (resumed) {
+    log.info(`Saved job ${resumed.ok ? 'delivered' : 'settled without delivery'}`);
+    current = null;
+  }
 
   timer = setInterval(() => { heartbeat(); }, heartbeatMs);
   timer.unref?.();

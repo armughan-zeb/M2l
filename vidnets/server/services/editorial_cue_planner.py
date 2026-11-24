@@ -990,6 +990,10 @@ def plan_editorial_cues(
             container,
             opening_scene=_is_opening_scene(index, scene_rows),
         )
+        if any(candidate.cue_type == "location" for candidate in candidates):
+            from .editorial_director.production_contract import narration_calls_for_map
+            if not narration_calls_for_map(text):
+                candidates = [candidate for candidate in candidates if candidate.cue_type != "location"]
         if not candidates:
             continue
         media_item = media_rows[index] if index < len(media_rows) else {}

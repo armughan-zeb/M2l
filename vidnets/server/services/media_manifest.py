@@ -23,7 +23,9 @@ This module makes that mix-up impossible to miss:
 * foreign_job_references() extracts distinct Vidnets job ids from
   temp/jobs/<id>/ path segments that do NOT belong to the claiming job.
 * summarize_manifest() counts real vs graphic-fallback assets, so a
-  delivery guard can refuse an all-graphic master.
+  delivery guard can refuse an all-graphic master. Stock scenes are
+  counted separately (stock_count / retrieved_count): stock is a real
+  file, but it must never be presented as retrieved web/YouTube media.
 
 The daemon-side guard lives in lib/masterManifestGuard.js and uses these
 same rules (reimplemented in JS — the daemon cannot import Python).
@@ -116,20 +118,50 @@ def _resolution_is_graphic(row: Mapping[str, Any]) -> bool:
     return str(row.get("provider") or "").strip().casefold() == "graphic"
 
 
+def _resolution_is_stock(row: Mapping[str, Any], label: str) -> bool:
+    """True when a non-graphic row is stock, not retrieved web/YouTube media."""
+    provider = str(row.get("provider") or "").strip().casefold()
+    if provider in {"stock", "pexels", "pixabay"}:
+        return True
+    return str(label or "").strip().casefold() in {"stock media", "stock media fallback"}
+
+
+def _resolution_is_retrieved(row: Mapping[str, Any], label: str) -> bool:
+    """True when a non-graphic row is genuinely retrieved web/YouTube media."""
+    provider = str(row.get("provider") or "").strip().casefold()
+    if provider in {"web", "youtube", "yt", "youtube clips", "web images"}:
+        return True
+    return str(label or "").strip().casefold() in {
+        "web images", "youtube clips", "youtube extracted frame",
+    }
+
+
 def summarize_manifest(manifest: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     """Count real vs graphic-fallback assets in a manifest.
 
     A scene counts as real media when its source label is not a graphic
     label, or when its media_resolution_v2 row is a non-graphic provider.
+    Stock is a real file, so it stays inside ``real_count`` (a stock-only
+    video is still deliverable, not an all-graphic failure) — but it is
+    NEVER folded silently into retrieved media: ``stock_count`` /
+    ``stock_indices`` name the stock scenes and ``retrieved_count`` counts
+    only genuinely retrieved web/YouTube scenes.
     """
     if not isinstance(manifest, Mapping):
-        return {"asset_count": 0, "real_count": 0, "graphic_count": 0, "foreign_jobs": []}
+        return {
+            "asset_count": 0, "real_count": 0, "graphic_count": 0,
+            "stock_count": 0, "retrieved_count": 0, "stock_indices": [],
+            "foreign_jobs": [],
+        }
     paths = list(manifest.get("media_paths") or [])
     labels = list(manifest.get("source_labels") or [])
     metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), Mapping) else {}
     rows = metadata.get("media_resolution_v2") or []
     asset_count = int(manifest.get("asset_count") or len(paths) or len(labels) or 0)
     graphic_count = 0
+    stock_count = 0
+    retrieved_count = 0
+    stock_indices: list[int] = []
     for index in range(max(len(paths), len(labels), len(rows) if isinstance(rows, Sequence) else 0)):
         row = rows[index] if isinstance(rows, Sequence) and index < len(rows) and isinstance(rows[index], Mapping) else {}
         label = labels[index] if index < len(labels) else ""
@@ -139,11 +171,19 @@ def summarize_manifest(manifest: Optional[Mapping[str, Any]]) -> dict[str, Any]:
             graphic = is_graphic_label(label)
         if graphic:
             graphic_count += 1
+        elif _resolution_is_stock(row, label):
+            stock_count += 1
+            stock_indices.append(index)
+        elif _resolution_is_retrieved(row, label):
+            retrieved_count += 1
     real_count = max(0, asset_count - graphic_count) if asset_count else 0
     return {
         "asset_count": asset_count,
         "real_count": real_count,
         "graphic_count": graphic_count,
+        "stock_count": stock_count,
+        "retrieved_count": retrieved_count,
+        "stock_indices": stock_indices,
         "foreign_jobs": foreign_job_references(paths, str(manifest.get("job_id") or "")),
     }
 

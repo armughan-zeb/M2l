@@ -400,3 +400,60 @@ def test_probe_health_is_isolated_by_account_and_model(monkeypatch):
     assert module._maybe_probe_vision(Probe("account-a","qwen/other"))[0]
     assert len(calls)==3
     assert all("account-a" not in key and "account-b" not in key for key in module._PROBE_DONE)
+
+
+def test_fast_mode_vision_makes_exactly_one_attempt(tmp_path, monkeypatch):
+    """(d) Validator-only fast path: exactly 1 network attempt, no repair
+    retry — even when the first response is malformed JSON."""
+    import json as _json
+
+    from services.job_context import job_scope as _job_scope
+
+    image = tmp_path / "image.png"
+    Image.new("RGB", (100, 60), (12, 34, 56)).save(image)
+    calls = []
+
+    class _Response:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    def _post(client, headers, payload):
+        calls.append(payload)
+        return _Response({"choices": [{"message": {"content": "not json at all"}}]})
+
+    context = {"llm_cache_dir": str(tmp_path / "cache"),
+               "usage_path": str(tmp_path / "logs" / "openrouter.jsonl")}
+    monkeypatch.setattr(QwenVisionClient, "_post_with_hard_timeout", _post)
+    with _job_scope(context):
+        fast = QwenVisionClient("account-a", model="qwen/test", fast_mode=True)
+        with pytest.raises(VisionClientError):
+            fast.analyze_image(str(image), "Check charging station", "Verify pixels")
+    assert len(calls) == 1
+
+    def _post_ok(client, headers, payload):
+        calls.append(payload)
+        content = _json.dumps(verdict())
+        return _Response({"choices": [{"message": {"content": content}}]})
+
+    calls.clear()
+    monkeypatch.setattr(QwenVisionClient, "_post_with_hard_timeout", _post_ok)
+    with _job_scope(context):
+        fast = QwenVisionClient("account-a", model="qwen/test", fast_mode=True)
+        result = fast.analyze_image(str(image), "Check charging station", "Verify pixels")
+    assert len(calls) == 1
+    assert result["identity_score"] == 95
+    # as_fast_mode() gives the same single-attempt behaviour from a normal client.
+    calls.clear()
+    with _job_scope(context):
+        normal = QwenVisionClient("account-a", model="qwen/test")
+        assert normal.as_fast_mode().fast_mode is True
+        assert normal.as_fast_mode().max_attempts == 1

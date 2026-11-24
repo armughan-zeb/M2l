@@ -115,7 +115,9 @@ class AgentTests(unittest.TestCase):
 
     def test_timeout_is_bounded_and_late_answer_is_rejected(self):
         start = time.monotonic()
-        with patch.object(agent_bridge, 'remaining_seconds', return_value=.05):
+        # The agent wall has a 600s floor by default; shrink it here so this
+        # bounded-timeout check still runs fast.
+        with patch.dict(os.environ, {'VIDZEO_AGENT_MIN_WALL_SECONDS': '0.05'}):
             with self.assertRaisesRegex(agent_bridge.AgentBridgeError, r'Muse request [a-f0-9]{32}'):
                 agent_bridge.agent_post({'messages': []}, .08, handle='external-agent:alice')
         self.assertLess(time.monotonic() - start, 1)
@@ -126,37 +128,40 @@ class AgentTests(unittest.TestCase):
             agent_bridge.complete_request(row['id'], 'alice', 'late')
 
     def test_agent_requests_get_a_minimum_answer_window(self):
-        # Small direct-provider timeouts do not apply to the Muse inbox.
+        # Callers pass fast-API timeouts (classification asks for 20s); the
+        # polling inbox needs minutes, so the bridge floors the wall.
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(agent_bridge.agent_post, {'messages': []}, 20,
                                  operation='vidnets_response', handle='external-agent:alice')
             row = self.wait_request()
-            self.assertAlmostEqual(row['expires_at'] - row['created_at'], 120, places=1)
+            self.assertGreaterEqual(row['expires_at'] - row['created_at'], 599)
             agent_bridge.complete_request(row['id'], 'alice', {'ok': True})
             reply = future.result(timeout=5).json()
             self.assertEqual(json.loads(reply['choices'][0]['message']['content']), {'ok': True})
 
     def test_vision_requests_get_the_same_minimum_answer_window(self):
-        # Vision and text share the same bounded request lifetime.
+        # Vision verdicts need the same minutes-long window as text: the
+        # floor applies regardless of kind, not just to text callers.
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(agent_bridge.agent_post, {'messages': []}, 20,
                                  operation='vidnets_vision', kind='vision',
                                  handle='external-agent:alice')
             row = self.wait_request()
             self.assertEqual(row['kind'], 'vision')
-            self.assertAlmostEqual(row['expires_at'] - row['created_at'], 120, places=1)
+            self.assertGreaterEqual(row['expires_at'] - row['created_at'], 599)
             agent_bridge.complete_request(row['id'], 'alice', {'ok': True})
             reply = future.result(timeout=5).json()
             self.assertEqual(reply['provider'], 'external_agent')
 
-    def test_legacy_environment_cannot_extend_the_answer_window(self):
-        # Old installations may still export a longer wall.
+    def test_minimum_answer_window_is_tunable_by_environment(self):
+        # The floor is VIDZEO_AGENT_MIN_WALL_SECONDS, not a hardcoded 600:
+        # raising it must lengthen the window a 20s caller gets.
         with patch.dict(os.environ, {'VIDZEO_AGENT_MIN_WALL_SECONDS': '900'}):
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(agent_bridge.agent_post, {'messages': []}, 20,
                                      operation='vidnets_response', handle='external-agent:alice')
                 row = self.wait_request()
-                self.assertAlmostEqual(row['expires_at'] - row['created_at'], 120, places=1)
+                self.assertGreaterEqual(row['expires_at'] - row['created_at'], 899)
                 agent_bridge.complete_request(row['id'], 'alice', {'ok': True})
                 future.result(timeout=5)
 

@@ -3584,8 +3584,25 @@ _DIRECTOR_RESPONSE_SCHEMA = {
     "additionalProperties": False,
     "required": ["scenes"],
     "properties": {
+        # P2: batch 0 returns the film-level art direction in the same turn
+        # as its scenes. Deliberately lenient (no required fields): a
+        # partial art object must not fail the whole batch response; the
+        # caller treats incomplete art as unusable and falls back to the
+        # standalone art call.
+        "art_direction": {"type": "object", "additionalProperties": False,
+            "properties": {
+                "style": {"type": "string", "maxLength": 32},
+                "display_font": {"type": "string", "maxLength": 64},
+                "body_font": {"type": "string", "maxLength": 64},
+                "accent_color": {"type": "string", "maxLength": 16},
+                "visual_motif": {"type": "string", "maxLength": 120},
+                "motion_rhythm": {"type": "string", "maxLength": 220},
+                "story_arc": {"type": "string", "maxLength": 360},
+                "retention_plan": {"type": "string", "maxLength": 240},
+            }},
         "scenes": {
             "type": "array",
+            "minItems": 1,
             "maxItems": 8,
             "items": {
                 "type": "object",
@@ -3673,6 +3690,14 @@ _DIRECTOR_RESPONSE_SCHEMA = {
                             "anchor_text": {"type": "string", "maxLength": 80},
                         },
                     }},
+                    # P1: editorial beats folded into the director's turn.
+                    # Optional: a batch that omits them still validates, and
+                    # the caller falls back to the standalone beats planner.
+                    "editorial_role": {"type": "string", "maxLength": 32},
+                    "editorial_treatment": {"type": "string", "maxLength": 32},
+                    "editorial_emphasis": {"type": "string", "maxLength": 64},
+                    "editorial_highlight_kind": {"type": "string", "maxLength": 32},
+                    "editorial_importance": {"type": "number", "minimum": 0, "maximum": 1},
                 },
             },
         },
@@ -3701,14 +3726,37 @@ def director_planning_budget(scene_count: int) -> Dict[str, float]:
     from ..job_context import current_job
     agent_wall = 0.0
     if current_job().get('llm_provider') == 'external_agent':
-        # Allocate a full inbox window per phase within the job budget.
-        from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
-        agent_wall = AGENT_REQUEST_WALL_SECONDS
+        # A tool-driven host needs time to read and answer the inbox. Keep
+        # every request bounded while preserving adaptive parallel chunks.
+        # Each call must last at least the agent answer floor
+        # (VIDZEO_AGENT_MIN_WALL_SECONDS, default 3600s): the phase scope
+        # caps the request wall, so a shorter call budget expires the
+        # answer mid-composition — the inbox watcher alone needs ~4.5 min
+        # to wake a worker.
+        try:
+            agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+        except (TypeError, ValueError):
+            agent_wall = 3600.0
         art, scene_call, composition, repair = agent_wall, agent_wall, agent_wall, agent_wall
-        batch_size, workers = 4, 2
+        # Direction batches are capped by the response schema
+        # (_DIRECTOR_RESPONSE_SCHEMA scenes maxItems 8), so 8 scenes is the
+        # widest batch the model may return; 4 workers is the non-agent
+        # default and the resident inbox concurrency (8) allows it. The old
+        # 4-scene / 2-worker override doubled the waves (and the bridge
+        # requests) for no schema reason.
+        batch_size, workers = 8, 4
         waves = max(1, (max(1, int(scene_count)) + batch_size * workers - 1) // (batch_size * workers))
     base = number("VIDZEO_EDITORIAL_DIRECTOR_TOTAL_TIMEOUT_SECONDS", 90, 15, 3600)
     cap = number("VIDZEO_EDITORIAL_DIRECTOR_MAX_TOTAL_TIMEOUT_SECONDS", 3600, 90, 7200)
+    if agent_wall:
+        # The cap must fit at least art + one scene wave + repair at the
+        # agent wall, or the scene stage collapses to zero: with the 3600s
+        # wall and the default 3600s cap, total - repair - 5 is negative and
+        # every scene batch is cancelled before it starts (stage 0). The
+        # job delivery budget still bounds real spend; this only stops the
+        # director zeroing its own stage. One wave needs art (1 wall) +
+        # scene+composition (2 walls) + repair (1 wall).
+        cap = max(cap, 4.0 * agent_wall + 5.0)
     adaptive = str(os.environ.get("VIDZEO_EDITORIAL_DIRECTOR_ADAPTIVE_BUDGET", "1")).strip().lower() not in {"0", "false", "off", "no"}
     requested = max(base, art + (scene_call + composition) * waves + repair + 5) if adaptive else base
     total = min(cap, requested)
@@ -3732,8 +3780,12 @@ def director_planning_budget(scene_count: int) -> Dict[str, float]:
 def _min_director_call_budget(agent_wall_seconds):
     """Smallest director call budget that can ever be answered on this job.
 
-    External-agent calls can use the inbox deadline when the job has
-    enough time remaining. Callers
+    Plain API calls need only a few seconds, but an external-agent call is
+    answered by a polling inbox watcher that needs minutes to wake a worker
+    (VIDZEO_AGENT_MIN_WALL_SECONDS, default 3600s). A director call issued
+    with less than that wall is guaranteed to expire before its answer
+    arrives (job 75fa1baa: a scene-72 composition repair issued with 77s
+    and a scene-direction call with 38s both expired unanswered). Callers
     must skip the call instead of issuing it when the remaining budget is
     below this floor; the scene degrades gracefully either way.
     """
@@ -4146,430 +4198,522 @@ def _plan_llm_scenes(
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
-        try:
-            art_call_timeout = max(.01, min(art_timeout, deadline - time.monotonic()))
-            art_response = _bounded_chat(
-                llm_client, art_call_timeout,
-                user_prompt=(f"Creative variation seed for this production: {creative_seed}. Use it only as a tie-breaker between equally grounded design choices; never let it alter facts. "
-                             "Set the video-level art direction. Read the full script context, identify its story arc and retention curve, "
-                             "then set a memorable visual motif and purposeful motion rhythm. Return only one coherent direction.\n\n" + user_prompt),
-                system_prompt=_ART_DIRECTION_PROMPT,
-                temperature=0.35,
-                max_tokens=900,
-                json_mode=True,
-                json_schema=_ART_DIRECTION_SCHEMA,
-                json_schema_name="vidnets_art_direction_v1",
-                primary_timeout_share=.8,
-                max_attempts=director_retries,
-                total_timeout_seconds=art_call_timeout,
-            )
-            art_payload = _decode_director_json(art_response)
-            art_route = _model_route_record("art_direction", llm_client)
-        except Exception as art_error:
-            # A slow or unavailable art-direction call must not prevent the
-            # separate, smaller scene-direction requests from using the LLM.
-            art_payload = {}
-            art_route = _model_route_record("art_direction", llm_client)
-            art_route["status"] = "failed"
-            art_route["error_type"] = type(art_error).__name__
-            metadata["art_direction_fallback"] = type(art_error).__name__
-            print(f"   [LLM Director] Art-direction request failed; continuing with bounded scene batches ({type(art_error).__name__})")
-        art_attempt_history = list(art_route.get("attempt_history") or [])
+        # P2 (fewer requests): the standalone vidnets_art_direction_v1 call
+        # is gone from the common path. Batch 0 returns the film-level art
+        # direction in the same turn as its scenes; the standalone art call
+        # (kept below as a fallback) only fires when batch 0 returns no
+        # usable art. The legacy all-in-one art response (scenes inside the
+        # art payload) is still honoured by that fallback path.
+        art_direction = dict(fallback_art_direction)
+        art_payload = {}
+        art_route = None
+        batch0_art = {}
         scene_batch_failures = []
-        # Older clients and test doubles may return the former all-in-one
-        # response. Preserve that load path while live OpenRouter uses the
-        # video-direction pass followed by bounded scene batches.
-        if isinstance(art_payload.get("scenes"), list):
-            art_route["stage"] = "art_direction_and_scenes"
-            scene_decisions = art_payload.get("scenes") or []
-            art_direction = fallback_art_direction
-            model_routes = [art_route]
-        else:
-            art_direction = {**fallback_art_direction, **art_payload}
+        scene_decisions = []
+        model_routes = []
+        def _normalize_art_direction(payload):
+            # Merge an LLM art-direction payload over the deterministic
+            # fallback, keeping the explicit script niche and the local
+            # visual grammar. Used for batch-0 art and for the fallback
+            # standalone art call alike.
+            merged = {**fallback_art_direction, **(payload or {})}
             # Scene copy may personalize the film motif, but the LLM's art
             # call cannot relabel the explicit script niche for later chunks.
-            art_direction["niche"] = niche
-            art_direction["visual_grammar"] = dict(visual_grammar)
+            merged["niche"] = niche
+            merged["visual_grammar"] = dict(visual_grammar)
             if niche == "crime":
-                art_direction["accent_color"] = str((editing_profile or {}).get("palette", {}).get("accent") or "#D32F2F")
+                merged["accent_color"] = str((editing_profile or {}).get("palette", {}).get("accent") or "#D32F2F")
             for key in ("visual_motif", "motion_rhythm", "story_arc", "retention_plan"):
-                value = str(art_direction.get(key) or "").strip()
-                art_direction[key] = value or fallback_art_direction[key]
-            scene_decisions = []
-            model_routes = [art_route]
-            batches = []
-            try:
-                scene_batch_size = max(1, min(10, int(os.environ.get("VIDZEO_EDITORIAL_DIRECTOR_SCENE_BATCH_SIZE", "8") or 8)))
-            except (TypeError, ValueError):
-                scene_batch_size = 8
-            scene_batch_size = int(budget.get('scene_batch_size', scene_batch_size))
-            story_map = _director_story_map(scene_texts)
-            runtime_capabilities = design_contract["capabilities"]
-            visual_argument_board = _director_visual_argument_board(scene_texts)
-            compact_capabilities = json.dumps(runtime_capabilities, ensure_ascii=False, separators=(",", ":"))
-            scene_palette = dict(visual_dna.palette or {}) if visual_dna else {}
-            scene_palette["accent"] = str(art_direction.get("accent_color") or scene_palette.get("accent") or "#FFFFFF")
-            metadata["context_strategy"] = "full_film_arc_scene_anchors_and_adjacent_beats"
-            metadata["scene_batch_size"] = scene_batch_size
-            metadata["visual_argument_board"] = visual_argument_board
-            metadata["capability_index_strategy"] = "complete_compact_catalog_no_removed_variants"
-            for batch_start in range(0, len(scene_lines), scene_batch_size):
-                batch_end = min(len(scene_lines), batch_start + scene_batch_size)
-                batch_lines = scene_lines[batch_start:batch_end]
-                before_context = scene_lines[batch_start - 1] if batch_start > 0 else "(opening scene)"
-                after_context = scene_lines[batch_end] if batch_end < len(scene_lines) else "(final scene)"
-                progress_start = batch_start / max(1, len(scene_lines))
-                progress_end = batch_end / max(1, len(scene_lines))
-                batch_context = " ".join(scene_texts[max(0, batch_start - 1):min(len(scene_texts), batch_end + 1)])
-                admin1_catalog = {
-                    name: code for name, code in load_admin1_catalog().items()
-                    if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", batch_context, re.I)
-                }
-                batches.append((batch_start, batch_end, batch_lines, (
-                    f"Video art direction (locked for this film): {json.dumps(_director_prompt_art_direction(art_direction), ensure_ascii=False, separators=(',', ':'))}\n"
-                    f"Live Remotion design capabilities (exact selectors and approved catalog): {compact_capabilities}\n"
-                    f"Creative variation seed: {creative_seed}. Use it only to resolve equally suitable visual choices; story facts always win.\n"
-                    f"Niche visual grammar: {json.dumps(dict(visual_grammar), ensure_ascii=False, separators=(',', ':'))}\n"
-                    f"Approved film color palette (exact hex/semantic roles): {json.dumps(scene_palette, ensure_ascii=False, separators=(',', ':'))}\n"
-                    f"Full-film story map, from the beginning through payoff:\n{story_map}\n"
-                    f"Film-wide visual argument opportunities: {json.dumps(_director_prompt_argument_window(visual_argument_board, batch_start, batch_end), ensure_ascii=False, separators=(',', ':'))}\n"
-                    "Choose the explanatory question and evidence BEFORE the template. These opportunities are alternatives, not a restricted component shortlist.\n"
-                    f"This window covers {progress_start:.0%}–{progress_end:.0%} of the film. Treat its scenes as one connected passage in that full arc.\n"
-                    f"Immediate setup just before this window: {before_context}\n"
-                    f"Immediate narrative handoff after this window: {after_context}\n"
-                    f"Available Natural Earth 1:10m state/prefecture features: {json.dumps(admin1_catalog, ensure_ascii=False)}.\n"
-                    f"Film-wide short-copy budget: at most {overlay_budget} scenes; one scene of cooldown, weighted toward pivotal exact facts/entities. Graphics can explain without extra headlines.\n"
-                    f"Direct only these scenes, preserving their global indices {batch_start}-{batch_end - 1}.\n"
-                    "STRICT REMOTION DESIGN CONTRACT: Use exact live component/variant/template selectors and schema fields. Explain the scene-specific fact; preserve all supported custom design options.\n"
-                    "The entire live palette is available; choose and vary evidence-supported families across the film. Aim near 30% purposeful graphics; retain clean media when it serves best.\n"
-                    "Apply the system grounding/placement rules and supplied local fps. Return only the owned scenes.\n\n"
-                    + "\n".join(batch_lines)
-                )))
-            try:
-                scene_max_tokens = max(1800, min(8000, int(os.environ.get("VIDZEO_EDITORIAL_DIRECTOR_SCENE_MAX_TOKENS", str(min(8000, 2400 * scene_batch_size))) or 2400 * scene_batch_size)))
-            except (TypeError, ValueError):
-                scene_max_tokens = min(8000, 2400 * scene_batch_size)
-            try:
-                scene_workers = max(1, min(4, int(os.environ.get("VIDZEO_EDITORIAL_DIRECTOR_SCENE_WORKERS", "4") or 4)))
-            except (TypeError, ValueError):
-                scene_workers = 3
-            scene_workers = int(budget.get('scene_workers', scene_workers))
+                value = str(merged.get(key) or "").strip()
+                merged[key] = value or fallback_art_direction[key]
+            return merged
 
-            def _batch_client():
-                # OpenRouterLLM keeps per-request retry history, so each live
-                # worker receives an isolated client. Test doubles are reused
-                # for backwards-compatible unit probes.
-                if hasattr(llm_client, "api_key") and hasattr(llm_client, "fallback_models"):
-                    try:
-                        return llm_client.__class__(
-                            api_key=llm_client.api_key,
-                            model=getattr(llm_client, "model", None),
-                            fallback_models=list(getattr(llm_client, "fallback_models", ()) or ()),
-                            use_server_fallbacks=bool(getattr(llm_client, "use_server_fallbacks", False)),
-                        )
-                    except Exception:
-                        pass
-                return llm_client
+        def _art_payload_usable(payload):
+            # Batch-0 art must carry the four content fields; a partial
+            # object is not usable art and triggers the fallback art call.
+            if not isinstance(payload, dict):
+                return False
+            return all(str(payload.get(key) or "").strip() for key in ("visual_motif", "motion_rhythm", "story_arc", "retention_plan"))
 
-            def _direct_batch(batch):
-                batch_start, batch_end, batch_lines, batch_prompt = batch
-                worker_client = _batch_client()
-                failure_stage = 'provider_request'
+        batches = []
+        try:
+            scene_batch_size = max(1, min(10, int(os.environ.get("VIDZEO_EDITORIAL_DIRECTOR_SCENE_BATCH_SIZE", "8") or 8)))
+        except (TypeError, ValueError):
+            scene_batch_size = 8
+        scene_batch_size = int(budget.get('scene_batch_size', scene_batch_size))
+        story_map = _director_story_map(scene_texts)
+        runtime_capabilities = design_contract["capabilities"]
+        visual_argument_board = _director_visual_argument_board(scene_texts)
+        compact_capabilities = json.dumps(runtime_capabilities, ensure_ascii=False, separators=(",", ":"))
+        def _current_scene_palette():
+            # Recomputed per batch prompt: batch 0 resolves the art
+            # direction, and later batches use its accent.
+            palette = dict(visual_dna.palette or {}) if visual_dna else {}
+            palette["accent"] = str(art_direction.get("accent_color") or palette.get("accent") or "#FFFFFF")
+            return palette
+
+        metadata["context_strategy"] = "full_film_arc_scene_anchors_and_adjacent_beats"
+        metadata["scene_batch_size"] = scene_batch_size
+        metadata["visual_argument_board"] = visual_argument_board
+        metadata["capability_index_strategy"] = "complete_compact_catalog_no_removed_variants"
+        for batch_start in range(0, len(scene_lines), scene_batch_size):
+            batch_end = min(len(scene_lines), batch_start + scene_batch_size)
+            batch_lines = scene_lines[batch_start:batch_end]
+            batches.append((batch_start, batch_end, batch_lines))
+
+        def _batch_prompt(batch_start, batch_end, batch_lines):
+            # Built at call time, not at batch-list time: batch 0 resolves
+            # the art direction, and later batches prompt with that art
+            # (and its palette accent) instead of the fallback.
+            before_context = scene_lines[batch_start - 1] if batch_start > 0 else "(opening scene)"
+            after_context = scene_lines[batch_end] if batch_end < len(scene_lines) else "(final scene)"
+            progress_start = batch_start / max(1, len(scene_lines))
+            progress_end = batch_end / max(1, len(scene_lines))
+            batch_context = " ".join(scene_texts[max(0, batch_start - 1):min(len(scene_texts), batch_end + 1)])
+            admin1_catalog = {
+                name: code for name, code in load_admin1_catalog().items()
+                if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", batch_context, re.I)
+            }
+            art_instruction = ""
+            if batch_start == 0:
+                art_instruction = (
+                    "FILM ART DIRECTION (this batch only, same turn): first decide the film-level art direction — "
+                    "a memorable visual motif, purposeful motion rhythm, the story arc and the retention plan — "
+                    "and return it in the top-level art_direction object; then direct your scenes consistently with it. "
+                    "Read the full script context below, identify its story arc and retention curve, and return only one coherent direction. "
+                    f"Creative variation seed for this production: {creative_seed}. Use it only as a tie-breaker between equally grounded design choices; never let it alter facts.\n\n"
+                )
+            return (
+                f"Video art direction (locked for this film): {json.dumps(_director_prompt_art_direction(art_direction), ensure_ascii=False, separators=(',', ':'))}\n"
+                f"Live Remotion design capabilities (exact selectors and approved catalog): {compact_capabilities}\n"
+                f"Creative variation seed: {creative_seed}. Use it only to resolve equally suitable visual choices; story facts always win.\n"
+                f"Niche visual grammar: {json.dumps(dict(visual_grammar), ensure_ascii=False, separators=(',', ':'))}\n"
+                f"Approved film color palette (exact hex/semantic roles): {json.dumps(_current_scene_palette(), ensure_ascii=False, separators=(',', ':'))}\n"
+                f"Full-film story map, from the beginning through payoff:\n{story_map}\n"
+                f"Film-wide visual argument opportunities: {json.dumps(_director_prompt_argument_window(visual_argument_board, batch_start, batch_end), ensure_ascii=False, separators=(',', ':'))}\n"
+                "Choose the explanatory question and evidence BEFORE the template. These opportunities are alternatives, not a restricted component shortlist.\n"
+                f"This window covers {progress_start:.0%}–{progress_end:.0%} of the film. Treat its scenes as one connected passage in that full arc.\n"
+                f"Immediate setup just before this window: {before_context}\n"
+                f"Immediate narrative handoff after this window: {after_context}\n"
+                f"Available Natural Earth 1:10m state/prefecture features: {json.dumps(admin1_catalog, ensure_ascii=False)}.\n"
+                f"Film-wide short-copy budget: at most {overlay_budget} scenes; one scene of cooldown, weighted toward pivotal exact facts/entities. Graphics can explain without extra headlines.\n"
+                f"Direct only these scenes, preserving their global indices {batch_start}-{batch_end - 1}.\n"
+                "STRICT REMOTION DESIGN CONTRACT: Use exact live component/variant/template selectors and schema fields. Explain the scene-specific fact; preserve all supported custom design options.\n"
+                "The entire live palette is available; choose and vary evidence-supported families across the film. Aim near 30% purposeful graphics; retain clean media when it serves best.\n"
+                "Apply the system grounding/placement rules and supplied local fps. Return only the owned scenes.\n\n"
+                "EDITORIAL BEAT (same turn, no separate beats request): for each owned scene also return editorial_role, editorial_treatment, editorial_emphasis, editorial_highlight_kind, editorial_importance. Most scenes: treatment=none with empty emphasis so the image or clip can breathe. Nominate only genuinely consequential moments; an emphasis must be a 1-4 word phrase copied verbatim from that scene's narration.\n\n"
+                + art_instruction
+                + "\n".join(batch_lines)
+            )
+        try:
+            scene_max_tokens = max(1800, min(8000, int(os.environ.get("VIDZEO_EDITORIAL_DIRECTOR_SCENE_MAX_TOKENS", str(min(8000, 2400 * scene_batch_size))) or 2400 * scene_batch_size)))
+        except (TypeError, ValueError):
+            scene_max_tokens = min(8000, 2400 * scene_batch_size)
+        try:
+            scene_workers = max(1, min(4, int(os.environ.get("VIDZEO_EDITORIAL_DIRECTOR_SCENE_WORKERS", "4") or 4)))
+        except (TypeError, ValueError):
+            scene_workers = 3
+        scene_workers = int(budget.get('scene_workers', scene_workers))
+
+        def _batch_client():
+            # OpenRouterLLM keeps per-request retry history, so each live
+            # worker receives an isolated client. Test doubles are reused
+            # for backwards-compatible unit probes.
+            if hasattr(llm_client, "api_key") and hasattr(llm_client, "fallback_models"):
                 try:
-                    remaining = min(scene_timeout, deadline - time.monotonic() - repair_timeout)
-                    batch_deadline = time.monotonic() + remaining
-                    if remaining < _min_director_call_budget(budget.get('agent_wall_seconds')):
-                        raise TimeoutError("director scene planning budget exhausted")
-                    response = _bounded_chat(worker_client, remaining,
-                        user_prompt=batch_prompt + '\nFIRST PASS: For Diagram return template_recipe=null with grounded actors/links and layout intent for the separate composition pass. Return concise decisions, not repeated policy or reasoning.',
-                        system_prompt=_LLM_DIRECTOR_PROMPT,
-                        temperature=0.5,
-                        max_tokens=scene_max_tokens,
-                        json_mode=True,
-                        json_schema=scene_response_schema,
-                        json_schema_name="vidnets_scene_direction_v1",
-                        primary_timeout_share=0.65,
-                        max_attempts=director_retries,
-                        total_timeout_seconds=remaining,
+                    return llm_client.__class__(
+                        api_key=llm_client.api_key,
+                        model=getattr(llm_client, "model", None),
+                        fallback_models=list(getattr(llm_client, "fallback_models", ()) or ()),
+                        use_server_fallbacks=bool(getattr(llm_client, "use_server_fallbacks", False)),
                     )
-                    failure_stage = 'response_decoding'
-                    payload = _decode_director_json(response)
-                    decisions = payload.get("scenes") or payload.get("decisions") or []
-                    failure_stage = 'scene_index_coverage'
-                    if isinstance(decisions, list):
-                        for row in decisions:
-                            if isinstance(row, dict):
-                                index_value = row.get('scene_index')
-                                if isinstance(index_value, str) and index_value.strip().isdigit():
-                                    row['scene_index'] = int(index_value)
-                        # Full-film context can cause a model to return extra
-                        # scenes. Only this worker's owned indices may mutate.
-                        decisions = [row for row in decisions if isinstance(row, Mapping)
-                                     and isinstance(row.get("scene_index"), int)
-                                     and batch_start <= row["scene_index"] < batch_end]
-                    if not isinstance(decisions, list) or {row["scene_index"] for row in decisions} != set(range(batch_start, batch_end)) or len(decisions) != len(batch_lines):
-                        raise ValueError(f"scene batch {batch_start}-{batch_end - 1} returned an incomplete plan")
-                    # A concrete composition pass prevents the broad director
-                    # from always choosing the cheapest diagram template.
-                    # It shares this chunk's deadline and never discards a
-                    # successful scene when the optional design pass fails.
-                    for decision in decisions:
-                        _normalize_conflicting_frame_mode(decision, scene_texts[int(decision['scene_index'])])
-                        if str(decision.get('frame_mode') or '') != 'diagram':
+                except Exception:
+                    pass
+            return llm_client
+
+        def _direct_batch(batch):
+            batch_start, batch_end, batch_lines = batch
+            worker_client = _batch_client()
+            batch_prompt = _batch_prompt(batch_start, batch_end, batch_lines)
+            scene_palette = _current_scene_palette()
+            failure_stage = 'provider_request'
+            batch_route = None
+            try:
+                remaining = min(scene_timeout, deadline - time.monotonic() - repair_timeout)
+                batch_deadline = time.monotonic() + remaining
+                if remaining < _min_director_call_budget(budget.get('agent_wall_seconds')):
+                    raise TimeoutError("director scene planning budget exhausted")
+                response = _bounded_chat(worker_client, remaining,
+                    user_prompt=batch_prompt + '\nFIRST PASS: For Diagram return template_recipe=null with grounded actors/links and layout intent for the separate composition pass. Return concise decisions, not repeated policy or reasoning.',
+                    system_prompt=_LLM_DIRECTOR_PROMPT,
+                    temperature=0.5,
+                    max_tokens=scene_max_tokens,
+                    json_mode=True,
+                    json_schema=scene_response_schema,
+                    json_schema_name="vidnets_scene_direction_v1",
+                    primary_timeout_share=0.65,
+                    max_attempts=director_retries,
+                    total_timeout_seconds=remaining,
+                )
+                # Snapshot the route NOW: _model_route_record reads the
+                # mutable client state (last_model / attempt_history), and
+                # later calls on a shared client overwrite it before the
+                # completion loop records the route. Since P2 the fallback
+                # art-direction call runs on that same shared client
+                # between batch 0 and route recording, so a lazily built
+                # record would name the art call's model for the scene
+                # batch (and lose the scene fallback). The snapshot is
+                # taken before the composition pass below, which also
+                # chats on this worker client.
+                batch_route = _model_route_record(
+                    "scene_direction", worker_client, range(batch_start, batch_end))
+                failure_stage = 'response_decoding'
+                payload = _decode_director_json(response)
+                # P2: batch 0 carries the film-level art direction. Stash
+                # it before the coverage check below: even a batch whose
+                # scenes fail validation may still have usable art for the
+                # remaining batches.
+                if batch_start == 0 and isinstance(payload.get("art_direction"), dict):
+                    batch0_art.update(payload["art_direction"])
+                decisions = payload.get("scenes") or payload.get("decisions") or []
+                failure_stage = 'scene_index_coverage'
+                if isinstance(decisions, list):
+                    for row in decisions:
+                        if isinstance(row, dict):
+                            index_value = row.get('scene_index')
+                            if isinstance(index_value, str) and index_value.strip().isdigit():
+                                row['scene_index'] = int(index_value)
+                    # Full-film context can cause a model to return extra
+                    # scenes. Only this worker's owned indices may mutate.
+                    decisions = [row for row in decisions if isinstance(row, Mapping)
+                                 and isinstance(row.get("scene_index"), int)
+                                 and batch_start <= row["scene_index"] < batch_end]
+                if not isinstance(decisions, list) or {row["scene_index"] for row in decisions} != set(range(batch_start, batch_end)) or len(decisions) != len(batch_lines):
+                    raise ValueError(f"scene batch {batch_start}-{batch_end - 1} returned an incomplete plan")
+                # A concrete composition pass prevents the broad director
+                # from always choosing the cheapest diagram template.
+                # It shares this chunk's deadline and never discards a
+                # successful scene when the optional design pass fails.
+                for decision in decisions:
+                    _normalize_conflicting_frame_mode(decision, scene_texts[int(decision['scene_index'])])
+                    if str(decision.get('frame_mode') or '') != 'diagram':
+                        continue
+                    passage = str(scene_texts[int(decision.get('scene_index', batch_start))])
+                    try:
+                        existing_recipe = validate_template_recipe(decision.get('template_recipe'))
+                        quality_error = _diagram_recipe_quality_error(existing_recipe, scene_durations[int(decision.get('scene_index', batch_start))], fps)
+                        if quality_error:
+                            decision['template_recipe'] = None
+                            decision['_composition_error'] = quality_error
+                            decision['_composition_quality_rejected'] = True
+                            raise ValueError(quality_error)
+                        if _recipe_is_grounded(existing_recipe, passage) and _recipe_supports_visual_type(existing_recipe, VisualSceneType.DIAGRAM.value):
+                            decision.pop('_composition_error', None)
+                            decision.pop('_composition_quality_rejected', None)
+                            decision['_composition_pass'] = 'initial_composition_valid'
                             continue
-                        passage = str(scene_texts[int(decision.get('scene_index', batch_start))])
-                        try:
-                            existing_recipe = validate_template_recipe(decision.get('template_recipe'))
-                            quality_error = _diagram_recipe_quality_error(existing_recipe, scene_durations[int(decision.get('scene_index', batch_start))], fps)
-                            if quality_error:
-                                decision['template_recipe'] = None
-                                decision['_composition_error'] = quality_error
-                                decision['_composition_quality_rejected'] = True
-                                raise ValueError(quality_error)
-                            if _recipe_is_grounded(existing_recipe, passage) and _recipe_supports_visual_type(existing_recipe, VisualSceneType.DIAGRAM.value):
-                                decision.pop('_composition_error', None)
-                                decision.pop('_composition_quality_rejected', None)
-                                decision['_composition_pass'] = 'initial_composition_valid'
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                        # Invalid or ungrounded first-pass geometry cannot block
-                        # later repair just because a recipe dictionary exists.
-                        decision['template_recipe'] = None
-                        design_remaining = min(budget['composition_seconds'], batch_deadline + budget['composition_seconds'] - time.monotonic(), deadline - time.monotonic() - repair_timeout)
-                        if design_remaining < _min_director_call_budget(budget.get('agent_wall_seconds')):
-                            decision['_composition_pass'] = 'budget_exhausted'
-                            continue
-                        # Per-scene state cannot leak from a preceding recipe,
-                        # and a preflight rejection has no correction prompt.
-                        composition_user_prompt = None
-                        recipe_schema = None
-                        try:
-                            composition_client = worker_client
-                            if hasattr(worker_client, 'api_key') and hasattr(worker_client, 'fallback_models'):
-                                composition_model, composition_fallbacks = _composition_model_route(director_config, worker_client)
-                                decision['_composition_model_chain'] = [composition_model, *composition_fallbacks]
-                                composition_client = worker_client.__class__(
-                                    api_key=worker_client.api_key, model=composition_model,
-                                    fallback_models=composition_fallbacks, use_server_fallbacks=False)
-                            approved_nodes = validated_diagram_nodes(decision.get('diagram_nodes'), passage)
-                            approved_links = validated_diagram_links(decision.get('diagram_links'), approved_nodes, passage)
-                            if len(approved_nodes) < 2:
-                                raise ValueError('Composition has no approved actors')
-                            object_properties = {
-                                'actor_label': {'type': 'string', 'enum': [node['label'] for node in approved_nodes]},
-                                'kind': {'type': 'string', 'enum': ['sphere', 'cone', 'arrow', 'circle', 'line', 'rect', 'path']},
-                                'points': {'type':'array', 'maxItems':12, 'items':{'type':'object','additionalProperties':False,
-                                    'required':['x','y'], 'properties':{'x':{'type':'number','minimum':0,'maximum':100},'y':{'type':'number','minimum':0,'maximum':100}}}},
-                                **{key: {'type': ['number', 'null'], 'minimum': 0, 'maximum': 100} for key in ['x', 'y', 'width', 'height']},
-                                'color_role': {'type': 'string', 'enum': ['accent', 'secondary', 'primary', 'background']},
-                                'fill_role': {'type': ['string', 'null'], 'enum': ['accent', 'secondary', 'primary', 'background', 'none', None]},
-                                'closed': {'type': ['boolean', 'null']},
-                                'motion': {'type': 'string', 'enum': ['fade', 'scale', 'draw', 'wipe', 'rise']},
-                                'start_seconds': {'type': 'number', 'minimum': 0, 'maximum': 60},
-                            }
-                            recipe_schema = {'type': 'object', 'additionalProperties': False,
-                                'required': ['id', 'name', 'objects', 'layout'], 'properties': {
-                                    'layout': {'type': ['string', 'null'], 'enum': ['flow', 'vertical', 'branch', 'network', None]},
-                                    'id': {'type': 'string', 'maxLength': 64}, 'name': {'type': 'string', 'maxLength': 80},
-                                    'objects': {'type': 'array', 'minItems': 2, 'maxItems': 8, 'items': {
-                                        'type': 'object', 'additionalProperties': False, 'required': list(object_properties),
-                                        'properties': object_properties}}}}
-                            composition_user_prompt = (f'Full film context: {story_map}\nNiche grammar: {json.dumps(dict(visual_grammar), ensure_ascii=False)}\nApproved palette: {json.dumps(scene_palette)}\nSelected narration: {passage}\nFrame clock: {int(fps)} fps; scene duration: {scene_durations[int(decision.get("scene_index", batch_start))]} seconds.\n' +
-                                'COMPOSITION PASS: Return only a recipe for this selected direction: ' + json.dumps({key: decision.get(key) for key in ['scene_index', 'type', 'variant', 'visual_intent', 'diagram_nodes', 'diagram_links', 'motion_cues']}, ensure_ascii=False) +
-                                '\nQUALITY REPAIR: '+str(decision.get('_composition_error') or 'No prior layout')+'. Keep objects within x=6..94 and y=10..72. Separate actor labels horizontally or vertically; leave at least .65 seconds of hold after the final reveal. Occupy substantial distinct frame area; background plates and stacked duplicates do not count.\nAllowed kinds: sphere,cone,arrow,circle,line,rect,path. A path supplies 2–12 normalized points for a meaningful traced contour or flow. Geometric illustration only; no external images. Do not use anonymous circles as substitutes for people, machinery or animal anatomy. Use substantial subject-specific silhouettes, contours and relationships, with readable labels. ' +
-                                '\nReturn a compact layout draft: id,name,objects. Every object includes points: use [] for non-path shapes and 2–12 explicit x/y contour points for a path; source/target identifiers cannot replace its geometry. Draw 3–5 purposeful geometric objects, each bound to its exact actor_label from the approved nodes. Use percentages for positions/sizes, palette roles for colors, local seconds for starts. Reserve the bottom 25% for emphasis and subtitles. Use semantic lighting: dark or occluding regions use background, illuminated or emitting elements use primary, and accent is an annotation. The compiler places each actor label above its object; account for label space and the 16:9 canvas. Circle/sphere boxes use different percentage axes: a round object 22% wide needs 39% height in 16:9. Square percentage boxes shrink the visible disc. Occupy at least 10% distinct frame area with actual actors, not arrows or background plates. Choose positions and shapes that explain this specific mechanism. Do not emit the full Remotion layer format, decorative card rows or generic heading plates.')
-                            composition_user_prompt += '\nPrefer to set x,y,width,height to null and choose layout=flow|vertical|branch|network: the local actor-layout compiler will fit your semantic shapes and labels. Supply geometry only when a physical spatial relationship requires it. Keep meaningful contours and separate subject objects for every approved actor.'
-                            composition_system_prompt = 'You design original documentary explanatory compositions from a validated Remotion vocabulary. Explain the spoken mechanism visually. Preserve the full story context and all grounding rules. Main subject paths should be closed filled silhouettes using fill_role; connectors use fill_role=none. Keep distinct actors separated with clear gutters and overlap below 18 percent of the smaller actor. Use narration-aligned short reveals followed by readable holds, never scene-long drawing.'
-                            initial_composition_budget = max(6.0, min(design_remaining, design_remaining * 0.6))
-                            designed = _bounded_chat(composition_client, initial_composition_budget,
-                                user_prompt=composition_user_prompt,
-                                system_prompt=composition_system_prompt,
-                                temperature=.6, max_tokens=2200, json_mode=True, json_schema=recipe_schema,
-                                json_schema_name='vidnets_scene_composition_v1', primary_timeout_share=.8,
-                                max_attempts=1, total_timeout_seconds=initial_composition_budget,
+                    except (ValueError, TypeError):
+                        pass
+                    # Invalid or ungrounded first-pass geometry cannot block
+                    # later repair just because a recipe dictionary exists.
+                    decision['template_recipe'] = None
+                    design_remaining = min(budget['composition_seconds'], batch_deadline + budget['composition_seconds'] - time.monotonic(), deadline - time.monotonic() - repair_timeout)
+                    if design_remaining < _min_director_call_budget(budget.get('agent_wall_seconds')):
+                        decision['_composition_pass'] = 'budget_exhausted'
+                        continue
+                    # Per-scene state cannot leak from a preceding recipe,
+                    # and a preflight rejection has no correction prompt.
+                    composition_user_prompt = None
+                    recipe_schema = None
+                    try:
+                        composition_client = worker_client
+                        if hasattr(worker_client, 'api_key') and hasattr(worker_client, 'fallback_models'):
+                            composition_model, composition_fallbacks = _composition_model_route(director_config, worker_client)
+                            decision['_composition_model_chain'] = [composition_model, *composition_fallbacks]
+                            composition_client = worker_client.__class__(
+                                api_key=worker_client.api_key, model=composition_model,
+                                fallback_models=composition_fallbacks, use_server_fallbacks=False)
+                        approved_nodes = validated_diagram_nodes(decision.get('diagram_nodes'), passage)
+                        approved_links = validated_diagram_links(decision.get('diagram_links'), approved_nodes, passage)
+                        if len(approved_nodes) < 2:
+                            raise ValueError('Composition has no approved actors')
+                        object_properties = {
+                            'actor_label': {'type': 'string', 'enum': [node['label'] for node in approved_nodes]},
+                            'kind': {'type': 'string', 'enum': ['sphere', 'cone', 'arrow', 'circle', 'line', 'rect', 'path']},
+                            'points': {'type':'array', 'maxItems':12, 'items':{'type':'object','additionalProperties':False,
+                                'required':['x','y'], 'properties':{'x':{'type':'number','minimum':0,'maximum':100},'y':{'type':'number','minimum':0,'maximum':100}}}},
+                            **{key: {'type': ['number', 'null'], 'minimum': 0, 'maximum': 100} for key in ['x', 'y', 'width', 'height']},
+                            'color_role': {'type': 'string', 'enum': ['accent', 'secondary', 'primary', 'background']},
+                            'fill_role': {'type': ['string', 'null'], 'enum': ['accent', 'secondary', 'primary', 'background', 'none', None]},
+                            'closed': {'type': ['boolean', 'null']},
+                            'motion': {'type': 'string', 'enum': ['fade', 'scale', 'draw', 'wipe', 'rise']},
+                            'start_seconds': {'type': 'number', 'minimum': 0, 'maximum': 60},
+                        }
+                        recipe_schema = {'type': 'object', 'additionalProperties': False,
+                            'required': ['id', 'name', 'objects', 'layout'], 'properties': {
+                                'layout': {'type': ['string', 'null'], 'enum': ['flow', 'vertical', 'branch', 'network', None]},
+                                'id': {'type': 'string', 'maxLength': 64}, 'name': {'type': 'string', 'maxLength': 80},
+                                'objects': {'type': 'array', 'minItems': 2, 'maxItems': 8, 'items': {
+                                    'type': 'object', 'additionalProperties': False, 'required': list(object_properties),
+                                    'properties': object_properties}}}}
+                        composition_user_prompt = (f'Full film context: {story_map}\nNiche grammar: {json.dumps(dict(visual_grammar), ensure_ascii=False)}\nApproved palette: {json.dumps(scene_palette)}\nSelected narration: {passage}\nFrame clock: {int(fps)} fps; scene duration: {scene_durations[int(decision.get("scene_index", batch_start))]} seconds.\n' +
+                            'COMPOSITION PASS: Return only a recipe for this selected direction: ' + json.dumps({key: decision.get(key) for key in ['scene_index', 'type', 'variant', 'visual_intent', 'diagram_nodes', 'diagram_links', 'motion_cues']}, ensure_ascii=False) +
+                            '\nQUALITY REPAIR: '+str(decision.get('_composition_error') or 'No prior layout')+'. Keep objects within x=6..94 and y=10..72. Separate actor labels horizontally or vertically; leave at least .65 seconds of hold after the final reveal. Occupy substantial distinct frame area; background plates and stacked duplicates do not count.\nAllowed kinds: sphere,cone,arrow,circle,line,rect,path. A path supplies 2–12 normalized points for a meaningful traced contour or flow. Geometric illustration only; no external images. Do not use anonymous circles as substitutes for people, machinery or animal anatomy. Use substantial subject-specific silhouettes, contours and relationships, with readable labels. ' +
+                            '\nReturn a compact layout draft: id,name,objects. Every object includes points: use [] for non-path shapes and 2–12 explicit x/y contour points for a path; source/target identifiers cannot replace its geometry. Draw 3–5 purposeful geometric objects, each bound to its exact actor_label from the approved nodes. Use percentages for positions/sizes, palette roles for colors, local seconds for starts. Reserve the bottom 25% for emphasis and subtitles. Use semantic lighting: dark or occluding regions use background, illuminated or emitting elements use primary, and accent is an annotation. The compiler places each actor label above its object; account for label space and the 16:9 canvas. Circle/sphere boxes use different percentage axes: a round object 22% wide needs 39% height in 16:9. Square percentage boxes shrink the visible disc. Occupy at least 10% distinct frame area with actual actors, not arrows or background plates. Choose positions and shapes that explain this specific mechanism. Do not emit the full Remotion layer format, decorative card rows or generic heading plates.')
+                        composition_user_prompt += '\nPrefer to set x,y,width,height to null and choose layout=flow|vertical|branch|network: the local actor-layout compiler will fit your semantic shapes and labels. Supply geometry only when a physical spatial relationship requires it. Keep meaningful contours and separate subject objects for every approved actor.'
+                        composition_system_prompt = 'You design original documentary explanatory compositions from a validated Remotion vocabulary. Explain the spoken mechanism visually. Preserve the full story context and all grounding rules. Main subject paths should be closed filled silhouettes using fill_role; connectors use fill_role=none. Keep distinct actors separated with clear gutters and overlap below 18 percent of the smaller actor. Use narration-aligned short reveals followed by readable holds, never scene-long drawing.'
+                        initial_composition_budget = max(6.0, min(design_remaining, design_remaining * 0.6))
+                        designed = _bounded_chat(composition_client, initial_composition_budget,
+                            user_prompt=composition_user_prompt,
+                            system_prompt=composition_system_prompt,
+                            temperature=.6, max_tokens=2200, json_mode=True, json_schema=recipe_schema,
+                            json_schema_name='vidnets_scene_composition_v1', primary_timeout_share=.8,
+                            max_attempts=1, total_timeout_seconds=initial_composition_budget,
+                        )
+                        decision['_composition_model'] = str(getattr(composition_client, 'last_model', None) or getattr(composition_client, 'model', '') or '')
+                        draft = _decode_director_json(designed)
+                        draft['id'] = re.sub(r'[^a-z0-9-]+', '-', str(draft.get('id') or '').casefold()).strip('-')[:64].rstrip('-') or f'scene-{batch_start}-composition'
+                        approved_nodes = validated_diagram_nodes(decision.get('diagram_nodes'), passage)
+                        if 'objects' in draft:
+                            draft = _compile_designed_diagram_recipe(
+                                draft, approved_nodes, approved_links, scene_palette, passage,
+                                scene_durations[int(decision.get('scene_index', batch_start))], fps,
+                                f'scene-{batch_start}-composition',
                             )
-                            decision['_composition_model'] = str(getattr(composition_client, 'last_model', None) or getattr(composition_client, 'model', '') or '')
-                            draft = _decode_director_json(designed)
-                            draft['id'] = re.sub(r'[^a-z0-9-]+', '-', str(draft.get('id') or '').casefold()).strip('-')[:64].rstrip('-') or f'scene-{batch_start}-composition'
-                            approved_nodes = validated_diagram_nodes(decision.get('diagram_nodes'), passage)
-                            if 'objects' in draft:
-                                draft = _compile_designed_diagram_recipe(
-                                    draft, approved_nodes, approved_links, scene_palette, passage,
-                                    scene_durations[int(decision.get('scene_index', batch_start))], fps,
-                                    f'scene-{batch_start}-composition',
+                        candidate = validate_template_recipe(draft)
+                        quality_error = _diagram_recipe_quality_error(candidate, scene_durations[int(decision.get('scene_index', batch_start))], fps)
+                        if quality_error:
+                            decision['_composition_quality_rejected'] = True
+                            raise ValueError(quality_error)
+                        if _recipe_is_grounded(candidate, passage) and _recipe_supports_visual_type(candidate, VisualSceneType.DIAGRAM.value):
+                            decision['template_recipe'] = candidate
+                            decision['template_id'] = 'generated-recipe'
+                            decision.pop('_composition_error', None)
+                            decision.pop('_composition_quality_rejected', None)
+                            decision['_composition_pass'] = 'accepted'
+                        else:
+                            decision['_composition_pass'] = 'rejected_ungrounded'
+                    except Exception as design_error:
+                        decision['_composition_error'] = str(design_error)[:180]
+                        decision['_composition_attempt_count'] = 1
+                        # Reserve part of the bounded composition allowance
+                        # for one focused correction. A rejected geometry
+                        # gets a chance to fix its exact issue before the
+                        # scene is degraded to media-only.
+                        correction_budget = min(
+                            budget['composition_seconds'],
+                            batch_deadline + budget['composition_seconds'] - time.monotonic(),
+                            deadline - time.monotonic() - repair_timeout,
+                        )
+                        if correction_budget >= _min_director_call_budget(budget.get('agent_wall_seconds')) and composition_user_prompt and recipe_schema:
+                            try:
+                                corrected = _bounded_chat(composition_client, correction_budget,
+                                    user_prompt=composition_user_prompt + '\nCORRECTION PASS: The previous layout was rejected because: ' + str(design_error)[:220] + '. Redesign the shapes and positions to fix this exact issue. Keep the same approved actors, narration facts, palette, and visual argument; make each actor substantial and distinct, prevent label collisions, and leave a readable hold.',
+                                    system_prompt=composition_system_prompt, temperature=.45, max_tokens=2200,
+                                    json_mode=True, json_schema=recipe_schema,
+                                    json_schema_name='vidnets_scene_composition_repair_v1', primary_timeout_share=.8,
+                                    max_attempts=1, total_timeout_seconds=correction_budget,
                                 )
-                            candidate = validate_template_recipe(draft)
-                            quality_error = _diagram_recipe_quality_error(candidate, scene_durations[int(decision.get('scene_index', batch_start))], fps)
-                            if quality_error:
-                                decision['_composition_quality_rejected'] = True
-                                raise ValueError(quality_error)
-                            if _recipe_is_grounded(candidate, passage) and _recipe_supports_visual_type(candidate, VisualSceneType.DIAGRAM.value):
-                                decision['template_recipe'] = candidate
+                                decision['_composition_model'] = str(getattr(composition_client, 'last_model', None) or getattr(composition_client, 'model', '') or '')
+                                corrected_draft = _decode_director_json(corrected)
+                                corrected_recipe = _compile_designed_diagram_recipe(
+                                    corrected_draft, approved_nodes, approved_links, scene_palette, passage,
+                                    scene_durations[int(decision.get('scene_index', batch_start))], fps,
+                                    f'scene-{batch_start}-composition-repair',
+                                )
+                                decision['template_recipe'] = corrected_recipe
                                 decision['template_id'] = 'generated-recipe'
                                 decision.pop('_composition_error', None)
                                 decision.pop('_composition_quality_rejected', None)
-                                decision['_composition_pass'] = 'accepted'
-                            else:
-                                decision['_composition_pass'] = 'rejected_ungrounded'
-                        except Exception as design_error:
-                            decision['_composition_error'] = str(design_error)[:180]
-                            decision['_composition_attempt_count'] = 1
-                            # Reserve part of the bounded composition allowance
-                            # for one focused correction. A rejected geometry
-                            # gets a chance to fix its exact issue before the
-                            # scene is degraded to media-only.
-                            correction_budget = min(
-                                budget['composition_seconds'],
-                                batch_deadline + budget['composition_seconds'] - time.monotonic(),
-                                deadline - time.monotonic() - repair_timeout,
-                            )
-                            if correction_budget >= _min_director_call_budget(budget.get('agent_wall_seconds')) and composition_user_prompt and recipe_schema:
-                                try:
-                                    corrected = _bounded_chat(composition_client, correction_budget,
-                                        user_prompt=composition_user_prompt + '\nCORRECTION PASS: The previous layout was rejected because: ' + str(design_error)[:220] + '. Redesign the shapes and positions to fix this exact issue. Keep the same approved actors, narration facts, palette, and visual argument; make each actor substantial and distinct, prevent label collisions, and leave a readable hold.',
-                                        system_prompt=composition_system_prompt, temperature=.45, max_tokens=2200,
-                                        json_mode=True, json_schema=recipe_schema,
-                                        json_schema_name='vidnets_scene_composition_repair_v1', primary_timeout_share=.8,
-                                        max_attempts=1, total_timeout_seconds=correction_budget,
-                                    )
-                                    decision['_composition_model'] = str(getattr(composition_client, 'last_model', None) or getattr(composition_client, 'model', '') or '')
-                                    corrected_draft = _decode_director_json(corrected)
-                                    corrected_recipe = _compile_designed_diagram_recipe(
-                                        corrected_draft, approved_nodes, approved_links, scene_palette, passage,
-                                        scene_durations[int(decision.get('scene_index', batch_start))], fps,
-                                        f'scene-{batch_start}-composition-repair',
-                                    )
-                                    decision['template_recipe'] = corrected_recipe
-                                    decision['template_id'] = 'generated-recipe'
-                                    decision.pop('_composition_error', None)
-                                    decision.pop('_composition_quality_rejected', None)
-                                    decision['_composition_pass'] = 'accepted_after_correction'
-                                    decision['_composition_attempt_count'] = 2
-                                except Exception as correction_error:
-                                    # Keep the original composition failure as the
-                                    # primary status. The focused correction is a
-                                    # recovery attempt; its failure should remain
-                                    # visible without obscuring why recovery began.
-                                    decision['_composition_pass'] = 'preserved_scene:' + type(design_error).__name__
-                                    decision['_composition_error'] = (
-                                        'initial=' + str(design_error)[:90]
-                                        + '; correction=' + type(correction_error).__name__
-                                        + ': ' + str(correction_error)[:70]
-                                    )
-                                    decision['_composition_attempt_count'] = 2
-                            else:
+                                decision['_composition_pass'] = 'accepted_after_correction'
+                                decision['_composition_attempt_count'] = 2
+                            except Exception as correction_error:
+                                # Keep the original composition failure as the
+                                # primary status. The focused correction is a
+                                # recovery attempt; its failure should remain
+                                # visible without obscuring why recovery began.
                                 decision['_composition_pass'] = 'preserved_scene:' + type(design_error).__name__
-                    return batch_start, decisions, worker_client, None
-                except Exception as batch_error:
-                    batch_error.director_failure_stage = failure_stage
-                    return batch_start, [], worker_client, batch_error
+                                decision['_composition_error'] = (
+                                    'initial=' + str(design_error)[:90]
+                                    + '; correction=' + type(correction_error).__name__
+                                    + ': ' + str(correction_error)[:70]
+                                )
+                                decision['_composition_attempt_count'] = 2
+                        else:
+                            decision['_composition_pass'] = 'preserved_scene:' + type(design_error).__name__
+                return batch_start, decisions, worker_client, None, batch_route
+            except Exception as batch_error:
+                batch_error.director_failure_stage = failure_stage
+                return batch_start, [], worker_client, batch_error, batch_route
 
-            completed = {}
-            failed_scene_indices = []
-            scene_batch_failures = []
-            executor = ThreadPoolExecutor(max_workers=min(scene_workers, max(1, len(batches))), thread_name_prefix="director-scene")
+        completed = {}
+        failed_scene_indices = []
+        scene_batch_failures = []
+        # P2: batch 0 runs first, synchronously — it carries the film-level
+        # art direction in the same turn as its scenes. Later batches then
+        # prompt with that art instead of the fallback.
+        batch0_worker = llm_client
+        if batches:
+            _b0_start, _b0_decisions, batch0_worker, _b0_error, _b0_route = _direct_batch(batches[0])
+            completed[_b0_start] = (_b0_decisions, batch0_worker, _b0_error, _b0_route)
+        if _art_payload_usable(batch0_art):
+            art_direction = _normalize_art_direction(batch0_art)
+            art_route = _model_route_record("art_direction", batch0_worker)
+            art_route["stage"] = "art_direction_from_scene_batch_0"
+            model_routes = [art_route]
+        else:
+            # Fallback: the standalone art-direction call, exactly as
+            # before. Only this path files vidnets_art_direction_v1.
             try:
-                futures = {executor.submit(_direct_batch, batch): batch[0] for batch in batches}
+                art_call_timeout = max(.01, min(art_timeout, deadline - time.monotonic()))
+                art_response = _bounded_chat(
+                    llm_client, art_call_timeout,
+                    user_prompt=(f"Creative variation seed for this production: {creative_seed}. Use it only as a tie-breaker between equally grounded design choices; never let it alter facts. "
+                                 "Set the video-level art direction. Read the full script context, identify its story arc and retention curve, "
+                                 "then set a memorable visual motif and purposeful motion rhythm. Return only one coherent direction.\n\n" + user_prompt),
+                    system_prompt=_ART_DIRECTION_PROMPT,
+                    temperature=0.35,
+                    max_tokens=900,
+                    json_mode=True,
+                    json_schema=_ART_DIRECTION_SCHEMA,
+                    json_schema_name="vidnets_art_direction_v1",
+                    primary_timeout_share=.8,
+                    max_attempts=director_retries,
+                    total_timeout_seconds=art_call_timeout,
+                )
+                art_payload = _decode_director_json(art_response)
+                art_route = _model_route_record("art_direction", llm_client)
+            except Exception as art_error:
+                # A slow or unavailable art-direction call must not prevent the
+                # separate, smaller scene-direction requests from using the LLM.
+                art_payload = {}
+                art_route = _model_route_record("art_direction", llm_client)
+                art_route["status"] = "failed"
+                art_route["error_type"] = type(art_error).__name__
+                metadata["art_direction_fallback"] = type(art_error).__name__
+                print(f"   [LLM Director] Art-direction request failed; continuing with bounded scene batches ({type(art_error).__name__})")
+            # Older clients and test doubles may return the former all-in-one
+            # response. Preserve that load path while live OpenRouter uses the
+            # video-direction pass followed by bounded scene batches.
+            if isinstance(art_payload.get("scenes"), list):
+                art_route["stage"] = "art_direction_and_scenes"
+                scene_decisions = art_payload.get("scenes") or []
+                art_direction = fallback_art_direction
+                model_routes = [art_route]
+            else:
+                art_direction = _normalize_art_direction(art_payload)
+                model_routes = [art_route]
+        art_attempt_history = list(art_route.get("attempt_history") or [])
+        # The legacy all-in-one art response already supplied every scene;
+        # its batches never ran, so there is nothing to complete.
+        _batches_to_complete = [] if scene_decisions else batches
+        if not scene_decisions and len(batches) > 1:
+            executor = ThreadPoolExecutor(max_workers=min(scene_workers, max(1, len(batches) - 1)), thread_name_prefix="director-scene")
+            try:
+                futures = {executor.submit(_direct_batch, batch): batch[0] for batch in batches[1:]}
                 stage_remaining = max(0.0, min(scene_stage_timeout, deadline - time.monotonic() - repair_timeout))
                 done, pending = wait(futures, timeout=stage_remaining)
                 for future in done:
-                    start, decisions, worker_client, batch_error = future.result()
-                    completed[start] = (decisions, worker_client, batch_error)
+                    start, decisions, worker_client, batch_error, batch_route = future.result()
+                    completed[start] = (decisions, worker_client, batch_error, batch_route)
                 for future in pending:
                     future.cancel()
-                    completed[futures[future]] = ([], llm_client, TimeoutError("director scene planning deadline exceeded"))
+                    completed[futures[future]] = ([], llm_client, TimeoutError("director scene planning deadline exceeded"), None)
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
-            for batch_start, batch_end, _batch_lines, _batch_prompt in batches:
-                decisions, worker_client, batch_error = completed[batch_start]
-                if batch_error is not None:
-                    failed_scene_indices.extend(range(batch_start, batch_end))
-                    scene_batch_failures.append({
-                        "scene_indices": list(range(batch_start, batch_end)),
-                        "error_type": type(batch_error).__name__,
-                        "failure_stage": getattr(batch_error, 'director_failure_stage', 'deadline'),
-                        "reason": str(batch_error)[:400],
-                    })
-                    route = _model_route_record("scene_direction", worker_client, range(batch_start, batch_end))
-                    route['status'] = 'failed'
-                    model_routes.append(route)
-                    metadata.setdefault("scene_attempt_history", []).extend(list(route.get("attempt_history") or []))
-                    print(f"   [LLM Director] Scene batch {batch_start}-{batch_end - 1} failed; only these beats will use local direction ({type(batch_error).__name__}: {str(batch_error)[:240]})")
-                    continue
-                for decision in decisions:
-                    is_diagram = (
-                        str(decision.get("frame_mode") or "").lower() == "diagram"
-                        or str(decision.get("type") or "").lower() == "diagram"
-                        or str(decision.get("_frame_mode_normalized") or "").startswith("diagram_")
-                    )
-                    if not is_diagram:
-                        continue
-                    recipe = decision.get("template_recipe")
-                    composition_status = str(decision.get("_composition_pass") or "")
-                    if isinstance(recipe, Mapping) and composition_status in {"accepted", "accepted_after_correction", "initial_composition_valid"}:
-                        continue
-                    scene_index = int(decision.get("scene_index", batch_start))
-                    passage = scene_texts[scene_index] if scene_index < len(scene_texts) else ""
-                    if _recover_explanatory_decision(decision, passage):
-                        metadata.setdefault("grounded_specialist_recovery_scene_indices", []).append(scene_index)
-                        continue
-                    # Geometry failure does not invalidate separately approved
-                    # narration-grounded copy. Keep that short selection over
-                    # the verified media; the film-wide copy budget and cooldown
-                    # below still decide whether it is displayed.
-                    preserved_copy = (
-                        str(decision.get('overlay_policy') or '') == 'single_short_highlight'
-                        and bool(str(decision.get('display_text') or '').strip())
-                        and _valid_director_copy(passage, decision.get('display_text'), decision.get('source_span'))
-                    )
-                    copy_fields = {key: decision.get(key) for key in ('display_text', 'source_span', 'emphasis_spans')}
-                    asset = media_items[scene_index] if media_items and scene_index < len(media_items) and isinstance(media_items[scene_index], Mapping) else {}
-                    media_kind = str(asset.get("media_type") or asset.get("type") or "").lower()
-                    media_component = VisualSceneType.SMART_VIDEO.value if media_kind in {"video", "youtube", "clip", "mp4"} else VisualSceneType.SMART_IMAGE.value
-                    decision.update({
-                        "type": media_component,
-                        "variant": "full_bleed" if media_component == VisualSceneType.SMART_VIDEO.value else "full_bleed_cinematic",
-                        "frame_mode": "media_only",
-                        "overlay_policy": "none",
-                        "display_text": "",
-                        "source_span": "",
-                        "emphasis_spans": [],
-                        "template_id": "full-bleed",
-                        "template_recipe": {},
-                        "diagram_nodes": [],
-                        "motion_cues": [cue for cue in decision.get("motion_cues", []) if isinstance(cue, Mapping) and cue.get("element") == "image"][:1],
-                        "visual_intent": _composition_media_fallback_intent(
-                            scene_texts[scene_index] if scene_index < len(scene_texts) else "",
-                            media_kind,
-                        ),
-                        "_composition_fallback": composition_status or "missing_recipe",
-                    })
-                    if preserved_copy:
-                        decision.update(copy_fields)
-                        decision.update(type=VisualSceneType.KINETIC_TEXT.value,
-                                        variant='mask_slide_up', frame_mode='kinetic',
-                                        visual_role='media_overlay', template_id='keyword-reveal',
-                                        overlay_policy='single_short_highlight')
-                        decision['visual_intent'] = (
-                            'Keep the verified subject visible; reveal only this exact narration-grounded '
-                            'highlight with a tight text-sized backing and separate caption band: '
-                            + str(copy_fields['display_text']))
-                        metadata.setdefault('preserved_composition_copy_scene_indices', []).append(scene_index)
-                    metadata.setdefault("composition_fallback_scene_indices", []).append(scene_index)
-                scene_decisions.extend(decisions)
-                route = _model_route_record(
-                    "scene_direction",
-                    worker_client,
-                    range(batch_start, batch_end),
-                )
+        for batch_start, batch_end, _batch_lines in _batches_to_complete:
+            decisions, worker_client, batch_error, batch_route = completed[batch_start]
+            if batch_error is not None:
+                failed_scene_indices.extend(range(batch_start, batch_end))
+                scene_batch_failures.append({
+                    "scene_indices": list(range(batch_start, batch_end)),
+                    "error_type": type(batch_error).__name__,
+                    "failure_stage": getattr(batch_error, 'director_failure_stage', 'deadline'),
+                    "reason": str(batch_error)[:400],
+                })
+                # Prefer the route snapshotted at call time: the worker
+                # client may have been reused by later calls since.
+                route = batch_route or _model_route_record("scene_direction", worker_client, range(batch_start, batch_end))
+                route['status'] = 'failed'
                 model_routes.append(route)
-                metadata.setdefault("scene_attempt_history", []).extend(
-                    list(route.get("attempt_history") or [])
+                metadata.setdefault("scene_attempt_history", []).extend(list(route.get("attempt_history") or []))
+                print(f"   [LLM Director] Scene batch {batch_start}-{batch_end - 1} failed; only these beats will use local direction ({type(batch_error).__name__}: {str(batch_error)[:240]})")
+                continue
+            for decision in decisions:
+                is_diagram = (
+                    str(decision.get("frame_mode") or "").lower() == "diagram"
+                    or str(decision.get("type") or "").lower() == "diagram"
+                    or str(decision.get("_frame_mode_normalized") or "").startswith("diagram_")
                 )
-            if failed_scene_indices:
-                metadata["local_fallback_scene_indices"] = sorted(set(failed_scene_indices))
-                metadata["scene_batch_failures"] = scene_batch_failures
+                if not is_diagram:
+                    continue
+                recipe = decision.get("template_recipe")
+                composition_status = str(decision.get("_composition_pass") or "")
+                if isinstance(recipe, Mapping) and composition_status in {"accepted", "accepted_after_correction", "initial_composition_valid"}:
+                    continue
+                scene_index = int(decision.get("scene_index", batch_start))
+                passage = scene_texts[scene_index] if scene_index < len(scene_texts) else ""
+                if _recover_explanatory_decision(decision, passage):
+                    metadata.setdefault("grounded_specialist_recovery_scene_indices", []).append(scene_index)
+                    continue
+                # Geometry failure does not invalidate separately approved
+                # narration-grounded copy. Keep that short selection over
+                # the verified media; the film-wide copy budget and cooldown
+                # below still decide whether it is displayed.
+                preserved_copy = (
+                    str(decision.get('overlay_policy') or '') == 'single_short_highlight'
+                    and bool(str(decision.get('display_text') or '').strip())
+                    and _valid_director_copy(passage, decision.get('display_text'), decision.get('source_span'))
+                )
+                copy_fields = {key: decision.get(key) for key in ('display_text', 'source_span', 'emphasis_spans')}
+                asset = media_items[scene_index] if media_items and scene_index < len(media_items) and isinstance(media_items[scene_index], Mapping) else {}
+                media_kind = str(asset.get("media_type") or asset.get("type") or "").lower()
+                media_component = VisualSceneType.SMART_VIDEO.value if media_kind in {"video", "youtube", "clip", "mp4"} else VisualSceneType.SMART_IMAGE.value
+                decision.update({
+                    "type": media_component,
+                    "variant": "full_bleed" if media_component == VisualSceneType.SMART_VIDEO.value else "full_bleed_cinematic",
+                    "frame_mode": "media_only",
+                    "overlay_policy": "none",
+                    "display_text": "",
+                    "source_span": "",
+                    "emphasis_spans": [],
+                    "template_id": "full-bleed",
+                    "template_recipe": {},
+                    "diagram_nodes": [],
+                    "motion_cues": [cue for cue in decision.get("motion_cues", []) if isinstance(cue, Mapping) and cue.get("element") == "image"][:1],
+                    "visual_intent": _composition_media_fallback_intent(
+                        scene_texts[scene_index] if scene_index < len(scene_texts) else "",
+                        media_kind,
+                    ),
+                    "_composition_fallback": composition_status or "missing_recipe",
+                })
+                if preserved_copy:
+                    decision.update(copy_fields)
+                    decision.update(type=VisualSceneType.KINETIC_TEXT.value,
+                                    variant='mask_slide_up', frame_mode='kinetic',
+                                    visual_role='media_overlay', template_id='keyword-reveal',
+                                    overlay_policy='single_short_highlight')
+                    decision['visual_intent'] = (
+                        'Keep the verified subject visible; reveal only this exact narration-grounded '
+                        'highlight with a tight text-sized backing and separate caption band: '
+                        + str(copy_fields['display_text']))
+                    metadata.setdefault('preserved_composition_copy_scene_indices', []).append(scene_index)
+                metadata.setdefault("composition_fallback_scene_indices", []).append(scene_index)
+            scene_decisions.extend(decisions)
+            # Prefer the route snapshotted at call time: the worker client
+            # may have been reused by later calls since.
+            route = batch_route or _model_route_record(
+                "scene_direction",
+                worker_client,
+                range(batch_start, batch_end),
+            )
+            model_routes.append(route)
+            metadata.setdefault("scene_attempt_history", []).extend(
+                list(route.get("attempt_history") or [])
+            )
+        if failed_scene_indices:
+            metadata["local_fallback_scene_indices"] = sorted(set(failed_scene_indices))
+            metadata["scene_batch_failures"] = scene_batch_failures
 
         if not scene_decisions:
             failure_type = next((row.get("error_type") for row in scene_batch_failures if row.get("error_type")), "")
@@ -4602,6 +4746,10 @@ def _plan_llm_scenes(
             revision_rows = [row for row in revision_rows if row in thin_rows or row in retained or 'too sparse' in str(row.get('_composition_error') or '')]
         if revision_rows:
             metadata['quality_revisions'] = []
+            # P7: round 2 must not re-file the identical prompt for scenes
+            # round 1 failed to fix. Rejection reasons recorded below are
+            # fed back into the next round's prompt per scene.
+            rejection_reasons = {}
             for round_index in range(2):
                 remaining = min(20.0, deadline - time.monotonic() - repair_timeout)
                 if remaining < 6:
@@ -4628,11 +4776,24 @@ def _plan_llm_scenes(
                             }
                             for idx in chunk_indices
                         ]
+                        # P7: tell the model why the previous attempt was
+                        # rejected, so round 2 fixes the cause instead of
+                        # re-filing the same failing approach.
+                        rejection_lines = []
+                        for owned in owned_scenes:
+                            reason = rejection_reasons.get(owned['scene_index'])
+                            if reason:
+                                owned['previous_attempt_rejected'] = reason
+                                rejection_lines.append(f"Scene {owned['scene_index']}: {reason}")
+                        rejection_note = (
+                            "\nPREVIOUS ATTEMPTS REJECTED - fix the stated problem for each scene below; do not repeat the rejected approach:\n" + "\n".join(rejection_lines)
+                            if rejection_lines else ""
+                        )
                         indices_label = ', '.join(map(str, chunk_indices))
                         token_budget = min(4000, max(1800, len(chunk) * 600))
                         response = _bounded_chat(
                             worker, call_budget,
-                            user_prompt='Revise ONLY scenes ' + indices_label + '. The film overuses sparse diagrams. Retain the full story arc and niche. Choose verified media or a grounded specialist that explains this beat. Preserve the explanatory purpose. You may return a grounded specialist or a materially different Diagram recipe with approved actors and relationships; do not substitute a generic title for a mechanism. Return supported components only. Keep approved copy exact, optional and brief; do not invent facts. Return complete scene rows for each owned scene from the usual schema.\n' + user_prompt + '\nOwned scenes:\n' + json.dumps(owned_scenes),
+                            user_prompt='Revise ONLY scenes ' + indices_label + '. The film overuses sparse diagrams. Retain the full story arc and niche. Choose verified media or a grounded specialist that explains this beat. Preserve the explanatory purpose. You may return a grounded specialist or a materially different Diagram recipe with approved actors and relationships; do not substitute a generic title for a mechanism. Return supported components only. Keep approved copy exact, optional and brief; do not invent facts. Return complete scene rows for each owned scene from the usual schema.\n' + user_prompt + rejection_note + '\nOwned scenes:\n' + json.dumps(owned_scenes),
                             system_prompt=_LLM_DIRECTOR_PROMPT, json_mode=True, json_schema=scene_response_schema,
                             json_schema_name='vidnets_scene_quality_revision_v1', temperature=.35, max_tokens=token_budget,
                             max_attempts=1, total_timeout_seconds=call_budget, primary_timeout_share=.8
@@ -4662,8 +4823,11 @@ def _plan_llm_scenes(
                     requested = {row['scene_index'] for row in revision_rows}
                     supported_types = set(_director_runtime_capabilities()['visual_systems'])
                     accepted = {}
+                    rejected = {}
                     for replacement in revised:
                         if not isinstance(replacement, dict) or replacement.get('scene_index') not in requested or replacement.get('type') not in supported_types:
+                            if isinstance(replacement, dict) and replacement.get('scene_index') in requested:
+                                rejected[replacement['scene_index']] = f"unsupported_type:{replacement.get('type')}"
                             continue
                         idx = replacement['scene_index']
                         _normalize_conflicting_frame_mode(replacement, scene_texts[idx])
@@ -4671,17 +4835,28 @@ def _plan_llm_scenes(
                         if recipe:
                             try:
                                 recipe = validate_template_recipe(recipe)
-                                if not _recipe_is_grounded(recipe, scene_texts[idx]) or not _recipe_supports_visual_type(recipe, replacement['type'], bool((replacement.get('map_shot') or {}).get('enabled'))):
+                                if not _recipe_is_grounded(recipe, scene_texts[idx]):
+                                    rejected[idx] = "recipe_ungrounded"
                                     continue
-                                if replacement.get('frame_mode') == 'diagram' and _diagram_recipe_quality_error(recipe, scene_durations[idx], fps):
+                                if not _recipe_supports_visual_type(recipe, replacement['type'], bool((replacement.get('map_shot') or {}).get('enabled'))):
+                                    rejected[idx] = "recipe_type_mismatch"
+                                    continue
+                                quality_error = _diagram_recipe_quality_error(recipe, scene_durations[idx], fps)
+                                if replacement.get('frame_mode') == 'diagram' and quality_error:
+                                    rejected[idx] = f"diagram_recipe_quality:{quality_error}"
                                     continue
                                 replacement['template_recipe'] = recipe
                                 replacement['_composition_pass'] = 'initial_composition_valid'
-                            except (TypeError, ValueError):
+                            except (TypeError, ValueError) as exc:
+                                rejected[idx] = f"recipe_invalid:{type(exc).__name__}"
                                 continue
                         elif replacement.get('frame_mode') == 'diagram' and not _recover_explanatory_decision(replacement, scene_texts[idx]):
+                            rejected[idx] = "diagram_recovery_failed"
                             continue
                         accepted[idx] = replacement
+                    # P7: carry this round's rejection reasons into round 2.
+                    rejection_reasons.update({idx: reason for idx, reason in rejected.items() if idx not in accepted})
+                    revision_failures.extend({'scene_index': idx, 'error_type': 'rejected', 'reason': reason} for idx, reason in rejected.items())
                     for row in scene_decisions:
                         if row['scene_index'] in accepted:
                             replacement = accepted[row['scene_index']]
@@ -4919,6 +5094,27 @@ def _plan_llm_scenes(
             director_config=director_config,
             metadata=metadata,
         )
+
+        # P1: beats folded into the director's turn. Derive the editorial
+        # beats from the direction decisions themselves so no separate
+        # vidzeo_editorial_beats_v1 request is filed. A failure here must
+        # never break the plan: the caller falls back to the standalone
+        # planner when the metadata carries no direction beats.
+        try:
+            from ..editorial_brain import beats_from_direction
+            _direction_beats = beats_from_direction(parsed, scene_texts, {
+                **(director_config or {}),
+                "_editorial_scene_starts": [
+                    sum(float(scene_durations[idx]) for idx in range(index))
+                    for index in range(len(scene_texts))
+                ],
+                "_editorial_total_duration": sum(float(value) for value in scene_durations),
+            })
+            if _direction_beats is not None:
+                metadata["editorial_beats"] = _direction_beats
+                metadata["editorial_beats_source"] = "direction"
+        except Exception:
+            pass
 
         # Copy repair is an LLM stage too. Finalize the route summary only
         # after every director call has completed so a repair-model fallback

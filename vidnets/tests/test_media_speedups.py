@@ -1,10 +1,12 @@
 """Tests for the Nov 10, 2026 media speedups.
 
-1. Parallel YT downloads: ranged-download workers (default 6, cap 8, with
-   a tiered small-host memory fit instead of the flat 2-worker cap under
-   12 GB), pool probe workers (default 10, cap 12), shared-source batch
-   workers (default 6, cap 8) and batch deadline (default 300s, was 120s).
-2. Vision gate pool 6 -> 12 (env VIDZEO_VISUAL_GATE_WORKERS wins).
+1. Parallel YT downloads: ranged-download workers (spec: YT Clip
+   Workers 2-4, default 4, with a tiered small-host memory fit instead
+   of the flat 2-worker cap under 12 GB), pool probe workers (default
+   10, cap 12), shared-source batch workers (default 6, cap 8) and
+   batch deadline (default 300s, was 120s).
+2. Vision gate pool spec 4-8 (default 8, env VIDZEO_VISUAL_GATE_WORKERS
+   wins, clamped to the spec range).
 3. Tighter pre-filter: the per-scene top-12 pool drops entries scoring below
    VIDZEO_VISUAL_RELATIVE_FLOOR (default 0.5) times the best metadata score,
    while always keeping at least the finalist count — vision never receives
@@ -16,6 +18,7 @@
    test_media_selection_spec.py / test_web_candidate_pool.py.
 """
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -35,12 +38,14 @@ class TestRangedDownloadWorkers(unittest.TestCase):
         from services.youtube_pipeline_v2 import _ranged_download_worker_limit
 
         # This VM: 7.9 GB total, ~1.7 GB available. The old flat cap forced
-        # 2 workers on every host under 12 GB; the tiered cap allows 4.
-        self.assertEqual(_ranged_download_worker_limit(6, 1759, 8 * 1024**3), 4)
-        self.assertEqual(_ranged_download_worker_limit(8, 1759, 8 * 1024**3), 4)
+        # 2 workers on every host under 12 GB; the total-RAM tiers allow 6
+        # (the old (available-256)//320 rule fitted 4 here). A running
+        # job holding memory no longer collapses the fit.
+        self.assertEqual(_ranged_download_worker_limit(6, 1759, 8 * 1024**3), 6)
+        self.assertEqual(_ranged_download_worker_limit(8, 1759, 8 * 1024**3), 6)
         # Genuinely small hosts (< 6 GB total) still stay at 2.
         self.assertEqual(_ranged_download_worker_limit(6, 5000, 5 * 1024**3), 2)
-        # Big hosts are bound only by the request and the per-worker allowance.
+        # Big hosts are bound only by the request and the total-RAM tier.
         self.assertEqual(_ranged_download_worker_limit(8, 5000, 16 * 1024**3), 8)
         # Tight memory scales down on its own whatever the host size.
         self.assertEqual(_ranged_download_worker_limit(8, 300, 16 * 1024**3), 1)
@@ -54,10 +59,11 @@ class TestRangedDownloadWorkers(unittest.TestCase):
         )
 
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_ranged_download_workers(), 6)
+            # Spec (Vidzeo Local thread pools): YT Clip Workers 2-4 —
+            # default 4, hard cap 4, even when the caller asks for more.
+            self.assertEqual(_ranged_download_workers(), 4)
             self.assertEqual(_ranged_download_workers(download_concurrency=3), 3)
-            # Hard cap 8, even when the caller asks for more.
-            self.assertEqual(_ranged_download_workers(download_concurrency=20), 8)
+            self.assertEqual(_ranged_download_workers(download_concurrency=20), 4)
             # Memory fit still applies when host memory is known.
             self.assertEqual(
                 _ranged_download_workers(available_mb=1759, total_bytes=8 * 1024**3),
@@ -65,8 +71,8 @@ class TestRangedDownloadWorkers(unittest.TestCase):
             )
             # Requested count (pre-fit, used by the telemetry receipt)
             # is the same parsing without the memory clamp.
-            self.assertEqual(_requested_download_workers(), 6)
-            self.assertEqual(_requested_download_workers(download_concurrency=20), 8)
+            self.assertEqual(_requested_download_workers(), 4)
+            self.assertEqual(_requested_download_workers(download_concurrency=20), 4)
             self.assertEqual(
                 _requested_download_workers(download_concurrency=3), 3)
         with mock.patch.dict(
@@ -116,11 +122,13 @@ class TestPoolDownloadHelpers(unittest.TestCase):
 
 
 class TestVisionGateWorkers(unittest.TestCase):
-    def test_gate_workers_default_twelve(self):
+    def test_gate_workers_default_eight(self):
+        # Spec (Vidzeo Local thread pools): Vision 4-8. The Nov 22 local
+        # tuning ran 12; the user ordered the spec values applied verbatim.
         from services.media_resolution_coordinator import _visual_gate_workers
 
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_visual_gate_workers(38), 12)
+            self.assertEqual(_visual_gate_workers(38), 8)
             self.assertEqual(_visual_gate_workers(3), 3)
             self.assertEqual(_visual_gate_workers(0), 1)
         with mock.patch.dict(
@@ -130,7 +138,7 @@ class TestVisionGateWorkers(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"VIDZEO_VISUAL_GATE_WORKERS": "99"}, clear=True
         ):
-            self.assertEqual(_visual_gate_workers(38), 24)
+            self.assertEqual(_visual_gate_workers(38), 8)
 
     def test_relative_floor_default_and_clamp(self):
         from services.media_resolution_coordinator import _visual_relative_floor
@@ -323,6 +331,12 @@ class TestSparePoolReuse(unittest.TestCase):
                  "forbidden_subjects": [],
                  "source_policy": {"visual_verification_required": True, "strict_real_media": True}},
             ]
+            for scene in scenes:
+                scene["visual_requirement"] = {
+                    "canonical_entity": "BNSF",
+                    "requirement_hash": scene["scene_id"],
+                }
+            reviewed = []
 
             def web_lane(scene, _cancel):
                 if scene["scene_index"] == 2:
@@ -332,8 +346,15 @@ class TestSparePoolReuse(unittest.TestCase):
                          "title": "BNSF locomotive snow", "score": 90,
                          "url": f"https://images.example/{os.path.basename(path)}"}]
 
-            def verify(_scene, _candidate):
-                return {"accepted": True, "status": "accepted", "score": 90}
+            def verify(scene, candidate):
+                path = candidate["path"]
+                reviewed.append((scene["scene_id"], path))
+                return {
+                    "accepted": True, "status": "accepted", "score": 90,
+                    "visual_checked": True, "visual_available": True, "semantic_verified": True,
+                    "verified_requirement_hash": scene["visual_requirement"]["requirement_hash"],
+                    "verified_asset_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                }
 
             result = resolve_storyboard_media_v2(
                 scenes,
@@ -351,6 +372,8 @@ class TestSparePoolReuse(unittest.TestCase):
             self.assertEqual(result[2].selected_path, shared)
             self.assertEqual(result[2].status, "accepted")
             self.assertEqual(result[2].fallback_reason, "spare_pool_reuse")
+            self.assertIn(("scene-2", shared), reviewed)
+            self.assertEqual(result[2].visual_decision["verified_requirement_hash"], "scene-2")
 
 
 if __name__ == "__main__":

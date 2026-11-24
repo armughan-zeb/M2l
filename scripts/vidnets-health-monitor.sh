@@ -47,6 +47,58 @@ report() {
 }
 mark_problem() { needs_user=1; report "$*"; }
 
+# Restart-loop guard: consecutive failed restarts of one service.
+# A crash-looping service must not be restarted every run forever, but
+# the guard must never deadlock recovery: after VIDMON_MAX_RESTART_FAILURES
+# (default 3) consecutive failures, restarts pause for
+# VIDMON_RESTART_COOLDOWN_SECONDS (default 1800s); once the cooldown
+# passes, one retry is allowed, and a failure re-arms the guard. Any
+# healthy observation resets the count.
+MAX_RESTART_FAILURES="${VIDMON_MAX_RESTART_FAILURES:-3}"
+RESTART_COOLDOWN_SECONDS="${VIDMON_RESTART_COOLDOWN_SECONDS:-1800}"
+restart_failures_file() { printf '%s/%s-restart-failures' "$STATE_DIR" "$1"; }
+restart_failure_state() {
+  local file raw count last
+  file="$(restart_failures_file "$1")"
+  raw="$(cat "$file" 2>/dev/null || true)"
+  count="${raw%% *}"
+  last="${raw##* }"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  printf '%s %s' "$count" "$last"
+}
+restart_failure_count() {
+  local count _last
+  read -r count _last <<< "$(restart_failure_state "$1")"
+  printf '%s' "$count"
+}
+note_restart_failure() {
+  printf '%s %s' "$(( $(restart_failure_count "$1") + 1 ))" "$(date +%s)" > "$(restart_failures_file "$1")" 2>/dev/null || true
+}
+reset_restart_failures() { rm -f "$(restart_failures_file "$1")" 2>/dev/null || true; }
+restart_loop_guarded() {
+  local count last now
+  read -r count last <<< "$(restart_failure_state "$1")"
+  now="$(date +%s)"
+  [ "$count" -ge "$MAX_RESTART_FAILURES" ] && [ $(( now - last )) -lt "$RESTART_COOLDOWN_SECONDS" ]
+}
+
+live_render_child() {
+  # A render child can outlive a dead server (orphaned ffmpeg/remotion)
+  # and has no active-job marker when the job was submitted locally, so
+  # the marker alone cannot prove no render is running. Same definition
+  # as the debugger's has_live_render_child (ffmpeg / remotion in the
+  # command line), scoped to this worker's repo/runtime paths so an
+  # unrelated ffmpeg on the host does not block recovery.
+  local procs
+  procs="$(pgrep -af -f 'ffmpeg|remotion' 2>/dev/null || true)"
+  [ -n "$procs" ] || return 1
+  # Path-scoped on purpose: on a shared host another worker's render
+  # must not block this worker's recovery, so only a render child
+  # working under this repo/runtime counts.
+  printf '%s\n' "$procs" | grep -q -F -e "$RUNTIME" -e "$REPO"
+}
+
 has_active_job() {
   local marker
   for marker in "${MUSE_WORK_DIR:-}" "$REPO/work" "$REPO/data/work"; do
@@ -189,13 +241,30 @@ probe_vidnets() {
 }
 
 restart_vidnets_if_safe() {
-  if has_active_job; then
-    local service_state
-    service_state="$(vidnets_service_state | tail -n 1)"
-    if [ "$service_state" != dead ]; then
+  local service_state
+  service_state="$(vidnets_service_state | tail -n 1)"
+  # The server process being alive blocks a restart even with no active
+  # job: starting a second server while the first still holds :5010 makes
+  # the new one bind the next port and split the queue. (Before, this
+  # check only ran when an active-job marker existed, so a hung server
+  # mid-render on a locally-submitted job could be restarted.)
+  if [ "$service_state" != dead ] && { [ "$service_state" = alive ] || has_active_job; }; then
+    if has_active_job; then
       mark_problem "vidnets: DOWN; active job checkpoint exists and service process state is ${service_state}; restart withheld because a live render cannot be ruled out"
-      return
+    else
+      mark_problem "vidnets: DOWN; server process is still alive but not answering; restart withheld (starting a second server would split the queue)"
     fi
+    return
+  fi
+  # A live render child with no active-job marker (locally-submitted job,
+  # orphaned ffmpeg after a server crash) must also block the restart.
+  if live_render_child; then
+    mark_problem 'vidnets: DOWN; a live ffmpeg/remotion render child is still running; restart withheld so the render is not killed'
+    return
+  fi
+  if restart_loop_guarded vidnets; then
+    mark_problem "vidnets: DOWN; restart loop guard: $(restart_failure_count vidnets) consecutive restarts failed; not retrying until the cooldown passes or Vidnets is healthy once"
+    return
   fi
   if [ "$DRY_RUN" = 1 ]; then
     if has_active_job; then
@@ -216,6 +285,7 @@ restart_vidnets_if_safe() {
     bash "$REPO/vidnets/VIDNETS_AGENT.sh" --runtime-root "$RUNTIME" start >/dev/null 2>&1 && restarted=1
   fi
   if [ "$restarted" = 1 ] && probe_vidnets; then
+    reset_restart_failures vidnets
     if has_active_job; then
       report 'vidnets: service recovered; saved queue job will reattach by its existing Vidnets job ID'
     else
@@ -223,12 +293,14 @@ restart_vidnets_if_safe() {
     fi
     vidnets_ok=1
   else
+    note_restart_failure vidnets
     mark_problem 'vidnets: DOWN; restart failed; inspect Vidnets logs'
   fi
 }
 
 if probe_vidnets; then
   vidnets_ok=1
+  reset_restart_failures vidnets
 else
   restart_vidnets_if_safe
 fi
@@ -250,6 +322,8 @@ if daemon_is_running; then
   :
 elif [ "$vidnets_ok" = 0 ]; then
   mark_problem 'daemon: NOT RUNNING and Vidnets is down'
+elif restart_loop_guarded daemon; then
+  mark_problem "daemon: NOT RUNNING; restart loop guard: $(restart_failure_count daemon) consecutive restarts failed; not retrying until the cooldown passes or the daemon is healthy once"
 elif [ "$DRY_RUN" = 1 ]; then
   if has_active_job; then
     mark_problem 'daemon: NOT RUNNING; WOULD restart and resume the saved job checkpoint'
@@ -262,6 +336,7 @@ elif docker_worker_managed; then
     # entrypoint in that container; its worker lock prevents a duplicate start.
     if ! docker compose -f "$REPO/docker-compose.yml" exec -T -d worker bash -lc \
       'cd /app && ./docker/entrypoint.sh start >> /data/daemon.log 2>&1 </dev/null'; then
+      note_restart_failure daemon
       mark_problem 'daemon: restart in running worker container failed; inspect /data/daemon.log'
     elif has_active_job; then
       report 'daemon: restarted inside worker container; saved job checkpoint will resume'
@@ -269,6 +344,7 @@ elif docker_worker_managed; then
       report 'daemon: restarted inside worker container'
     fi
   elif ! docker compose -f "$REPO/docker-compose.yml" up -d worker >/dev/null 2>&1; then
+    note_restart_failure daemon
     mark_problem 'daemon: container restart failed; inspect docker compose logs worker'
   elif has_active_job; then
     report 'daemon: worker container restarted; saved job checkpoint will resume'
@@ -277,6 +353,7 @@ elif docker_worker_managed; then
   fi
 elif [ -x "$REPO/start-daemon.sh" ]; then
   if ! (cd "$REPO" && nohup ./start-daemon.sh >> "$REPO/daemon.log" 2>&1 </dev/null &); then
+    note_restart_failure daemon
     mark_problem 'daemon: restart failed; inspect daemon.log'
   elif has_active_job; then
     report 'daemon: restarted; saved job checkpoint will resume'
@@ -285,6 +362,14 @@ elif [ -x "$REPO/start-daemon.sh" ]; then
   fi
 else
   mark_problem 'daemon: NOT RUNNING; no worker start command is available'
+fi
+
+# A daemon alive after this block means the last restart (if any) worked:
+# clear the loop-guard count. A failed attempt is counted at its own
+# failure branch above, so a run that never attempted a restart counts
+# nothing, and a healthy daemon always resets the guard.
+if daemon_is_running; then
+  reset_restart_failures daemon
 fi
 
 cms_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$CMS_URL" 2>/dev/null || true)"

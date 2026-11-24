@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
-import { AbsoluteFill, OffthreadVideo as RemotionOffthreadVideo, interpolate, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AbsoluteFill, interpolate, useCurrentFrame, useVideoConfig } from 'remotion';
+// @remotion/media Video decodes faster than OffthreadVideo (Remotion 4); aliased to the old name so call sites stay unchanged.
+import { Video as RemotionOffthreadVideo } from '@remotion/media';
 import { calculateCameraTransform, computeSpringEnter, computeEntranceStyle } from '../engine/MotionEngine';
 import { rgba } from '../theme';
 import { focalObjectPosition, resolveFocalBox, resolveMediaFit } from '../engine/FocalFrame';

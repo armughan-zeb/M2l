@@ -2,7 +2,7 @@
 import math
 
 
-def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_workers=1):
+def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_workers=1, vision_reserve_seconds=None):
     settings = config or {}
 
     def positive(value, default):
@@ -13,11 +13,34 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
             return default
 
     wall = positive(wall_seconds, 240.0)
+    # Vision reserve: the YT hard wall shrinks by the time verification
+    # needs (one external-agent inbox round trip, >=300s), instead of
+    # reserving only transfer time. The reserve is threaded from the
+    # coordinator's vision_reserve_seconds / VIDZEO_VISION_RESERVE_SECONDS;
+    # without it the stage keeps the old transfer-only reservation.
+    if vision_reserve_seconds is None:
+        vision_reserve_seconds = settings.get(
+            'vision_reserve_seconds',
+            settings.get('vision_reserve'),
+        )
+    if vision_reserve_seconds is None:
+        import os as _os
+
+        vision_reserve_seconds = _os.environ.get("VIDZEO_VISION_RESERVE_SECONDS")
+    try:
+        vision_reserve = max(0.0, float(vision_reserve_seconds or 0.0))
+    except (TypeError, ValueError):
+        vision_reserve = 0.0
     # Keep a small bounded provider-drain and parent-handoff margin. Reserving
     # 20% made the 150s mixed-media cap unusable for the three transfer waves
     # required by a 60% clip target on short films.
     internal = max(1.0, wall - min(18.0, wall * 0.10))
     hard = min(internal, positive(settings.get('yt_hard_timeout_seconds'), internal))
+    if vision_reserve:
+        # Shrink the hard wall by the vision reserve (floored so a search
+        # plus one minimum transfer still fits); the reserve is verification
+        # time, not discovery time.
+        hard = max(60.0, hard - vision_reserve)
     search_ceiling = min(120.0, hard * 0.28)
     search = min(search_ceiling, positive(settings.get('yt_search_timeout_seconds'), search_ceiling))
     if 0 < scene_count <= 12 and str(settings.get('llm_provider') or '') != 'external_agent':
@@ -28,15 +51,17 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
         # keep the ceiling instead; the branch wall still bounds the stage.
         search = min(search, 35.0)
     plan = {'yt_search_timeout_seconds': search, 'yt_hard_timeout_seconds': hard}
+    if vision_reserve:
+        plan['vision_reserve_seconds'] = vision_reserve
     if scene_count > 0 and not settings.get('yt_pool_first'):
         preselected = bool(settings.get('_youtube_quota_preselected'))
         try:
             coverage = 1.0 if preselected else float(settings.get('youtube_accepted_coverage_target',
-                                                                    settings.get('youtube_coverage_target', 0.8)))
+                                                                    settings.get('youtube_coverage_target', 0.30)))
             if not math.isfinite(coverage):
-                coverage = 1.0 if preselected else 0.8
+                coverage = 1.0 if preselected else 0.30
         except (TypeError, ValueError):
-            coverage = 1.0 if preselected else 0.8
+            coverage = 1.0 if preselected else 0.30
         coverage = max(0.0, min(1.0, coverage))
         target_scenes = max(1, math.ceil(scene_count * coverage))
         waves = math.ceil(target_scenes / max(1, int(download_workers)))

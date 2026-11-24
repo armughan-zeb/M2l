@@ -19,8 +19,16 @@ REPO_ROOT="$(pwd -P)"
 export MUSE_AUTO_LOOP=1
 export MUSE_INFERENCE_COMPULSORY=1
 export MUSE_RENDER_COMMAND="${MUSE_RENDER_COMMAND:-node $(printf '%q' "$REPO_ROOT/render-vidnets-linux.js")}"
+# Resident inference is the DEFAULT transport: the daemon's resident inbox
+# (1s poll + fs.watch) calls this spool command, and the resident inference
+# worker agent (scripts/resident-inference-worker/WORKER_BRIEF.md) answers
+# each request with real Muse inference in seconds. The host hook remains
+# the fallback when the worker is not running (the spool exits 3 and the
+# resident inbox leaves the request pending). Override only with another
+# REAL transport — never with the deleted test stub.
+export MUSE_INFERENCE_COMMAND="${MUSE_INFERENCE_COMMAND:-node $(printf '%q' "$REPO_ROOT/scripts/muse-inference-spool.cjs")}"
 export MUSE_VIDNETS_ROOT="${MUSE_VIDNETS_ROOT:-$REPO_ROOT/vidnets}"
-export MUSE_YOUTUBE_COVERAGE_TARGET="${MUSE_YOUTUBE_COVERAGE_TARGET:-0.8}"
+export MUSE_YOUTUBE_COVERAGE_TARGET="${MUSE_YOUTUBE_COVERAGE_TARGET:-0.30}"
 export MUSE_MEDIA_STRICT="${MUSE_MEDIA_STRICT:-0}"
 export MUSE_RENDER_CONCURRENCY="${MUSE_RENDER_CONCURRENCY:-1}"
 export VIDZEO_TEMP_DIR="${VIDZEO_TEMP_DIR:-${VIDZEO_RUNTIME_ROOT:-$HOME/workspace/vidnets-runtime}/temp}"
@@ -33,7 +41,7 @@ mkdir -p "$TMPDIR"
 # files, answered/expired inbox dirs) that no job ever re-reads. Prune
 # only entries older than 7 days, and only the known scratch patterns —
 # never temp/jobs (active Vidnets job work), media, caches, manifests, or
-# any bridge request newer than 7 days (every live TTL is <= 30 min).
+# any bridge request newer than 7 days (every live TTL is <= 60 min).
 # Cleanup must never block the daemon start: failures are logged, not fatal.
 cleanup_stale_scratch() {
   local temp_root="$VIDZEO_TEMP_DIR" removed=0
@@ -70,5 +78,31 @@ cleanup_stale_scratch() {
   echo "[start-daemon] stale scratch cleanup: removed $removed entr(ies) older than 7 days (runtime temp) / 1 day (/tmp)" >&2
 }
 cleanup_stale_scratch || echo "[start-daemon] stale scratch cleanup failed (non-fatal)" >&2
+
+# Resident inference pool check (non-fatal): the spool transport only
+# answers while at least one pool worker agent is alive. If no worker
+# heartbeat is fresh, requests fall back to the host hook (slower) until
+# the pool starts — see scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md.
+SPOOL_DIR="${MUSE_INFERENCE_SPOOL_DIR:-${VIDZEO_TEMP_DIR:-$HOME/workspace/vidnets-runtime/temp}/inference-spool}"
+if [ -n "${MUSE_INFERENCE_COMMAND:-}" ]; then
+  if python3 -c "
+import glob, json, os, sys, time
+files = glob.glob(os.path.join(sys.argv[1], 'worker-alive-*.json'))
+files.append(os.path.join(sys.argv[1], 'worker-alive.json'))
+ok = False
+for p in files:
+    try:
+        with open(p) as f:
+            updated = json.load(f).get('updatedAt', 0)
+        if time.time() - updated / 1000 < 90:
+            ok = True
+            break
+    except Exception:
+        continue
+print('ok' if ok else 'stale')
+" "$SPOOL_DIR" 2>/dev/null | grep -qx stale; then
+    echo "[start-daemon] WARNING: no resident inference worker pool heartbeat is fresh at $SPOOL_DIR/worker-alive-*.json — inbox requests will wait for the host hook until the pool starts (scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md)." >&2
+  fi
+fi
 
 exec node muse-agent.js start "$@"

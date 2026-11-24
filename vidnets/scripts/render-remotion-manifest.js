@@ -9,7 +9,43 @@ const { fileURLToPath } = require('url');
 const { joinRemotionSections, promoteExport } = require('./remotion-section-join');
 const root = path.resolve(__dirname, '..');
 const warnedMissingAssets = new Set();
-const MIN_REMOTION_AVAILABLE_MB = 384;
+// Admission floor, evidence-backed (Nov 16, 2026): the Wright render was
+// admitted at 615 MB free and completed (~23x real-time, 409 MB swap in
+// use); GTA VI progressed at 830 MB. The old 768 MB floor sat above this
+// VM's steady-state available memory (~350-650 MB), so the GTA job waited
+// forever: a render needs the browser tree (~353 MB RSS, measured on a
+// trivial 1080p page) plus the render Node process and ffmpeg (~150 MB)
+// just to load — about 500 MB. 512 sits just above that load minimum and
+// below the proven-completion band (615 MB). Below the floor a job waits
+// (retryable) instead of starting a browser it cannot back. Keep in step
+// with render_resource_manager.py.
+const MIN_REMOTION_AVAILABLE_MB = 512;
+// Remotion (@remotion/media) rejects mediaCacheSizeInBytes below 240 MB
+// (251658240 bytes). GTA VI ef306926 died at 78% with exactly that error
+// after the low-memory path handed it 64 MB (67108864). This floor is a
+// hard Remotion minimum, never a tuning knob.
+const MIN_MEDIA_CACHE_MB = 240;
+const MIN_MEDIA_CACHE_BYTES = MIN_MEDIA_CACHE_MB * 1024 ** 2;
+// Honest resident working set of one serial 1080p worker (Nov 16, 2026):
+// the measured ~353 MB headless-shell browser tree, plus ~150 MB for the
+// render Node process and the ffmpeg encoder, plus ~50 MB of headroom.
+// The old budget summed the CONFIG caps (media 240 + decoder 256 +
+// worker 400 + reserve 555 + margin 96 = 1547 MB) as if all were resident
+// at once; they are not — mediaCacheSizeInBytes and the decoder cache are
+// caps on caches that only grow to what the current section decodes, so
+// summing them priced every steady-state render out of existence. The
+// gate budgets the working set instead; swap absorbs the difference
+// (Wright completed with 409 MB of swap in use). Never below the Remotion
+// floors: the CONFIG values passed to Remotion stay at 240/256 MB.
+const WORKER_WORKING_SET_MB = 550;
+// Resident cache working set for the section being rendered: 64 MB of
+// decoder cache (8 decoded 1080p RGBA frames — serial rendering decodes
+// near the current timestamp) + 96 MB of media cache. Risk, stated
+// plainly: a scene with many large images can grow the media cache past
+// this allowance; the excess pages to swap (Wright proved it finishes)
+// and, in the worst case, a frame is re-decoded rather than served from
+// cache. The 240 MB CONFIG floor is untouched.
+const CACHE_WORKING_SET_MB = 160;
 
 function renderSectionHasher(payloadText, bundleHash, options) {
   // Version the output contract, not this runner's entire source. Admission,
@@ -27,6 +63,14 @@ function renderBrowserSession(openBrowser) {
   let browser = null;
   return {
     async get(options) {
+      // A browser killed out from under us (guard, crash, OOM) must
+      // never be handed back: Remotion hangs on its dead pages instead
+      // of erroring, so the section render stalls at 0 frames until
+      // the 300 s watchdog kills the whole attempt (GTA VI ef306926).
+      // Reopen when the cached browser is gone or reports disconnected.
+      if (browser && typeof browser.isConnected === 'function' && !browser.isConnected()) {
+        browser = null;
+      }
       if (!browser) browser = await openBrowser('chrome', options);
       return browser;
     },
@@ -334,6 +378,29 @@ function startLocalAssetServer() {
   });
 }
 
+// Pre-scaled 1080p variants created by advance preparation live next to the
+// original as `<stem>.scaled-1080p.<ext>`. Prefer them at compose time: a
+// 1080p source needs no downscale in Chromium, which is the render's hot
+// path on this VM. Strict no-op when no variant exists — the original is
+// used untouched. Images and video only; audio/fonts are never swapped.
+const SCALED_1080P_MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v']);
+
+function scaled1080pPathFor(filePath) {
+  const ext = path.extname(filePath);
+  if (!SCALED_1080P_MEDIA_EXTENSIONS.has(ext.toLowerCase())) return filePath;
+  return path.join(path.dirname(filePath), `${path.basename(filePath, ext)}.scaled-1080p${ext}`);
+}
+
+function preferScaled1080p(filePath) {
+  if (typeof filePath !== 'string' || !filePath) return filePath;
+  const scaled = scaled1080pPathFor(filePath);
+  if (scaled === filePath) return filePath;
+  try {
+    if (fs.existsSync(scaled) && fs.statSync(scaled).isFile()) return scaled;
+  } catch (_) {}
+  return filePath;
+}
+
 function asLocalUrl(value, baseUrl) {
   if (typeof value !== 'string') return value;
   let raw = value.trim();
@@ -376,7 +443,9 @@ function asLocalUrl(value, baseUrl) {
     try {
       const resolved = path.resolve(candidate);
       if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
-        const normalized = resolved.replace(/\\/g, '/');
+        // Prefer a pre-scaled 1080p sibling when advance preparation made
+        // one; otherwise the original resolves exactly as before.
+        const normalized = preferScaled1080p(resolved).replace(/\\/g, '/');
         // Strip a POSIX leading slash: `${baseUrl}//home/...` would parse
         // as a protocol-relative URL (host "home") instead of a path.
         return `${baseUrl}/${encodeURI(normalized.replace(/^\/+/, ''))}`;
@@ -459,6 +528,108 @@ function compositionSources() {
   return [...new Set(files)].filter((file) => fs.existsSync(file)).sort();
 }
 
+// Static-import scan of the composition entry's local import graph. The
+// directory walk above misses files the composition imports from OUTSIDE
+// those roots — DocumentaryComposition.jsx imports ../production-timeline
+// (vidnets/src/production-timeline.js) — so a change to such a file would
+// leave the bundle key unchanged and serve a stale bundle. The bundle key
+// therefore covers the union of the directory walk and this graph. Only
+// relative specifiers are followed; package imports are pinned by
+// package.json, which is already hashed.
+const LOCAL_IMPORT_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.json', '.css'];
+const IMPORT_SPECIFIER_RE = /(?:import\s+(?:[^'"]*?\s+from\s+)?|export\s+(?:[^'"]*?\s+from\s+)?|require\s*\(\s*|import\s*\(\s*)['"](\.[^'"]+)['"]/g;
+
+function resolveLocalImport(importerPath, specifier) {
+  const base = path.resolve(path.dirname(importerPath), specifier);
+  const candidates = [base];
+  for (const ext of LOCAL_IMPORT_EXTENSIONS) candidates.push(base + ext);
+  for (const ext of LOCAL_IMPORT_EXTENSIONS) candidates.push(path.join(base, `index${ext}`));
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function resolveCompositionImportGraph(entryPath, rootDir = root) {
+  const checkout = path.resolve(rootDir);
+  const seen = new Set();
+  const queue = [path.resolve(entryPath)];
+  const files = [];
+  while (queue.length) {
+    const current = queue.shift();
+    if (seen.has(current)) continue;
+    seen.add(current);
+    let text;
+    try {
+      if (!fs.existsSync(current) || !fs.statSync(current).isFile()) continue;
+      text = fs.readFileSync(current, 'utf8');
+    } catch (_) { continue; }
+    files.push(current);
+    IMPORT_SPECIFIER_RE.lastIndex = 0;
+    let match;
+    while ((match = IMPORT_SPECIFIER_RE.exec(text)) !== null) {
+      const resolved = resolveLocalImport(current, match[1]);
+      // A local import that escapes the checkout cannot be part of this
+      // bundle; anything inside it is hashed even if the directory walk
+      // never visits it.
+      if (resolved && resolved.startsWith(checkout + path.sep) && !seen.has(resolved)) {
+        queue.push(resolved);
+      }
+    }
+  }
+  return files.sort();
+}
+
+function remotionVersion() {
+  try {
+    return String(require('@remotion/bundler/package.json').version || 'unknown');
+  } catch (_) {}
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    return String(deps['@remotion/bundler'] || deps.remotion || 'unknown');
+  } catch (_) {}
+  return 'unknown';
+}
+
+// A cached bundle carries a manifest proving it was built from exactly
+// these sources with this Remotion version. Reuse requires the manifest:
+// a cache written before manifests existed, or under a different Remotion,
+// rebuilds once instead of risking a stale or incompatible bundle.
+const BUNDLE_MANIFEST_FILENAME = 'bundle-manifest.json';
+const BUNDLE_MANIFEST_VERSION = 1;
+
+function writeBundleManifest(cachedBundlePath, bundleHash) {
+  const manifest = {
+    version: BUNDLE_MANIFEST_VERSION,
+    hash: bundleHash,
+    remotionVersion: remotionVersion(),
+    createdAt: new Date().toISOString(),
+  };
+  fs.mkdirSync(cachedBundlePath, { recursive: true });
+  fs.writeFileSync(path.join(cachedBundlePath, BUNDLE_MANIFEST_FILENAME), JSON.stringify(manifest, null, 2), 'utf8');
+  return manifest;
+}
+
+function readBundleManifest(cachedBundlePath) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(cachedBundlePath, BUNDLE_MANIFEST_FILENAME), 'utf8'));
+    if (raw && raw.version === BUNDLE_MANIFEST_VERSION && typeof raw.hash === 'string') return raw;
+  } catch (_) {}
+  return null;
+}
+
+function cachedBundleIsUsable(cachedBundlePath, bundleHash) {
+  if (!fs.existsSync(path.join(cachedBundlePath, 'index.html'))) return false;
+  const manifest = readBundleManifest(cachedBundlePath);
+  if (!manifest) return false;
+  if (manifest.hash !== bundleHash) return false;
+  if (manifest.remotionVersion !== remotionVersion()) return false;
+  return true;
+}
+
 // The renderer needs documentary fonts, sound effects, and any saved Remotion
 // media. The web app's large template-animation library is not imported by the
 // composition and should not be copied into every render bundle.
@@ -496,7 +667,27 @@ function positiveNumber(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false } = {}) {
+// Free swap (Linux /proc/meminfo, kB) — the render's overflow headroom.
+// The gate counts available + free swap as headroom because this VM's
+// renders demonstrably complete with swap in use (Wright: 409 MB). Env
+// override VIDZEO_REMOTION_SWAP_FREE_MB (tests/direct use) wins; an
+// explicit options.swapFreeBytes wins over both. Non-Linux or unreadable
+// -> 0, so the gate degrades to available-only instead of guessing.
+function readSwapFreeBytes() {
+  const raw = process.env.VIDZEO_REMOTION_SWAP_FREE_MB;
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed * 1024 ** 2;
+  }
+  try {
+    const text = fs.readFileSync('/proc/meminfo', 'utf8');
+    const match = /^SwapFree:\s*(\d+)\s*kB/m.exec(text);
+    if (match) return Number(match[1]) * 1024;
+  } catch (_) {}
+  return 0;
+}
+
+function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false, swapFreeBytes: swapFreeBytesOpt } = {}) {
   const maximumWorkers = Math.max(1, Math.min(8, Math.floor(positiveNumber(process.env.VIDZEO_REMOTION_MAX_WORKERS, 8))));
   const cpuCount = Math.max(1, Number(os.availableParallelism?.()) || os.cpus().length || 1);
   const cpuLimit = Math.max(1, Math.min(maximumWorkers, cpuCount > 2 ? cpuCount - 1 : cpuCount));
@@ -512,15 +703,28 @@ function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false }
   // Keep a dependable reserve for Windows, Flask, Node and the Remotion browser.
   // Estimate per-worker Chromium memory from a 1080p-capable baseline plus
   // decoded RGBA frames, then choose up to eight workers as the available budget
-  // allows. This reserve limits parallelism; above the 384 MB admission floor
+  // allows. This reserve limits parallelism; above the 512 MB admission floor
   // a single worker may still proceed using the OS's paging/reclaim facilities.
-  const reserveBytes = Math.min(2 * 1024 ** 3, Math.max(384 * 1024 ** 2, totalBytes * 0.07));
-  const configuredWorkerMb = positiveNumber(process.env.VIDZEO_REMOTION_MEMORY_PER_WORKER_MB, 256);
+  // Steady-state tuning (Nov 16, 2026): the server/daemon RSS is already
+  // excluded from "available", so the reserve only covers their growth
+  // during a render plus OS headroom — 2% of RAM (128-256 MB), not the old
+  // 5-7% (397-555 MB here), which double-counted memory the server
+  // already holds and priced every steady-state render out of existence.
+  // The Python preflight (render_resource_manager.py) splits this: it
+  // keeps a 7% reserve for WORKER SCALING (the pinned scaling curve)
+  // and uses the same 2% reserve only for the working-set admission
+  // bar, so both gates agree on the admission decision. The JS is the
+  // authoritative enforcer at render time and forces serial below 2 GB
+  // available regardless of the plan's worker count.
+  // Wright/Berlin proved renders complete at 526-615 MB available, and the
+  // Remotion 240 MB media-cache floor is kept untouched.
+  const reserveBytes = Math.min(256 * 1024 ** 2, Math.max(128 * 1024 ** 2, Math.floor(totalBytes * 0.02)));
+  const configuredWorkerMb = positiveNumber(process.env.VIDZEO_REMOTION_MEMORY_PER_WORKER_MB, 192);
   const frameBytes = Math.max(1, Number(composition?.width) || 1920)
     * Math.max(1, Number(composition?.height) || 1080) * 4;
   const lowMemory = availableBytes < 3 * 1024 ** 3;
   const frameBuffers = Math.max(1, Math.min(lowMemory ? 2 : 16, Math.floor(positiveNumber(process.env.VIDZEO_REMOTION_FRAME_BUFFERS, 8))));
-  const workerOverheadMb = positiveNumber(process.env.VIDZEO_REMOTION_WORKER_OVERHEAD_MB, 128);
+  const workerOverheadMb = positiveNumber(process.env.VIDZEO_REMOTION_WORKER_OVERHEAD_MB, 64);
   const workerBytes = configuredWorkerMb * 1024 ** 2 + frameBytes * frameBuffers + workerOverheadMb * 1024 ** 2;
   const sharedBytes = ((lowMemory ? 128 : 256) + 96) * 1024 ** 2;
   const rawMemoryLimit = Math.max(0, Math.floor((availableBytes - reserveBytes - sharedBytes) / (workerBytes + 64 * 1024 ** 2)));
@@ -544,6 +748,13 @@ function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false }
     throw error;
   }
   let concurrency = Math.max(1, Math.min(requestedWorkers, cpuLimit, memoryLimit));
+  // Low-memory VM guard (Nov 16, 2026): the worker planning estimate was
+  // cut so the admission gate can pass at ~1100 MB, but two real Chromium
+  // workers need ~2.8 GB, so below 2 GB available a serial render is the
+  // only safe choice. Without this, the smaller estimate would admit a
+  // second worker at ~1700 MB that the VM cannot back (GTA VI ef306926).
+  const encodingConcurrency = concurrency;
+  if (availableBytes < 2 * 1024 ** 3) concurrency = 1;
   // The memory estimate is a hard ceiling. Do not force a second worker just
   // because the machine has multiple cores; low-RAM renders stay serial.
   const hardLimit = maximumWorkers;
@@ -555,14 +766,55 @@ function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false }
   // caches evict freshly decoded frames and cause "No frame found" failures.
   // Keep HD decoding at the production 256 MB budget under pressure. Reduce
   // workers and frame buffers instead of evicting decoded video frames early.
-  const decoderCacheBytes = 256 * 1024 ** 2;
+  // Low-memory tuning: same 128 MB shared-decoder budget the code already
+  // uses for sharedBytes below 3 GB. 3 video clips do not need the full
+  // 256 MB decoder cache; the 240 MB Remotion media-cache floor is separate
+  // and is not reduced.
+  const decoderCacheBytes = (lowMemory ? 128 : 256) * 1024 ** 2;
+  // videoCache is a real 256 MB allocation (offthreadVideoCacheSizeInBytes);
+  // the worker-sizing loop below must count it, as disallow_parallel_encoding
+  // already does. Audit: installed Remotion 4.0.526 validates
+  // offthreadVideoCacheSizeInBytes only as a positive whole number (no
+  // minimum), and the fixed 256 MB value already clears the 240 MB floor.
+  // Hold it to the same floor so no cache size passed to Remotion can ever
+  // silently regress below it.
+  const videoCacheMb = Math.max(256, MIN_MEDIA_CACHE_MB);
   if (hasVideo) {
-    while (concurrency > 1 && concurrency * workerBytes + decoderCacheBytes + 128 * 1024 ** 2 > renderBudgetBytes) concurrency--;
+    while (concurrency > 1 && concurrency * workerBytes + decoderCacheBytes + videoCacheMb * 1024 ** 2 + 128 * 1024 ** 2 > renderBudgetBytes) concurrency--;
   }
-  const mediaCacheBytes = Math.min(lowMemory ? 64 : 256, Math.max(64,
-    Math.floor((renderBudgetBytes - concurrency * workerBytes - decoderCacheBytes - 96 * 1024 ** 2) / (1024 ** 2)))) * 1024 ** 2;
+  // Working-set gate (Nov 16, 2026): the media cache and decoder cache
+  // are CONFIG caps, not allocations — Remotion only requires the media
+  // cache CONFIG to be >= 240 MB, it does not hold 240 MB resident (a
+  // too-small CONFIG is still a render guaranteed to fail validation,
+  // ef306926: 64 MB -> "minimum value ... is 240MB (251658240), got:
+  // 67108864" at 78%). The old check summed the caps (worker + decoder
+  // + 240 floor + margin) and demanded ~1101 MB available on a VM that
+  // steadies at 350-650 MB, so no render could ever start. The gate now
+  // budgets the resident working set against headroom (available + free
+  // swap) and passes the full 256 MB media cache CONFIG to Remotion
+  // regardless. Swap is real headroom here: Wright completed with 409 MB
+  // of it in use. If the working set does not fit, wait/retry via
+  // VIDZEO_LOW_MEMORY instead of launching a doomed render. Completed
+  // sections stay saved for resume (see waitForRenderMemory). The
+  // per-section gate is this same function, so the start and section
+  // thresholds cannot drift apart.
+  const swapFreeBytes = swapFreeBytesOpt !== undefined
+    ? Math.max(0, Number(swapFreeBytesOpt) || 0)
+    : readSwapFreeBytes();
+  const headroomBytes = availableBytes + swapFreeBytes;
+  const workingSetBytes = reserveBytes
+    + WORKER_WORKING_SET_MB * 1024 ** 2
+    + CACHE_WORKING_SET_MB * 1024 ** 2;
+  if (headroomBytes < workingSetBytes) {
+    const error = new Error(`[Remotion] Waiting for memory: ${Math.round(availableBytes / (1024 ** 2))} MB available + ${Math.round(swapFreeBytes / (1024 ** 2))} MB swap free; a serial render needs ${Math.round(workingSetBytes / (1024 ** 2))} MB of headroom for one worker (${WORKER_WORKING_SET_MB} MB), the working-set caches (${CACHE_WORKING_SET_MB} MB) and the reserve (${Math.round(reserveBytes / (1024 ** 2))} MB).`);
+    error.code = 'VIDZEO_LOW_MEMORY';
+    throw error;
+  }
+  // The media cache CONFIG is always the full 256 MB cap: the gate above
+  // already proved the working set fits, and a smaller CONFIG would only
+  // reintroduce the <240 MB validation failure. Never below the floor.
+  const mediaCacheBytes = 256 * 1024 ** 2;
   const offthreadVideoThreads = lowMemory ? 1 : Math.max(1, Math.min(4, Math.floor(cpuLimit / 2), concurrency));
-  const videoCacheMb = 256;
   return {
     concurrency,
     cpu_limit: cpuLimit,
@@ -570,9 +822,17 @@ function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false }
     raw_memory_limit: rawMemoryLimit,
     single_worker_fallback: singleWorkerFallback,
     minimum_available_memory_mb: MIN_REMOTION_AVAILABLE_MB,
-    preferred_available_memory_mb: Math.ceil((reserveBytes + workerBytes + sharedBytes + 64 * 1024 ** 2) / (1024 ** 2)),
+    // Headroom bar, not an available-RAM bar: reserve + worker working
+    // set + cache working set (867 MB on this 7.7 GB VM). A render is
+    // admitted when available + free swap reaches it (and available
+    // clears the 512 MB floor).
+    preferred_available_memory_mb: Math.ceil(workingSetBytes / (1024 ** 2)),
     cap: hardLimit,
     available_memory_mb: Math.round(availableBytes / (1024 ** 2)),
+    swap_free_mb: Math.round(swapFreeBytes / (1024 ** 2)),
+    headroom_mb: Math.round(headroomBytes / (1024 ** 2)),
+    worker_working_set_mb: WORKER_WORKING_SET_MB,
+    cache_working_set_mb: CACHE_WORKING_SET_MB,
     reserve_memory_mb: Math.round(reserveBytes / (1024 ** 2)),
     estimated_worker_memory_mb: Math.round(workerBytes / (1024 ** 2)),
     frame_buffers: frameBuffers,
@@ -581,14 +841,14 @@ function adaptiveConcurrency(composition, manifest = {}, { freshMemory = false }
     offthread_video_threads: offthreadVideoThreads,
     video_cache_bytes: videoCacheMb * 1024 ** 2,
     disallow_parallel_encoding: cpuLimit < 3 ||
-      renderBudgetBytes - concurrency * workerBytes - videoCacheMb * 1024 ** 2 - mediaCacheBytes - 96 * 1024 ** 2 < 384 * 1024 ** 2,
+      renderBudgetBytes - encodingConcurrency * workerBytes - videoCacheMb * 1024 ** 2 - mediaCacheBytes - 96 * 1024 ** 2 < 384 * 1024 ** 2,
     browser_heap_mb: singleWorkerFallback ? 256 : (lowMemory ? 512 : 1024),
   };
 }
 
 async function waitForRenderMemory(composition, manifest, options = {}) {
   const waitMs = Math.min(1200000, positiveNumber(options.memoryWaitMs,
-    positiveNumber(process.env.VIDZEO_REMOTION_MEMORY_WAIT_SECONDS, 120) * 1000));
+    positiveNumber(process.env.VIDZEO_REMOTION_MEMORY_WAIT_SECONDS, 600) * 1000));
   const deadline = Date.now() + waitMs;
   for (;;) {
     try { return adaptiveConcurrency(composition, manifest, options); }
@@ -665,9 +925,16 @@ function writeAssetDigestCache(cachePath, files) {
   }
 }
 
-function promoteBundleToCache(serveUrl, cachedBundlePath) {
+function promoteBundleToCache(serveUrl, cachedBundlePath, bundleHash) {
   fs.mkdirSync(path.dirname(cachedBundlePath), { recursive: true });
-  if (fs.existsSync(path.join(cachedBundlePath, 'index.html'))) return cachedBundlePath;
+  if (fs.existsSync(path.join(cachedBundlePath, 'index.html'))) {
+    // A concurrent render installed this bundle first; make sure it carries
+    // a manifest for this hash so the next render can reuse it. Never fatal.
+    try {
+      if (!cachedBundleIsUsable(cachedBundlePath, bundleHash)) writeBundleManifest(cachedBundlePath, bundleHash);
+    } catch (_) {}
+    return cachedBundlePath;
+  }
   if (fs.existsSync(cachedBundlePath)) fs.rmSync(cachedBundlePath, { recursive: true, force: true });
 
   const stagedCachePath = `${cachedBundlePath}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
@@ -690,9 +957,20 @@ function promoteBundleToCache(serveUrl, cachedBundlePath) {
   } catch (error) {
     fs.rmSync(stagedCachePath, { recursive: true, force: true });
     if (error.code === 'EEXIST' && fs.existsSync(path.join(cachedBundlePath, 'index.html'))) {
+      try {
+        if (!cachedBundleIsUsable(cachedBundlePath, bundleHash)) writeBundleManifest(cachedBundlePath, bundleHash);
+      } catch (_) {}
       return cachedBundlePath;
     }
     throw error;
+  }
+  // Stamp the manifest proving this bundle matches these sources; a
+  // manifest write failure must never block the render — the next render
+  // simply rebuilds instead of reusing.
+  try {
+    writeBundleManifest(cachedBundlePath, bundleHash);
+  } catch (error) {
+    console.warn(`[Remotion] Bundle manifest could not be saved: ${error.message}`);
   }
   return cachedBundlePath;
 }
@@ -793,11 +1071,28 @@ async function renderManifest() {
   let stagedPublicDir = null;
   try {
     reportStage('preparing renderer');
+    // Render mode: kill disposable processes (test runners, stray Chrome /
+    // ffmpeg, dockerd) BEFORE the first memory measurement, so the freed
+    // RAM improves the concurrency plan. Never fatal: a guard failure
+    // must not break the render.
+    try {
+      const renderMode = require('./render-mode');
+      const renderModeReport = await renderMode.enterRenderMode();
+      if (renderModeReport.enabled) {
+        console.log(`[RenderMode] freed ~${renderModeReport.freedMB} MB (available ${renderModeReport.memBeforeMB} -> ${renderModeReport.memAfterMB} MB); killed ${renderModeReport.killed.length} process(es)`);
+      } else {
+        console.log('[RenderMode] disabled (VIDZEO_RENDER_MODE=0)');
+      }
+    } catch (error) {
+      console.log(`[RenderMode] unavailable, continuing without it: ${error.message}`);
+    }
     const payloadText = fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, '');
     const payload = JSON.parse(payloadText);
     const rawManifest = payload.semantic_edit_manifest || payload.remotion_manifest || payload.manifest || payload;
     const manifest = normalizeManifest(rawManifest, baseUrl);
-    const initialResources = await waitForRenderMemory({ width: manifest.width, height: manifest.height }, manifest);
+    // Fresh read: the Flask env snapshot predates render-mode's kills, so it
+    // understates post-guard headroom; section re-plans already use freshMemory.
+    const initialResources = await waitForRenderMemory({ width: manifest.width, height: manifest.height }, manifest, { freshMemory: true });
 
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 
@@ -813,6 +1108,13 @@ async function renderManifest() {
     const hashStartedAt = Date.now();
     const hasher = crypto.createHash('sha256');
     for (const sourcePath of compositionSources()) {
+      hasher.update(path.relative(root, sourcePath).replace(/\\/g, '/'));
+      hasher.update(fs.readFileSync(sourcePath));
+    }
+    // Files the entry imports from outside the walked roots
+    // (../production-timeline): without them a source change would leave
+    // the key unchanged and serve a stale bundle.
+    for (const sourcePath of resolveCompositionImportGraph(entryPath)) {
       hasher.update(path.relative(root, sourcePath).replace(/\\/g, '/'));
       hasher.update(fs.readFileSync(sourcePath));
     }
@@ -843,8 +1145,8 @@ async function renderManifest() {
     console.log(`[Remotion] Verified ${publicAssets.length} bundled assets with SHA-256 in ${((Date.now() - hashStartedAt) / 1000).toFixed(2)}s (${assetHashCacheHits} cached).`);
 
     let serveUrl;
-    if (fs.existsSync(cachedBundlePath) && fs.existsSync(path.join(cachedBundlePath, 'index.html'))) {
-      console.log(`[Remotion] Reusing cached bundle: ${bundleHash}`);
+    if (cachedBundleIsUsable(cachedBundlePath, bundleHash)) {
+      console.log(`[Remotion] Reusing cached bundle: ${bundleHash} (manifest-verified)`);
       reportStage('bundling composition', 100, 'cached');
       serveUrl = cachedBundlePath;
       const cachedPublic = path.join(cachedBundlePath, 'public');
@@ -864,6 +1166,7 @@ async function renderManifest() {
         entryPoint: entryPath,
         rootDir: root,
         publicDir: stagedPublicDir,
+        rspack: true,
         onProgress: (progress) => {
           const percent = Math.max(0, Math.min(100, Math.floor(Number(progress) * 100)));
           if (percent !== lastBundlePercent) {
@@ -874,7 +1177,7 @@ async function renderManifest() {
         onDirectoryCreated: (dir) => { bundleDir = dir; },
         webpackOverride: (config) => config,
       });
-      serveUrl = promoteBundleToCache(serveUrl, cachedBundlePath);
+      serveUrl = promoteBundleToCache(serveUrl, cachedBundlePath, bundleHash);
     }
 
     // Measure actual font-loaded text in every production preview, not only
@@ -981,7 +1284,7 @@ async function renderManifest() {
       return;
     }
     const videoCacheBytes = concurrencyPlan.video_cache_bytes;
-    const x264Preset = String(process.env.VIDZEO_REMOTION_X264_PRESET || 'veryfast').trim().toLowerCase();
+    const x264Preset = String(process.env.VIDZEO_REMOTION_X264_PRESET || 'ultrafast').trim().toLowerCase();
     const allowedX264Presets = new Set(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow', 'placebo']);
     const selectedX264Preset = allowedX264Presets.has(x264Preset) ? x264Preset : 'veryfast';
     const requestedCrf = Number(process.env.VIDZEO_REMOTION_CRF || 18);
@@ -1017,6 +1320,8 @@ async function renderManifest() {
       codec: 'h264',
       x264Preset: selectedX264Preset,
       crf: selectedCrf,
+      imageFormat: 'jpeg',
+      logLevel: 'error',
       outputLocation: stagedOutput,
       inputProps,
       audioCodec: 'aac',
@@ -1107,6 +1412,18 @@ async function renderManifest() {
           console.log(`[Remotion] Reusing completed section ${index + 1}: frames ${start}-${end}`);
         } else {
           for (let attempt = 0; ; attempt++) {
+            // Re-shed before each section: memory can degrade mid-render
+            // (leaked Chrome, stray processes) after the one guard at start.
+            // Never fatal: a guard failure must not break the render.
+            try {
+              const renderMode = require('./render-mode');
+              const sectionModeReport = await renderMode.enterRenderMode();
+              if (sectionModeReport.enabled && sectionModeReport.killed.length) {
+                console.log(`[RenderMode] section ${index + 1}: freed ~${sectionModeReport.freedMB} MB; killed ${sectionModeReport.killed.length} process(es)`);
+              }
+            } catch (error) {
+              console.log(`[RenderMode] unavailable, continuing without it: ${error.message}`);
+            }
             const plan = await waitForRenderMemory(composition, manifest, {
               freshMemory: true, releaseOwnedResources:() => browserSession.close(),
             });
@@ -1234,4 +1551,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startLocalAssetServer, parseAssetRange, renderBrowserSession, renderSectionHasher, adaptiveConcurrency, waitForRenderMemory, stageRendererPublicAssets, ensureFfmpegOutputDirectory, pruneGeneratedBundleFiles, acquireRenderLease, asLocalUrl, normalizeManifest, finalizeMp4Audio };
+module.exports = { startLocalAssetServer, parseAssetRange, renderBrowserSession, renderSectionHasher, adaptiveConcurrency, waitForRenderMemory, stageRendererPublicAssets, ensureFfmpegOutputDirectory, pruneGeneratedBundleFiles, acquireRenderLease, asLocalUrl, normalizeManifest, finalizeMp4Audio, resolveCompositionImportGraph, remotionVersion, readBundleManifest, writeBundleManifest, cachedBundleIsUsable, scaled1080pPathFor, preferScaled1080p };

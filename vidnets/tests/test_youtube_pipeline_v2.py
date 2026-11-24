@@ -139,7 +139,15 @@ class YouTubePipelineV2Tests(unittest.TestCase):
     def test_authenticated_session_is_converted_to_memory_cookie_jar(self):
         instances, yt_dlp = self._mock_yt_dlp()
         source = self._cookie_jar()
+        # _get_authenticated_youtube_session consults the configured pool
+        # before ensure_verified_session: with the operator's real
+        # repo-root cookies.json present the pool would return that live
+        # session instead of the mocked one. An empty pool keeps this test
+        # on the mocked ensure_verified_session path it is testing.
         with yt_dlp, mock.patch(
+            "services.youtube_session.get_configured_pool",
+            return_value=SimpleNamespace(paths=[]),
+        ), mock.patch(
             "services.youtube_session.ensure_verified_session",
             return_value=(source, 7),
         ), mock.patch(
@@ -186,7 +194,8 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                     Path(command[-1]).write_bytes(b"clip" * 2048),
                     None,
                 )[1],
-            ), mock.patch.object(ytv2, "_source_video_height", return_value=1080):
+            ), mock.patch.object(ytv2, "_source_video_height", return_value=1080), \
+                 mock.patch("services.media_integrity.promote_verified_media", return_value=SimpleNamespace(valid=True, reason="ok")):
                 downloaded = ytv2._download_clip(
                     {"id": "video-1", "webpage_url": "https://youtube.com/watch?v=video-1"},
                     Path(temp_dir) / "clip.mp4",
@@ -263,6 +272,76 @@ class YouTubePipelineV2Tests(unittest.TestCase):
             )
         self.assertEqual(len(calls), 4)
         self.assertEqual(deadlines, [7.5])
+
+    def test_ranged_overlap_downloads_start_before_slow_transcripts(self):
+        # YT-lane speed fix (Nov 20, 2026): the transcript phase used to be
+        # a hard barrier (~130-175 s per pass live) before any download
+        # started. With overlap, a scene that already has a usable
+        # timestamp resolves its cut while transcripts are still running.
+        import shutil
+        import subprocess
+        import threading
+        import time
+
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg required")
+        release = threading.Event()
+
+        def slow_prepare(*_args, **_kwargs):
+            release.wait(timeout=60.0)
+            return {}, {"status": "completed", "sources_requested": 0,
+                        "scenes_with_moments": 0}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cut = Path(tmp) / "prep_cut.mp4"
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "testsrc=s=320x180:d=2", "-pix_fmt", "yuv420p", str(cut)],
+                check=True, timeout=60,
+            )
+            self.assertGreaterEqual(cut.stat().st_size, 8192)
+            candidate = {
+                "id": "c5qhgwwLY50", "video_id": "c5qhgwwLY50",
+                "title": "Grand Theft Auto VI trailer",
+                "channel": "Rockstar Games", "duration": 300,
+                "query_text": "Grand Theft Auto VI Vice City",
+                "score": 300, "v2_score": 300,
+                "prep_manifest_injected": True,
+                "prep_best_timestamp": 10.0,
+                "best_timestamp": 10.0,
+                "prep_live_scene": 0,
+                "prep_cache_path": str(cut),
+            }
+
+            def fake_search(groups, **_kwargs):
+                return {key: [dict(candidate)] for key in groups}
+
+            with mock.patch.dict(os.environ, {"VIDZEO_YT_POOL_FIRST": "0"}, clear=False), \
+                 mock.patch.object(ytv2, "_search_container_pools", side_effect=fake_search), \
+                 mock.patch("services.youtube_ranged_moments.prepare_ranged_moments",
+                            side_effect=slow_prepare):
+                started = time.monotonic()
+                try:
+                    result = ytv2.get_youtube_clips(
+                        script="Vice City was back. Florida was back.",
+                        title="Grand Theft Auto VI: Return to Vice City",
+                        num_scenes=1,
+                        scene_texts=["Vice City was back. Florida was back."],
+                        scene_durations=[9.0],
+                        use_authenticated_session=False,
+                        output_dir=tmp,
+                    )
+                finally:
+                    release.set()
+                elapsed = time.monotonic() - started
+            # The transcript phase was blocked the whole run: downloads must
+            # not have waited for it (the old synchronous code: 60 s+ wall).
+            self.assertLess(elapsed, 20.0)
+            self.assertEqual(len(result), 1)
+            self.assertTrue(result[0], "prep cut should resolve from disk")
+            selection = result.audit.get("ranged_moment_selection") or {}
+            self.assertTrue(selection.get("partial"),
+                            "audit must record that transcripts were still running")
 
     def test_pool_transcript_preparation_passes_authenticated_session(self):
         captured = {}
@@ -486,7 +565,12 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         official_score = ytv2._score_candidate(official, "Grand Theft Auto VI", scene, query, context)
         self.assertGreater(official_score, 0)
         self.assertEqual(ytv2._score_candidate(streamer, "Grand Theft Auto VI", scene, query, context), -999.0)
-        self.assertLess(ytv2._score_candidate(wrong_game, "Grand Theft Auto VI", scene, query, context), -100)
+        # Round 15 (topic track): a GTA V official clip is a general topic
+        # clip for a GTA VI scene now — positive, but below the scene's own
+        # VI trailer, which keeps scene-specific footage ranked first.
+        _wrong_game_score = ytv2._score_candidate(wrong_game, "Grand Theft Auto VI", scene, query, context)
+        self.assertGreater(_wrong_game_score, 0)
+        self.assertLess(_wrong_game_score, official_score)
         self.assertLess(ytv2._score_candidate(wrong_franchise, "Grand Theft Auto VI", scene, query, context), -100)
         self.assertEqual(ytv2._score_candidate(high_risk, "Grand Theft Auto VI", scene, query, context), -999.0)
         self.assertEqual(ytv2._score_candidate(concept, "Grand Theft Auto VI", scene, query, context), -999.0)
@@ -1087,7 +1171,10 @@ class YouTubePipelineV2Tests(unittest.TestCase):
             self.assertIn("height>=720", formats[0])
             self.assertTrue(all("height>=" in item for item in formats))
             self.assertTrue(any("height>=480" in item for item in formats))
-            self.assertTrue(any("height<=2160" in item for item in formats))
+            # The 1440p rung stays as the 4K-only last resort; the 2160p
+            # rung is gone (canvas caps at 1080p).
+            self.assertTrue(any("height<=1440" in item for item in formats))
+            self.assertFalse(any("height<=2160" in item for item in formats))
 
         with mock.patch.dict(os.environ, {
             "VIDZEO_YT_MIN_SOURCE_HEIGHT": "720",
@@ -1127,7 +1214,7 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         rendezvous = threading.Barrier(3)
         concurrent = []
 
-        def slow(path, _scene_index, _topic, _narration, _subject, _vc):
+        def slow(path, _scene_index, _topic, _narration, _subject, _vc, **_kwargs):
             calls.append(path)
             try:
                 rendezvous.wait(timeout=10)
@@ -1162,15 +1249,22 @@ class YouTubePipelineV2Tests(unittest.TestCase):
             ]
 
         # clipA scores below the accept floor (replace), clipB scores well (keep).
-        def fake_scored(path, _scene_index, _topic, _narration, _subject, _vc):
-            if "clipA" in path:
-                return (False, 40.0, True, "replace")
-            return (True, 90.0, True, "keep")
+        # Batched vision judges both downloaded candidates in one call; the
+        # best accepted candidate wins.
+        def fake_batched(candidates, _scene_index, _topic, _narration, _subject, _vc, **_kwargs):
+            out = {}
+            for cand in candidates:
+                cid = cand.get("candidate_id")
+                if cid == "clipA":
+                    out[cid] = (False, 40.0, True, "replace")
+                else:
+                    out[cid] = (True, 90.0, True, "keep")
+            return out
 
         with mock.patch.object(ytv2, "_search_youtube", side_effect=fake_fetch), \
              mock.patch.object(ytv2, "_get_authenticated_youtube_session", return_value=None), \
              mock.patch.object(ytv2, "_download_clip", side_effect=fake_dl), \
-             mock.patch.object(ytv2, "_visual_verdict_scored", side_effect=fake_scored), \
+             mock.patch.object(ytv2, "_batched_visual_verdicts", side_effect=fake_batched), \
              mock.patch.dict(os.environ, {"VIDZEO_YT_VISUAL_GATE_PARALLEL": "3"}, clear=False):
             pools = ytv2.build_clip_pools(
                 "John Cena",
@@ -1180,8 +1274,8 @@ class YouTubePipelineV2Tests(unittest.TestCase):
             )
             state = ytv2.make_resolve_state(pools)
             path = ytv2.resolve_clip_for_scene(0, pools, state, visual_context=StrictContext(), output_dir=str(tempfile.mkdtemp()))
-        # Candidates are downloaded progressively; the second is fetched only
-        # after strict vision rejects the first.
+        # Batched vision downloads the scene's candidates first, then judges
+        # them in one call: clipA is rejected, clipB wins.
         self.assertEqual(sorted(downloaded), ["clipA", "clipB"])
         self.assertIsNotNone(path)
         self.assertTrue(Path(path).exists())
@@ -1299,7 +1393,8 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         with mock.patch.object(ytv2, "_search_youtube", side_effect=fake_fetch), \
              mock.patch.object(ytv2, "_get_authenticated_youtube_session", return_value=None), \
              mock.patch.object(ytv2, "_download_clip", side_effect=fake_dl), \
-             mock.patch.object(ytv2, "_visual_verdict_scored", return_value=(False, 30.0, True, "replace")):
+             mock.patch.object(ytv2, "_batched_visual_verdicts",
+                               return_value={"clipA": (False, 30.0, True, "replace")}):
             pools = ytv2.build_clip_pools(
                 "John Cena",
                 ["John Cena trains for WWE."],
@@ -1635,12 +1730,17 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                 dict(base, id="clip3", title="John Cena training raw footage 3"),
             ]
 
-        mock_scored = mock.MagicMock(return_value=(False, 0.0, False, "no_model_available"))
+        mock_batched = mock.MagicMock(
+            side_effect=lambda candidates, *args, **kwargs: {
+                str(c.get("candidate_id")): (False, 0.0, False, "no_model_available")
+                for c in candidates
+            }
+        )
 
         with mock.patch.object(ytv2, "_search_youtube", side_effect=fake_fetch), \
              mock.patch.object(ytv2, "_get_authenticated_youtube_session", return_value=None), \
              mock.patch.object(ytv2, "_download_clip", side_effect=fake_dl), \
-             mock.patch.object(ytv2, "_visual_verdict_scored", mock_scored), \
+             mock.patch.object(ytv2, "_batched_visual_verdicts", mock_batched), \
              mock.patch.dict(os.environ, {
                  "VIDZEO_YT_FAIL_OPEN_ON_VISUAL_UNAVAILABLE": "1",
                  "VIDZEO_YT_RELAXED_VISUAL_GATE": "1",
@@ -1659,8 +1759,10 @@ class YouTubePipelineV2Tests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIsNotNone(results[0])
         self.assertTrue(Path(results[0]).exists())
-        self.assertEqual(downloaded, ["clip1"])
-        self.assertEqual(mock_scored.call_count, 1)
+        # Batched vision downloads the scene's candidates first, then judges
+        # them in ONE call: all three are downloaded, one batch filed.
+        self.assertEqual(downloaded, ["clip1", "clip2", "clip3"])
+        self.assertEqual(mock_batched.call_count, 1)
 
     def test_progressive_fallback_fails_open_when_vision_unavailable(self):
         downloaded = []
@@ -1681,12 +1783,17 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                 dict(base, id="clip2", title="John Cena training raw footage 2"),
             ]
 
-        mock_scored = mock.MagicMock(return_value=(False, 0.0, False, "vision_network_timeout"))
+        mock_batched = mock.MagicMock(
+            side_effect=lambda candidates, *args, **kwargs: {
+                str(c.get("candidate_id")): (False, 0.0, False, "vision_network_timeout")
+                for c in candidates
+            }
+        )
 
         with mock.patch.object(ytv2, "_search_youtube", side_effect=fake_fetch), \
              mock.patch.object(ytv2, "_get_authenticated_youtube_session", return_value=None), \
              mock.patch.object(ytv2, "_download_clip", side_effect=fake_dl), \
-             mock.patch.object(ytv2, "_visual_verdict_scored", mock_scored), \
+             mock.patch.object(ytv2, "_batched_visual_verdicts", mock_batched), \
              mock.patch.dict(os.environ, {
                  "VIDZEO_YT_FAIL_OPEN_ON_VISUAL_UNAVAILABLE": "1",
                  "VIDZEO_YT_RELAXED_VISUAL_GATE": "1",
@@ -1703,8 +1810,10 @@ class YouTubePipelineV2Tests(unittest.TestCase):
             )
         self.assertIsNotNone(path)
         self.assertTrue(Path(path).exists())
-        self.assertEqual(downloaded, ["clip1"])
-        self.assertEqual(mock_scored.call_count, 1)
+        # Batched vision downloads the scene's candidates first, then judges
+        # them in ONE call; vision-unavailable fails open on the first.
+        self.assertEqual(downloaded, ["clip1", "clip2"])
+        self.assertEqual(mock_batched.call_count, 1)
 
     def test_progressive_download_strict_fail_closed_when_fail_open_disabled(self):
         downloaded = []
@@ -1725,10 +1834,17 @@ class YouTubePipelineV2Tests(unittest.TestCase):
                 dict(base, id="clip2", title="John Cena training raw footage 2"),
             ]
 
+        mock_batched = mock.MagicMock(
+            side_effect=lambda candidates, *args, **kwargs: {
+                str(c.get("candidate_id")): (False, 0.0, False, "no_model")
+                for c in candidates
+            }
+        )
+
         with mock.patch.object(ytv2, "_search_youtube", side_effect=fake_fetch), \
              mock.patch.object(ytv2, "_get_authenticated_youtube_session", return_value=None), \
              mock.patch.object(ytv2, "_download_clip", side_effect=fake_dl), \
-             mock.patch.object(ytv2, "_visual_verdict_scored", return_value=(False, 0.0, False, "no_model")), \
+             mock.patch.object(ytv2, "_batched_visual_verdicts", mock_batched), \
              mock.patch.dict(os.environ, {
                  "VIDZEO_YT_FAIL_OPEN_ON_VISUAL_UNAVAILABLE": "0",
                  "VIDZEO_YT_RELAXED_VISUAL_GATE": "0",
@@ -1749,6 +1865,315 @@ class YouTubePipelineV2Tests(unittest.TestCase):
     def test_classify_visual_result_outcomes(self):
         self.assertEqual(ytv2._classify_visual_result(False, 0.0, False, "unavailable"), "unavailable")
         self.assertEqual(ytv2._classify_visual_result(True, 95.0, True, "high_quality"), "pass")
+
+    def test_search_container_pools_fits_wall_to_fanout(self):
+        """An explicit search timeout is raised to the fan-out floor.
+
+        Panama run 3 (job e053d262) got search<=55s from the stage budget,
+        which assumes a yt-dlp search answers in ~3s; measured live, the
+        same 12-query fan-out needs ~55s in a good hour via the egress
+        proxy, so the wall was consumed entirely and the run returned 0
+        candidates. The rounds floor therefore applies to explicit
+        timeouts too: a mocked 5s search must still return its candidates
+        past an explicit 2s wall instead of being cut off with nothing.
+        """
+        import time
+
+        def slow_search(query, results_per_query, session_jar=None, cancellation=None):
+            time.sleep(5)
+            return [{"id": f"video-{query.rsplit(' ', 1)[-1]}", "title": "A result"}]
+
+        row = {
+            "scene_index": 0,
+            "scene_text": "Grand Theft Auto VI neon streets at night.",
+            "candidate_subject": "Grand Theft Auto VI",
+            "queries": [f"Grand Theft Auto VI gameplay footage {i}" for i in range(8)],
+        }
+        started = time.monotonic()
+        with mock.patch.object(ytv2, "_search_youtube", side_effect=slow_search), \
+             mock.patch.dict(os.environ, {
+                 "VIDZEO_YT_SEARCH_PACE_SECONDS": "0",
+             }, clear=False):
+            # VIDZEO_YT_V2_SEARCH_TIMEOUT set in the ambient env would also
+            # count as explicit; clear it so only the passed timeout binds.
+            os.environ.pop("VIDZEO_YT_V2_SEARCH_TIMEOUT", None)
+            os.environ.pop("VIDZEO_YT_SCENE_SEARCH_BUDGET_SECONDS", None)
+            pools = ytv2._search_container_pools(
+                {"grand theft auto vi": [row]},
+                search_timeout_seconds=2,
+                session_jar=None,
+            )
+        elapsed = time.monotonic() - started
+        self.assertEqual(
+            sorted(item["id"] for items in pools.values() for item in items),
+            [f"video-{i}" for i in range(8)],
+        )
+        # 8 queries at the 4-worker cap = 2 rounds x the 5s mock.
+        self.assertGreaterEqual(elapsed, 9.0)
+        self.assertLess(elapsed, 13.0, f"fan-out wall fit ran past the mock ({elapsed:.1f}s)")
+
+    def test_search_container_pools_caps_search_concurrency(self):
+        """The pool fan-out never runs more than 4 concurrent searches.
+
+        Measured live Nov 19: 10-way concurrency makes each yt-dlp search
+        cost ~37-51s via the egress proxy (vs ~13-21s at 4-way and ~9s
+        sequential) while the 12-query total stays ~55-59s either way, so
+        extra workers only delay the first completed result.
+        """
+        import threading
+        import time
+
+        active = [0]
+        peak = [0]
+        lock = threading.Lock()
+
+        def slow_search(query, results_per_query, session_jar=None, cancellation=None):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            try:
+                time.sleep(0.2)
+                return [{"id": query, "title": "A result"}]
+            finally:
+                with lock:
+                    active[0] -= 1
+
+        def _row(scene_text, start):
+            return {
+                "scene_index": start,
+                "scene_text": scene_text,
+                "candidate_subject": "Grand Theft Auto VI",
+                "queries": [f"Grand Theft Auto VI gameplay footage {i}" for i in range(start, start + 6)],
+            }
+
+        rows = [
+            _row("Grand Theft Auto VI neon streets at night.", 0),
+            _row("Grand Theft Auto VI drives through Vice City.", 6),
+        ]
+        with mock.patch.object(ytv2, "_search_youtube", side_effect=slow_search), \
+             mock.patch.dict(os.environ, {
+                 "VIDZEO_YT_SEARCH_PACE_SECONDS": "0",
+                 "VIDZEO_YT_SEARCH_CONCURRENCY": "10",
+             }, clear=False):
+            os.environ.pop("VIDZEO_YT_V2_SEARCH_TIMEOUT", None)
+            os.environ.pop("VIDZEO_YT_SCENE_SEARCH_BUDGET_SECONDS", None)
+            pools = ytv2._search_container_pools(
+                {"grand theft auto vi": rows},
+                search_timeout_seconds=120,
+                session_jar=None,
+            )
+        self.assertLessEqual(peak[0], 4, f"search fan-out ran {peak[0]} concurrent searches")
+        self.assertEqual(sum(len(items) for items in pools.values()), 12)
+
+    def test_search_container_pools_anonymous_retry_gets_real_budget(self):
+        """A timed-out 0-candidate pass retries anonymously with its own wall.
+
+        The retry used to share the first pass's wall, so it inherited ~0s
+        whenever the first pass consumed its deadline (Panama run 3: it
+        never ran in either worker run). It now gets its own budget inside
+        the hard cap.
+        """
+        calls = []
+
+        def fake_pass(jobs, *, session_jar=None, search_timeout, max_workers, cancellation=None):
+            calls.append((session_jar is None, search_timeout))
+            if session_jar is not None:
+                return True, {}
+            return False, {"pool": [{"id": "video-1", "title": "A result"}]}
+
+        row = {
+            "scene_index": 0,
+            "scene_text": "Grand Theft Auto VI neon streets at night.",
+            "candidate_subject": "Grand Theft Auto VI",
+            "queries": ["Grand Theft Auto VI gameplay footage 0"],
+        }
+        with mock.patch.object(ytv2, "_run_pool_search_pass", side_effect=fake_pass), \
+             mock.patch.dict(os.environ, {
+                 "VIDZEO_YT_SEARCH_SECONDS_PER_QUERY": "1",
+                 "VIDZEO_YT_SEARCH_ANON_RETRY_SECONDS": "60",
+             }, clear=False):
+            os.environ.pop("VIDZEO_YT_V2_SEARCH_TIMEOUT", None)
+            os.environ.pop("VIDZEO_YT_SCENE_SEARCH_BUDGET_SECONDS", None)
+            pools = ytv2._search_container_pools(
+                {"grand theft auto vi": [row]},
+                search_timeout_seconds=2,
+                session_jar=object(),
+            )
+        self.assertEqual(len(calls), 2)
+        # First pass fitted to the fan-out floor (1 round x 1s + 15s = 16s),
+        # not the explicit 2s; the retry gets its own 60s inside the 240s cap.
+        self.assertEqual(calls[0], (False, 16.0))
+        self.assertEqual(calls[1], (True, 60.0))
+        self.assertEqual(
+            [item["id"] for items in pools.values() for item in items],
+            ["video-1"],
+        )
+
+    def test_assign_candidates_returns_ranked_options_per_scene(self):
+        """GTA-style pool: >=3 ranked, timestamped options per scene.
+
+        The old top-1-only assignment (break after the first timestamp)
+        starved scenes to 1 candidate each. The primary stays
+        assignments[idx]; the ranked list rides on it as ranked_options.
+        """
+        rows = [
+            {
+                "scene_index": 0,
+                "candidate_subject": "Grand Theft Auto VI",
+                "scene_subject": "Grand Theft Auto VI",
+                "scene_text": "Grand Theft Auto VI neon streets at night.",
+                "domain_category": "gaming",
+            },
+            {
+                "scene_index": 1,
+                "candidate_subject": "Grand Theft Auto VI",
+                "scene_subject": "Grand Theft Auto VI",
+                "scene_text": "Grand Theft Auto VI Leonida world showcase.",
+                "domain_category": "gaming",
+            },
+        ]
+        pool = [
+            {
+                "id": f"trailer-{i}",
+                "title": "Grand Theft Auto VI Trailer 2 official gameplay footage",
+                "description": "Grand Theft Auto VI official trailer gameplay",
+                "channel": "Rockstar Games",
+                "duration": 180.0,
+                "webpage_url": f"https://www.youtube.com/watch?v=trailer-{i}",
+                "query_text": "Grand Theft Auto VI trailer gameplay footage",
+            }
+            for i in range(4)
+        ]
+        assignments = ytv2._assign_candidates(
+            rows,
+            {"grand theft auto vi": pool},
+            [8.0, 8.0],
+            lenient_acceptance=True,
+        )
+        for idx in (0, 1):
+            assigned = assignments[idx]
+            self.assertIsNotNone(assigned, f"scene {idx} got no assignment")
+            options = assigned.get("ranked_options") or []
+            self.assertGreaterEqual(len(options), 3, f"scene {idx} has {len(options)} ranked options")
+            self.assertEqual(len({ytv2._video_id(o) for o in options}), len(options))
+            for option in options:
+                self.assertIsNotNone(option.get("best_timestamp"))
+
+    def test_transcript_fetch_many_second_call_hits_cache(self):
+        """Second fetch_many for the same ids makes zero provider calls."""
+        from services.youtube_transcript_index import YouTubeTranscriptIndex
+
+        calls = []
+
+        def provider(video_id):
+            calls.append(video_id)
+            return {
+                "segments": [{"start": 0.0, "end": 4.0, "text": "hello world"}],
+                "language": "en",
+                "source": "test",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index = YouTubeTranscriptIndex(
+                path=os.path.join(tmp, "transcripts.db"), provider=provider
+            )
+            first = index.fetch_many(["vid-abc"], deadline_seconds=30)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first["vid-abc"].status, "ready")
+            calls.clear()
+            second = index.fetch_many(["vid-abc"], deadline_seconds=30)
+            self.assertEqual(calls, [])
+            self.assertEqual(second["vid-abc"].status, "ready")
+            self.assertEqual(second["vid-abc"].segments[0].text, "hello world")
+
+    def test_youtube_frame_fallback_yields_multiple_frames_per_clip(self):
+        """Frame fallback yields several frames per clip, not one.
+
+        With VIDZEO_YT_FRAME_FALLBACK_SOURCES=3 / FRAMES=4 (the recommended
+        .env values) a single downloaded YouTube clip yields up to 4
+        timestamp frames for vision. The frame builder itself lives in the
+        coordinator; this pins the env-driven behaviour the YT lane relies
+        on for its YT->web/frame recovery.
+        """
+        from services.media_resolution_coordinator import (
+            _youtube_frame_fallback_candidates,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            clip.write_bytes(b"fake-clip")
+            frames = []
+            for i in range(4):
+                frame = Path(tmp) / f"frame-{i}.jpg"
+                frame.write_bytes(b"fake-frame")
+                frames.append(str(frame))
+            candidate = {
+                "source": "youtube",
+                "path": str(clip),
+                "candidate_id": "vid1",
+                "final_score": 90.0,
+            }
+            with mock.patch.dict(os.environ, {
+                "VIDZEO_YT_FRAME_FALLBACK_SOURCES": "3",
+                "VIDZEO_YT_FRAME_FALLBACK_FRAMES": "4",
+            }, clear=False), mock.patch(
+                "services.visual_intelligence.frame_extractor.extract_clip_frames",
+                return_value=(frames, 60.0),
+            ):
+                out = _youtube_frame_fallback_candidates({}, [candidate], 0)
+        self.assertGreaterEqual(len(out), 3)
+        self.assertGreaterEqual(len({row["path"] for row in out}), 3)
+        self.assertTrue(all(
+            row.get("fallback_layer") == "same_video_timestamp_frame" for row in out
+        ))
+
+
+    def test_same_video_alternate_blocked_for_caption_overlay(self):
+        # GTA VI run2 scene 6: two transfers burned on one captioned video.
+        rows = [
+            {"video_id": "FJudvYLUdD8", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "caption_overlay_rejected"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "FJudvYLUdD8", 3))
+
+    def test_same_video_alternate_blocked_on_second_content_failure(self):
+        # GTA VI run2 scene 5: one video failed twice (58s + 56s).
+        rows = [
+            {"video_id": "F4yOVIKCZpw", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "outro_endcard_rejected:high_black_outro_slate_ratio_0.79"},
+            {"video_id": "F4yOVIKCZpw", "status": "motion_or_quality_rejected",
+             "rejection_reason": "blank_or_low_information_frame"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "F4yOVIKCZpw", 3))
+
+    def test_same_video_alternate_allowed_for_first_timestamp_local_failure(self):
+        # An outro endcard is timestamp-local: a mid-video cut escapes it.
+        rows = [
+            {"video_id": "F4yOVIKCZpw", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "outro_endcard_rejected:high_black_outro_slate_ratio_0.79"},
+        ]
+        self.assertTrue(ytv2._same_video_alternate_allowed(rows, "F4yOVIKCZpw", 3))
+
+    def test_same_video_alternate_allowed_when_no_fresh_master_exists(self):
+        rows = [
+            {"video_id": "FJudvYLUdD8", "status": "overlay_or_talking_head_rejected",
+             "rejection_reason": "caption_overlay_rejected"},
+        ]
+        self.assertTrue(ytv2._same_video_alternate_allowed(rows, "FJudvYLUdD8", 1))
+
+    def test_same_video_alternate_blocked_for_static_master(self):
+        rows = [
+            {"video_id": "abc123", "status": "motion_or_quality_rejected",
+             "rejection_reason": "still_or_slideshow"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "abc123", 3))
+
+    def test_same_video_alternate_blocked_for_non_content_failure(self):
+        rows = [
+            {"video_id": "abc123", "status": "download_failed",
+             "rejection_reason": "transport_error"},
+        ]
+        self.assertFalse(ytv2._same_video_alternate_allowed(rows, "abc123", 3))
 
 
 if __name__ == "__main__":

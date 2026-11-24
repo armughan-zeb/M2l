@@ -21,7 +21,13 @@ export MUSE_REPO_ROOT="${MUSE_REPO_ROOT:-/app}"
 # of inside the image. headless_agent.py accepts --runtime-root before the
 # subcommand: `VIDNETS_AGENT.sh --runtime-root /data/runtime start`.
 export MUSE_VIDNETS_COMMAND="${MUSE_VIDNETS_COMMAND:-bash /app/vidnets/VIDNETS_AGENT.sh --runtime-root /data/runtime}"
-export MUSE_YOUTUBE_COVERAGE_TARGET="${MUSE_YOUTUBE_COVERAGE_TARGET:-0.8}"
+# Resident inference is the DEFAULT transport: the daemon's resident inbox
+# calls this spool command, and the resident inference worker agent
+# (scripts/resident-inference-worker/WORKER_BRIEF.md) answers each request
+# with real Muse inference in seconds. The host hook is the fallback when
+# the worker is not running. Never point this at a stub.
+export MUSE_INFERENCE_COMMAND="${MUSE_INFERENCE_COMMAND:-node /app/scripts/muse-inference-spool.cjs}"
+export MUSE_YOUTUBE_COVERAGE_TARGET="${MUSE_YOUTUBE_COVERAGE_TARGET:-0.30}"
 export MUSE_MEDIA_STRICT="${MUSE_MEDIA_STRICT:-0}"
 export VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE="${VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE:-12}"
 export VIDZEO_VISUAL_FINALIST_LIMIT="${VIDZEO_VISUAL_FINALIST_LIMIT:-3}"
@@ -32,6 +38,7 @@ export VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY="${VIDZEO_MIXED_YT_DOWNLOAD_CONCURRE
 export VIDZEO_YT_DOWNLOAD_CONCURRENCY="${VIDZEO_YT_DOWNLOAD_CONCURRENCY:-4}"
 # Thumbnails are SKIPPED: this worker delivers script + video only.
 export VIDZEO_SKIP_THUMBNAILS="${VIDZEO_SKIP_THUMBNAILS:-1}"
+export VIDZEO_AGENT_MIN_WALL_SECONDS="${VIDZEO_AGENT_MIN_WALL_SECONDS:-1200}"
 export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-/etc/ssl/certs/ca-certificates.crt}"
 export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
 export VIDZEO_RUNTIME_ROOT="${VIDZEO_RUNTIME_ROOT:-/data/runtime}"
@@ -65,7 +72,7 @@ if [ -z "${MUSE_INFERENCE_COMMAND:-}${MUSE_INFERENCE_URL:-}" ] && [ ! -f "$HOOK_
   echo "[vidzeo]   2. Set a real delivery target and enable the hook on the host Muse VM." >&2
   echo "[vidzeo]   3. Run ./setup.sh to install the script, then run doctor to check live answers." >&2
   echo "[vidzeo]   Full steps: docker/SETUP.md (\"Host Muse hook\")." >&2
-  echo "[vidzeo]   Target is <60s per answer; the hard request expiry is 120s. Multi-minute waits are a fault." >&2
+  echo "[vidzeo]   NOTE: with the resident inference worker running, inbox answers land in seconds; the host hook is only the fallback when the worker is down (hook wake latency is ~4.5 min). The agent-bridge request floor is 3600s." >&2
 fi
 if [ ! -f /data/.muse-agent.json ]; then
   echo "[vidzeo] WARNING: no worker credential at /data/.muse-agent.json — run ./setup.sh (pairing) first. The daemon will exit until paired." >&2

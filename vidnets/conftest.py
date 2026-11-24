@@ -1,6 +1,91 @@
 import pytest
 import importlib
+import importlib.util
+import os
 import sys
+import time
+from pathlib import Path
+
+_RENDER_GATE_MODULE = None
+
+
+def _load_render_gate():
+    """Load services/render_gate.py by file path (no package import, so
+    the gate never pulls the server in at session start)."""
+    global _RENDER_GATE_MODULE
+    if _RENDER_GATE_MODULE is not None:
+        return _RENDER_GATE_MODULE
+    gate_path = Path(__file__).resolve().parent / "server" / "services" / "render_gate.py"
+    spec = importlib.util.spec_from_file_location("vidnets_render_gate", gate_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _RENDER_GATE_MODULE = module
+    return module
+
+
+def pytest_sessionstart(session):
+    """Render gate: a render in progress owns the machine (Berlin Wall,
+    Nov 15 — the suite ran through a render at ~160 MB free until pytest
+    was killed by hand). If a render is active, wait for it (bounded by
+    VIDZEO_RENDER_GATE_WAIT_SECONDS, default 1200s) instead of starting
+    heavy test work on top of it. On timeout, proceed with a loud
+    warning — a test run must never hang forever, and it must never
+    fail the suite because a render exists. VIDZEO_RENDER_GATE=off
+    skips the wait entirely. Any gate error fails open: note it and
+    run the suite."""
+    try:
+        gate = _load_render_gate()
+        if gate is None:
+            return
+        if not gate.render_gate_enabled():
+            return
+        status = gate.is_render_active()
+        if not status["active"]:
+            return
+        wait_seconds = gate.render_gate_wait_seconds()
+        print(
+            "[RenderGate] render in progress ("
+            + "; ".join(status["signals"])
+            + f") — waiting up to {wait_seconds:.0f}s for the machine to free up "
+            "(VIDZEO_RENDER_GATE_WAIT_SECONDS to change, VIDZEO_RENDER_GATE=off to skip)",
+            flush=True,
+        )
+        last_notice = time.monotonic()
+        started = time.monotonic()
+
+        def _on_wait(wait_status, waited):
+            nonlocal last_notice
+            if time.monotonic() - last_notice >= 30.0:
+                last_notice = time.monotonic()
+                print(
+                    "[RenderGate] still waiting for render to finish "
+                    f"({waited:.0f}s of {wait_seconds:.0f}s; "
+                    + "; ".join(wait_status["signals"])
+                    + ")",
+                    flush=True,
+                )
+
+        result = gate.wait_for_render_idle(
+            timeout_seconds=wait_seconds, poll_seconds=5.0, on_wait=_on_wait
+        )
+        if result["idle"]:
+            print(
+                f"[RenderGate] render finished after {result['waitedSeconds']:.0f}s; starting tests",
+                flush=True,
+            )
+        else:
+            print(
+                "[RenderGate] WARNING: render still active after "
+                f"{result['waitedSeconds']:.0f}s ("
+                + "; ".join(result["status"]["signals"])
+                + ") — proceeding anyway; the render will stay starved, "
+                "re-check before heavy work",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[RenderGate] gate check failed ({exc}); proceeding without it", flush=True)
 
 
 @pytest.fixture(autouse=True)

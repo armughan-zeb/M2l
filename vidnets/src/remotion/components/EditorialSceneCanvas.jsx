@@ -1,5 +1,7 @@
 import React from 'react';
-import { AbsoluteFill, Img, OffthreadVideo, interpolate, spring, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AbsoluteFill, Img, interpolate, spring, useCurrentFrame, useVideoConfig } from 'remotion';
+// @remotion/media Video decodes faster than OffthreadVideo (Remotion 4); aliased to the old name so call sites stay unchanged.
+import { Video as OffthreadVideo } from '@remotion/media';
 import { rgba } from '../theme';
 
 const VIDEO_EXTENSIONS = /\.(?:mp4|webm|mov|mkv|avi|m4v)(?:[?#]|$)/i;
@@ -228,7 +230,7 @@ function EvidenceDesk({ scene, props, visualDNA }) {
   const source = upper(editorialLabel(props.source || props.attribution || props.publication || ''));
   return (
     <AbsoluteFill style={{ opacity: motion.opacity, color: colors.ink, overflow: 'hidden' }}>
-      <div style={{ position: 'absolute', left: '8%', top: '18%', width: '82%', maxWidth: 1200, transform: `translateY(${(1 - motion.enter) * 26}px)`, filter: `drop-shadow(0 4px 16px ${rgba(colors.bg, .62)})` }}>
+      <div style={{ position: 'absolute', left: '8%', top: '18%', width: '82%', maxWidth: 1200, transform: `translateY(${(1 - motion.enter) * 26}px)`, textShadow: `0 4px 16px ${rgba(colors.bg, .62)}` }}>
         {source && <div style={{ marginBottom: 15, color: colors.accent, fontFamily: fonts.body, fontSize: 14, fontWeight: 700, letterSpacing: '.08em', textTransform: 'uppercase' }}>{source}</div>}
         <div style={{ display: 'inline-block', color: colors.ink, fontFamily: fonts.display, fontSize: clean(title).length > 34 ? 54 : 72, fontWeight: 900, lineHeight: .96, letterSpacing: '-.055em', maxWidth: '92%', overflowWrap: 'anywhere' }}>{title}</div>
         <div style={{ marginTop: 13, width: 74 * clamp(motion.enter), height: 3, background: colors.accent, transformOrigin: 'left' }} />

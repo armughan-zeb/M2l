@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Sequence
 
-from .vidzeo_brain import _fallback_retrieval_context, _mechanical_scene_plan
+from .mechanical_scene_planner import content_words, game_for_scene, plan_mechanical_scene_rows
+from .vidzeo_brain import (
+    _default_youtube_intents,
+    _fallback_retrieval_context,
+    _is_format_phrase_subject,
+    _mechanical_scene_plan,
+)
 from .youtube_query_normalizer import normalize_youtube_query
 
 
@@ -41,6 +47,35 @@ def _compact_search_subject(anchor: str) -> str:
     return " ".join(kept[:4]).strip()
 
 
+def _positive_terms(context_terms: Any, mech_terms: Any, active: str,
+                    extra_terms: Any = ()) -> List[str]:
+    """Positive retrieval terms: the context's, padded to >= 3 from the
+    mechanical row's own terms (the contract validator rejects fewer).
+
+    The padding must not depend on the mechanical plan row: boundary
+    (intro/outro) scenes take the old topic-anchored plan and carry no
+    mechanical row, so with only the context terms they stall at two —
+    subject == domain anchor dedupes to one term, plus the domain
+    category (Panama: ["Panama Canal", "other"] on all 13 rows, which
+    failed every row in job f66daa53). Pad from the scene's own content
+    words next, then from the words of the active subject, so the >= 3
+    invariant holds for every row regardless of its plan path.
+    """
+    terms = [str(term).strip() for term in (context_terms or []) if str(term or "").strip()]
+    if not terms:
+        terms = [str(active).strip()] if str(active or "").strip() else []
+    for source in ((mech_terms or []), (extra_terms or []), str(active or "").split()):
+        for term in source:
+            if len(terms) >= 3:
+                break
+            clean = str(term or "").strip()
+            if clean and clean not in terms:
+                terms.append(clean)
+        if len(terms) >= 3:
+            break
+    return terms[:10]
+
+
 def _variants(*values: str) -> List[str]:
     return list(dict.fromkeys(value for value in values if value))
 
@@ -70,7 +105,7 @@ _DOMAIN_VISUAL_TERMS = {
     "gaming": (
         "gameplay", "driving", "vehicle", "vehicles", "police", "plane", "city",
         "mission", "missions", "character", "characters", "npc", "npcs", "interior",
-        "interiors", "animation", "animations", "physics", "trailer", "leak", "leaks",
+        "interiors", "animation", "animations", "physics", "trailer",
         "rockstar", "take-two", "netflix", "microsoft", "discord", "court", "subpoena",
         "radio", "music", "jason", "lucia", "vice city", "release",
     ),
@@ -173,6 +208,16 @@ def _entity_visual_kind(subject: str, scene_text: str, domain: str, section: Dic
     subject_text = str(subject or "").strip()
     subject_lower = subject_text.casefold()
     context = f"{subject_text} {scene_text or ''} {domain or ''}".casefold()
+    # A studio, a game title, or a place is never a person, however
+    # name-like its capitalization ("Rockstar Games", "Grand Theft Auto
+    # VI", "Vice City" all match the two-capitalized-words pattern below).
+    # Check those first: the old order returned "person" for all of them.
+    if re.search(r"\b(?:grand theft auto|gta)\s+(?:vi|v|iv|iii|6|5|4|3|six|five|four|three)\b", subject_lower):
+        return "topic"
+    if re.search(r"\b(?:games|studios|entertainment|interactive|company|corporation|pictures)\s*$", subject_lower):
+        return "topic"
+    if re.search(r"\b(?:city|streets?|island|keys|beach|state|county|country|neighborhood|district|town|village|province|coast|peninsula)\b", subject_lower):
+        return "place"
     if re.match(r"^(?:rms|hms|uss|ss|mv|ms|hmt)\b", subject_lower):
         # Initialed vessels are named maritime subjects (RMS Titanic, HMS
         # Victory), not retail products.  Give them an archive/ship query lane
@@ -198,6 +243,13 @@ def _entity_visual_kind(subject: str, scene_text: str, domain: str, section: Dic
         "biography", "portrait", "interview",
     }
     name_like = bool(re.fullmatch(r"[A-Z][A-Za-z0-9'’-]*(?:\s+[A-Z][A-Za-z0-9'’-]*){1,3}", subject_text))
+    if not name_like:
+        # Multi-person subjects joined by "and"/"&" ("Lucia Caminos and
+        # Jason Duval"): each part is a capitalized name on its own.
+        name_parts = [part.strip() for part in re.split(r"\s+(?:and|&)\s+", subject_text) if part.strip()]
+        name_like = len(name_parts) >= 2 and all(
+            re.fullmatch(r"[A-Z][A-Za-z0-9'’-]*(\s+[A-Z][A-Za-z0-9'’-]*)*", part)
+            for part in name_parts)
     if any(re.search(rf"\b{re.escape(term)}\b", context) for term in role_terms) or name_like:
         return "person"
     return "thing"
@@ -246,24 +298,88 @@ def build_mechanical_query_bundle(
     # made-up title phrase before the scene words.
     plan_topic = _compact_search_subject(global_anchor) or global_anchor
     bundle: Dict[str, List[Dict[str, Any]]] = {"web": [], "yt": [], "stock": []}
+    # Mechanical-first plan rows (deterministic prototype, promoted from
+    # scratch): per-scene subjects, distinctive-token facets, and
+    # per-lane queries derived from the scene's own narration. The bundle
+    # below still anchors retrieval on the section subject where the
+    # prototype row gives no scene subject, and intro/outro scenes keep
+    # the old topic-anchored path.
+    try:
+        mech_rows = plan_mechanical_scene_rows(
+            scene_texts, title, plan_topic, section_subjects)
+    except Exception:
+        mech_rows = []
 
     for idx, scene_text in enumerate(scene_texts):
         section = sections[idx] if idx < len(sections) and isinstance(sections[idx], dict) else {}
         subject = str(section_subjects[idx] if idx < len(section_subjects) else "").strip()
-        if section.get("is_intro") or str(section.get("container_id") or "").lower() == "outro":
+        is_boundary = bool(section.get("is_intro") or str(section.get("container_id") or "").lower() == "outro")
+        if is_boundary:
             subject = ""
-        # When no section subject exists, the raw title anchor is usually a
-        # made-up phrase, not a searchable subject. Compact it to its content
-        # words ("Amtrak's Long Run Through the Crew's Day" -> "Amtrak Crew")
-        # so every lane's queries can actually match real media.
-        active = subject or _compact_search_subject(global_anchor) or global_anchor
+        mrow = mech_rows[idx] if (not is_boundary and idx < len(mech_rows) and isinstance(mech_rows[idx], dict)) else {}
+        # Padding source for the >= 3 positive-terms contract. Boundary
+        # scenes take the old plan above and carry no mechanical row, so
+        # mrow is empty for them; the mech row's own terms are still the
+        # right pad (scene words), and the scene's content words cover a
+        # missing or failed mechanical build.
+        pad_terms = (
+            mech_rows[idx].get("retrieval_positive_terms")
+            if idx < len(mech_rows) and isinstance(mech_rows[idx], dict)
+            else []
+        )
+        # The scene's own subject (first entity / event framing) is the
+        # query anchor; the section subject stays the container identity
+        # (grouping, container isolation) and the fallback anchor.
+        mech_subject = str(mrow.get("scene_subject") or "").strip()
+        # The section detector can emit a format phrase as a container
+        # subject ("video game official trailer gameplay" for GTA scene 7):
+        # it fails the contract validator as a section_subject, so replace
+        # it with the scene's own subject before it reaches any row.
+        if subject and _is_format_phrase_subject(subject):
+            subject = mech_subject or _compact_search_subject(global_anchor) or global_anchor
+        active = mech_subject or subject or _compact_search_subject(global_anchor) or global_anchor
         context = _fallback_retrieval_context(active, scene_text, global_anchor)
-        domain_category = context.get("domain_category") or "other"
+        domain_category = str(mrow.get("domain_category") or "").strip() or context.get("domain_category") or "other"
         if domain_category == "other":
             domain_category = global_context.get("domain_category") or "other"
-        facet = _scene_visual_facet(scene_text, active, domain_category)
+        mech_intent = str(mrow.get("visual_intent") or "")
+        facet = mech_intent.split(": ", 1)[1].strip() if ": " in mech_intent else ""
+        if not facet:
+            # Boundary scenes carry no mechanical row (mrow is empty), so
+            # take the facet from the mechanical plan row itself: it is
+            # built from tokens distinctive to this scene's narration,
+            # which the plan-level validator requires. The generic scene
+            # facet (_scene_visual_facet) picks shared words instead
+            # ("caribbean pacific" also names scenes 1/7/8/13) and fails
+            # distinctiveness.
+            mech_row = mech_rows[idx] if idx < len(mech_rows) and isinstance(mech_rows[idx], dict) else {}
+            mech_visual = str(mech_row.get("visual_intent") or "")
+            facet = mech_visual.split(": ", 1)[1].strip() if ": " in mech_visual else ""
+        if not facet:
+            facet = _scene_visual_facet(scene_text, active, domain_category)
         entity_kind = _entity_visual_kind(active, scene_text, domain_category, section)
-        plan = _mechanical_scene_plan(scene_text, idx + 1, section_subject=subject, topic=plan_topic)
+        # The prototype types subjects from the scene's own words (a
+        # studio/game/place is never a person); trust it over the
+        # name-shape heuristic wherever they disagree on person/place/
+        # event, and never let a name-like topic become a person
+        # ("PlayStation 5"). Ship/food/object detections the prototype
+        # lacks are kept when it says topic.
+        proto_type = str(mrow.get("scene_subject_type") or "").strip().lower()
+        if proto_type in {"person", "place", "event"}:
+            entity_kind = proto_type
+        elif proto_type == "topic" and entity_kind not in {"ship", "food", "object"}:
+            entity_kind = "topic"
+        if is_boundary:
+            plan = _mechanical_scene_plan(scene_text, idx + 1, section_subject=subject, topic=plan_topic)
+            entity_kind = _entity_visual_kind(active, scene_text, domain_category, section)
+        else:
+            plan = {
+                "youtube": mrow.get("youtube") if isinstance(mrow.get("youtube"), dict) else {},
+                "web": mrow.get("web") if isinstance(mrow.get("web"), dict) else {},
+                "stock": mrow.get("stock") if isinstance(mrow.get("stock"), dict) else {},
+                "visual_metaphor": mech_intent,
+                "section_label": f"section_{idx + 1}" if subject else "intro",
+            }
         container_id = str(
             section.get("container_id")
             or plan.get("section_label")
@@ -277,17 +393,28 @@ def build_mechanical_query_bundle(
         common = {
             "scene_number": idx + 1,
             "section_subject": subject,
-            "scene_subject": str(section.get("scene_subject") or subject or active).strip(),
-            "scene_subject_type": entity_kind if subject and entity_kind in {"person", "place", "object", "food", "ship", "animal", "event"} else ("entity" if subject else "topic"),
-            "container_type": entity_kind if subject and entity_kind in {"person", "place", "object", "food", "ship", "animal", "event"} else ("entity" if subject else "topic"),
+            "scene_subject": str(mech_subject or section.get("scene_subject") or subject or active).strip(),
+            # "thing" means unknown: the neutral type is "topic", never the
+            # schema-invalid "entity" the old mapping emitted here.
+            "scene_subject_type": entity_kind if entity_kind in {"person", "place", "object", "food", "ship", "animal", "event", "topic", "product"} else "topic",
+            "container_type": entity_kind if entity_kind in {"person", "place", "object", "food", "ship", "animal", "event", "topic", "product"} else "topic",
             "subject_query": active,
             "topic_anchor": active,
             "global_topic": global_anchor,
             "domain_anchor": global_anchor,
             "domain_category": domain_category,
             "search_disambiguator": context.get("search_disambiguator") or active,
-            "retrieval_positive_terms": list(context.get("retrieval_positive_terms") or [active])[:10],
+            # The contract requires >= 3 positive terms; a short subject
+            # ("Food") can leave the context with only two, so pad from
+            # the mechanical row's own terms (scene words, already >= 3).
+            # Boundary scenes have no mechanical row: pad from the mech
+            # row's terms anyway (see pad_terms above) plus the scene's
+            # own content words, so the invariant holds on every path.
+            "retrieval_positive_terms": _positive_terms(
+                context.get("retrieval_positive_terms"), pad_terms, active,
+                extra_terms=content_words(scene_text)),
             "retrieval_negative_terms": list(context.get("retrieval_negative_terms") or [])[:10],
+            "youtube_query_intents": _default_youtube_intents(domain_category),
             "container_id": container_id,
             "section_id": container_id,
             "container_boundary": boundary,
@@ -301,11 +428,36 @@ def build_mechanical_query_bundle(
         }
 
         yt = plan.get("youtube") if isinstance(plan.get("youtube"), dict) else {}
+        # Scene-relative game: the validator requires at least one primary
+        # across web+yt to name the game THIS scene narrates. The gaming
+        # overrides below replace the prototype row's queries (which
+        # already carry the suffix), so re-attach it here.
+        _scene_game = game_for_scene(scene_text, title)
+        game_suffix = (
+            f" {_scene_game}"
+            if domain_category == "gaming" and _scene_game and _scene_game.lower() not in active.lower()
+            else ""
+        )
         if domain_category == "gaming":
             yt = {
-                "primary": f"{active} {facet} gameplay no commentary" if facet else f"{active} official gameplay",
-                "supporting": f"{active} {facet} official trailer" if facet else f"{active} official trailer",
-                "fallback": f"{active} gameplay footage",
+                "primary": f"{active} {facet}{game_suffix} gameplay no commentary" if facet else f"{active}{game_suffix} official gameplay",
+                "supporting": f"{active} {facet}{game_suffix} official trailer" if facet else f"{active}{game_suffix} official trailer",
+                "fallback": f"{active}{game_suffix} gameplay footage",
+            }
+        elif is_boundary and facet:
+            # Boundary scenes take the old topic-anchored plan, whose
+            # YouTube primary is built from a different facet than the
+            # recomputed scene facet the flat visual_intent carries
+            # (Panama scene 4: plan "Panam narrow strip" vs visual
+            # intent "caribbean pacific"). The shape validator requires
+            # the primary to carry a viewpoint word from the visual
+            # intent, so rebuild it from the same facet the web lane
+            # already uses. Non-boundary scenes keep the mechanical
+            # row's primary, which already shares its facet.
+            yt = {
+                "primary": f"{active} {facet} documentary footage",
+                "supporting": f"{active} {facet} footage",
+                "fallback": f"{active} footage",
             }
         yt_primary = normalize_youtube_query(
             _clean_query(yt.get("primary"), f"{active} real footage"),
@@ -341,9 +493,9 @@ def build_mechanical_query_bundle(
         web = plan.get("web") if isinstance(plan.get("web"), dict) else {}
         if domain_category == "gaming":
             web = {
-                "primary": f"{active} {facet} official screenshot" if facet else f"{active} official screenshot",
-                "supporting": f"{active} {facet} gameplay still" if facet else f"{active} gameplay still",
-                "fallback": f"{active} official image",
+                "primary": f"{active} {facet}{game_suffix} official screenshot" if facet else f"{active}{game_suffix} official screenshot",
+                "supporting": f"{active} {facet}{game_suffix} gameplay still" if facet else f"{active}{game_suffix} gameplay still",
+                "fallback": f"{active}{game_suffix} official image",
             }
         elif entity_kind == "person":
             # Person anchors need explicit portrait/photo nouns.  A generic

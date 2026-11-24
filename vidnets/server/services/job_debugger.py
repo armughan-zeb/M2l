@@ -19,14 +19,29 @@ Safety rules, all deliberate:
 * Never act on a job whose progress or normalized progress text changed
   recently, even if it is slow. The heartbeat's ``still working (Ns)``
   suffix is stripped before comparing, so a ticking clock is not progress.
-* Max 3 debugger actions per job per hour; a job debugger-restarted 3 times
-  is flagged and left alone -- no infinite restart loop.
+* Server restarts stay capped (max 3 per job per hour, 3 ever); a job
+  debugger-restarted 3 times is flagged and left alone -- no infinite
+  restart loop. Safe recovery actions (re-wake, scene advance, killing a
+  hung child, resuming a system-killed job) are NOT capped: they are
+  bounded by the tick itself (at most one per job per 120s) and must never
+  be the reason a recoverable job sits dead.
 * Never duplicate a job, never restart mid-render (a live ffmpeg/remotion
   child blocks the restart path), never act when more than one job is
   processing (the scene-advance flag is process-wide and assumes a single
   active media resolution).
 * A stale inbox request alone is NOT a stall signal: dead jobs leave pending
   requests behind for hours. Only requests belonging to a LIVE job count.
+
+THE DRIVER: the same tick also owns every job to the end. A system-killed
+job (reboot, crash, network error, the delivery-deadline watchdog's
+``Shared video processing deadline exceeded``) sits in ``paused`` /
+``cancelled`` / ``error`` with no processing job at all, so the stall pass
+above never sees it. The driver sweep in :meth:`JobDebugger.tick` resumes
+those jobs from their checkpoints (never a job the user cancelled --
+``cancel_requested`` is never touched) and escalates, with a clear marker
+on the job record and in the server log, when a job cannot be recovered
+(hard error, retries exhausted, no checkpoint). It runs on the same 120s
+tick, in the same thread, with no new processes and no tight polling.
 
 The module is stdlib-only so the coordinator and the queue manager can use
 its registry/picker without import cycles. Queue writes go through
@@ -46,6 +61,30 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 LOG_PREFIX = "[job-debugger]"
+
+# How many times the driver may auto-resume the SAME job stranded at the
+# SAME progress with the SAME reason before it escalates instead. A
+# deterministically failing stage (a render that fails identically every
+# time) must not loop resume -> fail -> resume forever on a memory-starved
+# VM. Progress is the discriminator: a job that gets FURTHER before
+# failing again resets the streak, so a legitimately progressing job that
+# accumulates attempts across reboots is never capped. This mirrors the
+# transient-error path's attempt<3 bound, keyed on stuckness rather than
+# total runs. Manual Retry is never capped — only automatic driver
+# resumes count. (The 3/hour and 3-ever restart caps are untouched.)
+DRIVER_RESUME_STREAK_LIMIT = 3
+
+# Progress tolerance for the driver-resume streak (Nov 16, 2026): a job
+# that creeps 1 point per attempt (73% -> 74% -> 75%) is just as stuck as
+# one that strands at the same percent — the GTA VI low-memory loop
+# proved it (the render waited, failed, and re-paused 1 point further
+# each time, resetting the streak forever). The streak is keyed on the
+# job's PROGRESS, not its pause reason: the same job also proved that
+# alternating reasons (low_memory -> remotion_render -> low_memory ...)
+# at the same progress resets a per-reason streak forever (attempts
+# 18-23). Only a genuine advance (>5 points) resets the streak, so a
+# legitimately progressing job is never capped.
+DRIVER_RESUME_PROGRESS_TOLERANCE = 5
 
 # ---------------------------------------------------------------------------
 # Configuration (env-tunable, defaults per the build brief)
@@ -89,6 +128,10 @@ class DebuggerConfig:
         self.max_actions_per_hour = max(
             1, _env_int("VIDZEO_JOB_DEBUGGER_MAX_ACTIONS_PER_HOUR", 3)
         )
+        # NOTE: max_actions_per_hour now bounds SERVER RESTARTS only. Safe
+        # recovery actions (re-wake, scene advance, hung-child kill, driver
+        # resume) are bounded by the tick itself and are never capped — see
+        # the driver notes in the module docstring.
         self.max_restarts = max(
             1, _env_int("VIDZEO_JOB_DEBUGGER_MAX_RESTARTS", 3)
         )
@@ -545,15 +588,15 @@ def tail_job_log(
             size = handle.tell()
             # Read the tail in bounded chunks; the log can be large.
             chunk = 65536
-            data = b""
+            data = ""
             while size > 0 and len(data) < 512 * 1024:
                 read = min(chunk, size)
                 size -= read
                 handle.seek(size)
-                data = handle.read(read).encode("utf-8", errors="replace") + data
+                data = handle.read(read) + data
                 if data.count("\n") > 400:
                     break
-        text = data.decode("utf-8", errors="replace")
+        text = data
         lines = [line for line in text.splitlines() if str(job_id) in line]
     except OSError:
         lines = []
@@ -633,6 +676,11 @@ def find_hung_children(
         ppid, start_ticks, cmdline = by_pid[pid]
         lowered = cmdline.lower()
         if "yt-dlp" not in lowered and "ffmpeg" not in lowered:
+            continue
+        # Defense in depth: render children (Remotion/ffmpeg finalize) are not
+        # downloads/probes — skip them even if the live-render check above
+        # missed the render (Area 3 hardening).
+        if "remotion" in lowered or "render-remotion-manifest" in lowered:
             continue
         started_at = boot_time + (start_ticks / ticks_per_second)
         age = now - started_at
@@ -762,17 +810,84 @@ def kill_hung_child(pid: int) -> Dict[str, Any]:
     return {"ok": True, "pid": pid}
 
 
+def _restart_verify_port() -> int:
+    """TCP port the restarter verifies after a restart (default 5010).
+
+    ``headless_agent.start`` binds the first free port from 5010, so 5010
+    is the expected port. The env override exists so tests can verify
+    against a scratch port instead of the live server's port.
+    """
+    try:
+        port = int(os.environ.get("VIDZEO_JOB_DEBUGGER_RESTART_VERIFY_PORT", "") or 5010)
+    except (TypeError, ValueError):
+        port = 5010
+    return port if 1 <= port <= 65535 else 5010
+
+
 def restart_server(reason: str = "") -> Dict[str, Any]:
     """Restart this server process so the job auto-resumes from its
     checkpoint. A detached restarter shell (own session, survives this
     process) SIGTERMs the server PID, waits, SIGKILLs if needed, then runs
-    the documented start command. Callers must have verified no render is
-    in progress and the restart cap is not hit."""
-    vidnets_dir = Path(__file__).resolve().parent.parent
+    the documented start command and verifies :5010 answers before it
+    reports success. Callers must have verified no render is in progress
+    and the restart cap is not hit.
+
+    Regression (2026-11-21, 5x death loop): the restarter used to compute
+    the start directory as ``Path(__file__).parent.parent`` -- that is
+    ``vidnets/server/`` -- and then ran ``bash VIDNETS_AGENT.sh`` there.
+    The launcher lives in ``vidnets/`` (one level up), so the start
+    command failed with "No such file or directory" and the server never
+    came back. The failure was silent three ways over: the restarter's
+    own stderr went to DEVNULL, the start command was backgrounded with
+    ``&`` so its exit code was never checked, and nothing verified the
+    port afterwards. All three are fixed here: the directory is the repo
+    root (``parent.parent.parent``) and is preflight-checked, the
+    restarter's output goes to the restarter log, the start runs in the
+    foreground of the detached restarter, and the port is verified before
+    the restarter exits. The server is killed by exact PID only, and only
+    after a ``/proc/<pid>/cmdline`` check that the PID really is this
+    server's ``main.py`` -- never ``pkill -f``, which would match the
+    restarter's own shell.
+    """
+    # services/job_debugger.py -> server -> vidnets (repo root, where
+    # VIDNETS_AGENT.sh lives). parent.parent alone is vidnets/server/.
+    vidnets_dir = Path(__file__).resolve().parent.parent.parent
+    launcher = vidnets_dir / "VIDNETS_AGENT.sh"
     runtime = runtime_root()
     start_log = runtime / "logs" / "server-start.log"
+    restarter_log = runtime / "logs" / "job-debugger-restart.log"
     pid = os.getpid()
+    verify_port = _restart_verify_port()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    if not launcher.is_file():
+        message = (
+            f"restart aborted: VIDNETS_AGENT.sh not found at {launcher} "
+            f"(vidnets_dir={vidnets_dir}); server pid {pid} left running"
+        )
+        print(f"{LOG_PREFIX} {message}", flush=True)
+        try:
+            restarter_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(restarter_log, "a", encoding="utf-8") as log_handle:
+                log_handle.write(f"\n[{stamp}] {message}\n")
+        except OSError:
+            pass
+        return {"ok": False, "pid": pid, "reason": reason, "error": message}
+    # The restarter runs detached (own session) and logs EVERYTHING to the
+    # restarter log: a failed start must be loud, never a silent DEVNULL.
+    # The start command runs in the FOREGROUND of the restarter --
+    # headless_agent.start() already spawns main.py detached and waits up
+    # to 45s for /api/status -- so its exit code is meaningful, and the
+    # verify loop below confirms the port answers before declaring success.
     script = (
+        f'exec >> "{restarter_log}" 2>&1\n'
+        f'echo "[{stamp}] job-debugger restart: {reason} (server pid {pid})"\n'
+        f'echo "[{stamp}] launcher: {launcher} (vidnets_dir {vidnets_dir})"\n'
+        "# Kill by exact PID only, and only if that PID is this server:\n"
+        "# a reused PID (or a wrong one) must never be signalled.\n"
+        f'if ! tr "\\0" " " < "/proc/{pid}/cmdline" 2>/dev/null | grep -q "main.py"; then\n'
+        f'  echo "[{stamp}] ABORT: pid {pid} is not the Vidnets server (cmdline: $(tr "\\0" " " < "/proc/{pid}/cmdline" 2>/dev/null)); not killing anything"\n'
+        "  exit 1\n"
+        "fi\n"
         "sleep 3\n"
         f"kill -TERM {pid} 2>/dev/null || true\n"
         "for i in $(seq 1 10); do\n"
@@ -781,25 +896,56 @@ def restart_server(reason: str = "") -> Dict[str, Any]:
         "done\n"
         f"kill -KILL {pid} 2>/dev/null || true\n"
         "sleep 1\n"
-        f"cd {vidnets_dir} && setsid nohup bash VIDNETS_AGENT.sh "
-        f"--runtime-root {runtime} start "
-        f">> {start_log} 2>&1 < /dev/null &\n"
+        f'echo "[{stamp}] starting server: bash VIDNETS_AGENT.sh --runtime-root {runtime} start"\n'
+        f'bash "{launcher}" --runtime-root "{runtime}" start '
+        f'>> "{start_log}" 2>&1\n'
+        "start_rc=$?\n"
+        f'echo "[{stamp}] server start exited rc=$start_rc (full log: {start_log})"\n'
+        "if [ \"$start_rc\" -ne 0 ]; then\n"
+        f'  echo "[{stamp}] FATAL: server start failed (rc=$start_rc); server NOT back. See {start_log}"\n'
+        "  exit 1\n"
+        "fi\n"
+        f'echo "[{stamp}] verifying server answers on :{verify_port}..."\n'
+        f"for i in $(seq 1 60); do\n"
+        f"  if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{verify_port}' 2>/dev/null; then\n"
+        f'    echo "[{stamp}] VERIFIED: server responding on :{verify_port}"\n'
+        "    exit 0\n"
+        "  fi\n"
+        "  sleep 1\n"
+        "done\n"
+        f'echo "[{stamp}] FATAL: server did not respond on :{verify_port} within 60s; see {start_log}"\n'
+        "exit 1\n"
     )
-    restarter_log = runtime / "logs" / "job-debugger-restart.log"
     restarter_log.parent.mkdir(parents=True, exist_ok=True)
+    start_log.parent.mkdir(parents=True, exist_ok=True)
     with open(restarter_log, "a", encoding="utf-8") as log_handle:
-        log_handle.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] restart requested: {reason}\n")
+        log_handle.write(f"\n[{stamp}] restart requested: {reason}\n")
         log_handle.write(script)
-    subprocess.Popen(
-        ["bash", "-c", script],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
+    # Detached in its own session so killing the server cannot take the
+    # restarter down with it; its output goes to the restarter log file,
+    # not DEVNULL, so a spawn-level failure is visible too.
+    with open(restarter_log, "a", encoding="utf-8") as restarter_out:
+        subprocess.Popen(
+            ["bash", "-c", script],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=restarter_out,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+    print(
+        f"{LOG_PREFIX} restart requested ({reason}); restarter spawned, "
+        f"logging to {restarter_log}",
+        flush=True,
     )
-    print(f"{LOG_PREFIX} restart requested ({reason}); restarter spawned", flush=True)
-    return {"ok": True, "pid": pid, "reason": reason}
+    return {
+        "ok": True,
+        "pid": pid,
+        "reason": reason,
+        "restarter_log": str(restarter_log),
+        "start_log": str(start_log),
+        "verify_port": verify_port,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -836,8 +982,10 @@ def save_state(state: Mapping[str, Any], path: Optional[Path] = None) -> None:
 
 
 class JobDebugger:
-    """Tick-based watchdog. ``tick()`` is pure decision + action against the
-    live queue file; the thread loop in :func:`start_job_debugger` drives it."""
+    """Tick-based watchdog + job driver. ``tick()`` is pure decision + action
+    against the live queue file; the thread loop in :func:`start_job_debugger`
+    drives it. The stall pass watches processing jobs; the driver sweep
+    (``_drive_recovery``) owns system-killed jobs to the end."""
 
     def __init__(
         self,
@@ -850,6 +998,7 @@ class JobDebugger:
         seen_path: Optional[Path] = None,
         state: Optional[Dict[str, Any]] = None,
         actions: Optional[Any] = None,
+        manager: Optional[Any] = None,
     ):
         self.config = config or DebuggerConfig()
         self.queue_path = queue_path or queue_file()
@@ -861,10 +1010,24 @@ class JobDebugger:
         # ``actions`` is a test seam: an object with force_rewake /
         # request_scene_advance / kill_hung_child / restart_server callables.
         self.actions = actions
+        # ``manager`` is a test seam: a live QueueManager. Without it the
+        # driver resolves the singleton lazily (see ``_manager``).
+        self._manager_override = manager
         self._lock = threading.Lock()
 
+    def _manager(self) -> Optional[Any]:
+        if self._manager_override is not None:
+            return self._manager_override
+        try:
+            from services.queue_manager import get_queue_manager
+
+            return get_queue_manager()
+        except Exception:
+            return None
+
     # -- queue reading ----------------------------------------------------
-    def read_processing_jobs(self) -> List[Dict[str, Any]]:
+    def read_all_items(self) -> List[Dict[str, Any]]:
+        """All queue items, whatever their status (the driver sweep)."""
         try:
             data = json.loads(self.queue_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -872,11 +1035,13 @@ class JobDebugger:
         items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list):
             return []
+        return [item for item in items if isinstance(item, dict)]
+
+    def read_processing_jobs(self) -> List[Dict[str, Any]]:
         return [
             item
-            for item in items
-            if isinstance(item, dict)
-            and str(item.get("status") or "").strip().lower() == "processing"
+            for item in self.read_all_items()
+            if str(item.get("status") or "").strip().lower() == "processing"
         ]
 
     # -- observation ------------------------------------------------------
@@ -911,9 +1076,19 @@ class JobDebugger:
         return record
 
     # -- rate limits ------------------------------------------------------
+    # The per-hour budget bounds SERVER RESTARTS only. Safe recovery
+    # actions (re-wake, scene advance, hung-child kill) are recorded here
+    # too, but they must never consume the restart budget: three rewakes
+    # in an hour used to block a dead-worker restart for another hour,
+    # leaving a recoverable job dead (reproduced 2026-11-16).
     def _actions_in_last_hour(self, job_id: str, now: float) -> int:
         actions = (self.state.get("actions") or {}).get(job_id) or []
-        return sum(1 for entry in actions if now - float(entry.get("at") or 0) < 3600)
+        return sum(
+            1
+            for entry in actions
+            if str(entry.get("action") or "") == "restart_server"
+            and now - float(entry.get("at") or 0) < 3600
+        )
 
     def _record_action(self, job_id: str, action: str, reason: str, now: float) -> None:
         actions = self.state.setdefault("actions", {}).setdefault(job_id, [])
@@ -939,15 +1114,291 @@ class JobDebugger:
             "live_render": has_live_render_child(),
         }
 
+    # -- driver: own every job to the end ---------------------------------
+    def _record_driver_action(self, job_id: str, kind: str, reason: str, now: float) -> None:
+        driver = self.state.setdefault("driver", {})
+        actions = driver.setdefault("actions", [])
+        actions.append({"job_id": job_id, "kind": kind, "reason": reason, "at": now})
+        driver["actions"] = actions[-100:]
+
+    def _escalate(
+        self, job_id: str, manager: Any, reason: str,
+        taken: List[Dict[str, Any]], now: float,
+    ) -> None:
+        """A job the driver cannot recover: mark it loudly, never silently.
+
+        The marker lands on the job record (``needs_human`` + progress text
+        + event, via the manager) and in the server log. An escalated job is
+        skipped by later sweeps, so the driver never loops on it.
+        """
+        text = f"Driver: needs a human — {reason}"
+        try:
+            manager.mark_needs_human(job_id, text)
+        except Exception as exc:
+            self._log(f"job {job_id} escalate failed: {exc}")
+        self._log(f"job {job_id} needs a human: {reason}")
+        taken.append({"job_id": job_id, "kind": "escalate", "reason": reason})
+        self._record_driver_action(job_id, "escalate", reason, now)
+
+    # -- driver resume streak: bound automatic retries -------------------
+    def _driver_resume_streak(self, job_id: str) -> Dict[str, Any]:
+        """Last recorded driver-resume streak for this job, if any."""
+        driver = self.state.get("driver") or {}
+        streaks = driver.get("resume_streaks") or {}
+        streak = streaks.get(job_id)
+        return dict(streak) if isinstance(streak, dict) else {}
+
+    def _driver_resume_exhausted(self, job_id: str, reason: str, item: Mapping[str, Any]) -> bool:
+        """True when the driver already resumed this job
+        ``DRIVER_RESUME_STREAK_LIMIT`` times and it stranded again at
+        (nearly) the same progress — a deterministic failure, not a
+        passing storm. Progress creep of up to
+        ``DRIVER_RESUME_PROGRESS_TOLERANCE`` points still counts as
+        stranded (see the constant); only a genuine advance resets it.
+        The streak is keyed on the JOB and its progress, deliberately
+        NOT on the pause reason: GTA VI ef306926 proved that alternating
+        reasons (low_memory -> remotion_render -> low_memory ...) at the
+        same progress resets a per-reason streak forever, so the driver
+        would retry a doomed attempt unboundedly. A reason change without
+        progress is not progress. ``reason`` is kept for the callers'
+        diagnostics; it does not gate the bound."""
+        streak = self._driver_resume_streak(job_id)
+        if not streak:
+            return False
+        try:
+            progress = int(item.get("progress") or 0)
+        except (TypeError, ValueError):
+            progress = 0
+        try:
+            start_progress = int(streak.get("start_progress", streak.get("progress")) or 0)
+        except (TypeError, ValueError):
+            start_progress = 0
+        try:
+            count = int(streak.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return count >= DRIVER_RESUME_STREAK_LIMIT and progress - start_progress <= DRIVER_RESUME_PROGRESS_TOLERANCE
+
+    def _note_driver_resume(
+        self, job_id: str, reason: str, item: Mapping[str, Any], now: float
+    ) -> int:
+        """Record a driver resume for the streak bound. Stranding within
+        ``DRIVER_RESUME_PROGRESS_TOLERANCE`` points of the streak's start
+        extends it, whatever the pause reason was this time; only a
+        genuine advance restarts it at 1. The reasons seen in the streak
+        are kept for the escalation message. Returns the new count."""
+        driver = self.state.setdefault("driver", {})
+        streaks = driver.setdefault("resume_streaks", {})
+        try:
+            progress = int(item.get("progress") or 0)
+        except (TypeError, ValueError):
+            progress = 0
+        previous = streaks.get(job_id) or {}
+        try:
+            previous_start = int(previous.get("start_progress", previous.get("progress")) or 0)
+        except (TypeError, ValueError):
+            previous_start = 0
+        try:
+            previous_count = int(previous.get("count") or 0)
+        except (TypeError, ValueError):
+            previous_count = 0
+        if (
+            previous_count > 0
+            and progress - previous_start <= DRIVER_RESUME_PROGRESS_TOLERANCE
+        ):
+            count = previous_count + 1
+            start_progress = previous_start
+            reasons = list(previous.get("reasons") or [previous.get("reason") or ""])
+            if str(reason or "") and str(reason or "") not in reasons:
+                reasons.append(str(reason or ""))
+        else:
+            count = 1
+            start_progress = progress
+            reasons = [str(reason or "")] if str(reason or "") else []
+        streaks[job_id] = {
+            "reason": str(reason or ""),
+            "reasons": reasons,
+            "progress": progress,
+            "start_progress": start_progress,
+            "count": count,
+            "at": now,
+        }
+        return count
+
+    def _drive_recovery(self, now: float) -> List[Dict[str, Any]]:
+        """Resume system-killed jobs; escalate the ones that cannot recover.
+
+        Runs on the same 120s tick as the stall pass, in the same thread:
+        one cheap queue-file read plus at most one resume/escalate per job
+        per tick — no new processes, no tight polling. Never touches a job
+        the user cancelled (``cancel_requested``) or one already escalated
+        (``needs_human``). Never touches a job that is processing, queued,
+        or completed — those are owned by the worker and the stall pass.
+        ``shutdown_timeout`` and ``cancellation_requested`` are left to
+        their existing paths (quiescence / startup recovery): their user
+        intent is ambiguous after a reboot.
+
+        Automatic resumes are streak-bounded, not endless: three driver
+        resumes that strand at the same progress with the same reason
+        escalate the job instead of looping a deterministically failing
+        stage. A job that gets further before failing again resets the
+        streak. A processing job flagged for the restart cap is escalated
+        only while it is still stalled; genuine progress after the flag
+        clears it.
+        """
+        taken: List[Dict[str, Any]] = []
+        manager = self._manager()
+        if manager is None:
+            return taken
+        try:
+            from services.queue_manager import (
+                SYSTEM_RECOVERY_PAUSED_REASONS,
+                _is_transient_queue_error,
+            )
+        except Exception:
+            return taken
+        flagged = self.state.get("flagged") or {}
+        for item in self.read_all_items():
+            job_id = str(item.get("id") or "")
+            if not job_id:
+                continue
+            if item.get("needs_human"):
+                continue
+            if item.get("cancel_requested"):
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            if status == "processing" and job_id in flagged:
+                # Restart cap hit. Escalate ONLY if the worker is still
+                # dead: a flagged job whose progress moved AFTER the flag
+                # was set recovered on its own, and escalating it would
+                # stamp needs_human (and its progress text) on a healthy,
+                # progressing job. A single observation is no baseline —
+                # neither clear nor escalate on the first sighting; the
+                # stall pass establishes the baseline and a later tick
+                # decides. ``flagged`` is never cleared on its own, so
+                # without this check every flagged job that recovered
+                # would be falsely escalated on the next sweep.
+                flag = flagged.get(job_id) or {}
+                obs = (self.state.get("observations") or {}).get(job_id) or {}
+                try:
+                    last_change = float(obs.get("last_change") or 0)
+                except (TypeError, ValueError):
+                    last_change = 0.0
+                try:
+                    first_seen = float(obs.get("first_seen") or 0)
+                except (TypeError, ValueError):
+                    first_seen = 0.0
+                try:
+                    flagged_at = float(flag.get("at") or 0)
+                except (TypeError, ValueError):
+                    flagged_at = 0.0
+                if last_change > flagged_at and last_change > first_seen:
+                    flagged.pop(job_id, None)
+                    self._log(
+                        f"job {job_id} recovered after restart cap; flag cleared"
+                    )
+                elif (
+                    last_change
+                    and now - last_change >= self.config.dead_worker_seconds
+                ):
+                    self._escalate(
+                        job_id, manager,
+                        str(flag.get("reason") or "debugger restart cap reached"),
+                        taken, now,
+                    )
+                continue
+            if status in ("completed", "processing", "queued"):
+                continue
+            if status == "paused":
+                reason = item.get("paused_reason")
+                if reason in SYSTEM_RECOVERY_PAUSED_REASONS:
+                    if self._driver_resume_exhausted(job_id, str(reason), item):
+                        seen = self._driver_resume_streak(job_id).get("reasons") or [reason]
+                        self._escalate(
+                            job_id, manager,
+                            f"auto-resume retries exhausted: paused ({', '.join(seen)}) "
+                            f"at {item.get('progress')}% after "
+                            f"{DRIVER_RESUME_STREAK_LIMIT} driver resumes "
+                            "without progress — manual Retry is still available",
+                            taken, now,
+                        )
+                    elif manager.resume_item(job_id):
+                        self._note_driver_resume(job_id, str(reason), item, now)
+                        text = f"system pause ({reason}) auto-resumed from checkpoint"
+                        taken.append({"job_id": job_id, "kind": "resume", "reason": text})
+                        self._record_driver_action(job_id, "resume", text, now)
+                        self._log(f"job {job_id} driver resume: {text}")
+                continue
+            if status == "cancelled":
+                # No cancel_requested (checked above): the system killed it
+                # — the deadline watchdog's "Shared video processing
+                # deadline exceeded" lands here. Resume from checkpoint,
+                # bounded like paused resumes: three system-cancels at
+                # the same progress mean the job stalls deterministically
+                # at that point, so escalate instead of looping on a
+                # fresh budget forever.
+                checkpoint_dir = item.get("checkpoint_dir")
+                if checkpoint_dir and Path(str(checkpoint_dir)).is_dir():
+                    if self._driver_resume_exhausted(job_id, "system_cancelled", item):
+                        self._escalate(
+                            job_id, manager,
+                            f"auto-resume retries exhausted: system-cancelled "
+                            f"at {item.get('progress')}% after "
+                            f"{DRIVER_RESUME_STREAK_LIMIT} driver resumes "
+                            "without progress — manual Retry is still available",
+                            taken, now,
+                        )
+                    elif manager.resume_item(job_id):
+                        self._note_driver_resume(job_id, "system_cancelled", item, now)
+                        text = "system-cancelled job auto-resumed from checkpoint"
+                        taken.append({"job_id": job_id, "kind": "resume", "reason": text})
+                        self._record_driver_action(job_id, "resume", text, now)
+                        self._log(f"job {job_id} driver resume: {text}")
+                else:
+                    self._escalate(
+                        job_id, manager,
+                        "cancelled by the system but no checkpoint survives to resume from",
+                        taken, now,
+                    )
+                continue
+            if status == "error":
+                error_text = str(item.get("error") or item.get("error_detail") or "")
+                attempt = int(item.get("attempt") or 0)
+                if _is_transient_queue_error(error_text) and attempt < 3:
+                    if manager.resume_item(job_id):
+                        text = f"transient error auto-retried (attempt {attempt + 1}/3)"
+                        taken.append({"job_id": job_id, "kind": "resume", "reason": text})
+                        self._record_driver_action(job_id, "resume", text, now)
+                        self._log(f"job {job_id} driver resume: {text}")
+                elif attempt >= 3:
+                    self._escalate(
+                        job_id, manager,
+                        f"transient error retries exhausted after {attempt} attempts: {error_text}",
+                        taken, now,
+                    )
+                else:
+                    self._escalate(
+                        job_id, manager,
+                        f"hard error, not a transient failure: {error_text or 'unknown error'}",
+                        taken, now,
+                    )
+                continue
+            # shutdown_timeout / cancellation_requested / anything unknown:
+            # left to the existing paths; the driver never guesses.
+        return taken
+
     # -- one tick ---------------------------------------------------------
     def tick(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
-        """Inspect every processing job once. Returns the actions taken."""
+        """Inspect every processing job once, then drive system-killed jobs.
+
+        Returns the actions taken (stall actions plus driver recoveries /
+        escalations). The driver sweep runs even when nothing is processing:
+        that is exactly when a system-killed job sits dead.
+        """
         now = time.time() if now is None else float(now)
         config = self.config
         jobs = self.read_processing_jobs()
         taken: List[Dict[str, Any]] = []
-        if not jobs:
-            return taken
         multiple_processing = len(jobs) > 1
         for item in jobs:
             job_id = str(item.get("id") or "")
@@ -989,18 +1440,36 @@ class JobDebugger:
                 f"approval_wait={diagnosis['log']['approval_wait']}"
             )
             self._record_diagnosis(job_id, diagnosis, now)
-            if (self.state.get("flagged") or {}).get(job_id):
-                self._log(f"job {job_id} flagged (restart cap hit); left alone")
-                continue
-            if self._actions_in_last_hour(job_id, now) >= config.max_actions_per_hour:
-                self._log(f"job {job_id} at action rate limit; waiting")
-                continue
-
+            # A flagged job (restart cap hit) is NOT skipped wholesale:
+            # the flag blocks server restarts only, and _choose_action
+            # enforces that. Safe recovery actions (re-wake, scene
+            # advance, hung-child kill) still run for a flagged job —
+            # skipping them because a restart counter ran out used to
+            # leave recoverable jobs dead. The driver sweep below still
+            # escalates a flagged job whose worker stays dead.
             action = self._choose_action(
                 job_id, record, diagnosis, quiet_for, scene_quiet_for,
                 seq_frozen_for, multiple_processing,
             )
             if action is None:
+                continue
+            # Only server restarts are rate-limited. Safe recovery actions
+            # (re-wake, scene advance, killing a hung child) are bounded by
+            # the tick itself — at most one per job per 120s — and capping
+            # them let recoverable jobs sit dead for an hour.
+            if (
+                action.get("kind") == "restart_server"
+                and self._actions_in_last_hour(job_id, now) >= config.max_actions_per_hour
+            ):
+                self._log(f"job {job_id} at restart rate limit; waiting")
+                # A held restart is a stall decision, not a silent skip:
+                # record it on the job so queue status shows why the
+                # dead worker is still waiting instead of restarting.
+                self._record_event(
+                    job_id,
+                    f"Debugger: server restart held by rate limit "
+                    f"({config.max_actions_per_hour}/hour); retrying on a later tick",
+                )
                 continue
             result = self._perform(job_id, action, now)
             result["job_id"] = job_id
@@ -1009,9 +1478,40 @@ class JobDebugger:
             self._log(
                 f"job {job_id} action {action['kind']}: {action['reason']} -> {result}"
             )
+        # The driver owns every job to the end: a system-killed job sits in
+        # paused/cancelled/error with no processing job at all, so this sweep
+        # runs even when the stall pass above had nothing to do.
+        try:
+            taken.extend(self._drive_recovery(now))
+        except Exception as exc:  # a driver sweep must never kill the server
+            self._log(f"driver sweep failed: {exc}")
+        # YouTube session watchdog: re-verify the cookie pool on this same
+        # 120s tick (the watchdog itself TTL-gates to ~one probe per
+        # account per verify TTL, and skips active renders). A flipped
+        # account is logged + recorded in the watchdog state file, which
+        # /api/status surfaces — so a revoked session is flagged BEFORE
+        # the next job's YouTube lane fails on it. Best-effort: never
+        # let the watchdog break the tick.
+        try:
+            from services.youtube_session_watchdog import check as _yt_session_check
+
+            for alert in _yt_session_check(now=now).get("alerts") or []:
+                taken.append({"kind": "youtube_session_alert", **alert})
+        except Exception as exc:  # a watchdog failure must never kill the tick
+            self._log(f"youtube session watchdog failed: {exc}")
         with self._lock:
             save_state(self.state, self.state_path)
         return taken
+
+    def _record_event(self, job_id: str, text: str) -> None:
+        """One debugger line on the job's progress history (best-effort)."""
+        try:
+            from services.queue_manager import get_queue_manager
+
+            manager = get_queue_manager()
+            manager.record_debugger_event(job_id, text)
+        except Exception as exc:  # event recording is best-effort
+            print(f"{LOG_PREFIX} event record failed: {exc}", flush=True)
 
     def _record_diagnosis(self, job_id: str, diagnosis: Mapping[str, Any], now: float) -> None:
         try:
@@ -1071,7 +1571,16 @@ class JobDebugger:
                 "scene_number": int(scene_number),
             }
         # 3. Hung download/probe child: kill it, the bounded lane call returns.
+        # Never kill during a live render: a long render's ffmpeg finalize step
+        # matches the hung-child pattern. The restart_server guard below already
+        # checks live_render; mirror it here (Area 3 hardening).
         if diagnosis.get("hung_children"):
+            if diagnosis.get("live_render"):
+                self._log(
+                    f"job {job_id} has hung child but a render child is alive; "
+                    "not killing"
+                )
+                return None
             child = diagnosis["hung_children"][0]
             return {
                 "kind": "kill_hung_child",
@@ -1144,6 +1653,8 @@ class JobDebugger:
 
     # -- status -----------------------------------------------------------
     def status(self) -> Dict[str, Any]:
+        driver = self.state.get("driver") or {}
+        driver_actions = driver.get("actions") or []
         return {
             "enabled": self.config.enabled,
             "interval_seconds": self.config.interval_seconds,
@@ -1157,6 +1668,11 @@ class JobDebugger:
             "restarts": dict(self.state.get("restarts") or {}),
             "flagged": dict(self.state.get("flagged") or {}),
             "pending_advance": pending_advance_requests(),
+            "driver": {
+                "resumed": sum(1 for a in driver_actions if a.get("kind") == "resume"),
+                "escalated": sum(1 for a in driver_actions if a.get("kind") == "escalate"),
+                "actions": driver_actions[-20:],
+            },
         }
 
 
