@@ -137,7 +137,7 @@ function OpenCluster({ children, region, colors, fonts, motion, label = '', comp
       : { width: compact ? 34 : 56, height: 3, background: colors.accent, flex: '0 0 auto' };
   const contentStyle = centered ? { width: '100%' } : { width: 'fit-content' };
   return <div style={{ position: 'absolute', ...regionStyle(region), opacity: motion.opacity, transform: 'translate(' + slide + 'px,' + ((1 - motion.enter) * 14) + 'px) scale(' + scale + ')', transformOrigin: centered ? 'center' : 'left top', pointerEvents: 'none' }}>
-    <div style={{ display: centered ? 'flex' : 'inline-flex', flexDirection: 'column', alignItems: centered ? 'center' : 'flex-start', ...contentStyle, maxWidth: '100%', color: colors.ink, filter: 'drop-shadow(0 3px 12px ' + rgba(colors.bg, .66) + ')', clipPath: motionMode === 'scan' ? 'inset(0 ' + ((1 - motion.enter) * 100) + '% 0 0)' : 'none' }}>
+    <div style={{ display: centered ? 'flex' : 'inline-flex', flexDirection: 'column', alignItems: centered ? 'center' : 'flex-start', ...contentStyle, maxWidth: '100%', color: colors.ink, textShadow: '0 3px 12px ' + rgba(colors.bg, .66), clipPath: motionMode === 'scan' ? 'inset(0 ' + ((1 - motion.enter) * 100) + '% 0 0)' : 'none' }}>
       {label && <div style={{ display: 'inline-flex', alignItems: 'center', gap: compact ? 8 : 10, maxWidth: '100%' }}>
         <span style={mark} /><span style={{ color: colors.accent, fontFamily: fonts.numbers, fontSize: compact ? 24 : 26, fontWeight: 700, letterSpacing: '.14em', lineHeight: 1.05, textTransform: 'uppercase', whiteSpace: 'nowrap', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
       </div>}

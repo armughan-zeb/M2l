@@ -232,9 +232,15 @@ test('generateScript with zero web claims asks Muse to synthesize and still fail
   }
 });
 
-test('agent-bridge request wall is capped at 120s even with a larger caller budget', async () => {
+test('agent-bridge round-trip wall is 3600s, matching the Vidnets server floor', async () => {
+  // Regression: the file-based bridge gave each request a 300s wall while
+  // the Vidnets server floors its agent requests at 3600s
+  // (VIDZEO_AGENT_MIN_WALL_SECONDS). The hook polls every 60s and a
+  // grounded draft takes minutes, so the shorter wall expired
+  // mid-composition and wasted the operator's answer. The request row
+  // written to disk must carry the full 3600s window.
   const { agentBridgeChat, MAX_WALL_MS } = require('../scriptit/src/providers/agentBridge');
-  assert.equal(MAX_WALL_MS, 120000, 'per-request wall must be 120s');
+  assert.equal(MAX_WALL_MS, 3600000, 'per-request wall must be 3600s');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptit-bridge-wall-'));
   const bridgeRoot = path.join(dir, 'agent-bridge');
   fs.mkdirSync(bridgeRoot, { recursive: true });
@@ -255,8 +261,8 @@ test('agent-bridge request wall is capped at 120s even with a larger caller budg
     const row = seen[0];
     const wallSeconds = row.expires_at - row.created_at;
     assert.ok(
-      wallSeconds >= 119 && wallSeconds <= 121,
-      `expected a ~120s window, got ${wallSeconds}s`,
+      wallSeconds >= 599 && wallSeconds <= 601,
+      `expected a ~600s window, got ${wallSeconds}s`,
     );
   } finally {
     clearInterval(operator);
@@ -266,7 +272,7 @@ test('agent-bridge request wall is capped at 120s even with a larger caller budg
   }
 });
 
-test('a completed Muse draft is retained without a second writing request', async () => {
+test('simplified pipeline: a failing draft gets ONE fix pass, then fails loudly (max 2 draft calls)', async () => {
   // Nov 9, 2026 simplification: draft 1 + one fix pass, never a 4–6 draft
   // loop over 17 minutes. A stub writer returns a short generic draft
   // every time, so the gate can never pass; the generation must stop
@@ -308,9 +314,8 @@ test('a completed Muse draft is retained without a second writing request', asyn
       research: realResearch,
       chatCompletionFn: fakeChat,
     });
-    assert.equal(calls, 1, `expected exactly one complete draft call, got ${calls}`);
-    assert.equal(out.meta.timing.draftCalls, 1, 'meta must report one draft call');
-    assert.ok(out.script.trim(), 'the written narration is retained');
+    assert.equal(calls, 2, `expected exactly 2 draft calls (draft + one fix pass), got ${calls}`);
+    assert.equal(out.meta.timing.draftCalls, 2, 'meta must report 2 draft calls');
     assert.equal(out.meta.publishable, false, 'a gate-failing draft must not be publishable');
     assert.ok((out.meta.quality.issues || []).length > 0, 'the failure must name its reasons');
   } finally {

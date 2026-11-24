@@ -19,12 +19,19 @@ cp .env.example .env   # then fill in the values below; .env is gitignored
 Settings that must be in `.env` (see `.env.example` for the full list):
 `MUSE_RENDER_COMMAND=node <absolute-repo-path>/render-vidnets-linux.js`,
 `MUSE_VIDNETS_ROOT=<repo>/vidnets`,
-`MUSE_YOUTUBE_COVERAGE_TARGET=0.8`,
+`MUSE_YOUTUBE_COVERAGE_TARGET=0.30` (normal default — gaming 0.80 /
+documentary 0.55 are wired per niche in code),
 `MUSE_MEDIA_STRICT=0` (filter-best; see §3),
 `MUSE_RENDER_CONCURRENCY=1`,
 `TMPDIR=<runtime>/temp` (NOT /tmp — it is a 512 MB tmpfs),
 `VIDZEO_TEMP_DIR=<runtime>/temp`.
-`MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` enables the resident Muse dispatcher. Hook-only installs use the host inbox hook. No API keys go in `.env`.
+`MUSE_INFERENCE_COMMAND=node <absolute-repo-path>/scripts/muse-inference-spool.cjs`
+(the shipped spool transport — the default; `MUSE_INFERENCE_URL` is the
+HTTP alternative, never both). The resident inference worker pool answers
+it — spawn the supervisor from
+`scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md` before the
+first job (it spawns 2–8 workers, scaling with the backlog). Hook-only
+installs use the host inbox hook. No API keys go in `.env`.
 
 Start Vidnets (the server is stateful — one instance only):
 
@@ -36,14 +43,15 @@ curl -s http://127.0.0.1:5010/api/status | python3 -m json.tool
 # Expected: healthy, ffmpeg true, can_start_render true.
 ```
 
-Enable the inbox-watch hook (`vidnets-inbox-watch`, poll 20s). If a
-resident transport is configured with `MUSE_INFERENCE_COMMAND` or
-`MUSE_INFERENCE_URL`, the dispatcher polls every second and answers in
-parallel (up to eight), while the hook is the alert-only fallback. Without
-that transport, the hook is the primary answerer. Its definition lives at
-`~/hooks/definitions/vidnets-inbox-watch.json` (`"enabled": true`).
-It wakes a Muse operator in the side chat to answer every inbox request
-(script, scene queries, direction, vision) via
+Enable the inbox-watch hook (`vidnets-inbox-watch`, poll 60s) as the
+fallback. The resident transport is the default: with
+`MUSE_INFERENCE_COMMAND` set to the spool transport and the resident
+inference worker running, the dispatcher polls every second and answers in
+parallel (up to eight) in seconds, while the hook only fires when the
+worker is down. Without that transport, the hook is the primary answerer.
+Its definition lives at `~/hooks/definitions/vidnets-inbox-watch.json`
+(`"enabled": true`). It wakes a Muse operator in the side chat to answer
+every inbox request (script, scene queries, direction, vision) via
 `VIDNETS_AGENT.sh request <id>` / `answer <id> <file>`.
 
 Verify the bridge, then start the daemon (detached — a foreground run
@@ -62,7 +70,8 @@ node muse-agent.js status
 ## 2. Job lifecycle (one CMS job, end to end)
 
 The CMS gives the title; the daemon claims it; the worker produces
-script + video, uploads to the CMS, marks completed (thumbnails are generated locally by Pikgen).
+script + video, uploads to the CMS, marks completed (thumbnails are
+skipped by the worker — Pikgen generates them locally).
 
 | Step | What happens | "Done" looks like | If it fails |
 |---|---|---|---|
@@ -71,8 +80,8 @@ script + video, uploads to the CMS, marks completed (thumbnails are generated lo
 | Script (once) | ScriptIT CLI, agent-bridge mode, at most `MUSE_SCRIPT_MAX_DRAFTS` calls (default 2: draft 1 + ONE fix pass) | Publishable script, words ≈ minutes × 150 (floor minutes × 135), external claims ≥ 1, 0 synthetic | Draft still fails the gate → CLI exits 2, job fails loudly. No more drafts |
 | Vidnets mixed-media | LLM writes queries from the scenes → search YouTube clips + web images → FILTER THE BEST (rank, keep the best real media; reject only clearly-wrong footage) → vision ranks (scores) → Remotion edits | Most scenes real, most of them clips where clips exist | See §5. One bounded media re-plan per job, before a 0-real fail only |
 | Render | Remotion renders the 1080p master (6 h CMS hard limit per attempt; 20 min inactivity limit) | Video ≥ 1920×1080, ≥ target minutes, h264+aac, ≥ 1 MB, audio stream present | Render stalls: check memory admission (`:5010` status) and the wrapper log — do not restart mid-render |
-| Validate | Wrapper checks the edit plan and the worker validates the master | `Edit plan: N/total scenes real media` with N equal to total | Incomplete coverage can trigger one bounded re-plan before delivery is blocked |
-| Deliver | Worker uploads video + script to the CMS (--skip-thumbnail), marks completed | CMS shows the job completed (Pikgen handles thumbnails locally) | Delivery validation fails → fix the artifact, do not weaken the checks |
+| Validate | Wrapper checks the edit plan: real-media count, video size, decode | `Edit plan: N/total scenes real media` with N ≥ 1 | N = 0 → wrapper fails the job (after the one bounded re-plan). Never deliver a graphics-only video |
+| Deliver | Worker uploads video + script to the CMS (--skip-thumbnail), marks completed (Pikgen handles thumbnails locally) | CMS shows the job completed | Delivery validation fails → fix the artifact, do not weaken the checks |
 
 ## 3. How filter-best works (the architecture, in one paragraph)
 
@@ -92,7 +101,7 @@ it without a reason recorded in the commit message. The render wrapper
 (`render-vidnets-linux.js:countRealScenes`) counts a scene as real when
 Vidnets' own adapter accepted it (`media.verified` in the edit plan, or
 a Muse-verified verdict) — an explicit Muse rejection always wins.
-Delivery requires accepted real media in every scene.
+The ONLY hard rule is delivery: 0 real-media scenes fails the job.
 
 ## 4. Settings
 
@@ -100,22 +109,29 @@ Every knob lives in `.env` / `.env.example`. Defaults are production.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MUSE_YOUTUBE_COVERAGE_TARGET` | 0.8 | Fraction of scenes the planner tries to fill with accepted YouTube clips |
+| `MUSE_YOUTUBE_COVERAGE_TARGET` | 0.30 (normal) | Fraction of scenes the planner tries to fill with accepted YouTube clips (code default 0.6); per-niche targets are wired in code — gaming 0.80, documentary 0.55, normal 0.30 |
 | `MUSE_MEDIA_STRICT` | 0 | 0 = filter-best (vision advisory); 1 = hard-required (strict retrieval + visual required) |
 | `MUSE_SCRIPT_MAX_DRAFTS` | 2 | Script model calls max (draft 1 + one fix pass) |
 | `MUSE_RESEARCH_TIMEOUT_MS` | 180000 | One shared research deadline for all providers |
 | `MUSE_REPLAN_MIN_REMAINING_MS` | 600000 | Render budget left required to attempt the one bounded media re-plan |
+| `VIDZEO_MAX_GRAPHIC_SCENES` | 5 | Graphic-fallback scenes allowed per video before the audit warns (render still continues; 0 real-media scenes overall is still the only hard fail) |
+| `VIDZEO_AGENT_MIN_WALL_SECONDS` | 3600 | Floor on agent-bridge inbox request TTLs (server side; raised Nov 15 from 600 — hook wakes alone can exceed 20 min) |
 | `MUSE_RENDER_CONCURRENCY` | 2 (code) / 1 (live `.env`) | Workers sharding ONE video's frames (see §8.4); live pins 1, the tested safe count |
 | `MUSE_RENDER_TIMEOUT_MS` | 21600000 | Overall render budget per job (6 h, matches the CMS hard limit) |
 | `TMPDIR` / `VIDZEO_TEMP_DIR` | `<runtime>/temp` | Scratch/temp root (never /tmp) |
-| `VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET` | 0.8 | Server-side YouTube coverage target (runtime `.env`) |
+| `VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET` | 0.30 (normal) | Server-side YouTube coverage target (runtime `.env`); per-niche — gaming 0.80, documentary 0.55, normal 0.30 |
 | `VIDZEO_AUTO_REQUEUE_INTERRUPTED` | 1 | Server auto-resumes jobs interrupted by a VM reboot |
+| `VIDZEO_YT_MEDIA_TAIL_SECONDS` | 120 | Media tail after YT discovery: total media budget for a 1-min video is 412s (292s discovery + 120s tail); YT recovery waves + the post-coordinator gate cut off at the total; in-flight downloads exempt |
+| `VIDZEO_YT_GENERAL_POOL_ENABLED` | 0 (False) | General YouTube pool disabled by default — scene-by-scene + web only |
+| `VIDZEO_YT_SALVAGE_SCREEN_BUDGET_SECONDS` | 60 | Disk salvage trusts prior screening (a clip with a passing download-time verdict in `youtube_scene_*.attempts.json` skips re-screening); total salvage screening bounded to this |
+| `VIDZEO_EXTERNAL_AGENT_VISION_CONCURRENCY` | 8 | In-flight external-agent vision calls (raised 4 → 8 on Nov 21, test-20 fan-out; matches the pool ceiling of 8) |
 
 ## 5. Monitoring
 
 `setup.sh` installs the `vidnets-health-monitor` cron at
 `~/hooks/scripts/vidnets-health-monitor.sh` and schedules it every minute,
-so inbox age is checked within the 60-second operator SLO. Existing installs
+so inbox age is checked well inside the 3600-second agent-bridge request
+floor. Existing installs
 must rerun setup to install or refresh it. It checks:
 daemon alive + connected, Vidnets `:5010` healthy + memory admission,
 CMS reachable + outage duration, inbox-watch hook enabled and recently run, no inbox
@@ -132,7 +148,7 @@ claims, delivers, or restarts a job mid-render.
 | Failure | Cause (seen) | Fix |
 |---|---|---|
 | Script `RESEARCH_INSUFFICIENT` | Zero external claims; providers thin for a niche title | Fail loudly; re-queue a different title or add sources. Do not loop research |
-| Inbox request expires unanswered | Muse did not answer within the 120-second request lifetime or the remaining job budget | Run `node muse-agent.js doctor` and check the resident transport or hook operator |
+| Inbox request expires unanswered | Muse did not answer within the 3600-second agent-bridge request floor (`VIDZEO_AGENT_MIN_WALL_SECONDS`) — with the resident worker pool down, the polling watcher alone needs ~4.5 min to wake | Check the pool heartbeats first (`worker-alive-<workerId>.json` in the spool dir, or `pool-status.json`), then run `node muse-agent.js doctor` and check the hook is enabled and the operator side chat is alive |
 | CMS 502/530 | CMS tunnel flapping | Daemon survives in-process with backoff — wait; do not restart it. Monitor reports outage duration |
 | VM reboot | VM restarts kill daemon + server | Health monitor restarts both; server auto-requeues interrupted jobs (`VIDZEO_AUTO_REQUEUE_INTERRUPTED=1`) |
 | Low memory / render held | Vidnets holds renders when available memory < ~384 MB estimate | Concurrency 1; wait for memory to free; never raise concurrency on this VM |
@@ -140,6 +156,7 @@ claims, delivers, or restarts a job mid-render.
 | 0 real media / all graphics | Discovery returned 0 candidates (search transport) OR strict flags hard-rejected everything | Check the manifest: if every lane returned 0 candidates, it is a transport problem (DNS/proxy), not strictness. If candidates existed but none survived, check `MUSE_MEDIA_STRICT` and the vision verdicts — filter-best must be on |
 | Wrapper fails "0 real-media scenes" | All scenes graphic fallback | One bounded re-plan already ran (or was skipped for lack of budget). Fail the job; re-queue the title only after the cause above is fixed |
 | Vision rejects a correct clip | Operator prompt too strict, or a watermarked/wrong-operator frame | The hook prompt is filter-best (reject only clearly-wrong). A wrong-operator frame (e.g. CSX illustrating Amtrak) is correctly rejected |
+| Pool empties mid-media after a render ends | stop_graceful race (fixed Nov 21, 2026) | A cancelled stop is NOT recalled once a worker has read it. Fix: two-tick render confirm before queueing stops, cancelled stops kept as tombstones, a worker exiting on a seen stop is re-healed immediately (`POOL_SUPERVISOR_BRIEF.md`) |
 
 ## 7. Distribution checklist (handing the repo to the next agent)
 
@@ -158,12 +175,16 @@ claims, delivers, or restarts a job mid-render.
    # scratch clone (no .env, no live Vidnets/hook from that path) —
    # that is expected. In the live repo it must PASS.
    ```
-4. Give the user the exact two push commands:
-   ```bash
-   git fetch <bundle> HEAD:<branch> && git push origin <branch>:main
-   ```
-   (branch name = the bundle name; push order matters if earlier
-   bundles are still unpushed — oldest first.)
+4. The VM CANNOT push to GitHub: SSH egress is blocked and there are
+   no git credentials on the VM, so `git push origin` fails from here.
+   Do NOT keep retrying it. The push goes through the GitHub connector
+   snapshot push (another session runs it — it pushes only the files
+   changed since the last snapshot, in ~2.5 MiB batches; a full-repo
+   snapshot is impossible at 135 MiB). Hand off the commit hash + the
+   bundle from step 2 and report that the push is pending that session.
+   (The 3 stub files deleted locally are still on origin/main — the
+   connector delete fails on them; they need the user's PC git or the
+   GitHub website.)
 5. Report: commit hash, bundle path, test results, what changed, what
    is still not perfect. Point the next agent at `rules.md` first.
 

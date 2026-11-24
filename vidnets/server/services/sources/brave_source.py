@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate, _accept_language
+from .base_source import BaseSource, ImageCandidate, _accept_language, request_proxies
 
 
 class BraveSource(BaseSource):
@@ -29,7 +29,8 @@ class BraveSource(BaseSource):
         return bool(self._key()) and super().is_available()
 
     def search(self, query: str, limit: int = 20,
-               filters: Optional[Dict] = None) -> List[ImageCandidate]:
+               filters: Optional[Dict] = None,
+               direct: bool = False) -> List[ImageCandidate]:
         if not self.is_available() or not str(query or "").strip():
             return []
         params = {
@@ -48,7 +49,8 @@ class BraveSource(BaseSource):
         }
         try:
             response = requests.get(self.SEARCH_URL, params=params, headers=headers,
-                                    timeout=self.timeout)
+                                    timeout=self.timeout,
+                                    proxies=request_proxies(direct))
             if response.status_code != 200:
                 self.record_failure()
                 return []

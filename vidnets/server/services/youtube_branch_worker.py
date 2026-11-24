@@ -32,6 +32,17 @@ def main() -> int:
             os.environ["VIDZEO_PIPELINE_V2_MODE"] = "1"
             os.environ["VIDZEO_YT_VISUAL_GATE"] = "0"
         from services.youtube_pipeline_v2 import get_youtube_clips
+        from services.job_context import job_scope
+        job_context = payload.get('job_context') or {}
+        job_scope_handle = job_scope(job_context)
+        job_scope_handle.__enter__()
+        visual_context = None
+        if payload.get('youtube_contact_vision'):
+            from services.visual_intelligence.context import VisualDecisionContext
+            visual_context = VisualDecisionContext.from_config(
+                payload.get('visual_config') or {}, len(payload.get('scene_texts') or []))
+            # The parent coordinator owns final per-scene verification.
+            visual_context.youtube_contact_only = True
 
         scene_texts = list(payload.get("scene_texts") or [])
         print(
@@ -42,6 +53,10 @@ def main() -> int:
         result = get_youtube_clips(
             script=str(payload.get("script") or ""),
             title=str(payload.get("title") or ""),
+            # Full job title for the prep-manifest injection lookup; the
+            # search title may be just the topic anchor (run 3: anchor
+            # injected 0; full title injected 9).
+            prep_manifest_title=str(payload.get("prep_manifest_title") or "") or None,
             num_scenes=len(scene_texts),
             scene_durations=list(payload.get("scene_durations") or []),
             scene_timing_windows=list(payload.get("scene_timing_windows") or []),
@@ -69,9 +84,11 @@ def main() -> int:
             use_authenticated_session=bool(payload.get("use_authenticated_session", True)),
             excluded_video_ids=payload.get('excluded_video_ids'),
             excluded_channel_ids=payload.get('excluded_channel_ids'),
-            visual_context=None,
+            visual_context=visual_context,
             prefer_whisper_timing=bool(payload.get("prefer_whisper_timing", True)),
-            pool_first=bool(payload.get("pool_first", False)),
+            # Contact selection is implemented in the ranged lane; avoid
+            # bypassing it through the legacy whole-source pool renderer.
+            pool_first=bool(payload.get("pool_first", False)) and not bool(payload.get('youtube_contact_vision')),
             cancellation=None,
         )
         output = {
@@ -79,6 +96,7 @@ def main() -> int:
             "paths": [str(path) if path else None for path in list(result or [])],
             "audit": getattr(result, "audit", {}) or {},
         }
+        job_scope_handle.__exit__(None, None, None)
         result_path.parent.mkdir(parents=True, exist_ok=True)
         temp_result = result_path.with_suffix(result_path.suffix + ".part")
         temp_result.write_text(

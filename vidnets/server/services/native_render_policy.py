@@ -43,16 +43,29 @@ def _stop_remotion_process(process) -> None:
 
 
 def _transient_remotion_failure(error: BaseException) -> bool:
-    """Classify failures that are safe to retry with one render worker.
+    """Classify failures that are safe to retry immediately with one render worker.
 
     The retry reuses the exact manifest, narration and media package. Source
     or React-plan defects stay terminal so production does not repeat an
     expensive render that cannot succeed without a code/data correction.
+
+    Deterministic Remotion prop-validation errors (e.g. the media cache
+    computed under low memory falling below Remotion's 240 MB minimum) are
+    NOT transient: an immediate retry with the same memory conditions fails
+    identically — GTA VI ef306926 burned its in-process retry this way
+    (``mediaCacheSizeInBytes`` 64 MB vs the 240 MB minimum, wrapped as a
+    ``CancelledError`` behind ``exit code 1``). They are still retryable
+    later (see :func:`_retryable_remotion_failure`) once memory is freed or
+    the cache floor is fixed, so they must not be marked terminal either.
     """
     message = str(error or "").lower()
     hard = (
         "syntaxerror", "referenceerror", "cannot find module", "module not found",
         "edit plan", "invalid manifest", "unsupported component", "cardinality mismatch", "attempt limit reached",
+        # Deterministic Remotion prop validation: retrying the identical
+        # config cannot succeed. "exit code" alone must not rescue these.
+        "mediacachesizeinbytes", "offthreadvideocachesizeinbytes",
+        "minimum value for the",
     )
     if any(token in message for token in hard):
         return False
@@ -62,6 +75,27 @@ def _transient_remotion_failure(error: BaseException) -> bool:
         "econnreset", "timed out", "timeout", "stalled", "exit code",
     )
     return any(token in message for token in transient)
+
+
+def _retryable_remotion_failure(error: BaseException) -> bool:
+    """Whether a LATER retry (new attempt, changed conditions) can succeed.
+
+    Unlike :func:`_transient_remotion_failure`, this does not gate the
+    immediate in-process retry — it gates the queue/driver decision to pause
+    the job for retry instead of failing it terminally. Only defects that no
+    retry can fix without a code or plan correction are terminal here:
+    syntax/reference errors, missing modules, invalid edit plans. Everything
+    else — including deterministic config errors such as an undersized media
+    cache, which a later attempt can pass once render-mode has freed memory
+    or the cache floor is fixed — stays retryable, because a failed render
+    must never kill a video except for no usable media / zero real media.
+    """
+    message = str(error or "").lower()
+    hard = (
+        "syntaxerror", "referenceerror", "cannot find module", "module not found",
+        "edit plan", "invalid manifest", "unsupported component", "cardinality mismatch", "attempt limit reached",
+    )
+    return not any(token in message for token in hard)
 
 
 def _enabled(value: Any) -> bool:
@@ -1897,6 +1931,21 @@ def _render_semantic_documentary_unlocked(
                         )
                     except Exception:
                         pass
+                # Back off before the single retry: an immediate re-run under
+                # the same memory pressure re-fails identically and burns a
+                # bundle + browser launch. The pause lets render-mode and the
+                # memory wait on the next attempt free RAM first. Completed
+                # sections are checkpointed by the JS runner, so the retry
+                # resumes them instead of re-rendering finished frames.
+                try:
+                    retry_backoff = float(os.environ.get("VIDZEO_REMOTION_RETRY_BACKOFF_SECONDS", "10") or 10)
+                except (TypeError, ValueError):
+                    retry_backoff = 10.0
+                retry_backoff = max(0.0, min(120.0, retry_backoff))
+                if retry_backoff > 0:
+                    time.sleep(retry_backoff)
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
                 try:
                     return render_semantic_documentary_remotion(
                         manifest=manifest,
@@ -1918,7 +1967,14 @@ def _render_semantic_documentary_unlocked(
                     f"Required Remotion render failed; legacy fallback is disabled: {exc}"
                 )
                 wrapped.stage = 'remotion_render'
-                wrapped.retryable = _transient_remotion_failure(exc)
+                # Driver retryability is broader than immediate retryability:
+                # a deterministic config error (undersized media cache) must
+                # not burn the in-process retry, but the job must pause for a
+                # later retry — not fail terminally — once memory is freed or
+                # the cache floor is fixed. Only proven-terminal defects are
+                # non-retryable here.
+                wrapped.retryable = _retryable_remotion_failure(exc)
+                wrapped.immediate_retry = _transient_remotion_failure(exc)
                 memory_snapshot = getattr(exc, "memory_snapshot", None)
                 if memory_snapshot:
                     wrapped.memory_snapshot = dict(memory_snapshot)

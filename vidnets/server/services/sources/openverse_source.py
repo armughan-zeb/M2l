@@ -17,7 +17,26 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate
+from .base_source import BaseSource, ImageCandidate, request_proxies
+
+
+def openverse_timeout_seconds() -> float:
+    """Per-request timeout for the Openverse API.
+
+    Round 4 (test 31 fix): direct egress is dead and the proxy
+    answers Openverse in ~19 s at best (then 504s), so the old 10 s
+    timeout never survived a real call. Default 45 s (env
+    ``VIDZEO_OPENVERSE_TIMEOUT_SECONDS``, clamped 5–120 s). The
+    value must stay under the muse wave wall or the wave abandons
+    the call at the wall — see ``muse_search``.
+    """
+    try:
+        return max(
+            5.0,
+            min(120.0, float(os.environ.get("VIDZEO_OPENVERSE_TIMEOUT_SECONDS", "45") or 45)),
+        )
+    except (TypeError, ValueError):
+        return 45.0
 
 
 class OpenverseSource(BaseSource):
@@ -25,7 +44,7 @@ class OpenverseSource(BaseSource):
     trust_score = 0.8
     tier = 1
     max_results_per_query = 30
-    timeout = 10.0
+    timeout = 45.0
 
     API_URL = "https://api.openverse.org/v1/images/"
     TOKEN_URL = "https://api.openverse.org/v1/auth_tokens/token/"
@@ -65,6 +84,10 @@ class OpenverseSource(BaseSource):
         ).strip()
         self.api_url = str(settings.get("api_url") or self.API_URL).strip()
         self.token_url = str(settings.get("token_url") or self.TOKEN_URL).strip()
+        # Round 4: the adapter timeout is env-driven (default 45 s) so a
+        # slow proxy response survives; the class attribute stays as the
+        # documented default for callers that read it without an instance.
+        self.timeout = openverse_timeout_seconds()
         verify_setting = settings.get("verify_license_pages", False)
         self.verify_license_pages = (
             verify_setting
@@ -231,7 +254,10 @@ class OpenverseSource(BaseSource):
             )
             return "", state
 
-    def _search_response(self, params: Dict[str, Any]) -> Optional[Any]:
+    def _search_response(
+        self, params: Dict[str, Any], direct: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Optional[Any]:
         token, auth_state = self._get_access_token()
         if auth_state == "invalid_credentials":
             return None
@@ -247,12 +273,21 @@ class OpenverseSource(BaseSource):
                     self.api_url,
                     params=params,
                     headers=headers,
-                    timeout=self.timeout,
+                    # Round 5: the wave's transport retry passes a
+                    # longer timeout; None keeps the instance default.
+                    timeout=float(timeout) if timeout is not None else self.timeout,
+                    proxies=request_proxies(direct),
                 )
             except requests.RequestException:
                 if attempt == 0:
                     time.sleep(0.25)
                     continue
+                # Round 4: a transport failure IS a failure. The old code
+                # swallowed it without record_failure(), so _failure_count
+                # stayed 0 and the manager misread a dead transport as a
+                # genuine empty answer — the alternate-route retry never
+                # fired and the circuit breaker never tripped.
+                self.record_failure()
                 return None
 
             status = int(getattr(response, "status_code", 0) or 0)
@@ -281,6 +316,8 @@ class OpenverseSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
+        timeout: Optional[float] = None,
     ) -> List[ImageCandidate]:
         filters = filters or {}
         clean = self._clean_query(query, max_words=8)
@@ -303,7 +340,7 @@ class OpenverseSource(BaseSource):
         if aspect_ratio:
             params["aspect_ratio"] = aspect_ratio
 
-        response = self._search_response(params)
+        response = self._search_response(params, direct=direct, timeout=timeout)
         if response is None:
             return []
         try:
@@ -325,7 +362,7 @@ class OpenverseSource(BaseSource):
                     self.verify_license_pages
                     and len(candidates) < self.license_verification_limit
                 ):
-                    verified, evidence = self._verify_source_page_license(dict(item))
+                    verified, evidence = self._verify_source_page_license(dict(item), direct=direct)
                     candidate.metadata["license_verified"] = bool(verified)
                     candidate.metadata["license_verification_evidence"] = evidence
                     candidate.metadata["license_verification_required"] = not bool(verified)
@@ -335,7 +372,9 @@ class OpenverseSource(BaseSource):
                 candidates.append(candidate)
         return candidates
 
-    def _verify_source_page_license(self, item: Mapping[str, Any]) -> Tuple[bool, str]:
+    def _verify_source_page_license(
+        self, item: Mapping[str, Any], direct: bool = False,
+    ) -> Tuple[bool, str]:
         """Confirm Openverse's reported license on the independent origin page."""
         landing_url = str(item.get("foreign_landing_url") or "").strip()
         if not re.match(r"^https?://", landing_url, flags=re.IGNORECASE):
@@ -357,6 +396,7 @@ class OpenverseSource(BaseSource):
                     },
                     timeout=self.timeout,
                     allow_redirects=True,
+                    proxies=request_proxies(direct),
                 )
             except requests.RequestException:
                 response = None

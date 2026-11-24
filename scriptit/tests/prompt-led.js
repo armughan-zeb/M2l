@@ -42,7 +42,9 @@ function beatText(beat) {
 }
 const BEAT_WORDS = beatText(1).split(/\s+/).filter(Boolean).length;
 
-// A complete short-video fixture.
+// 187 words: longer than the 1-minute target (160) so it exercises the
+// "longer narration must not trigger another provider request" rule, but
+// inside the gate's 1.35x length band.
 const ONE_MINUTE_SCRIPT = [
   'On July 20, 1969, Neil Armstrong stepped onto the Sea of Tranquility and became the first person to walk on the Moon. Buzz Aldrin followed him nineteen minutes later, while Michael Collins waited alone in the Command Module Columbia above them.',
   'Apollo 11 had launched from Kennedy Space Center on July 16, 1969, on a Saturn V rocket. Armstrong commanded the mission, Aldrin piloted the Lunar Module Eagle, and Collins stayed in lunar orbit while the other two descended to the surface.',
@@ -62,8 +64,6 @@ async function main() {
     assert.equal(options.responseFormat, undefined, 'production asks for one plain narration');
     const system = options.messages[0].content;
     const user = options.messages[1].content;
-    // The publishable branch asks the hook agent for scored opening variants.
-    if (user.includes('OPENING HOOK')) return { content: HOOK_JSON };
     assert.ok(system.includes('WRITING CONTRACT') && system.includes('SOURCE TIER RULES'));
     assert.ok(system.includes('do not invent stakes or manufacture mystery'), 'retention guidance must stay grounded in the evidence');
     assert.ok(system.includes('VISUAL EVIDENCE-AWARE STORY CHOICE') && system.includes('A similar-era image or a neighboring event does not verify the claim.'), 'specific visual beats must be grounded in the same event as the claim');

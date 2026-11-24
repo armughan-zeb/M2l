@@ -61,9 +61,14 @@ def test_explicitly_synthetic_publisher_does_not_consume_real_footage_slot():
 
 
 def test_range_download_memory_floor_and_parallel_headroom():
-    assert _ranged_download_worker_limit(4, 384, 8 * 1024**3) == 1
-    assert _ranged_download_worker_limit(4, 1024, 8 * 1024**3) == 2
+    # Total-RAM tiers (yt-speed): the fit no longer collapses when a running
+    # job holds memory — 8 GiB hosts fit 6 workers, so a 4-worker request is
+    # granted in full at 384 MB and 1024 MB available. Only genuine
+    # starvation (available below one worker's 320 MB reserve) drops to 1.
+    assert _ranged_download_worker_limit(4, 384, 8 * 1024**3) == 4
+    assert _ranged_download_worker_limit(4, 1024, 8 * 1024**3) == 4
     assert _ranged_download_worker_limit(4, 4096, 16 * 1024**3) == 4
+    assert _ranged_download_worker_limit(4, 100, 8 * 1024**3) == 1
 
 
 def test_verified_story_publisher_is_preferred_without_trusting_fan_names():

@@ -4,8 +4,18 @@
 /**
  * render-vidnets-linux.js — MUSE_RENDER_COMMAND wrapper (Linux hybrid path).
  *
- * The CMS daemon stays active while Vidnets renders. Muse answers the
- * inference inbox through the daemon's resident dispatcher or the host hook.
+ * The CMS daemon stays active and Vidnets does the rendering, but every
+ * reasoning / scene / query / vision decision is answered by a Muse operator
+ * through the Vidnets agent-bridge inbox (see the vidnets-inbox-watch hook).
+ *
+ * This wrapper deliberately does NOT use adapters/vidnets.js serviceInbox:
+ * that path would call MUSE_INFERENCE_COMMAND for every pending request
+ * while the hook worker is already answering the same requests directly
+ * via `VIDNETS_AGENT.sh answer` — the second answer would fail with
+ * "already answered". The pattern used here is the one proven by test jobs
+ * 0bb3f900 and ff377408: submit via the Vidnets launcher, poll job status,
+ * and let the hook worker answer the inbox. This wrapper only submits,
+ * polls, and validates.
  *
  * Contract (adapters/video.js runRenderCommand):
  *   stdin:  JSON { job, scriptText, scriptPath, workDir, outputPath }
@@ -16,7 +26,8 @@
  *   - Vidnets job ends error / cancelled / shutdown_timeout -> throw.
  *   - Vidnets job stays paused after 3 retries -> throw.
  *   - No video file, or video < 1 MB -> throw.
- *   - Every scene in the finished edit plan must have accepted real media.
+ *   - The finished edit plan has 0 real-media scenes (all graphic
+ *     fallbacks) -> throw instead of delivering a graphics-only video.
  *   - No fallback to the native Remotion engine or the solid-colour
  *     ffmpeg placeholder: those are what made live jobs graphics-only.
  *
@@ -47,11 +58,14 @@ const REPLAN_MIN_REMAINING_MS = 10 * MINUTE;
 
 /**
  * Pure decision: may the wrapper spend its one bounded media re-plan?
- * An incomplete plan earns at most one re-plan when enough budget remains.
+ * Only a finished plan with 0 Muse-verified real-media scenes earns one,
+ * only once per wrapper run, and only when enough render budget remains.
+ * Anything else (a broken render, a missing edit plan, a too-small video)
+ * fails immediately instead — retrying those would just repeat the failure.
  */
-function shouldAttemptReplan({ real, total = 1, replanAttempted, msRemaining, minRemainingMs = REPLAN_MIN_REMAINING_MS }) {
+function shouldAttemptReplan({ real, replanAttempted, msRemaining, minRemainingMs = REPLAN_MIN_REMAINING_MS }) {
   if (replanAttempted) return false;
-  if (real >= total) return false;
+  if (real !== 0) return false;
   return Number(msRemaining) >= Number(minRemainingMs);
 }
 
@@ -239,6 +253,7 @@ function resultVideoPath(item) {
  * Muse rejection (accepted === false, fatal_mismatch, rejected status)
  * always beats the flag: a rejected asset is never real. `verified`
  * still counts Muse-verified scenes separately, for reporting.
+ * The delivery rule is the ONLY hard rule: real === 0 fails the job.
  */
 function countRealScenes(packageDir, planPath) {
   if (!packageDir || !fs.existsSync(packageDir)) return null;
@@ -350,6 +365,9 @@ async function main() {
   const request = buildRequest(job, scriptText, packageDir);
   const requestFile = path.join(workDir, 'vidnets-request.json');
   const jobFile = path.join(workDir, 'vidnets-job.json');
+  // The one bounded re-plan is per JOB, not per wrapper run: if a previous
+  // run already spent it, the saved receipt says so (replanAttempted: 1) and
+  // a resume must not earn a second one.
   let receipt = readRenderReceipt(jobFile, job.jobId);
   let vidnetsJobId = receipt?.id || '';
   let replanAttempted = replanAlreadyUsed(receipt);
@@ -359,7 +377,7 @@ async function main() {
     receipt = { ...receipt, ...fields, id: vidnetsJobId, jobId: job.jobId, packageDir };
     writeJsonAtomic(jobFile, receipt);
   };
-  if (vidnetsJobId) log(`Re-attaching to existing Vidnets job ${vidnetsJobId} for ${job.jobId}`);
+  if (vidnetsJobId) log(`Re-attaching to existing Vidnets job ${vidnetsJobId} for ${job.jobId}${replanAttempted ? ' (media re-plan already used)' : ''}`);
 
   if (!vidnetsJobId) {
     log('Ensuring Vidnets service is ready');
@@ -387,6 +405,10 @@ async function main() {
     }
 
     // A lost status response does not establish that the renderer stopped.
+    // The status fetch is a read, not a render step: one transient failure
+    // must not kill a healthy render. BNSF attempt 5 died exactly this
+    // way — the wrapper exited while Vidnets job 23d01670 was still
+    // processing at 55%, and the CMS job was failed for nothing.
     let snapshot;
     try {
       snapshot = await vidnets(['job', vidnetsJobId], MINUTE);
@@ -456,17 +478,22 @@ async function main() {
         fail('Vidnets completed without an edit plan next to the video — the real-media mix cannot be verified. Failing instead of delivering an unverified video.');
       }
       log(`Edit plan: ${mediaCount.real}/${mediaCount.total} scenes real media (${mediaCount.verified} Muse-verified), ${mediaCount.graphic} graphic fallback(s)`);
+      // Production policy: the ONLY hard delivery rule is 0 real-media
+      // scenes — never deliver a graphics-only video. A scene counts as
+      // real via the adapter's own acceptance (verified flag) even when
+      // Muse never answered a vision request for it. Partial-real videos
+      // deliver with an advisory, unless MUSE_MEDIA_STRICT=1.
       if (mediaCount.real < mediaCount.total) {
         const strict = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
         const reason = `Vidnets accepted real media in ${mediaCount.real}/${mediaCount.total} scenes. Every scene needs accepted real media.`;
         const msRemaining = deadline - Date.now();
         const minRemainingMs = Math.max(0, Number(process.env.MUSE_REPLAN_MIN_REMAINING_MS) || REPLAN_MIN_REMAINING_MS);
-        if (shouldAttemptReplan({ ...mediaCount, replanAttempted, msRemaining, minRemainingMs })) {
+        if (shouldAttemptReplan({ real: mediaCount.real, replanAttempted, msRemaining, minRemainingMs })) {
           replanAttempted = true;
           const previousId = vidnetsJobId;
           const retryRequest = buildRetryRequest(request);
           const retryRequestFile = path.join(workDir, 'vidnets-request-replan.json');
-          log(`${reason} Attempting one re-plan with fresh queries and ${Math.round(msRemaining / 60000)} min left in the render budget`);
+          log(`0 real-media scenes — attempting the one bounded media re-plan (fresh queries, plan cache bypassed) with ${Math.round(msRemaining / 60000)} min left in the render budget`);
           vidnetsJobId = await submitRender({ jobId: job.jobId, filePath: retryRequestFile, request: retryRequest, submit });
           saveReceipt({
             cmsAttempt, pausedRetries: 0, submittedAt: new Date().toISOString(),

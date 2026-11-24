@@ -29,7 +29,6 @@ function resolveRenderCommand(command, root = config.ROOT) {
   return String(command).replace(/^(\s*(?:node|node\.exe)\s+)(?:["'](?:\.\/)?render-vidnets-linux\.js["']|(?:\.\/)?render-vidnets-linux\.js)(?=\s|$)/i,
     (_match, prefix) => prefix + quoteArg(path.join(root, 'render-vidnets-linux.js')));
 }
-
 /**
  * Parse one stderr line from render-vidnets-linux.js into live progress.
  *

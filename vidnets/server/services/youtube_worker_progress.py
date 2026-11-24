@@ -34,6 +34,37 @@ class YouTubeWorkerProgress:
                 self.remainder = b''
             for raw in lines:
                 line = raw.decode('utf-8', errors='replace')
+                # Round 13 (Nov 23, job 9ab2eb05): the transcript/moment
+                # stages emitted nothing the poller recognised, so the
+                # heartbeat kept saying "Searching YouTube (53 candidates
+                # found)" for ~670 s while the worker was actually
+                # fetching transcripts and matching moments. Recognise
+                # both stages with their counts so the heartbeat states
+                # the true stage.
+                match = re.search(
+                    r'\[yt-transcript\] fetching (\d+)/(\d+) completed transcript\(s\); (\d+) ready',
+                    line,
+                )
+                if match:
+                    completed, total, ready = map(int, match.groups())
+                    self._send(f'phase=transcripts completed={completed} total={total} ready={ready}')
+                    continue
+                match = re.search(
+                    r'\[yt-transcript\] deadline \S+: retaining (\d+)/(\d+) completed transcript\(s\); (\d+) unfinished; (\d+) ready',
+                    line,
+                )
+                if match:
+                    completed, total, _unfinished, ready = map(int, match.groups())
+                    self._send(f'phase=transcripts completed={completed} total={total} ready={ready}')
+                    continue
+                match = re.search(
+                    r'\[yt-moments\] matched (\d+) moments across (\d+)/(\d+) scenes',
+                    line,
+                )
+                if match:
+                    matched, scenes, total = map(int, match.groups())
+                    self._send(f'phase=moments matched={matched} scenes={scenes} total={total}')
+                    continue
                 match = re.search(r'search complete: (\d+) unique candidate', line)
                 if match and int(match[1]) > 0:
                     self._send(f'phase=search candidates={int(match[1])}')
@@ -61,6 +92,21 @@ class YouTubeWorkerProgress:
                     message = f"Downloading YouTube footage ({values.get('completed', '0')} clips received)"
                 elif phase in {'verification', 'complete'}:
                     message = f"Checking YouTube footage {values.get('ready', '0')}/{values.get('requested', '0')}"
+                elif phase == 'transcripts':
+                    # Round 13: never report the transcript stage as
+                    # "Searching" — job 9ab2eb05's heartbeat did exactly
+                    # that for ~670 s.
+                    message = (
+                        f"Fetching YouTube transcripts "
+                        f"({values.get('completed', '0')}/{values.get('total', '0')}, "
+                        f"{values.get('ready', '0')} ready)"
+                    )
+                elif phase == 'moments':
+                    message = (
+                        f"Matching YouTube moments "
+                        f"({values.get('matched', '0')} across "
+                        f"{values.get('scenes', '0')}/{values.get('total', '0')} scenes)"
+                    )
                 else:
                     message = f"Searching YouTube ({values.get('candidates', '0')} candidates found)"
                 try:

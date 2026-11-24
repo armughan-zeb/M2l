@@ -2,7 +2,7 @@
 
 Implements the VidRush-style scene-aware sampling strategy:
   - short scene (<5s)  : start, middle, end              -> 3 frames
-  - normal scene (5-20s): 0/25/50/75/100%               -> 5 frames
+  - normal scene (5-20s): 10/30/50/70/90% (spec §7)      -> 5 frames
   - long scene (20+s):  evenly spaced, capped at 8 frames
 
 Frames are extracted at low resolution (480px long edge) to keep memory
@@ -66,8 +66,10 @@ def _scene_split_timestamps(duration: float) -> List[float]:
         # short scene (3 frames) — start, middle, end, skipping edges
         return [duration * 0.1, duration * 0.5, duration * 0.9]
     if duration <= 20.0:
-        # normal scene (5 frames) — 0/25/50/75/100% with 5% edge pad
-        return [duration * p for p in (0.05, 0.25, 0.50, 0.75, 0.95)]
+        # normal scene (5 frames) — spec §7: 10/30/50/70/90%. The old
+        # 5/25/50/75/95% sampling grabbed near-edge frames that are
+        # often black / transitional; 10% and 90% skip those edges.
+        return [duration * p for p in (0.10, 0.30, 0.50, 0.70, 0.90)]
     # long scene — evenly spaced, 8 frames. Always skip the very first 5%
     # to avoid grabbing a black/intro frame at timestamp 0, which FFmpeg
     # routinely does on freshly-cut clips.

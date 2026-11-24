@@ -41,6 +41,10 @@ class _SemaphoredClient:
         with self._semaphore:
             return self._client.analyze_clip_frames(frame_paths, user_prompt, system_prompt)
 
+    def analyze_clip_frames_batch(self, candidates: list, user_prompt: str, system_prompt: str) -> dict:
+        with self._semaphore:
+            return self._client.analyze_clip_frames_batch(candidates, user_prompt, system_prompt)
+
     def _post(
         self,
         content: list,

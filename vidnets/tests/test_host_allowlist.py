@@ -116,7 +116,7 @@ def test_broker_catalog_matches_demotions():
     by_name = {row["name"]: row for row in web_image_source_catalog()}
     assert by_name["openverse"]["default"] is False
     assert by_name["getty_bing"]["default"] is False
-    assert by_name["getty_ddg"]["default"] is False
+    assert "getty_ddg" not in by_name  # removed Nov 19, 2026 (DDG bot-gates)
     assert by_name["wikimedia"]["default"] is True
 
 

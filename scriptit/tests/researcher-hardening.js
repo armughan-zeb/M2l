@@ -33,7 +33,14 @@ test('thorough gatherResearch includes yandex and yandex-news lanes', () => {
   assert.ok(src.includes('yandex: yandexH'), 'thorough return must expose the yandex lane');
 });
 
-test('research retry default is 3 attempts', () => {
+// Deliberate change (2026-11-15 research-timeout fix): retry default was
+// 3 attempts x 20s = 60s per provider, which exceeded the 45s research-pass
+// budget, so one slow provider could eat the whole pass before the reliable
+// lanes (Bing/Wikipedia/RSS) finished. Default is now 2 attempts x 15s
+// (~30s cap), inside the 30s provider deadline; the deadline-aware runner
+// still returns partial results from the lanes that did land.
+test('research retry default is 2 attempts', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'agents', 'researcher.js'), 'utf8');
-  assert.ok(src.includes('attempts: 3'), 'retry default must be 3 attempts');
+  assert.ok(src.includes('attempts: 2'), 'retry default must be 2 attempts');
+  assert.ok(src.includes('timeoutMs: 15000'), 'retry per-attempt timeout default must be 15s');
 });

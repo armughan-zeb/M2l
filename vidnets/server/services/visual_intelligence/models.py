@@ -121,6 +121,10 @@ class ClipAnalysis:
     final_score: float = 0.0
     vision_available: bool = False
     error: str = ""
+    # Batched vision only: the model's explicit per-candidate verdict
+    # ("accept"/"reject") from a batch call. Empty for single-candidate
+    # vision, where acceptance is derived from the scores alone.
+    batch_verdict: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -159,6 +163,7 @@ class ClipAnalysis:
             "final_score": round(self.final_score, 2),
             "vision_available": self.vision_available,
             "error": self.error,
+            "batch_verdict": self.batch_verdict,
         }
 
 

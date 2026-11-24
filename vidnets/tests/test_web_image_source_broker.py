@@ -17,17 +17,16 @@ class SourceBrokerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            WEB_ENGINE_PRIORITY, ("yandex", "bing", "flickr", "duckduckgo")
+            WEB_ENGINE_PRIORITY, ("yandex", "bing", "flickr")
         )
         tier_zero = [
             row["name"] for row in web_image_source_catalog() if int(row["tier"]) == 0
         ]
-        # Yandex first; Bing, Flickr and DuckDuckGo are fallbacks in that
+        # Yandex first; Bing and Flickr are fallbacks in that
         # order (lane names differ from engine names, hence the mapping).
         for earlier, later in (
             ("yandex", "bing_hybrid"),
             ("bing_hybrid", "flickr_api"),
-            ("flickr_api", "ddg_hybrid"),
         ):
             self.assertLess(tier_zero.index(earlier), tier_zero.index(later))
 
@@ -174,10 +173,14 @@ class SourceBrokerTests(unittest.TestCase):
         ):
             enabled_names = [name for name, _kind in resolver._enabled_fast_sources()]
 
+        # Muse-search (Nov 22, test-30 fix): openverse/wikimedia are
+        # folded INTO the muse_search wave (same APIs, one call per
+        # query), so the standalone lanes are no longer in the default
+        # wave — muse_search is the default lane that covers them.
         expected = {
             "universal_scraper", "yandex", "bing_hybrid", "flickr_api",
-            "ddg_hybrid", "openverse", "wikimedia", "library_of_congress",
-            "google_images", "getty_bing", "getty_ddg",
+            "muse_search", "library_of_congress",
+            "google_images", "getty_bing",
         }
         self.assertTrue(expected.issubset(default_names))
         self.assertTrue(expected.issubset(enabled_names))

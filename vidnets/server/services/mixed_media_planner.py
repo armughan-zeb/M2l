@@ -104,7 +104,11 @@ def _media_share(web, youtube, stock):
     return {"Web Images": web, "YouTube Clips": youtube, "Stock Media": stock, "AI Images": 0.0}
 
 _NICHE_MEDIA_PROFILES.update({
-    "crime": _media_share(.30, .55, .15), "history": _media_share(.45, .45, .10),
+    # Spec §5.1: crime/documentary 60% YouTube, history/royal 65%.
+    # History was 45% YouTube / 45% web — archival footage is the point
+    # of a history documentary, not stills. Crime was 55% YouTube / 15%
+    # stock; stock drops to the spec 10%.
+    "crime": _media_share(.30, .60, .10), "history": _media_share(.30, .65, .05),
     "royal": _media_share(.30, .65, .05), "documentary": _media_share(.30, .60, .10),
     "sports": _media_share(.20, .75, .05), "action": _media_share(.20, .75, .05),
     "gaming": _media_share(.15, .80, .05), "travel": _media_share(.20, .55, .25),
@@ -115,11 +119,29 @@ _NICHE_MEDIA_PROFILES.update({
     "business": _media_share(.35, .55, .10), "finance": _media_share(.35, .55, .10),
     "food": _media_share(.30, .60, .10), "architecture": _media_share(.30, .60, .10),
     "education": _media_share(.35, .55, .10), "health": _media_share(.35, .55, .10),
-    "lifestyle": _media_share(.30, .60, .10), "general": _media_share(.25, .55, .20),
+    # Spec §5.1: lifestyle/fitness is 20% YouTube / 80% web / 0% stock —
+    # clean stills, not footage. The old 60% YouTube weight was the
+    # fitness-lifestyle default leaking into every lifestyle job.
+    "lifestyle": _media_share(.80, .20, .00), "general": _media_share(.25, .55, .20),
     "disaster": _media_share(.35, .60, .05), "environment": _media_share(.30, .60, .10),
     "entertainment": _media_share(.30, .65, .05), "music": _media_share(.30, .65, .05),
 })
 _GAMING_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["gaming"])
+# The gaming YouTube target: 80% of scenes served by YouTube. Single source
+# of truth for app._apply_gaming_mode_policy (which stamps it onto the job
+# config) and the adapter's quota math. The planner weights alone only
+# reach 0.80, so the target must not be derived from them.
+GAMING_YOUTUBE_TARGET_RATIO = 0.80
+# The documentary YouTube target: 55% of scenes served by YouTube. Single
+# source of truth for app._apply_documentary_mode_policy (which stamps it
+# onto the job config) and the adapter's quota math. AUTO_YOUTUBE_RATIO
+# (0.55) is the pre-existing documentary constant; this name binds it to
+# the documentary niche the way GAMING_YOUTUBE_TARGET_RATIO binds 0.80 to
+# gaming. The planner's documentary retrieval weights (YouTube 0.60) are a
+# separate retrieval preference and must not be confused with this quota
+# target; without this stamp, documentary jobs fell through to the 0.30
+# adapter default.
+DOCUMENTARY_YOUTUBE_TARGET_RATIO = AUTO_YOUTUBE_RATIO
 _ACTION_SPORTS_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["sports"])
 _DOCUMENTARY_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["documentary"])
 _GENERAL_MIXED_MEDIA_WEIGHTS = dict(_NICHE_MEDIA_PROFILES["general"])
@@ -140,8 +162,32 @@ _NICHE_RETRIEVAL_POLICIES = {
         "yt_max_download_attempts_per_scene": 4,
         "mixed_yt_clip_max_seconds": 8.0,
         "max_still_hold_seconds": 3.2,
-        "max_visual_beat_seconds": 3.1,
+        # Spec §5.1: royal/history archival pans, 3.4s beats.
+        "max_visual_beat_seconds": 3.4,
         "intro_media_max_shots": 7,
+    },
+    "documentary": {
+        "web_max_candidate_downloads": 22,
+        "yt_download_candidate_limit": 5,
+        "yt_max_download_attempts_per_scene": 4,
+        "mixed_yt_clip_max_seconds": 8.0,
+        "max_still_hold_seconds": 3.0,
+        # Spec §5.1: documentary/crime evidence zooms, 3.0s beats.
+        # Previously fell through to the general 3.4s policy.
+        "max_visual_beat_seconds": 3.0,
+        "intro_media_max_shots": 7,
+    },
+    "lifestyle": {
+        "web_max_candidate_downloads": 20,
+        "yt_download_candidate_limit": 2,
+        "yt_max_download_attempts_per_scene": 3,
+        "mixed_yt_clip_max_seconds": 8.0,
+        "max_still_hold_seconds": 3.5,
+        # Spec §5.1: lifestyle/fitness clean stills, 3.5s beats.
+        # Previously fell through to the general policy with a 60%
+        # YouTube weight; the weight fix above makes this entry agree.
+        "max_visual_beat_seconds": 3.5,
+        "intro_media_max_shots": 6,
     },
     "gaming": {
         "web_max_candidate_downloads": 18,
@@ -225,7 +271,7 @@ _NICHE_ALIASES = {
     "economy": "economics", "books": "literature", "poetry": "literature",
 }
 _GTA_VI_POLICY_RE = re.compile(
-    r"\b(?:gta\s*(?:vi|6)|gta\s+six|grand\s+theft\s+auto\s*(?:vi|6))\b",
+    r"\b(?:gta\s*(?:vi|6)|gta\s+six|grand\s+theft\s+auto\s*(?:vi|6)|grand\s+theft\s+auto\s+six)\b",
     re.IGNORECASE,
 )
 
@@ -631,6 +677,50 @@ def classify_mixed_media_topic(
     if _contains_topic_term(context, _SIMPLE_TOPIC_TERMS):
         return "simple"
     return "general"
+
+
+def gaming_mode_for(
+    title: str = "",
+    script: str = "",
+    scene_texts: List[str] | None = None,
+    category: str = "",
+) -> bool:
+    """True when a job is a gaming title (GTA VI or any other game).
+
+    Reuses the two existing detectors — the GTA VI story regex and the
+    topic classifier — instead of adding a third. Gaming mode drives the
+    0.80 YouTube target, YT-primary lane order, and the gaming retrieval
+    policy; it is wired into the job config by
+    ``app._resolve_mixed_media_niche_policy`` as ``config['_gaming_mode']``.
+    """
+    if _gta_vi_story(title, script, scene_texts):
+        return True
+    return classify_mixed_media_topic(title, script, scene_texts, category) == "gaming"
+
+
+def documentary_mode_for(
+    title: str = "",
+    script: str = "",
+    scene_texts: List[str] | None = None,
+    category: str = "",
+) -> bool:
+    """True when a job is a documentary (any documentary-family topic).
+
+    Reuses the topic classifier instead of adding another detector. The
+    classifier returns "documentary" for an explicit documentary category
+    and "serious" for evidence-led history/disaster wording, which
+    resolve_media_policy maps onto the documentary policy niche; both mean
+    the job is documentary-family, so both count. Crime and royal jobs are
+    classified before "serious" and do not count. Gaming mode is checked
+    first by the caller and wins when a job is both. Jobs whose classifier
+    lands on a distinct sub-niche (history, maritime, ...) are not
+    documentary mode; only the resolved "documentary" policy niche (or the
+    classifier's documentary/serious outputs) stamps the 0.55 target.
+    """
+    return classify_mixed_media_topic(title, script, scene_texts, category) in {
+        "documentary",
+        "serious",
+    }
 
 
 def automatic_mixed_media_weights(
@@ -1192,6 +1282,7 @@ def build_adaptive_mixed_media_plan(
     category: str = "",
     scene_media_mode: str = "",
     media_policy: Dict[str, object] | None = None,
+    allow_stock: bool = True,
 ) -> AdaptiveMixedMediaPlan:
     automatic_mode = str(scene_media_mode or "").strip().lower() in {
         "auto", "automatic", "smart", "topic_aware", "topic-aware",
@@ -1235,6 +1326,11 @@ def build_adaptive_mixed_media_plan(
                 scene_texts=scene_texts,
                 category=category,
             )
+    if not allow_stock:
+        # Keep the intended motion share and give the unavailable stock
+        # slots to web stills before assigning scenes and planning queries.
+        weights["Web Images"] += weights["Stock Media"]
+        weights["Stock Media"] = 0.0
     num_scenes = len(scene_texts)
 
     yt_first = (

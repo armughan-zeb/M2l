@@ -111,7 +111,7 @@ export function IsometricMap({
             fontSize: 12,
             color: '#E2E8F0',
             lineHeight: 1.6,
-            backdropFilter: 'blur(8px)',
+            background: 'rgba(7, 16, 23, 0.72)',
           }}
         >
           <div>LAT: <span style={{ color: palette.accent }}>{latRoll}° N</span></div>

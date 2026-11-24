@@ -98,9 +98,60 @@ def _max_image_bytes() -> int:
 def _max_frame_tokens_hint() -> int:
     """Soft cap on total base64 bytes across all frames in one clip request."""
     try:
-        return max(256 * 1024, int(os.environ.get("VIDZEO_QWEN_VISION_MAX_CLIP_PAYLOAD_BYTES", str(1536 * 1024)) or (1536 * 1024)))
+        return max(256 * 1024, int(os.environ.get("VIDZEO_QWEN_VISION_MAX_CLIP_PAYLOAD_BYTES", str(4096 * 1024)) or (4096 * 1024)))
     except Exception:
-        return 1536 * 1024
+        return 4096 * 1024
+
+
+def _vision_batch_size() -> int:
+    """Candidates judged in one batched clip-vision call.
+
+    Vision lanes (2026-11-22): 4 candidates x 2 frames each (8 images)
+    per request — the top-3 finalists fit in one request with room for
+    one expansion candidate. Env ``VIDZEO_YT_VISION_BATCH_CANDIDATES``
+    (default 4, clamped 1..8); the transport ceiling is 16 images per
+    request (``SAFE_VISION_BATCH_IMAGES``), so 4 x 2 = 8 images keeps
+    the per-request image count identical to the web batch. The old
+    16-candidates-x-1-frame operating size is superseded: 1 frame per
+    candidate was a payload-saving compromise that the 4 MB payload cap
+    no longer needs (8 frames at 384px / quality 58 ≈ 400 KB).
+    """
+    try:
+        from .lane_budget import yt_vision_batch_candidates
+
+        return yt_vision_batch_candidates()
+    except Exception:
+        return 4
+
+
+def _vision_batch_frames() -> int:
+    """Frames per candidate in a batched clip-vision call (default 2)."""
+    try:
+        from .lane_budget import yt_vision_batch_frames
+
+        return yt_vision_batch_frames()
+    except Exception:
+        return 2
+
+
+def _web_vision_batch_images() -> int:
+    """Web images (scenes) per batched still-vision call (default 8)."""
+    try:
+        from .lane_budget import web_vision_batch_images
+
+        return web_vision_batch_images()
+    except Exception:
+        return 8
+
+
+# Max batch: max images carried in ONE vision request, both lanes.
+# A batch is up to 4 candidates x 2 frames each (YT, 8 images) or
+# 8 images (web). 16 images is the transport ceiling, not the size.
+# Live-tested 2026-11-20: 16 images in one request judges fine; the token
+# budget (raised alongside) is the binding limit, not the image count.
+# A scene has at most 8 candidates, so this covers a full scene in one
+# request — max parallel vision per scene.
+SAFE_VISION_BATCH_IMAGES = 16
 
 
 def _vision_image_probe_edge() -> int:
@@ -254,6 +305,118 @@ _V2_VERDICT_FIELDS = (
 )
 
 
+def _normalise_batch_response(payload: dict, image_paths: List[str], candidate_ids: List[str]) -> dict:
+    """Map a batched vision payload to {candidate_id: normalised verdict}.
+
+    Rows are matched to candidates by candidate_id when the model echoes
+    it; a row without a usable id falls back to the first still-unclaimed
+    candidate, in order. The assigned candidate_id is stamped on the
+    normalised row so downstream id checks (adapter
+    ``_validate_qwen_verdict_schema``) see the candidate the row judges.
+    Rows that are not objects are dropped. Raises VisionClientError when
+    no usable row survives.
+    """
+    rows = payload.get("verdicts") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise VisionClientError("Qwen Vision returned no batched verdicts")
+    wanted = [str(cid) for cid in (candidate_ids or [])]
+    while len(wanted) < len(image_paths):
+        wanted.append(str(image_paths[len(wanted)]))
+    results: dict = {}
+    unmapped: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("candidate_id") or "").strip()
+        if cid and cid in wanted and cid not in results:
+            normalised = _normalise_image_response(row)
+            normalised["candidate_id"] = cid
+            results[cid] = normalised
+        else:
+            unmapped.append(row)
+    for row in unmapped:
+        remaining = [cid for cid in wanted if cid not in results]
+        if not remaining:
+            break
+        cid = remaining[0]
+        normalised = _normalise_image_response(row)
+        normalised["candidate_id"] = cid
+        results[cid] = normalised
+    if not results:
+        raise VisionClientError("Qwen Vision returned no usable batched verdicts")
+    return results
+
+
+# Batched image vision (web lane): one request judges up to 8 candidates
+# for one scene and returns one verdict object per candidate. This is the
+# response_format contract for that request: the resident worker's
+# validate-before-deliver gate (validate_answer.py, via the server's
+# _json_schema_error) enforces it before an answer is delivered, and the
+# server enforces the same schema in agent_bridge.complete_request.
+# The verdicts cap MUST match SAFE_VISION_BATCH_IMAGES (16): a lower cap
+# makes every 5+ image batch fail submission with 400 "too many items"
+# (the YT lane hit exactly this live, 2026-11-20, with 8 verdicts).
+# Required per row: the V2 verdict fields the adapter's
+# _validate_qwen_verdict_schema enforces, plus the domain/scene/reason
+# fields the web resolver's judge needs. Optional numeric fields default
+# to 0.0 in _normalise_image_response when the model omits them.
+# additionalProperties is deliberately NOT false: a verdict may carry
+# extra advisory fields (identity_confirmed, talking_head, ...) without
+# failing the gate.
+_VISION_BATCH_ROW_SCHEMA = {
+    "type": "object",
+    "required": [
+        "candidate_id", "entity_conflict", "identity_score", "action_score",
+        "context_score", "quality", "visible_overlays", "subject_box",
+        "safe_text_regions", "fatal_mismatch", "domain_match", "scene_match",
+        "reason", "scene_description",
+    ],
+    "properties": {
+        "candidate_id": {"type": "string", "minLength": 1},
+        "entity_conflict": {"type": "boolean"},
+        "identity_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "action_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "context_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "quality": {"type": "number", "minimum": 0, "maximum": 100},
+        "final_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "relevance": {"type": "number", "minimum": 0, "maximum": 100},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 100},
+        "visible_overlays": {"type": "array"},
+        "subject_box": {"type": "object"},
+        "safe_text_regions": {"type": "array"},
+        "fatal_mismatch": {"type": "boolean"},
+        "domain_match": {"type": "boolean"},
+        "scene_match": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1},
+        "scene_description": {"type": "string"},
+        "has_text": {"type": "boolean"},
+        "watermark": {"type": "boolean"},
+        "synthetic_content": {"type": "boolean"},
+        "unsafe_content": {"type": "boolean"},
+        "suggestive_content": {"type": "boolean"},
+        "adult_content": {"type": "boolean"},
+        "source_presentation_type": {"type": "string"},
+        "identity_confirmed": {"type": "boolean"},
+    },
+}
+
+VISION_BATCH_VERDICT_SCHEMA = {
+    "name": "vidnets_vision_batch_verdict_v1",
+    "schema": {
+        "type": "object",
+        "required": ["verdicts"],
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": _VISION_BATCH_ROW_SCHEMA,
+            },
+        },
+    },
+}
+
+
 def _v2_schema_metadata(payload: dict) -> tuple[list[str], list[str]]:
     """Preserve enough raw-shape evidence for strict post-normalization QA."""
     present = [field for field in _V2_VERDICT_FIELDS if field in payload]
@@ -286,6 +449,7 @@ def _v2_schema_metadata(payload: dict) -> tuple[list[str], list[str]]:
 def _normalise_image_response(payload: dict) -> dict:
     schema_present, schema_errors = _v2_schema_metadata(payload)
     return {
+        **({"candidates": payload["candidates"]} if isinstance(payload.get("candidates"), list) else {}),
         **({'identity_confirmed': _coerce_bool(payload['identity_confirmed'])} if 'identity_confirmed' in payload else {}),
         "candidate_id": _coerce_str(payload.get("candidate_id")),
         "entity_conflict": _coerce_bool(payload.get("entity_conflict")),
@@ -394,6 +558,21 @@ def _normalise_clip_response(payload: dict) -> dict:
     }
 
 
+# Vision lanes (C8): the lane of the vision call in flight on this thread.
+# _ContextClient sets it around the raw-client callback; _post_with_hard_timeout
+# reads it so the filed agent-bridge row is tagged with its lane. A plain
+# threading.local: the transport client is shared across lanes/threads.
+_vision_lane_local = threading.local()
+
+
+def set_vision_lane(lane):
+    """Tag this thread's in-flight vision call with ``lane`` (or clear it)."""
+    _vision_lane_local.lane = str(lane or "").strip().lower() or None
+
+
+def _current_vision_lane():
+    return getattr(_vision_lane_local, "lane", None)
+
 class QwenVisionClient:
     """Thin multimodal client over OpenRouter targeting Qwen Flash."""
 
@@ -439,6 +618,9 @@ class QwenVisionClient:
             fallback_models = []
         self.timeout_seconds = float(timeout_seconds or _default_timeout())
         self.fast_mode = bool(fast_mode)
+        if self.fast_mode:
+            # Validator-only fast path: exactly one attempt (see _post).
+            self.max_attempts = 1
         configured = fallback_models if fallback_models is not None else FREE_VISION_FALLBACK_MODELS
         self.fallback_models = []
         seen = {self.model}
@@ -478,6 +660,17 @@ class QwenVisionClient:
         self._telemetry.last_latency_ms = max(0.0, float(value or 0.0))
 
     # -------- public -------------------------------------------------------
+
+    def as_fast_mode(self) -> "QwenVisionClient":
+        """Return a validator-only view of this client: exactly one attempt,
+        no repair retry. Shares credentials/model; used for recovery and
+        frame-fallback candidates so one slow inbox cannot eat the reserve."""
+        import copy
+
+        fast = copy.copy(self)
+        fast.fast_mode = True
+        fast.max_attempts = 1
+        return fast
 
     def is_available(self) -> bool:
         """Return whether the client is locally configured, without a paid ping."""
@@ -578,6 +771,169 @@ class QwenVisionClient:
             tail = " ".join(str(raw)[-400:].split())
             raise VisionClientError(f"Qwen Vision returned non-JSON clip analysis: ...{tail}")
         return _normalise_clip_response(payload)
+
+    def analyze_clip_frames_batch(
+        self,
+        candidates: List[dict],
+        user_prompt: str,
+        system_prompt: str,
+    ) -> dict:
+        """Judge a scene's clip candidates in batches of up to 4 candidates.
+
+        ``candidates`` is a list of ``{"candidate_id": str, "frame_paths":
+        [str, ...]}``. A batch carries at most 4 candidates x 2 frames
+        each (8 images per request) — the coordinator's top 3 finalists
+        fit in one request with room for 1 expansion candidate, and 2
+        frames (first + last sample of the probe window) bracket the
+        transcript-matched moment so the verdict sees the subject
+        persist across the cut, not just in one frame. A scene with more
+        candidates than the cap is split into multiple batches, each its
+        own vision request; the verdicts are merged. Returns
+        ``{candidate_id: normalised clip verdict}`` in the same shape as
+        ``analyze_clip_frames`` (plus ``batch_verdict`` / ``batch_score``),
+        so the existing accept/reject decision code can consume a batched
+        verdict without any rule change.
+
+        One request replaces one request per candidate: the model judges
+        several labelled frame groups in one look. A candidate missing from
+        the returned verdicts is simply absent from the result — the caller
+        treats it as vision-unavailable (fail-open, as today) or retries it
+        singly. A non-JSON or empty batch raises VisionClientError so the
+        caller can fall back to sequential per-candidate vision.
+
+        Deliberately NOT decorated with ``@cache_vision_response``: the
+        cache keys on a flat ``frame_paths`` argument and cannot key the
+        nested per-candidate frames. The context layer still dedupes
+        identical in-flight batch calls, and a sequential fallback still
+        benefits from the per-clip cache.
+        """
+        from .prompts import CLIP_BATCH_RESPONSE_FORMAT
+
+        if not candidates:
+            raise VisionClientError("No clip candidates provided for batch analysis")
+        batch_size = _vision_batch_size()
+        wanted = [c for c in candidates if isinstance(c, dict) and c.get("candidate_id") and c.get("frame_paths")]
+        if not wanted:
+            raise VisionClientError("No clip candidates with frames for batch analysis")
+        # Vision lanes: at most 4 candidates x 2 frames (8 images) per
+        # request. Chunk and merge; a chunk that fails raises so the
+        # caller falls back to sequential per-candidate vision (as today).
+        # The 16-image transport ceiling (SAFE_VISION_BATCH_IMAGES) is
+        # the hard cap, not the operating size.
+        merged: dict = {}
+        for start in range(0, len(wanted), batch_size):
+            chunk = wanted[start:start + batch_size]
+            merged.update(self._analyze_clip_frames_batch_chunk(chunk, user_prompt, system_prompt))
+        return merged
+
+    def _analyze_clip_frames_batch_chunk(
+        self,
+        candidates: List[dict],
+        user_prompt: str,
+        system_prompt: str,
+    ) -> dict:
+        """One batch: up to 4 candidates x 2 frames each, one request."""
+        from .prompts import CLIP_BATCH_RESPONSE_FORMAT
+
+        # 2 frames per candidate (first + last sample of the probe
+        # window) bracket the transcript-matched moment: the verdict
+        # sees the subject persist across the cut. 8 frames at 384px /
+        # quality 58 is ~400 KB — 10% of the 4 MB payload cap — so the
+        # old 1-frame-per-candidate payload compromise is no longer needed.
+        frames_per_candidate = _vision_batch_frames()
+        encoded: List[dict] = []
+        for cand in candidates:
+            frames = []
+            paths = list(cand.get("frame_paths") or [])
+            # First + last distinct frames; a single-frame candidate
+            # keeps its one frame.
+            wanted_paths = paths[:1]
+            if frames_per_candidate > 1 and len(paths) > 1:
+                wanted_paths = [paths[0], paths[-1]][:frames_per_candidate]
+            for path in wanted_paths:
+                uri = _encode_image_to_data_uri(
+                    path,
+                    max_long_edge=_vision_frame_probe_edge(),
+                    quality=58,
+                )
+                if uri:
+                    frames.append(uri)
+            if frames:
+                encoded.append({"candidate_id": str(cand["candidate_id"]), "frames": frames})
+        if not encoded:
+            raise VisionClientError("All batch clip frames failed to encode")
+        cap = _max_frame_tokens_hint()
+        while sum(len(uri) for item in encoded for uri in item["frames"]) > cap:
+            droppable = [
+                (i, len(item["frames"]))
+                for i, item in enumerate(encoded)
+                if len(item["frames"]) > 1
+            ]
+            if not droppable:
+                break
+            idx = max(droppable, key=lambda pair: max(
+                len(uri) for uri in encoded[pair[0]]["frames"]
+            ))[0]
+            frames = encoded[idx]["frames"]
+            frames.pop(max(range(len(frames)), key=lambda j: len(frames[j])))
+        content: List[dict] = [{"type": "text", "text": user_prompt}]
+        for item in encoded:
+            content.append({"type": "text", "text": f"Candidate {item['candidate_id']}:"})
+            for uri in item["frames"]:
+                content.append({"type": "image_url", "image_url": {"url": uri}})
+        # A batch verdict carries ~8 fields per candidate: give it a bigger
+        # token budget than a single verdict (1400) so a full batch is not
+        # truncated mid-list. Budget 10000 covers up to 16 verdicts with
+        # headroom (the user ordered the token limit raised to 10k: time
+        # matters more than tokens). full_budget=True keeps that budget in
+        # fast mode too — fast mode caps _post_json to 900 tokens, which
+        # truncates a batch response and makes the whole batch fail (the
+        # web lane hit exactly this via its fast_mode guard in test 13).
+        raw = self._post_json(
+            content,
+            system=system_prompt,
+            budget=10000,
+            retry_budget=12000,
+            response_format=CLIP_BATCH_RESPONSE_FORMAT,
+            full_budget=True,
+        )
+        payload = self._parse_json(raw)
+        if payload is None:
+            tail = " ".join(str(raw)[-400:].split())
+            raise VisionClientError(f"Qwen Vision returned non-JSON batch clip analysis: ...{tail}")
+        rows = payload.get("candidates")
+        if not isinstance(rows, list) or not rows:
+            raise VisionClientError("Qwen Vision batch clip analysis returned no candidates")
+        wanted_ids = {item["candidate_id"] for item in encoded}
+        out: dict = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate_id = _coerce_str(row.get("candidate_id"))
+            if not candidate_id or candidate_id not in wanted_ids:
+                continue  # unknown id: ignore, never invent a verdict
+            if candidate_id in out:
+                continue  # first verdict wins; duplicates are not re-judged
+            verdict = _coerce_str(row.get("verdict"), "reject").lower()
+            if verdict not in {"accept", "reject"}:
+                verdict = "reject"
+            score = _coerce_float(row.get("score"))
+            normalised = _normalise_clip_response({
+                **row,
+                "final_score": score,
+                "story_relevance": row.get("story_relevance", score),
+                "confidence": row.get("confidence", 0.0),
+                "fatal_mismatch": bool(row.get("fatal_mismatch")),
+                "talking_head": bool(row.get("talking_head")),
+                "reason": row.get("reason") or "",
+                "scene_description": row.get("scene_description") or "",
+            })
+            normalised["batch_verdict"] = verdict
+            normalised["batch_score"] = score
+            out[candidate_id] = normalised
+        if not out:
+            raise VisionClientError("Qwen Vision batch clip analysis matched no requested candidate")
+        return out
 
     @cache_vision_response
     def review_editorial_frames(self, frame_paths: List[str], context: str) -> dict:
@@ -715,6 +1071,91 @@ class QwenVisionClient:
             "_candidate_count": len(valid_paths),
         }
 
+    @cache_vision_response
+    def analyze_images_batch(self, image_paths: List[str], user_prompt: str, system_prompt: str, candidate_ids: Optional[List[str]] = None) -> dict:
+        """Judge a scene's image candidates in batches of up to 8 images.
+
+        One multimodal request carries at most SAFE_VISION_BATCH_IMAGES (16)
+        candidates and returns one verdict object per candidate, with the
+        same fields as analyze_image, keyed by candidate_id. A scene with
+        more candidates than the cap is split into multiple batches, each
+        its own vision request; the verdicts are merged. The token budget
+        scales with the batch (up to 10000) so a full batch is not truncated
+        mid-list. The acceptance rule is unchanged — only the transport is
+        batched: the caller still validates and scores each row exactly as
+        it would a
+        single-candidate verdict. The request carries
+        VISION_BATCH_VERDICT_SCHEMA as its response_format so the
+        validate-before-deliver gate enforces one verdict per candidate.
+        Raises VisionClientError when no candidate encodes, when the
+        payload is not JSON, or when no usable verdict comes back; callers
+        fall back to one analyze_image call per candidate.
+
+        fast_mode does NOT disable batching: a batch is one request (fewer
+        requests than the sequential loop it replaces), and in fast mode it
+        still gets exactly one attempt via _post_json's fast path. What
+        fast_mode must not do is cap the batch's token budget to 900 — a
+        batch verdict carries one verdict per candidate and needs its full
+        computed budget — so this call passes full_budget=True. (A previous
+        version raised "Batched vision is disabled in fast mode" here; that
+        guard disabled batching for every mixed-media job, because the
+        adapter sets fast_mode=True for all of them, so the batch never ran
+        live — test 13 failed 6/6 on it. Do not re-add the guard.)
+        """
+        paths = [str(path) for path in (image_paths or [])]
+        if not paths:
+            raise VisionClientError("No image candidates provided")
+        ids = [str(cid) for cid in (candidate_ids or [])]
+        while len(ids) < len(paths):
+            ids.append(str(paths[len(ids)]))
+        # Vision lanes: web batches carry 8 images per request (8 scenes
+        # x 1 candidate). The 16-image transport ceiling
+        # (SAFE_VISION_BATCH_IMAGES) is the hard cap, not the operating
+        # size: a 16-verdict web answer risks truncation mid-list and a
+        # failed batch loses 16 scenes at once. Chunk and merge; a chunk
+        # that fails raises so the caller falls back to sequential
+        # singles for the whole scene (as today).
+        merged: dict = {}
+        for start in range(0, len(paths), _web_vision_batch_images()):
+            chunk_paths = paths[start:start + _web_vision_batch_images()]
+            chunk_ids = ids[start:start + _web_vision_batch_images()]
+            merged.update(self._analyze_images_batch_chunk(chunk_paths, chunk_ids, user_prompt, system_prompt))
+        return merged
+
+    def _analyze_images_batch_chunk(self, paths: List[str], ids: List[str], user_prompt: str, system_prompt: str) -> dict:
+        """One batch: at most SAFE_VISION_BATCH_IMAGES images, one request."""
+        content: List[dict] = [{"type": "text", "text": user_prompt}]
+        valid_paths: List[str] = []
+        valid_ids: List[str] = []
+        for index, path in enumerate(paths):
+            uri = _encode_image_to_data_uri(
+                path,
+                max_long_edge=min(576, _vision_image_probe_edge()),
+                quality=68,
+            )
+            if not uri:
+                continue
+            valid_paths.append(path)
+            valid_ids.append(ids[index])
+            content.append({"type": "text", "text": f"Candidate {len(valid_paths) - 1} (candidate_id: {valid_ids[-1]})"})
+            content.append({"type": "image_url", "image_url": {"url": uri}})
+        if not valid_paths:
+            raise VisionClientError("All image candidates failed to encode")
+        budget = min(10000, 1400 + 800 * len(valid_paths))
+        retry_budget = min(12000, 2400 + 800 * len(valid_paths))
+        raw = self._post_json(
+            content,
+            system=system_prompt,
+            json_schema=VISION_BATCH_VERDICT_SCHEMA,
+            budget=budget,
+            retry_budget=retry_budget,
+            full_budget=True,
+        )
+        payload = self._parse_json(raw)
+        if payload is None:
+            raise VisionClientError("Qwen Vision returned non-JSON batch analysis")
+        return _normalise_batch_response(payload, valid_paths, valid_ids)
+
     # -------- internals ----------------------------------------------------
 
     def _post_json(
@@ -724,6 +1165,9 @@ class QwenVisionClient:
         system: str = "",
         budget: int = 1400,
         retry_budget: int = 2400,
+        json_schema: Optional[dict] = None,
+        response_format: Optional[dict] = None,
+        full_budget: bool = False,
     ) -> str:
         """Post with JSON mode and a lean token budget.
 
@@ -732,30 +1176,37 @@ class QwenVisionClient:
         gate spend tens of seconds per answer; with compact/degraded inputs
         the full verdict fits in ~1200 tokens, so keep the first shot lean
         and only retry once with more headroom when no JSON is extracted.
+
+        ``response_format`` overrides the default ``{"type": "json_object"}``
+        — the batched clip call passes its json_schema contract here so the
+        filed request carries the schema the worker must validate against.
+
+        ``full_budget`` is for batched calls only: a batch verdict carries
+        one verdict per candidate, so its token budget is sized for N
+        verdicts (2400-4000) and must NOT be capped to the 900-token fast
+        mode ceiling — a capped batch is truncated mid-list and unparseable.
+        Fast mode still means exactly one attempt (no retry) for a batch;
+        only the token ceiling is lifted.
         """
         raw = self._post(
             content,
             system=system,
             json_mode=True,
-            max_tokens=min(int(budget), 900) if self.fast_mode else budget,
+            json_schema=json_schema,
+            max_tokens=budget if full_budget else (min(int(budget), 900) if self.fast_mode else budget),
+            response_format=response_format,
         )
+        if self.fast_mode:
+            # Validator-only fast path: exactly one attempt, no plain-text
+            # repair retry. A malformed fast verdict is a miss, not a reason
+            # to spend a second network round trip on a fallback candidate.
+            return raw
         if _extract_json_text(raw) is None:
-            if self.fast_mode:
-                # Mixed Media uses a bounded advisory gate. Give a malformed
-                # JSON response one cheap plain-text repair shot, then let the
-                # normal metadata/fallback policy decide; do not spend a third
-                # network request on a single finalist.
-                raw = self._post(
-                    content,
-                    system=system,
-                    json_mode=False,
-                    max_tokens=min(int(retry_budget), 1000),
-                )
-            else:
-                raw = self._post(
-                    content, system=system, json_mode=True, max_tokens=retry_budget
-                )
-        if not self.fast_mode and _extract_json_text(raw) is None:
+            raw = self._post(
+                content, system=system, json_mode=True, json_schema=json_schema,
+                response_format=response_format, max_tokens=retry_budget
+            )
+        if _extract_json_text(raw) is None:
             # Some providers route response_format/json_object to a strict
             # variant that truncates reasoning models. Plain text mode lets us
             # extract the JSON from the raw response.
@@ -789,7 +1240,8 @@ class QwenVisionClient:
         from ..bounded_http import provider_post
         return provider_post(requests.post, OPENROUTER_API_URL, headers=headers,
                              json=payload, timeout=self.timeout_seconds,
-                             usage_kind='vision', operation='visual_review')
+                             usage_kind='vision', operation='visual_review',
+                             lane=_current_vision_lane())
 
     def _post(
         self,
@@ -798,6 +1250,8 @@ class QwenVisionClient:
         system: str = "",
         json_mode: bool = False,
         max_tokens: int = 900,
+        json_schema: Optional[dict] = None,
+        response_format: Optional[dict] = None,
     ) -> str:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -838,7 +1292,19 @@ class QwenVisionClient:
             model_groups.append(model_chain[4:7])
         if len(model_chain) > 1:
             payload["models"] = model_groups[0]
-        if json_mode:
+        if json_schema:
+            # A structured-output contract for this request. The resident
+            # worker's validate-before-deliver gate and the server's
+            # complete_request both enforce it via _json_schema_error;
+            # a provider that rejects it falls back to plain json_object
+            # via the 400/empty-content retries below, as today.
+            payload["response_format"] = {"type": "json_schema", "json_schema": json_schema}
+        elif response_format is not None:
+            # A caller-supplied full response_format (the batched clip call
+            # passes its json_schema contract here). json_schema above wins
+            # when both are given.
+            payload["response_format"] = response_format
+        elif json_mode:
             payload["response_format"] = {"type": "json_object"}
         # Qwen 3.x flash models default to thinking mode: the model emits a long
         # chain-of-thought ("reasoning") blob and leaves only "{}" / empty in
@@ -866,15 +1332,22 @@ class QwenVisionClient:
         last_error = ""
         structured_fallback_used = False
         attempts = min(self.max_attempts, 2) if current_job().get('cost_profile') == 'efficient' else self.max_attempts
-        request_budget = attempts + (1 if json_mode else 0)
+        if self.fast_mode:
+            # Validator-only fast path: exactly one network attempt, no
+            # retries, no structured-output fallback shot. The caller
+            # (recovery / frame candidates) treats a fast miss as a miss.
+            attempts = 1
+        request_budget = 1 if self.fast_mode else attempts + (1 if json_mode else 0)
         # An agent-backed verifier answers through the polling inbox, so one
         # attempt needs the full agent answer floor — otherwise the phase
         # scope below caps the request wall under it and the verdict expires
         # before the answer arrives.
         timeout_seconds = self.timeout_seconds
         if current_job().get('llm_provider') == 'external_agent':
-            from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
-            agent_wall = AGENT_REQUEST_WALL_SECONDS
+            try:
+                agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+            except (TypeError, ValueError):
+                agent_wall = 3600.0
             timeout_seconds = max(timeout_seconds, agent_wall)
         verdict_deadline = time.monotonic() + max(0.1, timeout_seconds * max(2, request_budget) + 10.0)
         for attempt in range(request_budget):
@@ -897,6 +1370,7 @@ class QwenVisionClient:
                     and json_mode
                     and "response_format" in payload
                     and not structured_fallback_used
+                    and not self.fast_mode
                 ):
                     # Provider routing differs. Retry once without structured
                     # output only for an explicit incompatibility response.

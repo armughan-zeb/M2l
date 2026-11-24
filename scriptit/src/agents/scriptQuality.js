@@ -231,7 +231,29 @@ function formatPlainNarration(text) {
     .trim();
 }
 
-function assessScript({ script, topic = '', wordTarget, previousScripts = [], contentType = 'general' }) {
+function normalizeDurationKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+// A previous script only counts against a new draft when it is the SAME
+// deliverable: same normalized topic AND same duration. A 1-min script is
+// not a duplicate of a 2-min script on the same topic, and a history entry
+// without a recorded duration cannot prove it is the same deliverable, so
+// it never counts. (The Apollo 1-min run was blocked by the Apollo 2-min
+// script from the same morning: same facts, same sentences, different
+// duration — and similarity() divides by the smaller shingle set, so a
+// shorter script reusing those sentences scores 1.000.)
+function sameTopicAndDuration(currentTopic, currentDuration, previous) {
+  if (!previous || typeof previous !== 'object') return false;
+  const previousTopic = normalizeForComparison(previous.topic || '');
+  if (!previousTopic || previousTopic !== normalizeForComparison(currentTopic)) return false;
+  const previousDuration = normalizeDurationKey(previous.duration);
+  const duration = normalizeDurationKey(currentDuration);
+  if (!previousDuration || !duration) return false;
+  return previousDuration === duration;
+}
+
+function assessScript({ script, topic = '', wordTarget, previousScripts = [], contentType = 'general', duration = '' }) {
   const cleaned = formatPlainNarration(script);
   const words = cleaned ? cleaned.split(/\s+/).length : 0;
   const paragraphs = paragraphsOf(cleaned);
@@ -239,7 +261,8 @@ function assessScript({ script, topic = '', wordTarget, previousScripts = [], co
   const genericMatches = BANNED_PATTERNS.flatMap((pattern) => cleaned.match(pattern) || []);
   const metaMatches = META_PATTERNS.flatMap((pattern) => cleaned.match(pattern) || []);
   const inferenceMatches = INFERENCE_PATTERNS.flatMap((pattern) => cleaned.match(pattern) || []);
-  const maxSimilarity = previousScripts.reduce((max, previous) => Math.max(max, similarity(cleaned, previous.script || previous)), 0);
+  const comparableScripts = previousScripts.filter((previous) => sameTopicAndDuration(topic, duration, previous));
+  const maxSimilarity = comparableScripts.reduce((max, previous) => Math.max(max, similarity(cleaned, previous.script || previous)), 0);
   const lengthRatio = wordTarget ? words / wordTarget : 1;
   const questionCount = (cleaned.match(/\?/g) || []).length;
   const repeatedSentenceStarts = repeatedStarts(cleaned);
@@ -263,7 +286,13 @@ function assessScript({ script, topic = '', wordTarget, previousScripts = [], co
   if (genericMatches.length > 1) issues.push('The draft uses repeated or generic AI phrasing.');
   if (metaMatches.length) issues.push('The draft contains process commentary instead of narration.');
   if (inferenceMatches.length) issues.push('The draft makes unsupported inferences instead of staying with sourced facts.');
-  if (maxSimilarity > 0.22) issues.push('The draft is too similar to a recent script.');
+  // Similarity is ADVISORY only, never a hard block. A fresh script for a
+  // genuinely new request — including a corrected re-run of the same
+  // topic+duration, which is mostly the same text by design — must never be
+  // killed by resemblance to an older script. The warning stays visible
+  // (and maxSimilarity is still reported in the metadata) so a human or
+  // automation can ask for a fresh take; the gate itself no longer decides.
+  if (maxSimilarity > 0.22) warnings.push('The draft is similar to a recent script on the same topic and duration — confirm it is a fresh take, not a repeat.');
   const allowance = wordTarget >= 1000 ? 200 : Math.min(200, Math.round(wordTarget * 0.15));
   const minAllowedWords = wordTarget ? Math.max(10, Math.min(Math.ceil(wordTarget * 0.85), wordTarget >= 1400 ? 1300 : wordTarget - allowance)) : 0;
   // The upper bound must leave room for the writer's own aim: the revision

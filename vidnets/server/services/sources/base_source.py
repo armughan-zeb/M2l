@@ -26,6 +26,19 @@ def _accept_language() -> str:
     return configured or "en-US,en;q=0.9"
 
 
+# Direct-egress proxy override (Nov 18, web-resilience): passing
+# proxies={http: None, https: None} makes one requests call skip the env
+# proxy vars. Sources accept a ``direct=`` flag and pass this through at
+# their requests call sites, so the resolver's route-switching retry can
+# re-run a failed lane direct without touching global state.
+DIRECT_PROXIES = {"http": None, "https": None}
+
+
+def request_proxies(direct: bool):
+    """proxies kwarg for a requests call: direct bypass, or None (env proxy)."""
+    return dict(DIRECT_PROXIES) if direct else None
+
+
 @dataclass
 class ImageCandidate:
     """Standardized image candidate from any source."""
@@ -114,11 +127,18 @@ class BaseSource(ABC):
         pass
 
     def is_available(self) -> bool:
-        """Health check — returns False if circuit breaker is open."""
+        """Health check — returns False if circuit breaker is open.
+
+        Round 4: the old code reset an expired circuit and then still
+        returned False, wasting one call per reset (the caller skipped
+        the source on the very call that healed it). A reset circuit
+        is available immediately.
+        """
         if self._circuit_open:
             if time.time() - self._last_failure_time > 60.0:
                 self._circuit_open = False
                 self._failure_count = 0
+                return True
             return False
         return True
 

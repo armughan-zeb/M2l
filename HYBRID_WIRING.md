@@ -35,7 +35,7 @@ and capped or removed:
    best and move on. Media priority is YouTube clips first, then web
    images, then stock (`adapters/vidnets.js:113`
    `media_source_priority: ['youtube', 'web', 'stock']`, coverage
-   target `MUSE_YOUTUBE_COVERAGE_TARGET`, production 0.8). The
+   target `MUSE_YOUTUBE_COVERAGE_TARGET`, production 0.30). The
    6779c09 selection fix was verified real (a downloaded cut no longer
    mints vision acceptance; the gate-approved verdict is reused) — see
    the hardening section below. The single bounded re-plan before a
@@ -46,7 +46,7 @@ and capped or removed:
    retry is the coordinator's bounded late-vision lane (already
    downloaded clips only, ≤60s past the wall) — part of the one pass,
    not a re-plan.
-   4. **ONE monitor.** `vidnets-health-monitor` (every minute) is the only
+4. **ONE monitor.** `vidnets-health-monitor` (every minute) is the only
    monitor — the old `vidnets-recovery-watch` self-removed on Nov 9
    and no longer exists. It checks daemon alive + connected, Vidnets
    :5010 healthy + memory admission, CMS reachable + outage duration,
@@ -58,12 +58,12 @@ and capped or removed:
    with sane defaults: `MUSE_SCRIPT_MAX_DRAFTS=2`,
    `MUSE_RESEARCH_TIMEOUT_MS=180000`,
    `MUSE_REPLAN_MIN_REMAINING_MS=600000`,
-   `MUSE_YOUTUBE_COVERAGE_TARGET=0.8`,
+   `MUSE_YOUTUBE_COVERAGE_TARGET=0.30`,
    `MUSE_RENDER_CONCURRENCY=1`,
    `VIDZEO_AGENT_MIN_WALL_SECONDS=600`. Two contradictions were
    removed: `MUSE_YOUTUBE_COVERAGE_TARGET` and
    `MUSE_RENDER_CONCURRENCY` were defined twice in `.env.example`
-   (0.6/4 in the rendering section vs 0.8/1 in production) — one
+   (0.6/4 in the rendering section vs 0.8/1 in production at the time) — one
    definition each now. `MUSE_RENDER_TIMEOUT_MS` is 6h everywhere
    (adapters + wrapper); `MUSE_SCRIPT_TIMEOUT_MS` is 45 min for the
    default CLI, 10 min for a custom command.
@@ -159,7 +159,7 @@ active, Vidnets renders, and Muse answers every inference request.
 2. **Vidnets server** — already running on :5010, local mode, auth off
    (`vidnets/.venv/bin/python3 main.py`, PID 5268). Do NOT restart it with
    the daemon; `VIDNETS_AGENT.sh start` reuses it (`reused: true`).
-3. **Inbox-watch hook** - `vidnets-inbox-watch`, poll 20s, re-wake 120s. When `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` is configured, the resident dispatcher polls every second and handles up to 8 requests; the hook then acts as its alert-only fallback. Without that resident transport, the hook is the primary answerer.
+3. **Inbox-watch hook** — `vidnets-inbox-watch`, poll 60s, re-wake 120s. When `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL` is configured, the resident dispatcher polls every second and handles up to 8 requests; the hook then acts as its alert-only fallback. Without that resident transport, the hook is the primary answerer.
    Watches `~/workspace/vidnets-runtime/temp/agent-bridge/*/request.json`
    and wakes a Muse operator in side chat
    `38c7bbce-a978-43e6-bf4d-3f6d227d474c` to answer. This is the ONLY
@@ -317,7 +317,7 @@ requester). The hook script wakes the operator, who fetches with
 | Web/YT clip + image sourcing | Not inference — Vidnets pipeline does the downloading (yt-dlp, web scrapers, Pexels/Pixabay if keys exist). Vision above is the gate that lets a candidate into the final plan | — | See vision row. If no candidate is accepted, the scene falls back to a graphic |
 
 Env that shapes sourcing (`.env` + `vidnets-runtime/.env`):
-`MUSE_YOUTUBE_COVERAGE_TARGET=0.8` (80% of scenes enter the YouTube
+`MUSE_YOUTUBE_COVERAGE_TARGET=0.30` (30% of scenes enter the YouTube
 lane), `MUSE_RENDER_CONCURRENCY=1` (low-memory VM), `TMPDIR` pointed at
 `vidnets-runtime/temp` (/tmp is a 512 MB tmpfs), Linux TTS fallback in
 `vidnets-runtime/.env` (`/opt/hatch/bin/tts`, Edge TTS websockets are
@@ -408,8 +408,10 @@ path in front of it did not. Fixed:
 
 `setup.sh` installs this monitor and replaces its single cron row on each
 rerun. Existing hosts must rerun setup to install the current monitor. The
-one-minute cadence is required by the 60-second answer SLO; five minutes can
-miss a whole 120-second request lifetime. The monitor keeps a bounded
+one-minute cadence keeps inbox age visible well inside the 600-second
+agent-bridge request floor (`VIDZEO_AGENT_MIN_WALL_SECONDS`); the polling
+inbox watcher alone needs ~4.5 min to wake a worker, so a shorter wall would
+expire answers mid-composition. The monitor keeps a bounded
 500-line run log at `~/hooks/state/vidnets-health-monitor/monitor.log` and
 uses `flock` to avoid overlapping runs.
 

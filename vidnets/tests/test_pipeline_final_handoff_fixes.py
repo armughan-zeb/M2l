@@ -247,6 +247,42 @@ def test_youtube_quota_cannot_certify_unseen_pixels(tmp_path, policy):
     assert _visual_requirement_issue(scene,row,None) == 'visual_verdict_rejected'
 
 
+def test_coordinator_deterministic_fail_open_survives_final_gate(tmp_path):
+    """Test 23 regression (job 1e78cf53 scenes 5/9/10): the coordinator
+    accepted 5 verified YouTube clips, but the post-coordinator gate
+    dropped the 3 whose inline vision check was skipped after the media
+    deadline, so the final mix was 2 YT instead of 5. A fail-open quota
+    mint — accepted + deterministic_only + a deadline-transport status —
+    is a deliberate coordinator acceptance under the Nov 17 fail-open
+    rule and must survive the final gate. A bare deterministic verdict
+    with no deadline signature still pends (see the test above)."""
+    from services.pipeline_v2_media_adapter import _visual_requirement_issue
+    source = tmp_path / 'scene_0006.mp4'
+    source.write_bytes(b'quota-clip-video')
+    requirement = {'strict_identity': True, 'requirement_hash': 'gta-scene-5'}
+    scene = {'text': "She is the series' first canon female protagonist.",
+             'visual_requirement': requirement}
+    # Exact recorded decision shape from test 23 scene 5 (pre-repair plan).
+    verdict = {'accepted': True, 'status': 'deadline_exceeded',
+               'verification_status': 'visual_verification_pending',
+               'visual_checked': False, 'visual_available': False,
+               'semantic_verified': False, 'deterministic_only': True,
+               'reason': 'youtube_quota_upgrade',
+               'visual_review_policy_version': 17}
+    row = {'provider': 'youtube', 'status': 'accepted',
+           'verification_status': 'verified',
+           'requirement_hash': 'gta-scene-5',
+           'selected_path': str(source), 'visual_decision': verdict}
+    assert _visual_requirement_issue(scene, row, None) == ''
+    # A fatal mismatch still vetoes the mint.
+    verdict['fatal_mismatch'] = True
+    assert _visual_requirement_issue(scene, row, None) == 'visual_verdict_rejected'
+    del verdict['fatal_mismatch']
+    # A bare deterministic verdict with no deadline signature still pends.
+    verdict['status'] = ''
+    assert _visual_requirement_issue(scene, row, None) == 'visual_verification_pending'
+
+
 def test_nearest_fallback_preserves_target_pixel_scope(tmp_path):
     from services.media_resolution_coordinator import SceneResolution, _review_bound_to_scene
     from services.pipeline_v2_media_adapter import _visual_requirement_issue

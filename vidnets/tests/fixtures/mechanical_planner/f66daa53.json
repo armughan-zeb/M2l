@@ -1,0 +1,22 @@
+{
+ "job_id": "f66daa53",
+ "title": "How the Panama Canal Changed World Trade",
+ "query_title": "Panama Canal",
+ "script": "Cross from the Pacific to the Caribbean in just two hours through the Panama Canal. Two oceans, two hours, one canal. That is the promise of this crossing, and the question of this film is what two hours between oceans does to world trade. \n\nPanamá is a narrow strip of land with two coasts and more than two thousand nine hundred kilometres of coastline, the Caribbean on one side and the Pacific on the other. The canal runs straight through it, joining the two oceans in a single transit. \n\nThe canal is the passage. Without it, the two oceans are separated by the land itself, and every crossing between them must go another way. With it, the passage takes two hours. \n\nPanamá today is known far beyond the canal. Panama City has been recognised as a UNESCO Creative City of Gastronomy since 2017, the country was chosen Best Tourist Destination in Latin America and South America for a third consecutive year, and Chiriquí Province was highlighted in Lonely Planet's Best in Travel for 2025. \n\nSo how did the Panama Canal change world trade? It put two oceans two hours apart. That crossing, two hours from the Pacific to the Caribbean, is the change itself.",
+ "scene_texts": [
+  "Cross from the Pacific to the Caribbean in just two hours through the Panama Canal. ",
+  "Two oceans, two hours, one canal. ",
+  "That is the promise of this crossing, and the question of this film is what two hours between oceans does to world trade. \n\n",
+  "Panamá is a narrow strip of land with two coasts and more than two thousand nine hundred kilometres of coastline, the Caribbean on one side and the Pacific on the other. ",
+  "The canal runs straight through it, joining the two oceans in a single transit. \n\n",
+  "The canal is the passage. ",
+  "Without it, the two oceans are separated by the land itself, and every crossing between them must go another way. ",
+  "With it, the passage takes two hours. \n\n",
+  "Panamá today is known far beyond the canal. ",
+  "Panama City has been recognised as a UNESCO Creative City of Gastronomy since 2017, the country was chosen Best Tourist Destination in Latin America and South America for a third consecutive year, and Chiriquí Province was highlighted in Lonely Planet's Best in Travel for 2025. \n\n",
+  "So how did the Panama Canal change world trade? ",
+  "It put two oceans two hours apart. ",
+  "That crossing, two hours from the Pacific to the Caribbean, is the change itself.\n"
+ ],
+ "source": "job f66daa53 checkpoints: request.json + scene_contracts.json expected.scene_texts; query_title is the live resolved anchor from _resolve_topic_anchor_for_config (server-runtime.log 09:49:00 run)"
+}

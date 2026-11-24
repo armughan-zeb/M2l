@@ -20,6 +20,19 @@ function minimumWords(job) {
   return minimumScriptWords(job.targetDurationMinutes || 8);
 }
 
+// Which narration engine generateScript uses. The DEFAULT is muse-search
+// (lib/museScript.js): direct web research through ScriptIT's research
+// pipeline plus chunked parallel bridge narration. ScriptIT's own CLI
+// stays available behind MUSE_SCRIPT_ENGINE=scriptit for fallback, and
+// an explicit MUSE_SCRIPT_COMMAND always wins (the sanctioned bypass
+// seam for a replacement command complying with the stdin/stdout
+// contract). The template fallback above stays opt-in only.
+function resolveScriptEngine(env = process.env) {
+  if (String(env.MUSE_SCRIPT_COMMAND || '').trim()) return 'command';
+  if (String(env.MUSE_SCRIPT_ENGINE || '').trim().toLowerCase() === 'scriptit') return 'scriptit';
+  return 'muse-search';
+}
+
 function normalizeScriptResult(parsed) {
   if (typeof parsed === 'string') return { scriptText: parsed.trim(), meta: {} };
   if (!parsed || typeof parsed !== 'object') return null;
@@ -65,7 +78,7 @@ async function runScriptCommand(command, job, workDir, { signal, onDetail, expan
       input: JSON.stringify(payload),
       cwd: workDir,
       signal,
-      timeoutMs: Number(timeoutMs) || Number(process.env.MUSE_SCRIPT_TIMEOUT_MS) || 120000,
+      timeoutMs: Number(timeoutMs) || Number(process.env.MUSE_SCRIPT_TIMEOUT_MS) || 10 * 60 * 1000,
       label: 'Muse script command',
       onStderrLine: line => {
         const progress = line.match(/^\[scriptit-cli\] \d{1,3}% (.+)$/);
@@ -185,6 +198,37 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
     }
   }
 
+  // Advance prep (prep pipeline): a script pre-generated while the VM was
+  // idle for this exact title + duration wins over a live ScriptIT run.
+  // The store lives outside any one job directory
+  // (VIDZEO_PREP_ROOT/scripts/<key>/); a hit is copied into this job's
+  // workDir so the rest of the pipeline sees a normal saved script.
+  // The hit is surfaced on the progress channel (it replaces a live
+  // generation); the miss is the common case and goes to the daemon log
+  // only, so it never pollutes the CMS progress detail stream.
+  try {
+    const prepStore = require('../lib/prepScriptStore');
+    const prepped = prepStore.findPreppedScript(job.title, job.targetDurationMinutes || 8);
+    if (prepped) {
+      const check = validateScript(prepped.scriptText, job);
+      if (check.ok) {
+        saveScript(workDir, prepped.scriptText, {
+          engine: 'prep-cache',
+          preppedAt: prepped.meta?.prepped_at || prepped.meta?.preppedAt || '',
+          prepPath: prepped.path
+        });
+        onDetail?.(`prep script hit: reusing pre-generated narration (${check.words} words)`);
+        return { scriptText: prepped.scriptText, words: check.words, resumed: true, meta: { engine: 'prep-cache', prepPath: prepped.path } };
+      }
+      console.info('prep script miss: pre-generated narration failed validation; generating live');
+    } else {
+      console.info('prep script miss: no pre-generated script for this title; generating live');
+    }
+  } catch (error) {
+    // A broken prep store must never break the live script stage.
+    console.info(`prep script miss: store unreadable (${error.message}); generating live`);
+  }
+
   // Template fallback is opt-in only. The old synthesizer pads generic
   // paragraphs to a word count; it is not a researched script and must never
   // be the silent default.
@@ -206,7 +250,33 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
   // another provider, and the template fallback below stays opt-in only.
   assertNoOpenRouterKey(process.env);
 
-  // Default engine: the ScriptIT headless CLI. In agent-bridge mode it needs
+  // Default engine: muse-search (lib/museScript.js). Direct web research
+  // through ScriptIT's research pipeline, then the narration in ~500-word
+  // sections minted as parallel bridge requests — each fits inside the
+  // 900s inbox wall that ScriptIT's single 2100-word request kept
+  // hitting (Nov 21 2026: three consecutive narration requests cancelled
+  // at the wall, then the 2700s budget fired and the CMS job failed).
+  // ScriptIT stays available behind MUSE_SCRIPT_ENGINE=scriptit; a
+  // custom MUSE_SCRIPT_COMMAND still wins (see resolveScriptEngine).
+  if (resolveScriptEngine() === 'muse-search') {
+    onProgress?.(10, 'Generating narration with Muse search (chunked sections)');
+    const { generateMuseScript } = require('../lib/museScript');
+    const result = await generateMuseScript(job, workDir, { signal, onDetail, onProgress });
+    const check = validateScript(result.scriptText, job);
+    if (result.meta?.publishable === false) onDetail?.('Narration retained with editorial warnings: ' + (result.meta?.quality?.issues || []).slice(0, 3).join('; '));
+    if (check.warnings.length) onDetail?.(check.warnings.join('; '));
+    if (!check.ok) {
+      throw new Error(
+        `${check.error}. The job needs complete narration for the requested runtime; ` +
+        'shorten the requested runtime in the CMS or generate more narration. No rendered master was produced.'
+      );
+    }
+    saveScript(workDir, result.scriptText, { engine: 'muse-search', meta: result.meta || {}, words: check.words });
+    onDetail?.(`Muse-search narration ready (${check.words} words${result.meta?.grounded ? '' : ', UNGROUNDED'})`);
+    return { ...result, meta: { ...(result.meta || {}), engine: 'muse-search' }, words: check.words, resumed: false };
+  }
+
+  // Fallback engine: the ScriptIT headless CLI. In agent-bridge mode it needs
   // no OpenRouter key — Muse answers its inference requests through the
   // Vidnets inbox. A custom MUSE_SCRIPT_COMMAND still wins when set.
   const scriptitCli = path.join(__dirname, '..', 'scriptit', 'cli', 'generate.js');
@@ -217,11 +287,10 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
   }
   const effectiveCommand = command || `node ${quoteArg(scriptitCli)}`;
   // Agent-bridge round-trips are human-speed (inbox + operator); give the
-  // default engine its 45-minute workflow deadline. A custom command is
-  // bounded at 120s unless MUSE_SCRIPT_TIMEOUT_MS overrides it. Muse inbox
-  // requests themselves remain capped at 120s.
+  // default engine its 45-minute workflow deadline. A custom command keeps
+  // the 10-minute default unless MUSE_SCRIPT_TIMEOUT_MS overrides it.
   const timeoutMs = Number(process.env.MUSE_SCRIPT_TIMEOUT_MS)
-    || (isDefault ? 45 * 60 * 1000 : 120000);
+    || (isDefault ? 45 * 60 * 1000 : 10 * 60 * 1000);
 
   onProgress?.(10, isDefault ? 'Generating narration with ScriptIT (agent-bridge mode)' : 'Generating narration with the Muse agent');
   let result = await runScriptCommand(effectiveCommand, job, workDir, { signal, onDetail, timeoutMs });
@@ -273,6 +342,7 @@ async function generateScript(job, workDir, { signal, onDetail, onProgress } = {
 
 module.exports = {
   minimumScriptWords: minimumWords,
+  resolveScriptEngine,
   validateScript,
   generateScript,
   synthesizeNarration,

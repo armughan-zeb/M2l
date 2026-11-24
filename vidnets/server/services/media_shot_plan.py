@@ -560,9 +560,37 @@ def _candidate_rows(item: Mapping[str, Any]) -> list[dict[str, Any]]:
     for alternate in alternates:
         if not isinstance(alternate, Mapping):
             continue
-        from .visual_intelligence.semantic_guard import explicit_scene_conflict
+        from .visual_intelligence.semantic_guard import explicit_scene_conflict, subject_level_accepts_verdict
         if any(explicit_scene_conflict(alternate.get(key)) for key in ("visual_decision", "qwen_result")) or explicit_scene_conflict(alternate):
-            continue
+            # Subject-level rescue: an alternate that authentically
+            # shows the scene's subject stays, even when its stored
+            # verdict rejected it only for literal mismatch. The
+            # stored verdicts are live vision verdicts, so the guard
+            # sees them as vision-checked. Wrong-subject / wrong-era /
+            # unsafe verdicts still drop the alternate.
+            _rescued = False
+            for _key in ("visual_decision", "qwen_result", None):
+                _verdict = alternate.get(_key) if _key else alternate
+                if not isinstance(_verdict, Mapping):
+                    continue
+                try:
+                    _live = dict(_verdict)
+                    _live["visual_checked"] = True
+                    if subject_level_accepts_verdict(_live, item, alternate):
+                        _rescued = True
+                        break
+                except Exception:
+                    continue
+            if not _rescued:
+                continue
+            # The later verified check would still drop this alternate
+            # on its stored "rejected" status, so the rescue marks the
+            # local row accepted — the guard has already decided these
+            # pixels authentically show the scene's subject.
+            alternate = dict(alternate)
+            alternate["verification_status"] = "accepted"
+            alternate["verified"] = True
+            alternate["subject_level_accepted"] = True
         alternate_status = str(alternate.get("verification_status") or "").strip().casefold()
         explicit_verified = (
             alternate.get("verified") is True

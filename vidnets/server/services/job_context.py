@@ -13,13 +13,40 @@ def current_job():
 
 
 def remaining_seconds(default=None):
+    """Seconds left on the current job's deadline, or ``default``.
+
+    When a delivery budget is attached, its *live* deadline is the source of
+    truth — the budget's deadline moves forward on every genuine progress
+    report (``DeliveryBudget.note_progress``), so a job that keeps moving
+    must not be killed by a stale snapshot. The context's ``deadline_at`` is
+    only the snapshot taken when the job started; when a budget exists it is
+    ignored in favour of the live deadline. A tighter phase deadline set by
+    ``phase_scope`` (``phase_deadline_at``) still binds as a minimum, so
+    short per-stage walls keep working. With no budget, the context deadline
+    is used as before.
+    """
     context = current_job()
     budget = context.get('delivery_budget')
     if budget is not None and getattr(budget, 'render_started', False):
         deadline = context.get('phase_deadline_at')
         return max(0.0, deadline - time.monotonic()) if deadline is not None else float('inf')
-    deadline = context.get('deadline_at')
-    return max(0.0, deadline - time.monotonic()) if deadline is not None else default
+    candidates = []
+    if budget is not None:
+        live = getattr(budget, 'deadline_at', None)
+        if live is not None:
+            clock = getattr(budget, 'clock', None)
+            now = float(clock()) if callable(clock) else time.monotonic()
+            candidates.append(float(live) - now)
+    phase_deadline = context.get('phase_deadline_at')
+    if phase_deadline is not None:
+        candidates.append(float(phase_deadline) - time.monotonic())
+    if budget is None:
+        deadline = context.get('deadline_at')
+        if deadline is not None:
+            candidates.append(float(deadline) - time.monotonic())
+    if candidates:
+        return max(0.0, min(candidates))
+    return default
 
 
 def check_job_active():

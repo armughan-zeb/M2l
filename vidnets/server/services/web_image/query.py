@@ -1295,6 +1295,82 @@ def _is_weak_subject_phrase(value: str) -> bool:
     return len(terms) <= 3 and all(term in weak or term in STOPWORDS or term in _NON_NAME_WORDS for term in terms)
 
 
+# Generic media nouns the query builders append to every query. They carry
+# no entity on their own, so they are stripped before judging a query.
+_QUERY_GENERIC_WORDS = frozenset({
+    "photo", "photos", "photograph", "photographs", "image", "images",
+    "picture", "pictures", "documentary", "footage", "video", "videos",
+    "still", "stills", "reference", "screenshot", "screenshots", "clip",
+    "clips", "official", "trailer", "wallpaper",
+})
+
+# Pronouns / demonstratives: a query whose only subject is one of these
+# names nobody and nothing.
+_QUERY_PRONOUN_WORDS = frozenset({
+    "they", "he", "she", "we", "you", "i", "it", "his", "her", "hers",
+    "their", "theirs", "its", "this", "these", "those", "there", "here",
+    "who", "whom", "what", "which", "my", "our", "your", "me", "him",
+    "them", "us",
+})
+
+
+def is_degenerate_query(query: str) -> bool:
+    """True when a search query names no searchable entity.
+
+    Nov 22 (d1ece590 stall fix): the pipeline emitted queries such as
+    'They documentary drove photograph' and 'They photo' for narration
+    "They drove." — a bare pronoun plus a verb plus generic media nouns.
+    No engine can answer those with a scene-relevant image, and the
+    resolver burned its whole retry budget (5 attempts, ~35-40s) on each
+    one. A query is degenerate when, after stripping generic media words,
+    it has no content token left, or it is pronoun-led with at most one
+    leftover content token (usually a bare verb: 'They drove photo').
+    A single named entity ('Rockstar photograph') is NOT degenerate: it is
+    a valid broad query.
+    """
+    text = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not text:
+        return True
+    tokens = re.findall(r"[A-Za-z0-9]+", text)
+    if not tokens:
+        return True
+    lowered = [token.lower() for token in tokens]
+    content = [
+        token for token in lowered
+        if token not in _QUERY_GENERIC_WORDS
+        and token not in _QUERY_PRONOUN_WORDS
+        and token not in STOPWORDS
+    ]
+    if not content:
+        return True
+    if lowered[0] in _QUERY_PRONOUN_WORDS and len(content) <= 1:
+        return True
+    return False
+
+
+def clean_scene_queries(queries, fallback_subject: str = "") -> List[str]:
+    """Drop degenerate queries; never return an empty list when a fallback exists.
+
+    Keeps the scene's good queries in order and drops the garbage. When
+    every query was garbage, substitutes one broad topic-anchored query so
+    the scene still searches instead of failing with zero queries — the
+    pipeline keeps moving on the scene's other queries or, failing that,
+    on the topic anchor.
+    """
+    kept = [
+        str(query)
+        for query in (queries or [])
+        if str(query or "").strip() and not is_degenerate_query(query)
+    ]
+    kept = list(dict.fromkeys(kept))
+    if kept:
+        return kept
+    anchor = re.sub(r"\s+", " ", str(fallback_subject or "")).strip()
+    if anchor:
+        return [f"{anchor} documentary photograph"]
+    return []
+
+
 def _detect_fictional_franchise_subject(text: str) -> str:
     lower = (text or "").lower()
     simpsons_terms = (

@@ -180,15 +180,23 @@ test('requested 5 can never run as 5 on this 4-vCPU box (CPU cap is 3)', () => {
 test('Vidnets render script honours MUSE_RENDER_CONCURRENCY and defaults to 2', () => {
   // adaptiveConcurrency is exported by render-remotion-manifest.js.
   const { adaptiveConcurrency } = require('../vidnets/scripts/render-remotion-manifest');
+  const os = require('node:os');
   const comp = { width: 1920, height: 1080 };
   const saved = { ...process.env };
+  const savedFree = os.freemem, savedTotal = os.totalmem, savedParallelism = os.availableParallelism;
   try {
+    // Nov 16, 2026 hardening: serial admission now needs ~1.5 GB free (the
+    // 240 MB Remotion media-cache floor), so this test must not depend on
+    // ambient freemem() — on a pressured VM the call correctly throws
+    // VIDZEO_LOW_MEMORY instead of returning a plan. Stub a healthy box
+    // so the test checks the request path, not the machine's mood.
+    os.totalmem = () => 8 * 1024 ** 3;
+    os.freemem = () => 4 * 1024 ** 3;
+    os.availableParallelism = () => 4;
     for (const k of ['VIDZEO_REMOTION_CONCURRENCY', 'MUSE_RENDER_CONCURRENCY',
       'VIDZEO_REMOTION_WORKERS', 'MUSE_REMOTION_WORKERS']) delete process.env[k];
     const def = adaptiveConcurrency(comp, { scenes: [] },
       {});
-    // 8 GB box, plenty free in this stubbed env? No: uses real freemem(),
-    // so only assert the request path degrades safely, never above 2 by default.
     assert.ok(def.concurrency >= 1 && def.concurrency <= 2,
       `default concurrency must be 1-2, got ${def.concurrency}`);
     process.env.MUSE_RENDER_CONCURRENCY = '5';
@@ -197,5 +205,8 @@ test('Vidnets render script honours MUSE_RENDER_CONCURRENCY and defaults to 2', 
       `requested 5 must yield 1-5, got ${five.concurrency}`);
   } finally {
     process.env = saved;
+    os.freemem = savedFree;
+    os.totalmem = savedTotal;
+    os.availableParallelism = savedParallelism;
   }
 });

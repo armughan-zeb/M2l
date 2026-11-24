@@ -13,7 +13,7 @@ const { xSearch } = require('../providers/xSearch');
 const { hnSearch } = require('../providers/hackernews');
 const { detectNiche } = require('./nicheDetector');
 const { runProvider, providerHealth } = require('../research/resilience');
-const { runBatches } = require('../utils/concurrency');
+const { runBatches, runBatchesWithDeadline } = require('../utils/concurrency');
 const { gdeltSearch, openAlexSearch, crossrefSearch, usgsSearch } = require('../providers/freeData');
 const { relevanceScore, isOfficial } = require('./evidence');
 
@@ -29,8 +29,14 @@ async function safe(fn) {
 
 // Each lane is isolated. A provider can time out, be rate limited, or open a
 // circuit without taking down the rest of the research run.
+// Full-mode retries are deliberately cheap (2 attempts x 15s): on this
+// bot-gated egress a provider that fails twice in 15s will not succeed on
+// a third try five seconds later, and the retry budget is better spent on
+// the next provider. BOT_CHALLENGE / 4xx already fail fast without retry
+// (see resilience.classifyProviderError), so the attempts here mostly cover
+// transient timeouts and 429s.
 function retry(provider, fn, options = {}) {
-  return runProvider(provider, fn, { attempts: 3, delayMs: 400, timeoutMs: 20000, ...options });
+  return runProvider(provider, fn, { attempts: 2, delayMs: 400, timeoutMs: 15000, ...options });
 }
 
 function normalizeDate(value) {
@@ -207,20 +213,24 @@ async function gatherQuickResearch(query, { includeReddit = true, fetchLimit = 5
   // serializes concurrent connections, so firing all 8 providers at once
   // made them ALL time out (Bing, Wikipedia, Reddit and X aborted
   // together in a live probe) while the same calls succeed sequentially.
+  // Reliable providers first: Bing, Wikipedia and RSS answer in seconds on
+  // this egress, while DuckDuckGo / Yandex are bot-gated and Reddit / X
+  // often 403. A pass cut short by its budget must already hold the good
+  // lanes — the gated ones are a bonus, never the gate.
   const results = await runBatches([
     () => quickRetry('bing', () => bingSearch(query, { limit: 8, timeoutMs: 6500 })),
-    () => quickRetry('duckduckgo', () => ddgSearch(query, { limit: 8, timeoutMs: 6500 })),
-    () => quickRetry('yandex', () => yandexSearch(query, { limit: 7, timeoutMs: 6500 })),
     () => quickRetry('wikipedia', () => wikipediaDeep(query, { limit: 2, timeoutMs: 7500 })),
     () => quickRetry('rss', () => searchRss(query, { limit: 10, niche })),
     () => quickRetry('bing-official', () => bingSearch(primaryQuery, { limit: 6, timeoutMs: 6500 })),
+    () => quickRetry('duckduckgo', () => ddgSearch(query, { limit: 8, timeoutMs: 6500 })),
+    () => quickRetry('yandex', () => yandexSearch(query, { limit: 7, timeoutMs: 6500 })),
     includeReddit
       ? () => quickRetry('reddit', () => redditSearch(query, { limit: 6, timeoutMs: 6500 }))
       : () => Promise.resolve({ results: [] }),
     () => quickRetry('x-discovery', () => xSearch(query, { limit: 6, timeoutMs: 6500 })),
   ], 3, (fn) => fn());
 
-  const [bing, ddg, yandex, wiki, rss, officialSearch, reddit, xDiscovery] = results;
+  const [bing, wiki, rss, officialSearch, ddg, yandex, reddit, xDiscovery] = results;
   const bingList = uniqueByUrl([...(Array.isArray(bing) ? bing : []), ...(Array.isArray(officialSearch) ? officialSearch : [])]);
   const ddgList = Array.isArray(ddg) ? ddg : [];
   const yandexList = Array.isArray(yandex) ? yandex : [];
@@ -311,71 +321,102 @@ async function gatherQuickResearch(query, { includeReddit = true, fetchLimit = 5
   };
 }
 
-async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, phase = 'fast', includeStructured = true, researchPlan, quick = false, signal } = {}) {
+async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, phase = 'fast', includeStructured = true, researchPlan, quick = false, signal, phaseBudgetMs = 45000 } = {}) {
   signal?.throwIfAborted();
   if (quick) return gatherQuickResearch(query, { includeReddit, fetchLimit: Math.min(fetchLimit, 5) });
   const niche = detectNiche(query).niche;
   const officialSeeds = officialSourceSeeds(query, niche);
+  // The whole pass must resolve inside its phase budget with whatever it
+  // gathered — never throw the reliable providers' results away because a
+  // gated provider ran long. Providers get ~2/3 of the budget, article
+  // hydration the rest; both phases stop claiming new work at their
+  // deadline and return partial results. The pipeline's per-pass timeout
+  // (60s) is the backstop, not the mechanism.
+  const passStartedAt = Date.now();
+  const providerDeadlineAt = passStartedAt + Math.round(phaseBudgetMs * 0.66);
+  const hydrationDeadlineAt = passStartedAt + phaseBudgetMs;
 
-  // Thunks, not promises: runBatches starts them 3 at a time. Firing all
-  // ~15 provider calls at once through the egress proxy made them all
+  // Named thunks, not promises: the runner starts them 3 at a time. Firing
+  // all ~15 provider calls at once through the egress proxy made them all
   // stall and time out together (verified live: a concurrent burst lost
   // Bing, Wikipedia, Reddit and X; sequential calls succeed in 1-3s).
-  const tasks = [
-    () => retry('duckduckgo', () => ddgSearch(query, { limit: 8 })),
-    () => retry('duckduckgo-news', () => ddgSearch(`${query} latest news`, { limit: 6 })),
-    () => retry('rss', () => searchRss(query, { limit: 16, niche })),
-    () => retry('bing', () => bingSearch(query, { limit: 8, timeoutMs: 15000 })),
-    () => retry('bing-official', () => bingSearch(`${query} official announcement`, { limit: 8, timeoutMs: 15000 })),
-    () => retry('wikipedia', () => wikipediaDeep(query, { limit: 2 })),
-    () => retry('hackernews', () => hnSearch(query, { limit: 6 })),
-    () => retry('yandex', () => yandexSearch(query, { limit: 8 })),
-    () => retry('yandex-news', () => yandexNewsSearch(query, { limit: 6 })),
-  ];
+  // Order is reliable-first: Bing, Wikipedia and RSS answer in seconds on
+  // this bot-gated egress, while DuckDuckGo / Yandex hit bot challenges and
+  // Reddit / GDELT 403 or 429. A pass cut short by its budget must already
+  // hold the good lanes; the gated ones are a bonus, never the gate.
+  const tasks = [];
+  const addTask = (key, run) => tasks.push({ key, run });
+  addTask('bing', () => retry('bing', () => bingSearch(query, { limit: 8, timeoutMs: 15000 })));
+  addTask('bing-official', () => retry('bing-official', () => bingSearch(`${query} official announcement`, { limit: 8, timeoutMs: 15000 })));
+  addTask('wikipedia', () => retry('wikipedia', () => wikipediaDeep(query, { limit: 2 })));
+  addTask('rss', () => retry('rss', () => searchRss(query, { limit: 16, niche })));
   const primaryQuery = PRIMARY_SEARCHES[niche] && PRIMARY_SEARCHES[niche](query);
-  if (primaryQuery) tasks.push(() => retry('bing-primary', () => bingSearch(primaryQuery, { limit: 8, timeoutMs: 15000 })));
-  if (includeReddit) {
-    tasks.push(() => retry('reddit', () => redditSearch(query, { limit: 6 })));
-  }
-  const structuredStartIndex = tasks.length;
-  if (includeStructured) {
-    // Thread the timeout into the provider call too: getJson's own 12s
-    // abort used to fire under proxy congestion while the outer
-    // runProvider budget was 15s, surfacing as a bare AbortError and
-    // tripping the circuit after 3 attempts (Cooper run: gdelt aborted).
-    tasks.push(() => retry('gdelt', () => gdeltSearch(query, { limit: phase === 'deep' ? 10 : 5, timeoutMs: 15000 }), { timeoutMs: 15000 }));
-    if (phase === 'deep') {
-      if (['science', 'health', 'finance', 'tech'].includes(niche)) {
-        tasks.push(() => retry('openalex', () => openAlexSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
-        tasks.push(() => retry('crossref', () => crossrefSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
-      }
-      tasks.push(() => retry('usgs', () => usgsSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
-    }
-  }
+  if (primaryQuery) addTask('bing-primary', () => retry('bing-primary', () => bingSearch(primaryQuery, { limit: 8, timeoutMs: 15000 })));
   // Deep research should investigate specific gaps rather than only increase
   // the number of generic search hits. Keep the planned lane bounded so a
   // weak or unavailable provider cannot make the whole pass unresponsive.
-  const structuredEndIndex = tasks.length;
   const plannedQueries = [...new Set((researchPlan?.questions || [])
     .flatMap((item) => item.queries || item.query || [])
     .map((value) => String(value || '').trim())
     .filter(Boolean))]
     .slice(0, phase === 'deep' ? 8 : 4);
-  const targetedStartIndex = tasks.length;
   plannedQueries.forEach((targetQuery, index) => {
-    tasks.push(() => retry(`targeted-bing-${index + 1}`, () => bingSearch(targetQuery, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 20000 }));
+    addTask('targeted-bing', () => retry(`targeted-bing-${index + 1}`, () => bingSearch(targetQuery, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 20000 }));
+  });
+  addTask('duckduckgo', () => retry('duckduckgo', () => ddgSearch(query, { limit: 8 })));
+  addTask('duckduckgo-news', () => retry('duckduckgo-news', () => ddgSearch(`${query} latest news`, { limit: 6 })));
+  addTask('yandex', () => retry('yandex', () => yandexSearch(query, { limit: 8 })));
+  addTask('yandex-news', () => retry('yandex-news', () => yandexNewsSearch(query, { limit: 6 })));
+  addTask('hackernews', () => retry('hackernews', () => hnSearch(query, { limit: 6 })));
+  if (includeReddit) {
+    addTask('reddit', () => retry('reddit', () => redditSearch(query, { limit: 6 })));
+  }
+  if (includeStructured) {
+    // Thread the timeout into the provider call too: getJson's own 12s
+    // abort used to fire under proxy congestion while the outer
+    // runProvider budget was 15s, surfacing as a bare AbortError and
+    // tripping the circuit after 3 attempts (Cooper run: gdelt aborted).
+    addTask('structured', () => retry('gdelt', () => gdeltSearch(query, { limit: phase === 'deep' ? 10 : 5, timeoutMs: 15000 }), { timeoutMs: 15000 }));
+    if (phase === 'deep') {
+      if (['science', 'health', 'finance', 'tech'].includes(niche)) {
+        addTask('structured', () => retry('openalex', () => openAlexSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
+        addTask('structured', () => retry('crossref', () => crossrefSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
+      }
+      addTask('structured', () => retry('usgs', () => usgsSearch(query, { limit: 6, timeoutMs: 15000 }), { timeoutMs: 15000 }));
+    }
+  }
+  plannedQueries.forEach((targetQuery, index) => {
     if (index < (phase === 'deep' ? 4 : 2)) {
-      tasks.push(() => retry(`targeted-duckduckgo-${index + 1}`, () => ddgSearch(targetQuery, { limit: 6 }), { timeoutMs: 20000 }));
+      addTask('targeted-duckduckgo', () => retry(`targeted-duckduckgo-${index + 1}`, () => ddgSearch(targetQuery, { limit: 6 }), { timeoutMs: 20000 }));
     }
   });
 
-  const results = await runBatches(tasks, 3, (fn) => fn());
+  const results = await runBatchesWithDeadline(tasks, 3, (task) => task.run(), { deadlineAt: providerDeadlineAt, signal });
   signal?.throwIfAborted();
-  const [ddg, ddgNews, rss, bing, bingOfficial, wiki, hn, yandex, yandexNews] = results;
-  const primary = primaryQuery ? results[9] : [];
-  const reddit = includeReddit ? results[primaryQuery ? 10 : 9] : null;
-  const structured = results.slice(structuredStartIndex, structuredEndIndex).flatMap((result) => Array.isArray(result) ? result : []);
-  const targeted = results.slice(targetedStartIndex).flatMap((result) => Array.isArray(result) ? result : []);
+  const byKey = new Map();
+  results.forEach((result, i) => {
+    const key = tasks[i].key;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(result);
+  });
+  const one = (key, fallback = []) => {
+    const arr = byKey.get(key);
+    return arr && arr.length ? arr[0] : fallback;
+  };
+  const many = (key) => byKey.get(key) || [];
+  const ddg = one('duckduckgo');
+  const ddgNews = one('duckduckgo-news');
+  const rss = one('rss');
+  const bing = one('bing');
+  const bingOfficial = one('bing-official');
+  const wiki = one('wikipedia');
+  const hn = one('hackernews');
+  const yandex = one('yandex');
+  const yandexNews = one('yandex-news');
+  const primary = one('bing-primary');
+  const reddit = one('reddit', null);
+  const structured = many('structured').flatMap((result) => Array.isArray(result) ? result : []);
+  const targeted = [...many('targeted-bing'), ...many('targeted-duckduckgo')].flatMap((result) => Array.isArray(result) ? result : []);
   const rssList = Array.isArray(rss) ? rss : [];
   const ddgNewsList = Array.isArray(ddgNews) ? ddgNews : [];
   const ddgList = Array.isArray(ddg) ? ddg : [];
@@ -436,12 +477,15 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
     })
     .slice(0, fetchLimit);
 
-  const fetched = await runBatches(unique, 3, async (item) => {
+  // Hydration shares the pass budget: articles that do not start before
+  // the hydration deadline are skipped, not awaited. Snippets and
+  // provider-supplied bodies (Wikipedia extracts) still count as evidence.
+  const fetched = await runBatchesWithDeadline(unique, 3, async (item) => {
     signal?.throwIfAborted();
     const article = await fetchArticle(item.url, { signal });
     signal?.throwIfAborted();
     return { url: item.url, article };
-  });
+  }, { deadlineAt: hydrationDeadlineAt, signal });
   signal?.throwIfAborted();
   const articleByUrl = new Map(fetched.filter((entry) => entry.article && entry.article.text).map((entry) => [entry.url, entry.article]));
 
@@ -504,7 +548,7 @@ async function gatherResearch(query, { includeReddit = true, fetchLimit = 12, ph
     official: officialH,
     redditBlocked: !!(reddit && reddit.blocked),
     redditViaRss: !!(reddit && reddit.viaRss),
-    errors: [ddg, ddgNews, rss, bing, bingOfficial, wiki, hn, yandex, yandexNews, primary, reddit, ...results.slice(structuredStartIndex)]
+    errors: results
       .filter((x) => x && x.error && !String(x.error).includes('RSS fallback'))
       .map((x) => `${x.provider || 'provider'}: ${x.error}`),
     stats: {

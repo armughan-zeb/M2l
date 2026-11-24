@@ -94,11 +94,16 @@ def _fetch_source_chapters(video_id, timeout_seconds=10):
     script = (
         "import json,sys;sys.path.insert(0,sys.argv[1]);"
         "from services.yt_dlp_runtime import load_yt_dlp;"
-        "from services.youtube_pipeline_v2 import _youtube_js_runtime_options;"
+        "from services.youtube_pipeline_v2 import _youtube_js_runtime_options, _install_shared_youtube_session;"
         "opts=dict(quiet=True,no_warnings=True,skip_download=True,"
         "socket_timeout=4,retries=0,extractor_retries=0,ignore_no_formats_error=True);"
         "opts.update(_youtube_js_runtime_options());"
         "ydl=load_yt_dlp().YoutubeDL(opts);"
+        # Anonymous spot (fixed Nov 17): the subprocess used to run with
+        # no session at all. Resolve the shared pool session in-process
+        # (in-memory only, never written to disk); on any failure it
+        # stays anonymous and the chapter lookup degrades to public data.
+        "_install_shared_youtube_session(ydl);"
         "info=ydl.extract_info('https://www.youtube.com/watch?v='+sys.argv[2],download=False);"
         "print('VIDNETS_CHAPTERS='+json.dumps((info or {}).get('chapters') or []))"
     )

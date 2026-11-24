@@ -6,16 +6,30 @@ from services import render_resource_manager as resources
 
 @pytest.mark.parametrize('available,blocked,state', [(870,False,'low_memory'), (200,True,'waiting'), (4096,False,'ready')])
 def test_ui_and_render_preflight_share_the_admission_floor(monkeypatch, available, blocked, state):
-    monkeypatch.setattr(resources, '_memory_snapshot', lambda: {'total_mb':8192,'available_mb':available})
+    monkeypatch.setattr(resources, '_memory_snapshot', lambda: {'total_mb':8192,'available_mb':available,'swap_free_mb':600})
     status = resources.render_memory_status()
     assert status['render_blocked'] is blocked
     assert status['admission_state'] == state
-    assert status['minimum_available_mb'] == 384
+    assert status['minimum_available_mb'] == 512
+
+
+def test_gta_vi_steady_state_admits_serial_render():
+    # GTA VI ef306926 replay (Nov 16, 2026): 7.7 GB box, 600 MB available,
+    # 600 MB swap free — the old sum-of-caps gate demanded ~1101 MB and
+    # waited forever. The working-set gate admits one serial worker.
+    plan = resources.select_remotion_workers(600, 7880, cpu_count=4, video_heavy=True, swap_free_mb=600)
+    assert plan['recommended_workers'] == 1
+    assert plan['single_worker_fallback'] == 1
+    assert plan['minimum_available_mb'] == 512
+    assert plan['headroom_mb'] >= plan['working_set_mb']
+    # Same level with no swap headroom, and below the floor, still wait.
+    assert resources.select_remotion_workers(600, 7880, cpu_count=4, video_heavy=True, swap_free_mb=0)['recommended_workers'] == 0
+    assert resources.select_remotion_workers(500, 7880, cpu_count=4, video_heavy=True, swap_free_mb=600)['recommended_workers'] == 0
 
 
 def test_memory_recovery_never_closes_unrelated_apps_from_stale_env(monkeypatch):
     monkeypatch.setenv('VIDZEO_CLOSE_UNNECESSARY_APPS', '1')
-    monkeypatch.setattr(resources, '_memory_snapshot', lambda: {'total_mb':8192,'available_mb':870})
+    monkeypatch.setattr(resources, '_memory_snapshot', lambda: {'total_mb':8192,'available_mb':870,'swap_free_mb':600})
     def forbidden(*args, **kwargs):
         raise AssertionError('A render must not close unrelated desktop applications')
     monkeypatch.setattr(resources, '_close_visible_user_apps_until_headroom', forbidden)
@@ -55,20 +69,26 @@ def test_continuous_render_has_no_elapsed_time_cutoff():
 
 
 @pytest.mark.parametrize('total_mb', [8192, 16384, 32768])
-@pytest.mark.parametrize('available_mb', [384, 512, 1000, 1200])
+@pytest.mark.parametrize('available_mb', [768, 1000, 1200])
 @pytest.mark.parametrize('video_heavy', [False, True])
 def test_one_worker_can_start_when_reserve_exhausts_headroom(total_mb, available_mb, video_heavy):
-    plan = resources.select_remotion_workers(available_mb, total_mb, cpu_count=8, video_heavy=video_heavy)
+    # Steady-state swap (~600 MB free) is the headroom that lets a serial
+    # render start on this VM; without it the working set does not fit.
+    plan = resources.select_remotion_workers(available_mb, total_mb, cpu_count=8, video_heavy=video_heavy, swap_free_mb=600)
     assert plan['recommended_workers'] >= 1
-    assert plan['minimum_available_mb'] == 384
+    assert plan['minimum_available_mb'] == 512
     assert plan['memory_limit'] >= 1
     if plan['raw_memory_limit'] == 0:
         assert plan['single_worker_fallback'] == 1
         assert plan['recommended_workers'] == 1
 
 
-@pytest.mark.parametrize('available_mb', [-1, 0, 200, 383])
-def test_below_floor_waits_even_if_worker_estimate_is_overridden(available_mb):
+@pytest.mark.parametrize('available_mb', [-1, 0, 200, 615, 767])
+def test_insufficient_headroom_waits_even_if_worker_estimate_is_overridden(available_mb):
+    # 615 MB is the Wright 1-min admission that crawled at ~23x real-time
+    # with swap in use: with NO swap headroom supplied here it must wait,
+    # not render. The same level admits when steady-state swap (~600 MB)
+    # is present — see test_gta_vi_steady_state_admits_serial_render.
     plan = resources.select_remotion_workers(available_mb, 8192, cpu_count=8)
     assert plan['recommended_workers'] == 0
     assert plan['single_worker_fallback'] == 0
@@ -84,10 +104,10 @@ def test_headroom_adds_workers_without_exceeding_cpu_or_cap():
     assert resources.select_remotion_workers(16384, 32768, cpu_count=2)['recommended_workers'] == 2
 
 
-@pytest.mark.parametrize('available_mb', [384, 1000, 1200])
+@pytest.mark.parametrize('available_mb', [768, 1000, 1200])
 def test_preflight_returns_instead_of_raising_at_admission_floor(monkeypatch, available_mb):
     snapshot = {'total_mb': 16384, 'available_mb': available_mb,
-                'free_mb': available_mb, 'process_rss_mb': 100}
+                'free_mb': available_mb, 'swap_free_mb': 600, 'process_rss_mb': 100}
     monkeypatch.setattr(resources, '_memory_snapshot', lambda: dict(snapshot))
     plan = resources.prepare_render_resources(release_idle=False, video_heavy=True)
     assert plan['selected_workers'] == 1
@@ -105,8 +125,8 @@ def test_memory_wait_resumes_once_free_ram_reaches_floor(monkeypatch, tmp_path):
     def prepare(**kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
-            raise resources.RenderMemoryLowError('Waiting for memory', {'available_mb': 383})
-        return resources.select_remotion_workers(384, 16384, cpu_count=8)
+            raise resources.RenderMemoryLowError('Waiting for memory', {'available_mb': 767})
+        return resources.select_remotion_workers(768, 16384, cpu_count=8, swap_free_mb=600)
 
     def render(**kwargs):
         assert kwargs['memory_snapshot']['recommended_workers'] == 1
