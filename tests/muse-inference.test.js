@@ -154,7 +154,10 @@ test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key
   const previousCoverage = process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
   let request;
   try {
-    delete process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
+    // Merged invariant (Nov 14, 2026): the YouTube coverage target is 0.30
+    // (docker-compose.yml) — NOT the remote branch's 0.8. Pin the deployed
+    // value explicitly rather than the adapter's unset default.
+    process.env.MUSE_YOUTUBE_COVERAGE_TARGET = '0.30';
     request = buildRequest(job, 'Some narration.', '/tmp');
   } finally {
     if (previousCoverage === undefined) delete process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
@@ -162,7 +165,7 @@ test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key
   }
   assert.equal(request.llm_provider, 'external_agent');
   assert.equal(request.openrouter_api_key, '');
-  assert.equal(request.youtube_accepted_coverage_target, 0.8);
+  assert.equal(request.youtube_accepted_coverage_target, 0.3);
   // Filter-best (Nov 9, 2026): vision is advisory by default — the two
   // strict flags are OFF, so an uncertain verdict never blocks delivery.
   // Named-entity scenes still require a live verdict inside the server
@@ -171,6 +174,9 @@ test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key
   assert.equal(request.strict_retrieval_accuracy, false);
   assert.equal(request.visual_understanding, true);
   assert.equal(request.stock_video_only, false);
+  assert.equal(request.allow_relevant_stock, false);
+  assert.equal(request.allow_stock_last_resort, false);
+  assert.deepEqual(request.media_source_priority, ['youtube', 'web']);
   assert.equal(request.allow_emergency_media, false);
   assert.equal(request.allow_grounded_graphic_fallback, true);
   assert.equal(request.media_fallback_policy, 'grounded_graphic');

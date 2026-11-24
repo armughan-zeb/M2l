@@ -23,15 +23,23 @@ services:
       MUSE_INFERENCE_COMPULSORY: "1"
       MUSE_AUTO_LOOP: "1"
       MUSE_RENDER_COMMAND: "node /app/render-vidnets-linux.js"
+      # Resident inference (default): the daemon's resident inbox calls this
+      # spool command and the resident inference worker pool answers in
+      # parallel (scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md).
+      # The host hook is the fallback when the pool is down. Never a stub.
+      MUSE_INFERENCE_COMMAND: "node /app/scripts/muse-inference-spool.cjs"
       MUSE_VIDNETS_ROOT: "/app/vidnets"
       MUSE_VIDNETS_COMMAND: "bash /app/vidnets/VIDNETS_AGENT.sh --runtime-root /data/runtime"
       MUSE_REPO_ROOT: "/app"
       MUSE_RENDER_CONCURRENCY: "1"
-      # Production defaults aligned with workflow.md and the incident report.
-      # YouTube coverage 0.8, web pool 12/scene, finalists 3, vision pool 12,
+      # Nov 10, 2026 standing decisions — do not "fix" these back.
+      # YT coverage 0.30 (web is the main source; the old 0.8 was stale),
       # web pool 12/scene, finalists 3, vision pool 12, relative floor 0.5,
-      # YT vision frames 2/clip, YT downloads 4.
-      MUSE_YOUTUBE_COVERAGE_TARGET: "0.8"
+      # YT vision frames 2/clip, YT downloads 4, wall floor 3600s (raised
+      # Nov 15 from 1200s: hook wakes alone can exceed 20 min, so a 20-min
+      # TTL expired answers mid-round-trip; 3600s is a deadline, not a
+      # delay — the resident worker answers in seconds).
+      MUSE_YOUTUBE_COVERAGE_TARGET: "0.30"
       MUSE_MEDIA_STRICT: "0"
       VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE: "12"
       VIDZEO_VISUAL_FINALIST_LIMIT: "3"
@@ -40,6 +48,7 @@ services:
       VIDZEO_YT_VISUAL_GATE_FRAMES: "2"
       VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY: "4"
       VIDZEO_YT_DOWNLOAD_CONCURRENCY: "4"
+      VIDZEO_AGENT_MIN_WALL_SECONDS: "3600"
       # Thumbnails are SKIPPED: this worker delivers script + video only.
       VIDZEO_SKIP_THUMBNAILS: "1"
       # TLS: the image's own CA bundle (never a host path).

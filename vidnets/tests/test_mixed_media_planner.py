@@ -147,9 +147,11 @@ class MixedMediaPlannerTests(unittest.TestCase):
 
         youtube_count = plan.final_counts["YouTube Clips"]
         self.assertEqual(plan.topic_policy, "history")
-        self.assertEqual(plan.final_counts["Stock Media"], 1)
-        self.assertEqual(plan.final_counts["Web Images"], 5)
-        self.assertAlmostEqual(youtube_count / len(scenes), 0.40)
+        # Spec §5.1 history weights 30% web / 65% YouTube / 5% stock:
+        # 10 scenes -> Hamilton-Hare gives 3 web / 7 YouTube / 0 stock.
+        self.assertEqual(plan.final_counts["Stock Media"], 0)
+        self.assertEqual(plan.final_counts["Web Images"], 3)
+        self.assertAlmostEqual(youtube_count / len(scenes), 0.70)
         self.assertTrue(all(
             "Web Images" in decision.fallback_sources
             for decision in plan.decisions
@@ -188,8 +190,8 @@ class MixedMediaPlannerTests(unittest.TestCase):
             scene_media_mode="automatic",
         )
 
-        self.assertEqual(plan.requested_weights["Web Images"], 0.45)
-        self.assertEqual(plan.requested_weights["YouTube Clips"], 0.45)
+        self.assertEqual(plan.requested_weights["Web Images"], 0.30)
+        self.assertEqual(plan.requested_weights["YouTube Clips"], 0.65)
         self.assertGreater(plan.final_counts["YouTube Clips"], 4)
         self.assertEqual(sum(plan.final_counts.values()), len(scenes))
 
@@ -264,6 +266,66 @@ class MixedMediaPlannerTests(unittest.TestCase):
         self.assertTrue(policy["llm_supported"])
         self.assertEqual(policy["weights"]["YouTube Clips"], 0.80)
 
+    def test_gaming_mode_for_detects_gta_vi_and_other_games(self):
+        # GTA VI via the story regex, even without the word "gaming".
+        self.assertTrue(planner.gaming_mode_for(
+            title="GTA VI: Vice City",
+            script="Leonida revealed in the record-breaking first trailer.",
+        ))
+        # Another game via the topic classifier.
+        self.assertTrue(planner.gaming_mode_for(
+            title="Elden Ring boss guide",
+            script="Elden Ring gameplay walkthrough and boss fight strategy.",
+        ))
+        # Explicit gaming category is authoritative.
+        self.assertTrue(planner.gaming_mode_for(
+            title="Untitled", script="A documentary.", category="gaming",
+        ))
+        # A non-gaming documentary is not gaming mode.
+        self.assertFalse(planner.gaming_mode_for(
+            title="The History of Jaguar Cars",
+            script="A factual history of the 1961 Jaguar E-Type classic automobile.",
+        ))
+
+    def test_documentary_youtube_target_is_55_percent_and_gaming_stays_80(self):
+        # AUTO_YOUTUBE_RATIO (0.55) is the documentary constant, bound to
+        # the documentary niche; gaming keeps its own 0.80 target.
+        self.assertEqual(planner.AUTO_YOUTUBE_RATIO, 0.55)
+        self.assertEqual(planner.DOCUMENTARY_YOUTUBE_TARGET_RATIO, 0.55)
+        self.assertEqual(
+            planner.DOCUMENTARY_YOUTUBE_TARGET_RATIO, planner.AUTO_YOUTUBE_RATIO
+        )
+        self.assertEqual(planner.GAMING_YOUTUBE_TARGET_RATIO, 0.80)
+
+    def test_documentary_mode_for_detects_documentary_family_topics(self):
+        # Explicit documentary category is authoritative (Panama proof job).
+        self.assertTrue(planner.documentary_mode_for(
+            title="How the Panama Canal Changed World Trade",
+            script="The Panama Canal changed world trade.",
+            category="documentary",
+        ))
+        # Evidence-led wording that the classifier maps to "serious"
+        # (resolve_media_policy maps it onto the documentary policy niche).
+        self.assertTrue(planner.documentary_mode_for(
+            title="When the Earth Shook",
+            script="An earthquake documentary about the disaster and the rescue.",
+        ))
+        # Gaming is not documentary mode.
+        self.assertFalse(planner.documentary_mode_for(
+            title="GTA VI: Vice City",
+            script="Leonida revealed in the record-breaking first trailer.",
+        ))
+        # Crime is classified before "serious" and is not documentary mode.
+        self.assertFalse(planner.documentary_mode_for(
+            title="Crime investigation",
+            script="Police investigation, forensic evidence, and a murder trial.",
+        ))
+        # A plain general topic is not documentary mode.
+        self.assertFalse(planner.documentary_mode_for(
+            title="Morning routine",
+            script="A simple everyday routine.",
+        ))
+
     def test_crime_and_history_have_distinct_evidence_led_profiles(self):
         crime = planner.resolve_media_policy(
             title="Crime investigation",
@@ -274,9 +336,19 @@ class MixedMediaPlannerTests(unittest.TestCase):
             script="A historical documentary about an ancient battle and its archives.",
         )
         self.assertEqual(crime["niche"], "crime")
-        self.assertAlmostEqual(crime["weights"]["YouTube Clips"], 0.55, places=4)
+        # Spec §5.1: crime/documentary 60% YouTube / 30% web / 10% stock.
+        self.assertAlmostEqual(crime["weights"]["YouTube Clips"], 0.60, places=4)
         self.assertEqual(history["niche"], "history")
-        self.assertAlmostEqual(history["weights"]["Web Images"], 0.45, places=4)
+        # Spec §5.1: history/royal 65% YouTube / 30% web / 5% stock.
+        self.assertAlmostEqual(history["weights"]["Web Images"], 0.30, places=4)
+        self.assertAlmostEqual(history["weights"]["YouTube Clips"], 0.65, places=4)
+
+    def test_lifestyle_uses_mostly_web_stills(self):
+        # Spec §5.1: lifestyle/fitness 20% YouTube / 80% web / 0% stock.
+        weights = planner._automatic_mode_weights("lifestyle")
+        self.assertAlmostEqual(weights["YouTube Clips"], 0.20, places=4)
+        self.assertAlmostEqual(weights["Web Images"], 0.80, places=4)
+        self.assertAlmostEqual(weights["Stock Media"], 0.00, places=4)
 
 
 if __name__ == "__main__":

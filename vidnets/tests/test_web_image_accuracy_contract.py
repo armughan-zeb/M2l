@@ -415,11 +415,12 @@ def test_one_bad_comparison_candidate_does_not_reject_the_scene(tmp_path):
     Image.new("RGB", (800, 450), color=(30, 60, 110)).save(right)
 
     class Client:
-        def compare_images(self, _paths, _prompt):
-            return {"candidates": [
-                {"relevance": 10, "confidence": 95, "fatal_mismatch": True},
-                {"relevance": 90, "quality": 70, "confidence": 94},
-            ]}
+        # P4: the gate single-verifies each candidate in rank order; the
+        # stub answers per image path instead of one compare payload.
+        def analyze_image(self, path, _prompt, _system):
+            if path == str(wrong):
+                return {"relevance": 10, "confidence": 95, "fatal_mismatch": True}
+            return {"relevance": 90, "quality": 70, "confidence": 94}
 
     class Context:
         model = "test-model"
@@ -453,7 +454,7 @@ def test_visual_unavailable_strict_mode_keeps_metadata_winner(tmp_path):
     Image.new("RGB", (800, 450), color=(40, 80, 120)).save(candidate)
 
     class Client:
-        def compare_images(self, _paths, _prompt):
+        def analyze_image(self, _path, _prompt, _system):
             raise RuntimeError("vision provider unavailable")
 
     class Context:
@@ -483,8 +484,12 @@ def test_default_web_resolver_keeps_all_bounded_provider_lanes_enabled():
     from services.web_image.resolver import _enabled_fast_sources
 
     names = {name for name, _kind in _enabled_fast_sources()}
-    assert {"flickr_api", "yandex", "bing_hybrid", "ddg_hybrid", "openverse", "wikimedia"}.issubset(names)
-    assert {"getty_bing", "getty_ddg"}.issubset(names)
+    # Muse-search (Nov 22, test-30 fix): openverse/wikimedia are folded
+    # into the muse_search wave — the standalone lanes no longer appear
+    # in the default wave, muse_search covers both APIs.
+    assert {"flickr_api", "yandex", "bing_hybrid", "muse_search"}.issubset(names)
+    assert {"getty_bing"}.issubset(names)
+    assert "ddg_hybrid" not in names and "getty_ddg" not in names
 
 
 def test_visual_unavailable_non_strict_marks_unverified(tmp_path):
@@ -495,7 +500,7 @@ def test_visual_unavailable_non_strict_marks_unverified(tmp_path):
     Image.new("RGB", (800, 450), color=(40, 80, 120)).save(candidate)
 
     class Client:
-        def compare_images(self, _paths, _prompt):
+        def analyze_image(self, _path, _prompt, _system):
             raise RuntimeError("vision provider unavailable")
 
     class Context:
@@ -527,8 +532,13 @@ def test_visual_rejection_is_advisory_in_delivery_mode(tmp_path):
     Image.new("RGB", (800, 450), color=(40, 80, 120)).save(candidate)
 
     class Client:
-        def compare_images(self, _paths, _prompt):
-            return {"acceptable": False, "candidates": []}
+        # P4: the old aggregate rejection (acceptable False, no rows) has no
+        # single-verify equivalent. The same advisory outcome — a weak,
+        # unconfident verdict keeps the metadata winner instead of
+        # hard-failing the scene — is a row that normalizes to "unverified".
+        def analyze_image(self, _path, _prompt, _system):
+            return {"relevance": 50, "quality": 40, "confidence": 40,
+                    "fatal_mismatch": False}
 
     class Context:
         model = "test-model"
@@ -550,7 +560,8 @@ def test_visual_rejection_is_advisory_in_delivery_mode(tmp_path):
 
     assert winner is not None
     assert winner["path"] == str(candidate)
-    assert winner["visual_gate_status"] == "advisory_rejected"
+    assert winner["visual_outcome"] == "uncertain"
+    assert winner["visual_unverified"] is True
 
 
 def test_high_brand_score_cannot_override_explicit_scene_mismatch(tmp_path):
@@ -560,12 +571,13 @@ def test_high_brand_score_cannot_override_explicit_scene_mismatch(tmp_path):
     for path in paths:
         Image.new('RGB', (800, 450), color=(40, 80, 120)).save(path)
     class Client:
-        def compare_images(self, _paths, _prompt):
-            return {'acceptable': True, 'candidates': [
-                {'relevance': 95, 'quality': 95, 'confidence': 95,
-                 'domain_match': True, 'scene_match': False},
-                {'relevance': 70, 'quality': 70, 'confidence': 90,
-                 'domain_match': True, 'scene_match': True}]}
+        # P4: per-path single-verify rows instead of one compare payload.
+        def analyze_image(self, path, _prompt, _system):
+            if path == str(paths[0]):
+                return {'relevance': 95, 'quality': 95, 'confidence': 95,
+                        'domain_match': True, 'scene_match': False}
+            return {'relevance': 70, 'quality': 70, 'confidence': 90,
+                    'domain_match': True, 'scene_match': True}
     class Context:
         model = 'test-model'
         visual_required = True
@@ -585,27 +597,42 @@ def test_web_shortlist_skips_mods_and_visible_wrong_subsystem(tmp_path):
     for path in paths:
         Image.new('RGB', (800, 450), color=(40, 80, 120)).save(path)
     class Client:
-        def compare_images(self, selected, _prompt):
-            assert selected == [str(paths[1]), str(paths[2])]
-            return {'confidence':95, 'candidates':[
-                {'relevance':99, 'quality':90, 'scene_match':True, 'domain_match':True,
-                 'scene_description':'Workers installing solar panels on a roof.'},
-                {'relevance':85, 'quality':85, 'scene_match':True, 'domain_match':True,
-                 'scene_description':'Tesla cars parked beside Supercharger stations.'}]}
+        # P4: per-path single-verify rows; the mod candidate is filtered
+        # before vision, so it must never be verified.
+        def __init__(self):
+            self.calls = []
+
+        def analyze_image(self, path, _prompt, _system):
+            self.calls.append(path)
+            if path == str(paths[1]):
+                return {'relevance': 99, 'quality': 90, 'scene_match': True, 'domain_match': True,
+                        'scene_description': 'Workers installing solar panels on a roof.'}
+            if path == str(paths[2]):
+                return {'relevance': 85, 'quality': 85, 'scene_match': True, 'domain_match': True,
+                        'scene_description': 'Tesla cars parked beside Supercharger stations.'}
+            raise AssertionError(f"unexpected single verify for {path}")
     class Context:
         model = 'test-model'
         visual_required = True
+
+        def __init__(self):
+            self.client = Client()
+
         def get_client(self):
-            return Client()
+            return self.client
+
+    context = Context()
     winner = resolver._rank_deferred_scene_shortlist(scene_index=0,
         scene_text='Supercharger stations help drivers recharge.', subject='Tesla', global_topic='Tesla',
         query='Tesla Supercharger station', candidates=[
             {'path':str(paths[0]), 'title':'Tesla Supercharger FS25 KingMods', 'domain':'kingmods.net'},
             {'path':str(paths[1]), 'title':'Tesla solar installation', 'domain':'archive'},
             {'path':str(paths[2]), 'title':'Tesla charging station', 'domain':'archive'}],
-        visual_context=Context())
+        visual_context=context)
     assert winner['path'] == str(paths[2])
     assert 'Supercharger' in winner['visual_decision']['scene_description']
+    assert str(paths[0]) not in context.client.calls
+    assert context.client.calls == [str(paths[1]), str(paths[2])]
 
 
 def test_aggregate_visual_rejection_cannot_override_contextual_candidate_evidence(tmp_path):
@@ -616,19 +643,15 @@ def test_aggregate_visual_rejection_cannot_override_contextual_candidate_evidenc
     Image.new("RGB", (800, 450), color=(40, 80, 120)).save(candidate)
 
     class Client:
-        def compare_images(self, _paths, _prompt):
+        # P4: single-verify returns the one row directly.
+        def analyze_image(self, _path, _prompt, _system):
             return {
-                "acceptable": False,
-                "confidence": 95,
-                "reason": "The image is contextual rather than an exact moment.",
-                "candidates": [{
-                    "relevance": 35,
-                    "quality": 65,
-                    "confidence": 90,
-                    "domain_match": True,
-                    "scene_match": True,
-                    "fatal_mismatch": False,
-                }],
+                "relevance": 35,
+                "quality": 65,
+                "confidence": 90,
+                "domain_match": True,
+                "scene_match": True,
+                "fatal_mismatch": False,
             }
 
     class Context:
@@ -661,8 +684,13 @@ def test_aggregate_visual_rejection_without_rows_is_uncertain_not_a_hard_veto(tm
     Image.new("RGB", (800, 450), color=(40, 80, 120)).save(candidate)
 
     class Client:
-        def compare_images(self, _paths, _prompt):
-            return {"acceptable": False, "confidence": 98, "candidates": []}
+        # P4: the old "acceptable False, no rows" case has no single-verify
+        # equivalent. The same uncertain outcome — no qualified candidate
+        # without a confident rejection — is a row that normalizes to
+        # "unverified" under the strict (reject_only_irrelevant=0) branch.
+        def analyze_image(self, _path, _prompt, _system):
+            return {"relevance": 50, "quality": 40, "confidence": 40,
+                    "fatal_mismatch": False}
 
     class Context:
         model = "test-model"
@@ -671,15 +699,16 @@ def test_aggregate_visual_rejection_without_rows_is_uncertain_not_a_hard_veto(tm
         def get_client(self):
             return Client()
 
-    winner = _rank_deferred_scene_shortlist(
-        scene_index=0,
-        scene_text="Prince Harry and Meghan prepare to return to Britain.",
-        subject="Prince Harry",
-        global_topic="The British Royal Family",
-        query="Prince Harry portrait",
-        candidates=[{"path": str(candidate), "domain": "archive", "candidate_class": "anchored"}],
-        visual_context=Context(),
-    )
+    with mock.patch.dict(os.environ, {"VIDZEO_VISUAL_REJECT_ONLY_IRRELEVANT": "0"}, clear=False):
+        winner = _rank_deferred_scene_shortlist(
+            scene_index=0,
+            scene_text="Prince Harry and Meghan prepare to return to Britain.",
+            subject="Prince Harry",
+            global_topic="The British Royal Family",
+            query="Prince Harry portrait",
+            candidates=[{"path": str(candidate), "domain": "archive", "candidate_class": "anchored"}],
+            visual_context=Context(),
+        )
 
     assert winner["path"] == str(candidate)
     assert winner["visual_outcome"] == "uncertain"
@@ -699,15 +728,12 @@ def test_relaxed_visual_gate_keeps_borderline_but_rejects_confident_irrelevance(
             self.relevance = relevance
             self.confidence = confidence
 
-        def compare_images(self, _paths, _prompt):
+        def analyze_image(self, _path, _prompt, _system):
             return {
-                "acceptable": True,
-                "candidates": [{
-                    "relevance": self.relevance,
-                    "quality": 40,
-                    "confidence": self.confidence,
-                    "fatal_mismatch": False,
-                }],
+                "relevance": self.relevance,
+                "quality": 40,
+                "confidence": self.confidence,
+                "fatal_mismatch": False,
             }
 
     class Context:
@@ -769,10 +795,10 @@ def test_slow_vision_does_not_block_later_scene_discovery(tmp_path, monkeypatch)
         )
 
     class Client:
-        def compare_images(self, _paths, _prompt):
+        def analyze_image(self, _path, _prompt, _system):
             time.sleep(0.20)
             vision_finished.append(time.monotonic())
-            return {"candidates": [{"relevance": 90, "quality": 70, "confidence": 90}]}
+            return {"relevance": 90, "quality": 70, "confidence": 90}
 
     class Context:
         model = "test-model"

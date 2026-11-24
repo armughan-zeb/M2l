@@ -29,6 +29,11 @@ class WebImageModularTests(unittest.TestCase):
     def setUp(self):
         from services.web_image import flickr_api_source
         flickr_api_source._flickr_session = None
+        # Module-global latch: any earlier real Flickr call returning code
+        # 100/105 flips this and reroutes later searches to the HTML lane,
+        # which breaks this test's JSON-only mock (Mock .text). Reset it so
+        # the test is hermetic regardless of full-suite order.
+        flickr_api_source._flickr_api_key_invalid = False
 
     def test_derive_effective_web_title(self):
         title, terms = _derive_effective_web_title(
@@ -712,7 +717,8 @@ class WebImageModularTests(unittest.TestCase):
     @mock.patch("services.web_image.resolver._discover_hybrid_urls")
     @mock.patch("services.web_image.resolver._discover_flickr_api_urls")
     @mock.patch("services.web_image.resolver._pre_score_candidate")
-    def test_adaptive_download_limit_excellent_match(self, mock_pre_score, mock_flickr_api, mock_hybrid, mock_api):
+    @mock.patch("services.web_image.resolver.search_muse_sources", return_value=[])
+    def test_adaptive_download_limit_excellent_match(self, mock_muse, mock_pre_score, mock_flickr_api, mock_hybrid, mock_api):
         mock_flickr_api.return_value = [
             {"url": "https://example.com/1.jpg", "title": "A", "source": "flickr_api", "query": "test"},
             {"url": "https://example.com/2.jpg", "title": "B", "source": "flickr_api", "query": "test"},

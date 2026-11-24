@@ -111,8 +111,15 @@ async function runResearchJob({ topic, input = {}, store, backgroundDeep = true,
 
   await researchStore.checkpointJob(jobId, { status: 'fast_research', phase: 'fast_research', progress: 10 });
   let fast;
+  // Pass budgets (60s each) fit inside the writer's 180s research deadline
+  // with ~60s left for the direct-recovery pass. They used to be 90s each:
+  // fast 90 + deep 90 exactly consumed the outer 180s, so any slow pass
+  // made the outer timeout fire, the writer discarded the pipeline's
+  // already-checkpointed evidence, and the recovery pass got 0ms. The
+  // gather call itself resolves inside a 45s phase budget with partial
+  // results, so 60s is a backstop, not the mechanism.
   try {
-    fast = await boundedCall(ownedSignal => gatherResearchFn(trimmedTopic, { includeReddit, fetchLimit: quickMode ? 5 : 6, phase: 'fast', researchPlan, quick: quickMode, signal: ownedSignal }), { signal, timeoutMs: 90000, label: 'Fast research' });
+    fast = await boundedCall(ownedSignal => gatherResearchFn(trimmedTopic, { includeReddit, fetchLimit: quickMode ? 5 : 6, phase: 'fast', researchPlan, quick: quickMode, signal: ownedSignal, phaseBudgetMs: 45000 }), { signal, timeoutMs: 60000, label: 'Fast research' });
   } catch (err) {
     signal?.throwIfAborted();
     fast = emptyResearch(trimmedTopic, err.message);
@@ -182,7 +189,7 @@ async function runResearchJob({ topic, input = {}, store, backgroundDeep = true,
     const deepPlan = { ...researchPlan, questions: openQuestions.length ? openQuestions : researchPlan.questions };
     let deep;
     try {
-      deep = await boundedCall(ownedSignal => gatherResearchFn(trimmedTopic, { includeReddit, fetchLimit: 18, phase: 'deep', researchPlan: deepPlan, quick: false, signal: ownedSignal }), { signal, timeoutMs: 90000, label: 'Deep research' });
+      deep = await boundedCall(ownedSignal => gatherResearchFn(trimmedTopic, { includeReddit, fetchLimit: 18, phase: 'deep', researchPlan: deepPlan, quick: false, signal: ownedSignal, phaseBudgetMs: 45000 }), { signal, timeoutMs: 60000, label: 'Deep research' });
     } catch (err) {
       signal?.throwIfAborted();
       warnings.push(`Deep research failed: ${err.message}`);

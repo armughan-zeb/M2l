@@ -306,7 +306,9 @@ def _parse_flickr_html(html_text: str, limit: int) -> List[Dict]:
     return rows
 
 
-def _search_flickr_html(query: str, limit: int = 20, min_views: int = 0) -> List[Dict]:
+def _search_flickr_html(
+    query: str, limit: int = 20, min_views: int = 0, direct: bool = False,
+) -> List[Dict]:
     """Full-text Flickr search via the public search page (no API key)."""
     q = re.sub(r"\s+", " ", (query or "").strip())
     if not q:
@@ -322,6 +324,7 @@ def _search_flickr_html(query: str, limit: int = 20, min_views: int = 0) -> List
                 params={"text": q},
                 headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
                 timeout=10,
+                proxies=_request_proxies(direct),
             )
             if resp.status_code == 200:
                 data = resp.text
@@ -355,11 +358,20 @@ def _search_flickr_html(query: str, limit: int = 20, min_views: int = 0) -> List
     return results
 
 
+# Direct-egress proxy override (Nov 18, web-resilience); see hybrid_search.
+_DIRECT_PROXIES = {"http": None, "https": None}
+
+
+def _request_proxies(direct: bool):
+    return dict(_DIRECT_PROXIES) if direct else None
+
+
 def search_flickr_api(
     query: str,
     limit: int = 20,
     min_views: int = 0,
     sort: str = "relevance",
+    direct: bool = False,
 ) -> List[Dict]:
     """
     Search Flickr via REST API and return candidate dicts.
@@ -375,7 +387,7 @@ def search_flickr_api(
     _last_search_network_error = ""
 
     if _flickr_api_key_invalid:
-        html_rows = _search_flickr_html(q, limit=limit, min_views=min_views)
+        html_rows = _search_flickr_html(q, limit=limit, min_views=min_views, direct=direct)
         if html_rows:
             _last_search_network_failed = False
             _last_search_network_error = ""
@@ -409,7 +421,8 @@ def search_flickr_api(
     for attempt in range(_retry_count()):
         try:
             _pace_flickr_call()
-            resp = session.get(_FLICKR_REST_URL, params=params, timeout=10)
+            resp = session.get(_FLICKR_REST_URL, params=params, timeout=10,
+                               proxies=_request_proxies(direct))
             last_status = resp.status_code
             if resp.status_code == 200:
                 data = resp.json()
@@ -444,7 +457,7 @@ def search_flickr_api(
         # API failed (dead bundled key, rate limit, or network). Fall back
         # to the no-key HTML search page before giving up, so the flickr
         # lane still returns full-text results without a configured key.
-        html_rows = _search_flickr_html(q, limit=limit, min_views=min_views)
+        html_rows = _search_flickr_html(q, limit=limit, min_views=min_views, direct=direct)
         if html_rows:
             _last_search_network_failed = False
             _last_search_network_error = ""

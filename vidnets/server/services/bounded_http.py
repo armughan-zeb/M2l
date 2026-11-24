@@ -8,7 +8,7 @@ from .job_context import check_job_active, remaining_seconds
 _SLOTS = threading.BoundedSemaphore(12)
 
 
-def provider_post(post, url, *, headers, json, timeout, usage_kind='text', operation=''):
+def provider_post(post, url, *, headers, json, timeout, usage_kind='text', operation='', lane=None):
     check_job_active()
     from .job_context import current_job
     from .agent_bridge import AGENT_HANDLE, agent_post
@@ -20,7 +20,7 @@ def provider_post(post, url, *, headers, json, timeout, usage_kind='text', opera
     if agent_mode:
         if usage_kind == 'tts':
             raise ValueError('External-agent jobs use the local Audiogram voice engine.')
-        response = agent_post(json, timeout, operation=operation, kind=usage_kind, handle=raw_handle)
+        response = agent_post(json, timeout, operation=operation, kind=usage_kind, handle=raw_handle, lane=lane)
         from .openrouter_usage import record_usage
         record_usage(response.json(), kind=usage_kind, operation=operation, model='external-agent')
         return response

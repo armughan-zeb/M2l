@@ -1130,6 +1130,69 @@ def _source_candidate(record: Any) -> Dict[str, Any]:
     }
 
 
+_NUMBERED_FRANCHISE_ENTRIES = frozenset({"vi", "v", "iv", "iii"})
+
+
+def _source_passes_scene_game_for(pipeline: Any, source_candidates: Dict[str, Any],
+                                  source_id: str, candidate: Any,
+                                  scene_subject: str, scene_text: str) -> bool:
+    """Per-scene game check for one (scene, source) pair.
+
+    Round 15: the exact-title gate runs first — era entries (2002 Vice
+    City, San Andreas) and cross-game footage stay blocked. A clip naming
+    a DIFFERENT numbered entry of the same franchise (GTA V for a GTA VI
+    scene) passes the gate as general topic footage, but it is a fallback:
+    it loses the scene when a same-game source is in the pool for this
+    scene, and is usable only when no same-game source exists. That keeps
+    "perfect clip first, general clip as fallback" in cut selection, while
+    the layered fallback chain may still list the general clip as an
+    option. Fail-open on any helper error, as before.
+    """
+    try:
+        gate = getattr(pipeline, "_gaming_exact_title_gate", None)
+        if callable(gate) and bool(gate(candidate, scene_subject, scene_text, None)):
+            return False
+    except Exception:
+        return True
+    try:
+        scene_games = getattr(pipeline, "_scene_subject_games", None)
+        entries_fn = getattr(pipeline, "_gta_entries", None)
+        if not callable(scene_games) or not callable(entries_fn):
+            return True
+        scene_numbered = set(scene_games(scene_text, scene_subject, None)) & set(_NUMBERED_FRANCHISE_ENTRIES)
+        if not scene_numbered:
+            return True
+        cand_text = " ".join([
+            str((candidate or {}).get("title") or ""),
+            str((candidate or {}).get("description") or ""),
+            str((candidate or {}).get("channel") or (candidate or {}).get("uploader") or ""),
+        ])
+        cand_numbered = set(entries_fn(cand_text)) & set(_NUMBERED_FRANCHISE_ENTRIES)
+        if not cand_numbered or (cand_numbered & scene_numbered):
+            return True
+        # Different numbered entry, same franchise: a general fallback.
+        # Block it only when a same-game source that itself clears the
+        # gate is in the pool for this scene.
+        for other_id, other in (source_candidates or {}).items():
+            if other_id == source_id:
+                continue
+            try:
+                if callable(gate) and bool(gate(other, scene_subject, scene_text, None)):
+                    continue
+            except Exception:
+                continue
+            other_text = " ".join([
+                str((other or {}).get("title") or ""),
+                str((other or {}).get("description") or ""),
+                str((other or {}).get("channel") or (other or {}).get("uploader") or ""),
+            ])
+            if set(entries_fn(other_text)) & scene_numbered:
+                return False
+    except Exception:
+        return True
+    return True
+
+
 def _source_visual_priority(record: Any) -> float:
     """Score source-level footage likelihood before paying full-download cost.
 
@@ -2531,6 +2594,25 @@ def _prefetch_probe_transcript_moments(
     return audit
 
 
+def _pool_slice_seconds(scene_durations, scene_index: int) -> float:
+    """FFmpeg slice length for one pool scene, in seconds.
+
+    Spec (Vidzeo Local): 4-8s slice around the matched moment. Scene
+    durations (narration beats, ~2.6-3.4s) are shorter than the spec
+    slice; the cut is clamped to the spec range and the renderer trims
+    any excess to the scene slot.
+    """
+    try:
+        raw = float(
+            scene_durations[scene_index]
+            if scene_index < len(scene_durations)
+            else 4.0
+        )
+    except (TypeError, ValueError, IndexError):
+        raw = 4.0
+    return min(8.0, max(4.0, raw))
+
+
 def resolve_pool_first(
     pipeline,
     pools,
@@ -3019,7 +3101,34 @@ def resolve_pool_first(
     }
     multi_topic_pool = len(topic_keys) > 1
     for scene_index, row in enumerate(pools.rows):
-        duration = float(pools.scene_durations[scene_index] if scene_index < len(pools.scene_durations) else 4.0)
+        duration = _pool_slice_seconds(pools.scene_durations, scene_index)
+        # Per-scene game check. The shared shortlist is global — a source's
+        # metadata_score is its BEST scene fit — so a source that is right
+        # for one scene can be wrong-game for another (a GTA V clip in a
+        # GTA VI job: it fits a GTA V-narrating scene, enters the 3-6
+        # source shortlist, and token-overlap affinity ranks it first for
+        # a GTA VI scene because "GTA V Vice City gameplay" shares
+        # vice/city/gameplay tokens). Affinity cannot see the game, and
+        # with no visual context the cut gate accepts on deterministic
+        # checks alone ("vision_disabled") — the coordinator's vision is
+        # the only later guard, and it fail-opens when vision is down
+        # (deterministic_degraded). Apply the same scene-relative game
+        # gate the primary lane uses, per (scene, source), before any
+        # moment from that source is planned for the scene. A source
+        # stays available for the scenes it IS right for; only its
+        # wrong-game scenes lose it.
+        _scene_subject = str(
+            row.get("candidate_subject") or row.get("section_subject") or ""
+        )
+        _scene_text = str(row.get("scene_text") or "")
+
+        def _source_passes_scene_game(source_id: str) -> bool:
+            candidate = source_candidates.get(source_id) or {}
+            return _source_passes_scene_game_for(
+                pipeline, source_candidates, source_id, candidate,
+                _scene_subject, _scene_text,
+            )
+
         grid_shift = (
             zlib.crc32(
                 "{}:{}".format(
@@ -3032,6 +3141,9 @@ def resolve_pool_first(
         raw_moments = [
             moment for moment in list((pools.moment_assignments or {}).get(scene_index) or [])
             if str(getattr(moment, "source_id", "") or getattr(moment, "video_id", "")) in source_candidates
+            and _source_passes_scene_game(
+                str(getattr(moment, "source_id", "") or getattr(moment, "video_id", ""))
+            )
         ][:moment_limit]
         # Always keep one option per downloaded source before filling the
         # remaining option budget with additional transcript moments. The old
@@ -3082,6 +3194,15 @@ def resolve_pool_first(
                 ]
                 ranked += [source_id for source_id, score in scored if score <= 0.0]
                 source_ids = ranked
+        # Per-scene game check (see above): drop wrong-game sources from
+        # THIS scene's list, before rotation and intro reservations can
+        # pick one as the scene's primary. A scene left with no source
+        # gets no YT plan here and falls through to the coordinator's
+        # web/stock lanes rather than cutting a wrong-game clip.
+        source_ids = [
+            source_id for source_id in source_ids
+            if _source_passes_scene_game(source_id)
+        ]
         # Transcript grounding rotates the primary source per scene. Without
         # it every scene's assignment lands on the same top-ranked video, so
         # the whole quota re-cuts one source at nearby grid offsets. Rotate the
@@ -3317,7 +3438,30 @@ def resolve_pool_first(
         for scene_index, row in enumerate(pools.rows):
             if scene_index in planned_scene_indices:
                 continue
-            source_id = selected_source_ids[scene_index % len(selected_source_ids)]
+            # Per-scene game check, as in the plan loop above: rotate
+            # through the admitted pool for the first source this scene
+            # may actually use. When every admitted source is wrong-game
+            # for the scene, leave it unplanned — the coordinator's
+            # web/stock lanes fill it — rather than cutting a clip the
+            # scene's game gate already forbids.
+            _fallback_subject = str(
+                row.get("candidate_subject") or row.get("section_subject") or ""
+            )
+            _fallback_text = str(row.get("scene_text") or "")
+            source_id = None
+            for _offset in range(len(selected_source_ids)):
+                _try_id = selected_source_ids[
+                    (scene_index + _offset) % len(selected_source_ids)
+                ]
+                _try_candidate = source_candidates.get(_try_id) or {}
+                if _source_passes_scene_game_for(
+                    pipeline, source_candidates, _try_id, _try_candidate,
+                    _fallback_subject, _fallback_text,
+                ):
+                    source_id = _try_id
+                    break
+            if source_id is None:
+                continue
             candidate = source_candidates.get(source_id) or {}
             duration = float(
                 pools.scene_durations[scene_index]

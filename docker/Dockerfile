@@ -28,8 +28,8 @@
 # only. Build it on a host with Docker before trusting it for production.
 # See docker/README.md + docker/SETUP.md.
 #
-# Defaults in this image align with the production workflow and incident
-# report: YouTube coverage target 0.8,
+# Defaults in this image are the Nov 10, 2026 standing decisions — do not
+# "fix" them back: YT coverage target 0.30 (web is the main source),
 # web pool 12/scene, finalists 3, vision pool 12, relative floor 0.5,
 # YT vision frames 2/clip, YT downloads 4, ScriptIT standard mode for
 # <=2min videos (the CLI default), pool reuse on, thumbnails SKIPPED.
@@ -49,7 +49,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MUSE_VIDNETS_ROOT=/app/vidnets \
     MUSE_REPO_ROOT=/app \
     MUSE_RENDER_CONCURRENCY=1 \
-    MUSE_YOUTUBE_COVERAGE_TARGET=0.8 \
+    # Nov 10, 2026 standing decisions (see AGENT_TRAINING.md). YT coverage
+    # 0.30: web images are the main source; the old 0.8 was per-job values.
+    MUSE_YOUTUBE_COVERAGE_TARGET=0.30 \
     MUSE_MEDIA_STRICT=0 \
     VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE=12 \
     VIDZEO_VISUAL_FINALIST_LIMIT=3 \
@@ -60,6 +62,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VIDZEO_YT_DOWNLOAD_CONCURRENCY=4 \
     # Thumbnails are SKIPPED: this worker delivers script + video only.
     VIDZEO_SKIP_THUMBNAILS=1 \
+    # Director/media wall floor (Nov 10): 1200s, not 600 — long-form jobs
+    # need the room; the budget math still caps the total per job.
+    VIDZEO_AGENT_MIN_WALL_SECONDS=1200 \
     # TLS: the image's own CA bundle (never a host path — none exists
     # inside the image). Node + Python both trust it.
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \

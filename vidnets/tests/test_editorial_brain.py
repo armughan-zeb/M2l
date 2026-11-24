@@ -4,6 +4,21 @@ from server.services import editorial_brain
 from server.services.documentary_editing import build_documentary_edit_plan
 
 
+def _force_invalid_deterministic_beats(monkeypatch):
+    """Mechanical-first: deterministic beats pass validation, so the LLM
+    path only runs for invalid beats. Tests that exercise the LLM path
+    force every deterministic beat invalid (bad sound_intent) while
+    keeping its real content, so the repair flow sees the same beats."""
+    real = editorial_brain.deterministic_editorial_beat
+
+    def patched(text, index, total):
+        beat = real(text, index, total)
+        beat["sound_intent"] = "bogus-intent"
+        return beat
+
+    monkeypatch.setattr(editorial_brain, "deterministic_editorial_beat", patched)
+
+
 def test_editorial_payload_accepts_fenced_or_preambled_json():
     assert editorial_brain._parse_editorial_payload(
         "Here is the plan:\n```json\n{\"beats\": [{\"scene_index\": 0}]}\n```"
@@ -31,6 +46,7 @@ def test_editorial_brain_uses_openrouter_model_and_preserves_partial_chunks(monk
         ]
 
     monkeypatch.setattr(editorial_brain, "_plan_chunk", fake_chunk)
+    _force_invalid_deterministic_beats(monkeypatch)
     texts = ["The critical evidence changed the case."] * 30
     beats = editorial_brain.plan_editorial_beats(
         texts,
@@ -80,6 +96,7 @@ def test_llm_text_budget_prevents_forced_text_on_every_scene(monkeypatch):
         ]
 
     monkeypatch.setattr(editorial_brain, "_plan_chunk", fake_chunk)
+    _force_invalid_deterministic_beats(monkeypatch)
     beats = editorial_brain.plan_editorial_beats(
         ["The critical evidence changed everything."] * 20,
         {"openrouter_api_key": "test", "documentary_density": "balanced"},
@@ -116,6 +133,7 @@ def test_editorial_selection_preserves_dates_and_varied_key_facts(monkeypatch):
         return beats
 
     monkeypatch.setattr(editorial_brain, "_plan_chunk", fake_chunk)
+    _force_invalid_deterministic_beats(monkeypatch)
     texts = [
         f"Investigators confirmed {kinds[index % len(kinds)][1]} during the disaster."
         for index in range(21)
@@ -314,6 +332,7 @@ def test_semantic_fallback_recovers_exact_named_fact_when_deterministic_is_empty
 
 def test_empty_openrouter_plan_gets_bounded_grounded_recovery(monkeypatch):
     monkeypatch.setattr(editorial_brain, "_plan_chunk", lambda *args, **kwargs: [])
+    _force_invalid_deterministic_beats(monkeypatch)
     beats = editorial_brain.plan_editorial_beats(
         [
             "Rockstar Games returns players to Vice City.",
@@ -341,6 +360,7 @@ def test_empty_openrouter_plan_gets_bounded_grounded_recovery(monkeypatch):
 
 def test_empty_openrouter_plan_targets_editorial_coverage_without_returning_zero(monkeypatch):
     monkeypatch.setattr(editorial_brain, "_plan_chunk", lambda *args, **kwargs: [])
+    _force_invalid_deterministic_beats(monkeypatch)
     texts = [
         "The studio announced a record launch for the new platform.",
         "The project created a breakthrough in battery technology.",
@@ -449,6 +469,7 @@ def test_underfilled_openrouter_plan_gets_one_focused_openrouter_repair_before_l
         return [beat(0, "final warning", "warning")]
 
     monkeypatch.setattr(editorial_brain, "_plan_chunk", fake_chunk)
+    _force_invalid_deterministic_beats(monkeypatch)
     texts = [
         "The final warning changed the investigation.",
         "Only 27 percent survived the test.",
@@ -483,6 +504,7 @@ def test_empty_openrouter_quality_repair_is_bounded_to_one_extra_call(monkeypatc
         return []
 
     monkeypatch.setattr(editorial_brain, "_plan_chunk", empty_chunk)
+    _force_invalid_deterministic_beats(monkeypatch)
     beats = editorial_brain.plan_editorial_beats(
         [
             "The final warning changed the investigation.",
@@ -586,6 +608,7 @@ def test_underfilled_editorial_repair_uses_configured_long_wait(monkeypatch):
         return [beat(0, "first discovery", "key_fact")]
 
     monkeypatch.setattr(editorial_brain, "_plan_chunk", fake_chunk)
+    _force_invalid_deterministic_beats(monkeypatch)
     monkeypatch.setenv("VIDZEO_EDITORIAL_BRAIN_REPAIR_TIMEOUT_SECONDS", "75")
     texts = [
         "The first discovery changed the project.",
@@ -605,3 +628,71 @@ def test_underfilled_editorial_repair_uses_configured_long_wait(monkeypatch):
 
     assert len(calls) == 2
     assert calls[1][1] == 75
+
+
+# P1 (fewer-requests): beats folded into the director's turn. The director
+# returns editorial_* fields per scene; beats_from_direction normalizes
+# them through the same grounding rules as the standalone planner, so no
+# separate vidzeo_editorial_beats_v1 request is filed.
+
+
+def test_beats_from_direction_carries_director_fields():
+    texts = [
+        "On 12 March 1989 the dam failed, killing 200 people.",
+        "The river rose slowly through the valley.",
+        "Engineers inspected the cracked wall the next morning.",
+        "The town rebuilt over the following decade.",
+    ]
+    decisions = [
+        {"scene_index": 0, "editorial_role": "evidence", "editorial_treatment": "date",
+         "editorial_emphasis": "12 March 1989", "editorial_highlight_kind": "milestone",
+         "editorial_importance": 0.9},
+        {"scene_index": 1},
+        {"scene_index": 2},
+        {"scene_index": 3},
+    ]
+    beats = editorial_brain.beats_from_direction(decisions, texts)
+    assert beats is not None
+    assert len(beats) == 4
+    assert beats[0]["emphasis"] and beats[0]["emphasis"] in texts[0]
+    # The normalizer records provenance; a substituted phrase is marked
+    # direction+deterministic, so assert the prefix, not the exact value.
+    assert str(beats[0]["source"]).startswith("direction")
+    assert beats[0]["selected_for_text"] is True
+    assert sum(1 for beat in beats if beat.get("selected_for_text")) <= 3
+
+
+def test_beats_from_direction_falls_back_without_editorial_fields():
+    texts = [
+        "The river rose slowly through the valley.",
+        "Engineers inspected the cracked wall the next morning.",
+    ]
+    decisions = [{"scene_index": 0}, {"scene_index": 1}]
+    beats = editorial_brain.beats_from_direction(decisions, texts)
+    assert beats is not None
+    assert len(beats) == 2
+    assert all(beat["source"] == "deterministic" for beat in beats)
+
+
+def test_beats_from_direction_rejects_ungrounded_emphasis():
+    texts = ["The river rose slowly through the valley."]
+    decisions = [
+        {"scene_index": 0, "editorial_role": "reveal", "editorial_treatment": "keyword",
+         "editorial_emphasis": "quantum flux capacitor", "editorial_highlight_kind": "key_fact",
+         "editorial_importance": 0.9},
+    ]
+    beats = editorial_brain.beats_from_direction(decisions, texts)
+    assert beats is not None
+    assert len(beats) == 1
+    assert "quantum flux capacitor" not in str(beats[0]["emphasis"])
+    assert not beats[0]["emphasis"] or beats[0]["emphasis"] in texts[0]
+
+
+def test_beats_from_direction_returns_none_without_full_coverage():
+    texts = ["Scene one narration.", "Scene two narration."]
+    decisions = [{"scene_index": 0, "editorial_role": "intro", "editorial_treatment": "none",
+                  "editorial_emphasis": "", "editorial_highlight_kind": "none",
+                  "editorial_importance": 0.3}]
+    assert editorial_brain.beats_from_direction(decisions, texts) is None
+    assert editorial_brain.beats_from_direction([], texts) is None
+    assert editorial_brain.beats_from_direction(decisions, []) is None

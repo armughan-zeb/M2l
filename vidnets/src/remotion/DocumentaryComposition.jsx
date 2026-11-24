@@ -1,5 +1,7 @@
 import React from 'react';
-import { AbsoluteFill, Audio, Img, OffthreadVideo, Sequence, interpolate, spring, staticFile, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AbsoluteFill, Audio, Img, Sequence, interpolate, spring, staticFile, useCurrentFrame, useVideoConfig } from 'remotion';
+// @remotion/media Video decodes faster than OffthreadVideo (Remotion 4); aliased to the old name so call sites stay unchanged.
+import { Video as OffthreadVideo } from '@remotion/media';
 import { GraphicTemplate } from './templates';
 import { mergeTheme, rgba } from './theme';
 import { DocumentaryFontFaces, useDocumentaryFontsReady } from './fonts';
@@ -298,7 +300,7 @@ function MediaLayer({ media, theme, scene, visualDNA = {}, isBlurred = false }) 
   if (effectiveTreatment === 'paper_reveal') {
     return <AbsoluteFill style={{ overflow: 'hidden' }}>
       {visual({ position: 'absolute', inset: '-10%', width: '120%', height: '120%', objectFit: 'cover', filter: 'blur(28px) brightness(0.35) saturate(1.2)' })}
-      <AbsoluteFill style={{ clipPath: `polygon(0 0,${reveal * 96}% 0,${reveal * 100}% 12%,${reveal * 96}% 25%,${reveal * 100}% 40%,${reveal * 95}% 57%,${reveal * 100}% 74%,${reveal * 96}% 88%,${reveal * 100}% 100%,0 100%)`, filter: 'drop-shadow(14px 0 16px rgba(0,0,0,.55))' }}>
+      <AbsoluteFill style={{ clipPath: `polygon(0 0,${reveal * 96}% 0,${reveal * 100}% 12%,${reveal * 96}% 25%,${reveal * 100}% 40%,${reveal * 95}% 57%,${reveal * 100}% 74%,${reveal * 96}% 88%,${reveal * 100}% 100%,0 100%)`, textShadow: '14px 0 16px rgba(0,0,0,.55)' }}>
         {visual()}
       </AbsoluteFill>
     </AbsoluteFill>;
@@ -1146,7 +1148,7 @@ function TimedCaptionTrack({ scene, fps, theme }) {
     </React.Fragment>;
   });
   return <div style={{ ...captionContainer, zIndex: 30, pointerEvents: 'none', display: 'flex' }}>
-    <div style={{ maxWidth: useSafeRegion ? '100%' : '88%', width: 'fit-content', textAlign: horizontalAnchor === 'flex-start' ? 'left' : horizontalAnchor === 'flex-end' ? 'right' : 'center', opacity: enter, transform: `translateY(${(1 - enter) * 6}px)`, color: '#fff', fontFamily: `${face}, sans-serif`, fontWeight, fontSize: textSize, lineHeight: 1.12, letterSpacing: styleName === 'archive' ? '.035em' : styleName === 'impact' ? '-.025em' : '-.012em', textTransform: styleName === 'impact' || styleName === 'archive' ? 'uppercase' : 'none', textShadow, borderBottom: styleName === 'documentary' ? `2px solid ${accent}` : 'none', padding: styleName === 'documentary' ? '0 0 .1em' : 0, filter: styleName === 'impact' ? 'drop-shadow(0 4px 9px rgba(0,0,0,.42))' : 'none' }}>
+    <div style={{ maxWidth: useSafeRegion ? '100%' : '88%', width: 'fit-content', textAlign: horizontalAnchor === 'flex-start' ? 'left' : horizontalAnchor === 'flex-end' ? 'right' : 'center', opacity: enter, transform: `translateY(${(1 - enter) * 6}px)`, color: '#fff', fontFamily: `${face}, sans-serif`, fontWeight, fontSize: textSize, lineHeight: 1.12, letterSpacing: styleName === 'archive' ? '.035em' : styleName === 'impact' ? '-.025em' : '-.012em', textTransform: styleName === 'impact' || styleName === 'archive' ? 'uppercase' : 'none', textShadow, borderBottom: styleName === 'documentary' ? `2px solid ${accent}` : 'none', padding: styleName === 'documentary' ? '0 0 .1em' : 0, textShadow: styleName === 'impact' ? `${textShadow}, 0 4px 9px rgba(0,0,0,.42)` : textShadow }}>
       {wordsView}
     </div>
   </div>;

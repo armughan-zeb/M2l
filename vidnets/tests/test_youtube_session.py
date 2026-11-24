@@ -91,6 +91,26 @@ class YouTubeSessionTests(unittest.TestCase):
         self.assertNotIn("secret-value", json.dumps(container))
         self.assertEqual(container["protected"], "windows-dpapi-current-user")
 
+    def test_session_status_surfaces_cookie_pool_health(self):
+        # The multi-account pool used to be invisible: a stale pool silently
+        # fell back to anonymous public search. session_status() must carry
+        # the redacted per-account health so /api/status can show it.
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"VIDZEO_SECURE_DATA_DIR": temp_dir, "VIDZEO_YT_COOKIE_FILES": "", "VIDZEO_YT_COOKIE_DIR": temp_dir},
+            clear=False,
+        ):
+            session.reset_configured_pool()
+            status = session.session_status()
+        self.assertIn("pool", status)
+        self.assertIsInstance(status["pool"], list)
+        self.assertIn("pool_healthy_accounts", status)
+        self.assertIsInstance(status["pool_healthy_accounts"], int)
+        self.assertGreaterEqual(status["pool_healthy_accounts"], 0)
+        self.assertIn("pool_message", status)
+        self.assertIsInstance(status["pool_message"], str)
+        self.assertNotIn("secret-value", json.dumps(status))
+
     def test_persisted_session_restores_without_reopening_browser_database(self):
         profile = session.BrowserProfile("firefox", "profile-path", "default", time.time())
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
@@ -398,6 +418,48 @@ class YouTubeSessionTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertTrue(status["cookie_update_required"])
         self.assertIn("Connect YouTube", status["message"])
+
+    def test_stale_signed_out_marker_does_not_block_fresh_cookie_file(self):
+        # Regression: one live probe marked the saved session signed-out
+        # (Nov 17) and ensure_session then raised before ever trying the
+        # repo cookie file, so search stayed anonymous until the marker was
+        # cleared by hand. A freshly supplied file is new evidence and must
+        # be tried first; on success it clears the stale marker.
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {
+                "VIDZEO_SECURE_DATA_DIR": temp_dir,
+                "VIDZEO_YT_COOKIES_FROM_BROWSER": "chrome",
+            },
+            clear=False,
+        ), mock.patch.object(
+            session, "_verify_youtube_session", return_value=(True, "youtube-confirmed")
+        ), mock.patch.object(
+            session, "_protect", side_effect=lambda value: b"dpapi:" + value
+        ), mock.patch.object(
+            session, "_write_netscape_cookies", return_value=[]
+        ):
+            state_path = Path(temp_dir) / "youtube-session-state.json"
+            state_path.write_text(json.dumps({
+                "version": 1,
+                "cookie_update_required": True,
+                "cookie_update_reason": "youtube-reported-signed-out",
+                "verification": "youtube-reported-signed-out",
+                "preferred_browser": "chrome",
+            }), encoding="utf-8")
+            cookie_path = Path(temp_dir) / "cookies.txt"
+            export = http.cookiejar.MozillaCookieJar(str(cookie_path))
+            for cookie in _authenticated_jar():
+                export.set_cookie(cookie)
+            export.save(ignore_discard=True, ignore_expires=True)
+            with mock.patch.dict(
+                os.environ, {"VIDZEO_YT_COOKIES_FILE": str(cookie_path)}, clear=False
+            ):
+                jar, _generation = session.ensure_session()
+
+            self.assertTrue(session._jar_is_authenticated(jar))
+            self.assertFalse(state_path.is_file())
+            self.assertTrue(session.session_status()["ready"])
 
     def test_rejected_import_marks_cookie_update_required(self):
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(

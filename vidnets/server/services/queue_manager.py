@@ -50,7 +50,69 @@ MAX_FINISHED_HISTORY = 12
 _RECOVERY_PAUSE_TEXT = {
     'delivery_deadline': 'Processing time limit reached. Click Retry to continue from saved work.',
     'preparation_stall': 'Preparation stalled. Click Retry to continue from saved work.',
+    'system_cancel_recovered': 'Interrupted by the system. Click Retry to continue from saved work.',
+    'system_error_interrupted': 'Interrupted by a transient error. Click Retry to continue from saved work.',
 }
+# Paused reasons that are always system-caused (never a user choice): the
+# job driver and startup maintenance auto-resume these. A PAUSED job with
+# any other (or missing) reason is left alone — it may have been parked
+# deliberately.
+#
+# The five retryable worker-loop pauses belong here too. Each is set by the
+# worker only with retryable=True, a checkpoint dir, and "Click Retry"
+# text — a stage that failed transiently (low RAM, a bad edit plan, a
+# failed render, a media-contract miss, a scene-plan failure), never a
+# user park. Before this they were stranded: the driver, startup
+# maintenance and the reboot path all skipped them, so a render-failed
+# job like GTA VI ef306926 (paused remotion_render at 78%, checkpoints
+# intact, render_failure.json retryable:true) sat forever until a human
+# clicked Retry. The driver still bounds how often it auto-resumes one
+# (see the resume streak in job_debugger.py), so a deterministically
+# failing stage escalates instead of looping.
+SYSTEM_RECOVERY_PAUSED_REASONS = frozenset({
+    'backend_restart',
+    'cancellation_cleanup_timeout',
+    'delivery_deadline',
+    'preparation_stall',
+    'system_cancel_recovered',
+    'system_error_interrupted',
+    'low_memory',
+    'openrouter_scene_plan',
+    'remotion_edit_plan',
+    'media_contract',
+    'remotion_render',
+})
+_TRANSIENT_QUEUE_ERROR_MARKERS = (
+    'timeout', 'timed out', 'deadline', 'network', 'connection',
+    'reset', 'refused', 'unreachable', 'temporarily', 'try again',
+    '502', '503', '504', '530',
+)
+
+
+def _system_cancel_pause_reason(cancellation_reason) -> Optional[str]:
+    """Map a system cancellation reason to a resumable pause reason.
+
+    Returns None for user cancellations and anything unrecognized — those
+    stay CANCELLED. The delivery-deadline watchdog and the preparation-stall
+    path cancel directly (no staged pause), so this is what lets them land
+    PAUSED instead of being lost.
+    """
+    reason = str(cancellation_reason or '')
+    if reason.startswith('Shared video processing deadline'):
+        return 'delivery_deadline'
+    if reason.startswith('Preparation stopped advancing'):
+        return 'preparation_stall'
+    return None
+
+
+def _is_transient_queue_error(error_text) -> bool:
+    """True when an error looks like a passing storm, not a broken job.
+
+    Reboot/crash/network/deadline failures auto-retry; a hard contract
+    failure (no media at all, bad config) must not loop forever.
+    """
+    text = str(error_text or '').lower()
+    return any(marker in text for marker in _TRANSIENT_QUEUE_ERROR_MARKERS)
 _REDACTED_SECRET = ""
 _SENSITIVE_CONFIG_KEYS = {
     "api_key",
@@ -205,6 +267,16 @@ class QueueManager:
         self._queue_lock = threading.Lock()
         self._persistence_lock = threading.Lock()
         self._queue_condition = threading.Condition(self._queue_lock)
+        # Status snapshots for /api/queue/status. The queue holds completed
+        # jobs with multi-MB manifests (live queue.json is ~38 MB), so
+        # building a status payload means a ~10s deepcopy + ~17s redact.
+        # That work must never run under _queue_lock (it starved the
+        # endpoint past a 10s curl timeout) and the endpoint must never
+        # block on the lock: get_status serves the last snapshot when the
+        # lock is busy. Guarded by its own small lock; entries are
+        # (compact, owner_id) -> (built_at_monotonic, payload_dict).
+        self._status_cache: Dict = {}
+        self._status_cache_lock = threading.Lock()
         self._queue_needs_secret_scrub = False
         self._queue_needs_config_migration = False
         self._save_tick = 0
@@ -301,8 +373,30 @@ class QueueManager:
             with self._persistence_lock:
                 self._save_tick += 1
                 do_full_backup = (self._save_tick % self._full_backup_interval) == 0
+                # Snapshot queue state briefly under its state lock, then
+                # deepcopy, redact and serialize outside it so status
+                # polling is not held behind large job manifests. Progress
+                # writes are separately rate-limited by the worker.
+                # NOTE: the deepcopy used to run under _queue_lock. The
+                # live queue holds ~38 MB of completed-job manifests, so
+                # that deepcopy took ~11s under the lock and starved
+                # /api/queue/status past its 10s timeout. A shallow copy
+                # freezes each item's top-level keys (the worker only ever
+                # assigns top-level keys, or appends to progress_events,
+                # which deepcopy tolerates); nested config/result dicts are
+                # replaced wholesale, never mutated in place. If a
+                # concurrent mutation does raise, retry once with the lock
+                # held (old behaviour, bounded).
                 with self._queue_lock:
-                    queue_snapshot = copy.deepcopy(self.queue)
+                    queue_snapshot = [
+                        dict(item) if isinstance(item, dict) else item
+                        for item in self.queue
+                    ]
+                try:
+                    queue_snapshot = copy.deepcopy(queue_snapshot)
+                except RuntimeError:
+                    with self._queue_lock:
+                        queue_snapshot = copy.deepcopy(self.queue)
                 data = {
                     'items': _redact_sensitive_data(queue_snapshot, persistence=True),
                     'last_updated': datetime.now().isoformat()
@@ -426,6 +520,21 @@ class QueueManager:
                 recovered += 1
                 recovered_cancellations += 1
             elif status == JobStatus.SHUTDOWN_TIMEOUT:
+                # A shutdown timeout after a USER cancellation is still a
+                # user cancellation: finalize it as CANCELLED, never park
+                # it PAUSED as a retryable interruption — otherwise the
+                # record presents "click Resume" for a job the user
+                # explicitly stopped. Only a system-caused timeout (no
+                # cancel_requested flag) becomes a resumable pause.
+                if item.get('cancel_requested'):
+                    item['status'] = JobStatus.CANCELLED
+                    item['progress_text'] = 'Cancelled after backend restart'
+                    item['cancelled_at'] = datetime.now().isoformat()
+                    item['cancel_recovered'] = True
+                    record_recovery_event(item, item['progress_text'])
+                    recovered += 1
+                    recovered_cancellations += 1
+                    continue
                 # No child process can still be tracked after a restart. Keep
                 # the job resumable, but make the interruption visible rather
                 # than presenting an indefinitely stopping card.
@@ -436,6 +545,66 @@ class QueueManager:
                 record_recovery_event(item, item['progress_text'])
                 recovered += 1
                 recovered_timeouts += 1
+            elif status == JobStatus.CANCELLED:
+                # A system-caused cancellation (deadline watchdog, crash,
+                # reboot mid-finalize) can leave a job CANCELLED even though
+                # nobody asked for it to stop. The guardrail is the
+                # cancel_requested flag: the user-cancel path always sets
+                # it, system cancels never do. A system-cancelled job with
+                # real checkpoints on disk is resumable — auto-requeue it,
+                # or park it PAUSED so Retry works. A user-cancelled job is
+                # never touched, and a cancelled job with no checkpoints
+                # has nothing to resume.
+                if item.get('cancel_requested'):
+                    continue
+                checkpoint_dir = item.get('checkpoint_dir')
+                if not checkpoint_dir or not Path(str(checkpoint_dir)).is_dir():
+                    continue
+                if auto_requeue:
+                    item['status'] = JobStatus.QUEUED
+                    item['progress'] = 0
+                    item['progress_text'] = 'Queued (auto-resumed after system cancellation)'
+                    item.pop('cancelled_at', None)
+                    item.pop('error', None)
+                    item.pop('error_detail', None)
+                else:
+                    item['status'] = JobStatus.PAUSED
+                    item['progress_text'] = 'Paused after system cancellation - click Resume to continue'
+                    item['paused_reason'] = 'system_cancel_recovered'
+                    item['retryable'] = True
+                record_recovery_event(item, item['progress_text'])
+                recovered += 1
+                recovered_cancellations += 1
+            elif status == JobStatus.ERROR:
+                # A job the user cancelled must never be auto-retried as a
+                # "transient error", even with auto-requeue on: the worker
+                # routes a cancelled run to CANCELLATION_REQUESTED, not
+                # ERROR, so this is purely defensive — but the guardrail
+                # is the cancel_requested flag, and it is checked
+                # everywhere a job can be brought back.
+                if item.get('cancel_requested'):
+                    continue
+                # A transient error (timeout, network, gateway 502/503/504/
+                # 530) is a passing storm: auto-retry it, bounded by the
+                # attempt cap — the worker increments attempt on each run,
+                # so a job that keeps failing transiently still ends after
+                # 3 attempts instead of looping forever. Hard errors stay
+                # ERROR for a human to retry.
+                if int(item.get('attempt') or 0) >= 3:
+                    continue
+                if not _is_transient_queue_error(
+                    item.get('error') or item.get('error_detail') or ''
+                ):
+                    continue
+                if auto_requeue:
+                    item['status'] = JobStatus.QUEUED
+                    item['progress'] = 0
+                    item['progress_text'] = 'Queued (auto-resumed after transient error)'
+                    item['paused_reason'] = 'system_error_interrupted'
+                    item['retryable'] = True
+                    record_recovery_event(item, item['progress_text'])
+                    recovered += 1
+                    recovered_processing += 1
 
         if recovered > 0:
             action = "auto-requeued" if auto_requeue else "paused"
@@ -612,11 +781,36 @@ class QueueManager:
     def resume_item(self, job_id: str, config: Optional[Dict] = None) -> bool:
         """
         Resume a paused or error job by setting status back to queued.
+
+        A job the queue marked CANCELLED is also resumable when the
+        cancellation was system-caused (deadline watchdog, crash): it
+        carries no ``cancel_requested`` flag and has checkpoints on disk.
+        A job the user explicitly cancelled (``cancel_requested`` set) is
+        never resumable — auto-retry must not fight the user.
         """
         updated_config = normalize_generation_config(config) if config is not None else None
         with self._queue_lock:
             item = self.get_item(job_id)
-            if not item or item['status'] not in {JobStatus.PAUSED, JobStatus.ERROR, JobStatus.SHUTDOWN_TIMEOUT}:
+            if not item:
+                return False
+            # The user-cancel guardrail applies to EVERY status, not just
+            # CANCELLED. A user-cancelled job whose cleanup timed out lands
+            # SHUTDOWN_TIMEOUT and is re-parked PAUSED
+            # (cancellation_cleanup_timeout) on reboot with
+            # cancel_requested still set; without this check the manual
+            # retry endpoint, startup maintenance and any other
+            # resume_item caller would auto-resume a job the user
+            # explicitly stopped. The driver has its own identical check,
+            # but resume_item is the choke point every path funnels
+            # through — it must refuse on its own.
+            if item.get('cancel_requested'):
+                return False
+            status = item['status']
+            if status == JobStatus.CANCELLED:
+                checkpoint_dir = item.get('checkpoint_dir')
+                if not checkpoint_dir or not Path(str(checkpoint_dir)).is_dir():
+                    return False
+            elif status not in {JobStatus.PAUSED, JobStatus.ERROR, JobStatus.SHUTDOWN_TIMEOUT}:
                 return False
             # A timed-out cleanup can be released only after the callback
             # returned and every registered worker stopped.
@@ -632,12 +826,34 @@ class QueueManager:
                 item['config'] = updated_config
             item.update(status=JobStatus.QUEUED, progress=0, progress_text='Queued (Resumed)', progress_seq=1,
                         progress_events=[{'seq': 1, 'progress': 0, 'text': 'Queued (Resumed)'}])
-            for key in ('error', 'error_detail', 'paused_reason', 'cancel_recovered', 'retryable', 'memory_warning'):
+            for key in ('error', 'error_detail', 'paused_reason', 'cancel_recovered', 'retryable', 'memory_warning', 'cancelled_at', 'cancel_reason', 'needs_human'):
                 item.pop(key, None)
         self._save_queue()
         with self._queue_condition:
             self._queue_condition.notify_all()
         print(f"Resumed job {job_id}")
+        return True
+
+    def mark_needs_human(self, job_id: str, reason: str) -> bool:
+        """Flag a job the driver cannot recover, for a human to look at.
+
+        Sets ``needs_human`` so the driver never loops on it, stamps the
+        reason as the visible progress text, and records a progress event.
+        Never raises; returns False when the job is gone. A later manual
+        resume (via :meth:`resume_item`) clears the flag.
+        """
+        clean = str(reason or '').strip() or 'Needs a human to look at this job.'
+        with self._queue_lock:
+            item = self.get_item(job_id)
+            if not item:
+                return False
+            item['needs_human'] = True
+            item['progress_text'] = clean
+        self._save_queue()
+        try:
+            self.record_debugger_event(job_id, clean)
+        except Exception:
+            pass
         return True
 
     def record_debugger_event(self, job_id: str, text: str) -> bool:
@@ -793,68 +1009,209 @@ class QueueManager:
         compact["result"] = result_summary
         return compact
 
-    def get_status(self, compact: bool = False, owner_id: Optional[str] = None) -> Dict:
-        """Get queue status for API; compact mode keeps polling responsive."""
-        with self._queue_lock:
-            if compact:
-                # Do not deep-copy the full historical manifests before
-                # trimming them. That was the remaining source of latency on
-                # the polling endpoint even after the response was compacted.
-                status_fields = (
-                    'id', 'created_at', 'started_at', 'completed_at', 'status',
-                    'progress', 'progress_text', 'progress_seq', 'progress_events',
-                    'type', 'error', 'error_detail', 'paused_reason',
-                    'cancel_requested', 'retryable', 'memory_warning',
-                    'checkpoint_dir', 'edit_plan_path', 'last_run_id', 'config', 'result',
-                )
-                items = []
-                for raw_item in self.queue:
-                    if not isinstance(raw_item, dict):
-                        continue
-                    if owner_id is not None and (raw_item.get('config') or {}).get('auth_user_id') != owner_id:
-                        continue
-                    item = {
-                        key: raw_item.get(key)
-                        for key in status_fields
-                        if key in raw_item
-                    }
-                    if isinstance(item.get('config'), dict):
-                        item['config'] = _redact_sensitive_data(item['config'])
-                    items.append(_redact_sensitive_data(self._compact_status_item(item)))
-            else:
-                items = _redact_sensitive_data([item for item in self.queue if owner_id is None or
-                    (item.get('config') or {}).get('auth_user_id') == owner_id])
-            visible_ids = {item['id'] for item in items}
-            active = {
-                job_id: {
-                    'run_id': state.get('run_id'),
-                    'attempt': state.get('attempt'),
-                    'cancellation_requested': bool(state.get('context') and state['context'].cancelled()),
-                    'requested_at': state.get('requested_at'),
-                    'active_processes': state.get('context').active_process_count() if state.get('context') else 0,
-                    'active_futures': state.get('context').active_future_count() if state.get('context') else 0,
-                    'cancellation_acknowledged': bool(state.get('cancellation_acknowledged', False)),
-                    'cleanup_status': state.get('cleanup_status') or ('stopping' if state.get('context') and state['context'].cancelled() else 'running'),
-                    'quiesced_at': state.get('quiesced_at'),
+    # Status snapshot TTLs: compact payloads build in ~0.2s (the UI polls
+    # this); full payloads walk ~38 MB of completed-job manifests (~17s of
+    # redact), so they are cached longer. Both are served from cache when
+    # the queue lock is busy, so the endpoint answers in <1s under load.
+    _STATUS_CACHE_TTL_COMPACT_SECONDS = 2.0
+    _STATUS_CACHE_TTL_FULL_SECONDS = 5.0
+    _STATUS_LOCK_TIMEOUT_SECONDS = 0.5
+
+    def _status_cache_state(self):
+        """Return (cache_dict, lock) for the status snapshot cache.
+
+        Normally created in __init__; lazily created here because tests
+        build bare QueueManager instances with object.__new__ (no
+        __init__) and set only the fields they need. The setdefault
+        dance converges on one lock even if two threads race the first
+        access.
+        """
+        cache = self.__dict__.get('_status_cache')
+        if cache is None:
+            cache = self.__dict__.setdefault('_status_cache', {})
+        lock = self.__dict__.get('_status_cache_lock')
+        if lock is None:
+            self.__dict__.setdefault('_status_cache_lock', threading.Lock())
+            lock = self.__dict__['_status_cache_lock']
+        return cache, lock
+
+    def _status_cache_get(self, compact: bool, owner_id: Optional[str]):
+        """Return (payload, is_stale, structure_sig) for the cached status.
+
+        ``structure_sig`` is the (id, status) tuple the payload was built
+        from; a caller compares it with the live queue to notice items
+        being added/removed or changing status.
+        """
+        cache, lock = self._status_cache_state()
+        with lock:
+            entry = cache.get((compact, owner_id))
+        if entry is None:
+            return None, False, None
+        built_at, payload, sig = entry
+        ttl = (self._STATUS_CACHE_TTL_COMPACT_SECONDS if compact
+               else self._STATUS_CACHE_TTL_FULL_SECONDS)
+        return payload, (time.monotonic() - built_at) > ttl, sig
+
+    def _status_cache_put(self, compact: bool, owner_id: Optional[str],
+                          payload: Dict, sig):
+        cache, lock = self._status_cache_state()
+        with lock:
+            cache[(compact, owner_id)] = (time.monotonic(), payload, sig)
+
+    @staticmethod
+    def _status_structure_sig(queue_snapshot) -> tuple:
+        """Cheap (id, status) fingerprint of the queue's structure.
+
+        Progress values change every few seconds and are allowed to go
+        stale up to the cache TTL; additions, removals and status
+        transitions must be visible on the next poll, so they are part
+        of the fingerprint and force a rebuild when they change.
+        """
+        return tuple(
+            (item.get('id'), item.get('status'))
+            for item in queue_snapshot if isinstance(item, dict)
+        )
+
+    def _build_status_payload(self, queue_snapshot, active_snapshot, compact: bool,
+                              owner_id: Optional[str] = None) -> Dict:
+        """Build the status dict from lock-free snapshots (no lock held).
+
+        Callers pass shallow copies taken under _queue_lock; the expensive
+        redact/deep-copy of multi-MB manifests runs here, outside the
+        lock, so progress updates and cancellation never wait on it.
+        """
+        if compact:
+            # Do not deep-copy the full historical manifests before
+            # trimming them. That was the remaining source of latency on
+            # the polling endpoint even after the response was compacted.
+            status_fields = (
+                'id', 'created_at', 'started_at', 'completed_at', 'status',
+                'progress', 'progress_text', 'progress_seq', 'progress_events',
+                'type', 'error', 'error_detail', 'paused_reason',
+                'cancel_requested', 'retryable', 'memory_warning', 'needs_human',
+                'checkpoint_dir', 'edit_plan_path', 'last_run_id', 'config', 'result',
+            )
+            items = []
+            for raw_item in queue_snapshot:
+                if not isinstance(raw_item, dict):
+                    continue
+                if owner_id is not None and (raw_item.get('config') or {}).get('auth_user_id') != owner_id:
+                    continue
+                item = {
+                    key: raw_item.get(key)
+                    for key in status_fields
+                    if key in raw_item
                 }
-                for job_id, state in self.active_jobs.items()
-                if owner_id is None or job_id in visible_ids
+                if isinstance(item.get('config'), dict):
+                    item['config'] = _redact_sensitive_data(item['config'])
+                items.append(_redact_sensitive_data(self._compact_status_item(item)))
+        else:
+            items = _redact_sensitive_data([item for item in queue_snapshot if owner_id is None or
+                (item.get('config') or {}).get('auth_user_id') == owner_id])
+        visible_ids = {item['id'] for item in items}
+        active = {
+            job_id: {
+                'run_id': state.get('run_id'),
+                'attempt': state.get('attempt'),
+                'cancellation_requested': bool(state.get('context') and state['context'].cancelled()),
+                'requested_at': state.get('requested_at'),
+                'active_processes': state.get('context').active_process_count() if state.get('context') else 0,
+                'active_futures': state.get('context').active_future_count() if state.get('context') else 0,
+                'cancellation_acknowledged': bool(state.get('cancellation_acknowledged', False)),
+                'cleanup_status': state.get('cleanup_status') or ('stopping' if state.get('context') and state['context'].cancelled() else 'running'),
+                'quiesced_at': state.get('quiesced_at'),
             }
+            for job_id, state in active_snapshot.items()
+            if owner_id is None or job_id in visible_ids
+        }
+        return {
+            'items': items,
+            'active_jobs': list(active),
+            'active_job_state': active,
+        }
+
+    def get_status(self, compact: bool = False, owner_id: Optional[str] = None) -> Dict:
+        """Get queue status for API; compact mode keeps polling responsive.
+
+        Never blocks on the queue lock: a brief snapshot is taken under
+        it (0.5s timeout) and the payload is built outside it. A fresh
+        cached snapshot is served when the queue structure (item ids and
+        statuses) is unchanged — progress values may lag up to the cache
+        TTL. When the lock is busy and only a stale snapshot exists, the
+        stale payload is served with ``snapshot_stale: true`` — a
+        slightly old progress reading beats a timed-out poll.
+        """
+        snapshot = None
+        acquired = self._queue_lock.acquire(timeout=self._STATUS_LOCK_TIMEOUT_SECONDS)
+        if acquired:
+            try:
+                queue_snapshot = [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in self.queue
+                ]
+                active_snapshot = {
+                    job_id: dict(state) for job_id, state in self.active_jobs.items()
+                }
+                worker_running = self.worker_running
+                worker_count = int(self.worker_count or 1)
+                sig = self._status_structure_sig(queue_snapshot)
+                snapshot = (queue_snapshot, active_snapshot, worker_running,
+                            worker_count, sig)
+            except RuntimeError:
+                # A lock-free progress mutation raced the snapshot copy;
+                # treat the lock as busy and serve the cache below.
+                snapshot = None
+            finally:
+                self._queue_lock.release()
+        if snapshot is None:
+            cached, stale, _sig = self._status_cache_get(compact, owner_id)
+            if cached is not None:
+                return dict(cached, snapshot_stale=True) if stale else dict(cached)
             return {
-                'items': items,
+                'items': [],
                 'worker_running': self.worker_running,
                 'worker_count': int(self.worker_count or 1),
-                'active_jobs': list(active),
-                'active_job_state': active,
+                'active_jobs': [],
+                'active_job_state': {},
+                'snapshot_stale': True,
+                'snapshot_empty': True,
             }
+        queue_snapshot, active_snapshot, worker_running, worker_count, sig = snapshot
+        cached, stale, cached_sig = self._status_cache_get(compact, owner_id)
+        if cached is not None and not stale and cached_sig == sig:
+            return dict(cached)
+        try:
+            payload = self._build_status_payload(
+                queue_snapshot, active_snapshot, compact, owner_id)
+        except RuntimeError:
+            # A concurrent mutation raced the lock-free build; retry once
+            # with the lock held (old behaviour, bounded).
+            with self._queue_lock:
+                queue_snapshot = copy.deepcopy(self.queue)
+                active_snapshot = {
+                    job_id: dict(state) for job_id, state in self.active_jobs.items()
+                }
+            payload = self._build_status_payload(
+                queue_snapshot, active_snapshot, compact, owner_id)
+        payload['worker_running'] = worker_running
+        payload['worker_count'] = worker_count
+        self._status_cache_put(compact, owner_id, payload, sig)
+        return dict(payload)
 
     def get_item_snapshot(self, job_id: str, owner_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Return one redacted queue item, including its full manifest."""
+        """Return one redacted queue item, including its full manifest.
+
+        The item is shallow-copied under the lock; the ~1s redact of a
+        multi-MB manifest runs outside it, like get_status.
+        """
         with self._queue_lock:
             item = next((row for row in self.queue if row.get('id') == job_id), None)
             if item and owner_id is not None and (item.get('config') or {}).get('auth_user_id') != owner_id:
                 return None
-            return _redact_sensitive_data(dict(item)) if isinstance(item, dict) else None
+            snapshot = dict(item) if isinstance(item, dict) else None
+        if snapshot is None:
+            return None
+        return _redact_sensitive_data(snapshot)
 
     # =========================================================================
     # WORKER MANAGEMENT
@@ -941,6 +1298,24 @@ class QueueManager:
                     # racing the DELETE response and makes the UI's
                     # cancellation_requested state reliable to pollers.
                     pause_text = _RECOVERY_PAUSE_TEXT.get(item.get('paused_reason'))
+                    if not pause_text and not state.get('requested_at'):
+                        # System-caused cancellation with no user request:
+                        # the delivery-deadline watchdog (and the preparation
+                        # stall path) cancels directly, without staging the
+                        # resumable pause the heartbeat path stages. Land
+                        # these as PAUSED instead of CANCELLED so the job
+                        # auto-resumes from its checkpoint on the next
+                        # startup instead of being lost. A job the user
+                        # cancelled (requested_at set) always stays CANCELLED.
+                        system_pause = _system_cancel_pause_reason(
+                            getattr(cancellation, 'reason', '')
+                        )
+                        if system_pause:
+                            item['paused_reason'] = system_pause
+                            item['cancel_reason'] = str(
+                                getattr(cancellation, 'reason', '') or ''
+                            )
+                            pause_text = _RECOVERY_PAUSE_TEXT.get(system_pause)
                     if not state.get('requested_at') and pause_text:
                         item['status'] = JobStatus.PAUSED
                         item['progress_text'] = pause_text

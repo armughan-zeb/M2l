@@ -203,7 +203,7 @@ def main(argv=None):
     commands.add_parser('start').add_argument('--recover', action='store_true')
     commands.add_parser('capabilities')
     commands.add_parser('pending')
-    for name in ('request', 'job', 'retry', 'reuse'):
+    for name in ('request', 'job', 'retry', 'reuse', 'claim'):
         commands.add_parser(name).add_argument('id')
     commands.add_parser('submit').add_argument('file')
     answer = commands.add_parser('answer')
@@ -245,14 +245,41 @@ def main(argv=None):
                 content = json.loads(content)
             except ValueError:
                 pass
-            result = _json_http(url + '/api/agent/requests/' + args.id + '/complete', key=key, body={'content': content})
+            # Claimant marks this answer as the hook agent's, so the bridge
+            # can tell it apart from the daemon's resident inbox (both run
+            # as 'local-user'). Without it, a claim held by the daemon
+            # would refuse this answer as "claimed by another worker".
+            result = _json_http(url + '/api/agent/requests/' + args.id + '/complete', key=key, body={'content': content, 'claimant': 'hook-agent'})
+        elif args.command == 'claim':
+            result = _json_http(url + '/api/agent/requests/' + args.id + '/claim', key=key, body={'claimant': 'hook-agent'})
         elif args.command == 'retry':
             result = _json_http(url + '/api/agent/jobs/' + args.id + '/retry', key=key, body={})
         else:
-            path = {'capabilities': '/api/agent/capabilities', 'pending': '/api/agent/requests',
-                    'request': '/api/agent/requests/' + str(getattr(args, 'id', '')),
-                    'job': '/api/agent/jobs/' + str(getattr(args, 'id', ''))}[args.command]
-            result = _json_http(url + path, key=key)
+            if args.command == 'request':
+                result = _json_http(url + '/api/agent/requests/' + str(getattr(args, 'id', '')), key=key)
+                if isinstance(result, dict) and result.get('id'):
+                    # Claim the request before composing: without a claim
+                    # the daemon's resident inbox and the pool race this
+                    # agent on the same request (2026-11-21, job
+                    # a42a1b7b — 6 answers lost to "already answered").
+                    # A live claim held by someone else means: skip it,
+                    # do not compose a duplicate answer.
+                    if result.get('state') == 'claimed' and result.get('claimed_by') not in (None, 'hook-agent'):
+                        print(json.dumps({'error': 'request claimed by ' + str(result.get('claimed_by')) + ' — skip it'}, ensure_ascii=False), file=sys.stderr)
+                        return 1
+                    try:
+                        claim = _json_http(url + '/api/agent/requests/' + str(getattr(args, 'id', '')) + '/claim', key=key, body={'claimant': 'hook-agent'})
+                    except Exception as exc:
+                        print(json.dumps({'error': 'could not claim request — skip it: ' + str(exc)}, ensure_ascii=False), file=sys.stderr)
+                        return 1
+                    if isinstance(claim, dict) and claim.get('claimed') is False:
+                        print(json.dumps({'error': 'request claimed by another worker — skip it'}, ensure_ascii=False), file=sys.stderr)
+                        return 1
+                    result['claimed'] = True
+            else:
+                path = {'capabilities': '/api/agent/capabilities', 'pending': '/api/agent/requests',
+                        'job': '/api/agent/jobs/' + str(getattr(args, 'id', ''))}[args.command]
+                result = _json_http(url + path, key=key)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

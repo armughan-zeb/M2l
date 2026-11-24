@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate
+from .base_source import BaseSource, ImageCandidate, request_proxies
 
 
 def _text(value: object, limit: int = 500) -> str:
@@ -43,6 +43,7 @@ class LibraryOfCongressSource(BaseSource):
         query: str,
         limit: int = 20,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         clean = self._clean_query(query, max_words=8)
         if not clean:
@@ -58,6 +59,7 @@ class LibraryOfCongressSource(BaseSource):
             response = self.session.get(
                 self.API_URL,
                 params=params,
+                proxies=request_proxies(direct),
                 timeout=self.timeout,
             )
             response.raise_for_status()

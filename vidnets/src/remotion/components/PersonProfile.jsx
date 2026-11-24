@@ -1,5 +1,7 @@
 import React from 'react';
-import { AbsoluteFill, Img, OffthreadVideo, interpolate, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AbsoluteFill, Img, interpolate, useCurrentFrame, useVideoConfig } from 'remotion';
+// @remotion/media Video decodes faster than OffthreadVideo (Remotion 4); aliased to the old name so call sites stay unchanged.
+import { Video as OffthreadVideo } from '@remotion/media';
 import { computeSpringEnter, computeEntranceStyle } from '../engine/MotionEngine';
 import { documentaryTypography, fittedDocumentarySize } from '../engine/DocumentaryTypography';
 import { spokenPhraseFrame } from '../engine/DirectorMotion';
@@ -76,7 +78,7 @@ export function PersonProfile({ scene = {}, visualDNA = {}, props = {}, asset = 
                 opacity: enter,
                 transform: `translateY(${((1 - enter) * 28).toFixed(2)}px) scale(${(.985 + enter * .015).toFixed(4)})`,
                 clipPath: `inset(0 0 ${interpolate(enter, [0, 1], [100, 0]).toFixed(2)}% 0)`,
-                filter: `drop-shadow(0 18px 30px rgba(0,0,0,.42)) drop-shadow(0 0 16px ${palette.accent || '#D9A441'}35)`,
+                boxShadow: `0 18px 30px rgba(0,0,0,.42), 0 0 16px ${palette.accent || '#D9A441'}35`,
               }}
             />
           </div>
@@ -128,7 +130,7 @@ export function PersonProfile({ scene = {}, visualDNA = {}, props = {}, asset = 
           transform: `translateY(${reveal}px)`,
           color: palette.primary || '#F8FAFC',
           textAlign: textSide,
-          filter: 'drop-shadow(0 3px 16px rgba(0,0,0,.72))',
+          textShadow: '0 3px 16px rgba(0,0,0,.72)',
         }}
       >
         {role && (

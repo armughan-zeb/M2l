@@ -13,7 +13,33 @@ from typing import Any, Dict, List
 
 MAX_REMOTION_WORKERS = 8
 MIN_REMOTION_WORKERS = 1
-MIN_REMOTION_AVAILABLE_MB = 384
+# Admission floor for one serial 1080p worker (MB of *available* RAM).
+# The old 768 MB floor sat above this VM's steady-state available memory
+# (~350-650 MB), so the GTA VI job waited forever: a render needs the
+# browser tree (~353 MB RSS, measured on a trivial 1080p page) plus the
+# render Node process and ffmpeg (~150 MB) just to load — about 500 MB.
+# 512 sits just above that load minimum and below the proven-completion
+# band (Wright completed at 615 MB available, GTA VI progressed at
+# 830 MB). Below the floor the job waits (retryable, resumable) instead
+# of starting a browser it cannot back. Keep in sync with
+# MIN_REMOTION_AVAILABLE_MB in vidnets/scripts/render-remotion-manifest.js
+# (JS gate for direct renders).
+MIN_REMOTION_AVAILABLE_MB = 512
+# Honest resident working set of one serial 1080p worker (Nov 16, 2026):
+# the measured ~353 MB headless-shell browser tree, plus ~150 MB for the
+# render Node process and the ffmpeg encoder, plus ~50 MB of headroom.
+# The old budget summed the CONFIG caps (media 240 + decoder 256 +
+# worker 400 + reserve 555 + margin 96 = 1547 MB) as if all were resident
+# at once; they are not — the media and decoder caches are caps that only
+# grow to what the current section decodes. The gate budgets the working
+# set against headroom (available + free swap); swap absorbs the
+# difference (Wright completed with 409 MB of swap in use).
+WORKER_WORKING_SET_MB = 550
+# Resident cache working set for the section being rendered: 64 MB of
+# decoder cache (8 decoded 1080p RGBA frames) + 96 MB of media cache.
+# The CONFIG values passed to Remotion (media 240, video 256 MB) are
+# caps, not allocations, and are untouched.
+CACHE_WORKING_SET_MB = 160
 
 # How often the render memory wait re-checks admission (seconds). The old
 # loop slept 2s; a media worker that frees memory was therefore noticed up
@@ -305,15 +331,17 @@ def _memory_snapshot() -> Dict[str, int]:
         import psutil
 
         memory = psutil.virtual_memory()
+        swap = psutil.swap_memory()
         process_rss = psutil.Process(os.getpid()).memory_info().rss
         return {
             "total_mb": int(memory.total // (1024 * 1024)),
             "available_mb": int(memory.available // (1024 * 1024)),
             "free_mb": int(memory.free // (1024 * 1024)),
+            "swap_free_mb": int(swap.free // (1024 * 1024)),
             "process_rss_mb": int(process_rss // (1024 * 1024)),
         }
     except Exception:
-        return {"total_mb": 0, "available_mb": 0, "free_mb": 0, "process_rss_mb": 0}
+        return {"total_mb": 0, "available_mb": 0, "free_mb": 0, "swap_free_mb": 0, "process_rss_mb": 0}
 
 
 def _trim_current_process_working_set() -> bool:
@@ -434,13 +462,32 @@ def select_remotion_workers(
     height: int = 1080,
     cpu_count: int | None = None,
     video_heavy: bool = False,
+    swap_free_mb: int = 0,
 ) -> Dict[str, int]:
-    """Scale workers by headroom, admitting one worker above the paging floor."""
+    """Scale workers by headroom, admitting one worker above the paging floor.
+
+    The serial fallback budgets the resident working set against headroom
+    (available + free swap), not the sum of the Remotion CONFIG caps: the
+    media/decoder caches are caps, not allocations. See the module header.
+    """
     total_bytes = max(1, int(total_mb)) * 1024 * 1024
     available_bytes = max(0, int(available_mb)) * 1024 * 1024
     cpu_total = max(1, int(cpu_count or os.cpu_count() or 1))
     cpu_limit = max(1, min(MAX_REMOTION_WORKERS, cpu_total - 1 if cpu_total > 2 else cpu_total))
+    # Two reserves, two different questions (Nov 16, 2026):
+    # - The SCALING reserve (7% of RAM, 384 MB-2 GB) prices parallelism:
+    #   how many workers fit. It is deliberately conservative and pins
+    #   the scaling curve (2 workers at 1800 MB, 1 at 1500 MB on an 8 GB
+    #   box); cutting it would advertise workers the VM cannot back.
+    # - The ADMISSION reserve (2% of RAM, 128-256 MB) prices the actual
+    #   headroom the already-running server/daemon need to grow during a
+    #   render. Their RSS is already excluded from "available", so a 7%
+    #   admission reserve would double-count memory they already hold —
+    #   that double-count is what priced every steady-state render out
+    #   of existence (bar 1283 MB vs 600 MB available + 600 MB swap).
+    #   The working-set bar below uses the admission reserve only.
     reserve_bytes = min(2 * 1024**3, max(384 * 1024**2, int(total_bytes * 0.07)))
+    admission_reserve_bytes = min(256 * 1024**2, max(128 * 1024**2, int(total_bytes * 0.02)))
     frame_bytes = max(1, int(width)) * max(1, int(height)) * 4
     configured_worker_mb = 256
     # Frame buffers are pipelining, not output quality: in extreme
@@ -455,13 +502,23 @@ def select_remotion_workers(
     worker_bytes = configured_worker_mb * 1024**2 + frame_bytes * frame_buffers + worker_overhead_mb * 1024**2
     shared_bytes = ((128 if available_mb < 3072 else 256) + 96) * 1024**2
     raw_memory_limit = max(0, (available_bytes - reserve_bytes - shared_bytes) // max(1, worker_bytes + 64 * 1024**2))
-    # The reserve is a parallelism budget, not a mandatory allocation. Under
-    # pressure it can exceed all available RAM and incorrectly prevent even a
-    # single worker from starting forever. Permit serial rendering above the
-    # admission floor; its actual working set still depends on scene contents.
-    single_worker_fallback = available_mb >= MIN_REMOTION_AVAILABLE_MB and raw_memory_limit < 1
-    memory_limit = max(MIN_REMOTION_WORKERS, raw_memory_limit) if available_mb >= MIN_REMOTION_AVAILABLE_MB else 0
+    # Working-set gate: a serial render is admitted when the browser can
+    # load (available clears the floor) and the working set fits in
+    # headroom (available + free swap). Swap is real headroom here —
+    # Wright completed with 409 MB of it in use. The old check summed the
+    # CONFIG caps and demanded ~1547 MB on a VM that steadies at
+    # 350-650 MB, so no render could ever start.
+    headroom_mb = int(available_mb) + max(0, int(swap_free_mb))
+    working_set_mb = int(admission_reserve_bytes // (1024**2)) + WORKER_WORKING_SET_MB + CACHE_WORKING_SET_MB
+    serial_ok = available_mb >= MIN_REMOTION_AVAILABLE_MB and headroom_mb >= working_set_mb
+    single_worker_fallback = serial_ok and raw_memory_limit < 1
+    memory_limit = max(MIN_REMOTION_WORKERS, raw_memory_limit) if (raw_memory_limit >= 1 or serial_ok) else 0
     selected = min(MAX_REMOTION_WORKERS, cpu_limit, int(memory_limit))
+    # No sub-2GB serial cap here: the JS renderer (adaptiveConcurrency)
+    # is the authoritative enforcer at render time and already forces
+    # concurrency 1 below 2 GB available. This preflight plan scales
+    # workers by headroom (2 at 1800 MB), and capping it here would
+    # contradict that scaling contract and the renderer's own decision.
     # The memory estimate is a hard ceiling. Do not force a second worker just
     # because the machine has multiple cores; low-RAM renders stay serial.
     return {
@@ -472,13 +529,19 @@ def select_remotion_workers(
         "raw_memory_limit": int(raw_memory_limit),
         "single_worker_fallback": int(single_worker_fallback),
         "available_mb": int(available_mb),
+        "swap_free_mb": max(0, int(swap_free_mb)),
+        "headroom_mb": headroom_mb,
+        "working_set_mb": working_set_mb,
+        "worker_working_set_mb": WORKER_WORKING_SET_MB,
+        "cache_working_set_mb": CACHE_WORKING_SET_MB,
+        "admission_reserve_mb": int(admission_reserve_bytes // (1024 * 1024)),
         "reserve_mb": int(reserve_bytes // (1024 * 1024)),
         "estimated_worker_mb": int(round(worker_bytes / (1024 * 1024))),
         "frame_buffers": frame_buffers,
         "worker_overhead_mb": worker_overhead_mb,
         "video_heavy": int(bool(video_heavy)),
         "minimum_available_mb": MIN_REMOTION_AVAILABLE_MB,
-        "preferred_available_mb": int((reserve_bytes + shared_bytes + worker_bytes + 64 * 1024**2) // (1024**2) + 1),
+        "preferred_available_mb": working_set_mb,
     }
 
 
@@ -487,13 +550,14 @@ def render_memory_status() -> Dict[str, Any]:
     snapshot = dict(_memory_snapshot())
     known = int(snapshot.get('total_mb') or 0) > 0
     available = max(0, int(snapshot.get('available_mb') or 0))
-    plan = select_remotion_workers(available, int(snapshot.get('total_mb') or 0), video_heavy=True)
+    swap_free = max(0, int(snapshot.get('swap_free_mb') or 0))
+    plan = select_remotion_workers(available, int(snapshot.get('total_mb') or 0), video_heavy=True, swap_free_mb=swap_free)
     blocked = known and plan['recommended_workers'] < MIN_REMOTION_WORKERS
     warning = known and (available < 1024 or bool(plan.get('single_worker_fallback')))
     state = 'unknown' if not known else ('waiting' if blocked else ('low_memory' if warning else 'ready'))
     message = (
         'Memory measurement is unavailable; the renderer will check before starting.' if not known else
-        f'Waiting for memory: {available} MB available; {MIN_REMOTION_AVAILABLE_MB} MB is needed before starting a render.' if blocked else
+        f'Waiting for memory: {available} MB available + {swap_free} MB swap free; {plan["working_set_mb"]} MB of headroom is needed before starting a render.' if blocked else
         f'Low-memory mode: {available} MB available. Rendering can continue with one worker.' if warning else
         'Memory headroom is sufficient for rendering.'
     )
@@ -547,6 +611,7 @@ def prepare_render_resources(
         width=width,
         height=height,
         video_heavy=video_heavy,
+        swap_free_mb=after.get("swap_free_mb", 0),
     ) if require_remotion else {
         "recommended_workers": 0,
         "max_workers": MAX_REMOTION_WORKERS,
@@ -600,6 +665,7 @@ def prepare_render_resources(
             width=width,
             height=height,
             video_heavy=video_heavy,
+            swap_free_mb=after_recovery.get("swap_free_mb", 0),
         )
         if recovery_plan.get("recommended_workers", 0) >= MIN_REMOTION_WORKERS:
             snapshot.update(
@@ -610,12 +676,13 @@ def prepare_render_resources(
             )
             return snapshot
         # A held render must be unmistakable in the server log: one line
-        # naming the measured headroom and the floor, so the wrapper/job
+        # naming the measured headroom and the working-set bar, so the wrapper/job
         # error is never mistaken for unanswered inference requests.
         print(
             "   [render-memory] HELD: render refused: only "
-            f"{after_recovery.get('available_mb', 0)} MB available; at least "
-            f"{MIN_REMOTION_AVAILABLE_MB} MB is needed for one Remotion worker. "
+            f"{after_recovery.get('available_mb', 0)} MB available + "
+            f"{after_recovery.get('swap_free_mb', 0)} MB swap free; "
+            f"{recovery_plan.get('working_set_mb', MIN_REMOTION_AVAILABLE_MB)} MB of headroom is needed for one Remotion worker. "
             "Free memory and retry.",
             flush=True,
         )
@@ -627,10 +694,12 @@ def prepare_render_resources(
             if after_recovery.get(key) is not None:
                 snapshot[key] = int(after_recovery[key])
         snapshot["available_at_raise_mb"] = int(after_recovery.get("available_mb") or 0)
+        snapshot["swap_free_at_raise_mb"] = int(after_recovery.get("swap_free_mb") or 0)
         raise RenderMemoryLowError(
             "Available memory is below the admission floor for one Remotion worker. "
-            f"Only {after_recovery.get('available_mb', 0)} MB is available; "
-            f"at least {MIN_REMOTION_AVAILABLE_MB} MB is needed to attempt serial rendering. "
+            f"Only {after_recovery.get('available_mb', 0)} MB is available + "
+            f"{after_recovery.get('swap_free_mb', 0)} MB swap free; "
+            f"{recovery_plan.get('working_set_mb', MIN_REMOTION_AVAILABLE_MB)} MB of headroom is needed to attempt serial rendering. "
             "Free memory and retry.",
             snapshot,
         )

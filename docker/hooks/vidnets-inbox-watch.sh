@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# Watches the Vidnets agent-bridge inbox for new pending requests (text or
+# vision) from the running jobs, so Muse can answer them as the operator
+# before their TTL expires. Re-wakes for a still-pending request if it has
+# not been woken recently (240s normally; 120s for scriptit.* requests,
+# whose file-based bridge wall is the tightest. The hook polls every 20s,
+# so a 120s re-wake nudges a still-pending draft every sixth poll. The
+# longer re-wake matters because composing a full answer takes minutes —
+# re-waking at 120s used to launch a second worker for the same request
+# while the first was still writing, and the loser got a 400.
+# Agent-request TTLs are floored at 600s server-side
+# (VIDZEO_AGENT_MIN_WALL_SECONDS) and 600s on the ScriptIT bridge.
+#
 # Legacy wake-up path when a resident Muse inference transport is unavailable.
 # INSTALL (host Muse VM, not the container):
 #   1. Edit BRIDGE below: the extracted repo dir + /data/runtime/temp/agent-bridge.

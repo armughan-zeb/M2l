@@ -98,8 +98,10 @@ def repair_failed_shots(manifest, config=None, client=None):
         # The repair call answers through the polling inbox, so it needs the
         # full agent answer floor — a 30s budget expires before the answer
         # arrives (the phase scope below caps the request wall at it).
-        from services.agent_bridge import AGENT_REQUEST_WALL_SECONDS
-        agent_wall = AGENT_REQUEST_WALL_SECONDS
+        try:
+            agent_wall = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600") or 3600))
+        except (TypeError, ValueError):
+            agent_wall = 3600.0
         repair_seconds = max(repair_seconds, agent_wall)
     budget = max(0, min(repair_seconds, remaining_seconds(900) - reserve))
     if budget < .01:

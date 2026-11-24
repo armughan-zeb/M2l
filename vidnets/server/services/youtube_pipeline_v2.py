@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import uuid
 from collections import Counter, defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -41,11 +42,130 @@ from .youtube_query_normalizer import normalize_youtube_query, normalize_youtube
 from .yt_dlp_runtime import runtime_receipt, YouTubeRuntimeLog
 from .scene_entities import comparison_pair_conflict, explicit_named_pairs
 
+# Candidate scoring (``_score_candidate``) runs the shared clip classifiers
+# once per (scene, candidate) pair — ~2,000 calls for an 11-scene job over a
+# 188-candidate pool — and those classifiers match hundreds of taxonomy
+# keywords with dynamically built regexes (``_keyword_in_text``). CPython's
+# ``re`` cache holds 512 patterns and clears entirely when full, so with a
+# ~679-pattern working set every call recompiled nearly every pattern:
+# measured 40 distinct scorings at 6.7 s CPU with the default cache vs
+# 1.3 s with room for the working set (second pass 6.5 s vs 0.8 s). Raise
+# the ceiling once, at import, so the working set stays compiled for the
+# life of the worker process. Only ever raise, never lower; a few MB of
+# compiled patterns is the entire cost.
+try:
+    re._MAXCACHE = max(int(getattr(re, "_MAXCACHE", 512) or 512), 8192)
+except (AttributeError, TypeError, ValueError):
+    pass
+
+
+# Niche-taxonomy memo (assignment wall). ``universal_clip_classifier.score_niches``
+# is a pure function of its text argument (reads only the NICHE_TAXONOMY
+# constant) and the YT assignment calls it ~2x per (scene, candidate) pair
+# through ``detect_niche_conflict`` -- once for the scene text, once for the
+# candidate text. The scene text repeats for every candidate of a scene and
+# the candidate text repeats for every scene, so the distinct inputs are
+# ~200 per job while the calls are ~4,000. Each call runs ~800 regex keyword
+# searches, so the uncached scan is the binding cost of assignment (measured
+# on the real run-7 pool: 56% of assignment CPU, 225k ``_keyword_in_text``
+# calls for 150 pairs). Cache it at the module attribute so
+# ``detect_niche_conflict`` -- its only caller, and itself imported only by
+# this module -- sees the cached version. A copy is returned because callers
+# get a mutable dict. Semantics are unchanged: same input, same scores.
+# Kill-switch: VIDZEO_YT_SCORE_NICHES_CACHE=0 restores the uncached call.
+try:
+    from . import universal_clip_classifier as _universal_clip_classifier
+
+    _score_niches_orig = _universal_clip_classifier.score_niches
+    _score_niches_cache: Dict[Any, Any] = {}
+
+    def _score_niches_cached(title: str, script_text: str = "") -> dict:
+        if os.environ.get("VIDZEO_YT_SCORE_NICHES_CACHE", "1") == "0":
+            return _score_niches_orig(title, script_text)
+        key = (title or "", script_text or "")
+        hit = _score_niches_cache.get(key)
+        if hit is None:
+            hit = _score_niches_orig(title, script_text)
+            if len(_score_niches_cache) >= 4096:
+                _score_niches_cache.clear()
+            _score_niches_cache[key] = hit
+        return dict(hit)
+
+    _universal_clip_classifier.score_niches = _score_niches_cached
+except Exception:
+    pass
+
 
 def _youtube_host_dns_failure(error) -> bool:
     text = str(error or '').lower()
-    return any(host in text for host in ('youtube.com', 'youtubei.googleapis.com')) and any(
-        marker in text for marker in ('failed to resolve', 'getaddrinfo failed', 'name resolution'))
+    # yt-dlp wrappers do not always retain the hostname in the nested socket
+    # exception, so recognize DNS failures in this YouTube-only transport path
+    # even when the final error string contains only the resolver failure.
+    return any(marker in text for marker in (
+        'failed to resolve', 'getaddrinfo failed', 'name resolution',
+        'name or service not known', 'temporary failure in name resolution',
+    ))
+
+
+_YT_NETWORK_DIAGNOSTIC_LOCK = threading.Lock()
+_YT_NETWORK_DIAGNOSTIC: Dict[str, str] = {}
+
+
+def _network_disabled_by_runtime() -> bool:
+    return str(os.environ.get('CODEX_SANDBOX_NETWORK_DISABLED', '') or '').strip().lower() in {
+        '1', 'true', 'yes', 'on',
+    }
+
+
+def _record_youtube_network_failure(stage: str, error: Any = '') -> Dict[str, str]:
+    """Store a safe, actionable diagnosis and stop repeating a dead network call."""
+    detail = str(error or '').lower()
+    if _network_disabled_by_runtime():
+        code = 'network_disabled_by_sandbox'
+        message = (
+            'Outbound networking is disabled for this worker runtime '
+            '(CODEX_SANDBOX_NETWORK_DISABLED=1). Run Muse on a network-enabled '
+            'host; application code cannot override the runtime network policy.'
+        )
+    elif any(marker in detail for marker in (
+        'failed to resolve', 'getaddrinfo failed', 'name resolution',
+        'name or service not known', 'temporary failure in name resolution',
+        'provider_dns_unavailable', 'dns_resolution_failed',
+    )):
+        code = 'dns_resolution_failed'
+        message = (
+            'YouTube hostnames could not be resolved. Check the worker DNS '
+            'resolver and outbound DNS (UDP/TCP 53), then HTTPS access (TCP 443).'
+        )
+    elif any(marker in detail for marker in (
+        'network is unreachable', 'unreachable network', 'no route to host',
+        'connection refused', 'wsaenetunreach', 'winerror 10051', 'errno 101',
+    )):
+        code = 'outbound_network_unavailable'
+        message = 'The worker cannot reach the YouTube endpoint; check its route, firewall, and HTTPS egress.'
+    else:
+        code = 'youtube_transport_unavailable'
+        message = 'YouTube transport failed; inspect the stage log for the provider error.'
+    diagnostic = {'code': code, 'stage': str(stage or 'retrieval'), 'message': message}
+    if code not in {
+        'network_disabled_by_sandbox', 'dns_resolution_failed',
+        'outbound_network_unavailable',
+    }:
+        return diagnostic
+    with _YT_NETWORK_DIAGNOSTIC_LOCK:
+        if not _YT_NETWORK_DIAGNOSTIC:
+            _YT_NETWORK_DIAGNOSTIC.update(diagnostic)
+        return dict(_YT_NETWORK_DIAGNOSTIC)
+
+
+def _current_youtube_network_diagnostic() -> Dict[str, str]:
+    with _YT_NETWORK_DIAGNOSTIC_LOCK:
+        return dict(_YT_NETWORK_DIAGNOSTIC)
+
+
+def _reset_youtube_network_diagnostic() -> None:
+    with _YT_NETWORK_DIAGNOSTIC_LOCK:
+        _YT_NETWORK_DIAGNOSTIC.clear()
 
 
 def _youtube_js_runtime_options() -> Dict[str, Any]:
@@ -676,25 +796,144 @@ def _clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+_norm_cache: Dict[str, str] = {}
+
+
 def _norm(value: Any) -> str:
+    # Pure function called ~180k times per 11-scene assignment over the same
+    # handful of strings (subject, scene_text, title, channel per pair), so
+    # cache string inputs. Non-string inputs compute directly (uncached).
+    if isinstance(value, str):
+        hit = _norm_cache.get(value)
+        if hit is not None:
+            return hit
+        result = _norm_compute(value)
+        if len(_norm_cache) >= 8192:
+            _norm_cache.clear()
+        _norm_cache[value] = result
+        return result
+    return _norm_compute(value)
+
+
+def _norm_compute(value: Any) -> str:
     import unicodedata
     text = _clean_text(value).lower()
     text = ''.join(char for char in unicodedata.normalize('NFKD', text) if not unicodedata.combining(char))
     return re.sub(r"[^a-z0-9\s'-]+", " ", text).strip()
 
 
-# GTA VI is a separate game identity. GTA V footage is a different title and
-# must not be injected as a default supporting lane. A scene can request a
-# clearly labelled predecessor/comparison beat, but it must name GTA V and
-# express that comparison in the scene copy, as well as opt in via its plan.
+# GTA VI is a separate game identity, but relevance is SCENE-relative, not
+# title-absolute. A GTA VI script narrates GTA V too ("more than ten years
+# since Grand Theft Auto Five, a game that has sold more than two hundred
+# million copies"), so a scene about GTA V's sales/legacy may use GTA V
+# footage, while a scene about the VI trailers, Leonida, or Lucia and Jason
+# may not. The gate therefore compares the candidate's GTA entry against
+# the entries the SCENE is about (_scene_subject_games), never against the
+# video title alone. Spelled-out numerals count: "Grand Theft Auto Six"
+# is VI and "Grand Theft Auto Five" is V — the script spells them out.
+# The 2002 "GTA: Vice City" entry is never a VI scene's game: a bare
+# "Vice City" in scene copy is the new Vice City setting, not the 2002 game.
 _GTA_VI_RE = re.compile(
-    r"\b(?:grand theft auto\s*(?:vi|6)|gta\s*(?:vi|6)|gta six)\b",
+    r"\b(?:grand theft auto\s*(?:vi|6)|grand theft auto six|gta\s*(?:vi|6)|gta six)\b",
     re.IGNORECASE,
 )
 _GTA_V_RE = re.compile(
-    r"\b(?:grand theft auto\s*v|gta\s*v|gta\s*5)\b",
+    r"\b(?:grand theft auto\s*v(?![iv])|grand theft auto\s*5|grand theft auto five|gta\s*v(?![iv])|gta\s*5|gta five)\b",
     re.IGNORECASE,
 )
+_GTA_FRANCHISE_RE = re.compile(
+    r"\b(?:grand theft auto|gta)\b",
+    re.IGNORECASE,
+)
+_GTA_VICE_CITY_2002_RE = re.compile(
+    r"\b(?:grand theft auto|gta)\s*:?\s*vice city\b",
+    re.IGNORECASE,
+)
+_GTA_SAN_ANDREAS_RE = re.compile(
+    r"\b(?:grand theft auto|gta)\b[^.]{0,40}?\bsan andreas\b",
+    re.IGNORECASE,
+)
+
+
+def _gta_entries(text: str) -> set:
+    """Return every GTA entry a text names: ``vi``, ``v``, ``iv``, ``iii``,
+    ``san_andreas``, ``vice_city`` (2002), ``liberty_city_stories``.
+
+    Set-valued: a scene can name two entries at once. A bare "Vice City"
+    names no entry (it is the new Vice City setting in a GTA VI scene);
+    only a "GTA: Vice City" style mention names the 2002 game.
+    """
+    lowered = _norm(text or "")
+    if not _GTA_FRANCHISE_RE.search(lowered):
+        return set()
+    entries = set()
+    if _GTA_VI_RE.search(lowered):
+        entries.add("vi")
+    if _GTA_V_RE.search(lowered):
+        entries.add("v")
+    if re.search(r"\b(?:grand theft auto\s*iv|grand theft auto\s*4|gta\s*iv|gta\s*4)\b", lowered):
+        entries.add("iv")
+    if re.search(r"\b(?:grand theft auto\s*iii|grand theft auto\s*3|gta\s*iii|gta\s*3)\b", lowered):
+        entries.add("iii")
+    if _GTA_SAN_ANDREAS_RE.search(lowered):
+        entries.add("san_andreas")
+    if _GTA_VICE_CITY_2002_RE.search(lowered):
+        entries.add("vice_city")
+    return entries
+
+
+def _scene_subject_games(scene_text: str, subject: str = "",
+                         context: Optional[Dict[str, Any]] = None) -> set:
+    """Return the GTA entries a scene is about, from its narration first.
+
+    The scene's own copy is authoritative: a beat narrating GTA V's sales
+    names GTA V; a beat about the VI trailers names GTA VI; a beat naming
+    both (the proof job's scene 0) returns both. When the scene copy names
+    no entry, the row subject / domain anchor (the job topic, e.g. "Grand
+    Theft Auto VI") fills in. Empty set means the scene names no game and
+    no gate applies.
+    """
+    scene_games = _gta_entries(scene_text or "")
+    if scene_games:
+        return scene_games
+    anchor_text = " ".join([
+        str(subject or ""),
+        str((context or {}).get("domain_anchor") or ""),
+        str((context or {}).get("container_subject") or ""),
+    ])
+    return _gta_entries(anchor_text)
+
+
+def _scene_game_match(candidate: Dict[str, Any], scene_text: str, subject: str = "",
+                      context: Optional[Dict[str, Any]] = None,
+                      entry: str = "") -> bool:
+    """True when the candidate names GTA entry ``entry`` and the scene is about it."""
+    if entry:
+        return (entry in _scene_subject_games(scene_text, subject, context)
+                and entry in _gta_entries(" ".join([
+                    str(candidate.get("title") or ""),
+                    str(candidate.get("description") or ""),
+                    str(candidate.get("channel") or candidate.get("uploader") or ""),
+                ])))
+    scene_games = _scene_subject_games(scene_text, subject, context)
+    candidate_games = _gta_entries(" ".join([
+        str(candidate.get("title") or ""),
+        str(candidate.get("description") or ""),
+        str(candidate.get("channel") or candidate.get("uploader") or ""),
+    ]))
+    return bool(scene_games and candidate_games and (scene_games & candidate_games))
+
+
+# Canonical title per GTA entry, for scene-relative subject matching.
+_GTA_ENTRY_TITLES = {
+    "vi": "Grand Theft Auto VI",
+    "v": "Grand Theft Auto V",
+    "iv": "Grand Theft Auto IV",
+    "iii": "Grand Theft Auto III",
+    "san_andreas": "Grand Theft Auto: San Andreas",
+    "vice_city": "Grand Theft Auto: Vice City",
+    "liberty_city_stories": "Grand Theft Auto: Liberty City Stories",
+}
 _GTA_GAMEPLAY_TERMS = {
     "gameplay", "walkthrough", "mission", "missions", "open world",
     "driving", "driving gameplay", "raw gameplay", "no commentary",
@@ -729,7 +968,14 @@ def _scene_explicitly_requests_gta_v_comparison(
         str(row.get("visual_facet") or ""),
         str(row.get("gta_v_support_reason") or ""),
     )))
-    if not _GTA_V_RE.search(intent) or not _GTA_V_COMPARISON_TERMS.search(intent):
+    # The plan-level opt-in (gta_vi_supporting_gameplay, required above) IS
+    # the explicit allowance, so the scene copy need not also repeat the
+    # literal "GTA V" string: "supporting gameplay from the previous game"
+    # is an explicit comparison. The candidate itself must still name GTA V
+    # (checked in _gta_v_supporting_gameplay), and a negated instruction
+    # below still vetoes the exception. Never inferred from the GTA VI
+    # topic alone: without the plan flag this returns False above.
+    if not _GTA_V_COMPARISON_TERMS.search(intent):
         return False
     # Negative query instructions (for example, "avoid GTA V") never turn on
     # the exception, even if another word in the same note says "supporting".
@@ -762,6 +1008,99 @@ def _gta_v_supporting_gameplay(
     # second gameplay-positive check here so a GTA V trailer, news package, or
     # creator commentary cannot slip through as a supporting visual.
     return any(term in text for term in _GTA_GAMEPLAY_TERMS)
+
+
+# Non-GTA games whose footage routinely borrows GTA characters as
+# parody/crossover material ("GTA 6 in WWE 2K26", "GTA VI recreated in
+# Fortnite"). A clip whose title names one of these games, or whose
+# description places its footage inside one ("in / using / made in /
+# recreated in / remade in / built in <game>"), is footage OF that game,
+# not of GTA — no matter whose names it borrows. mHaQ_n03qeU ("JASON
+# DUVAL VS LUCIA CAMINOS ! #GTA6", "Gran Theft auto 6 in WWE 2k26")
+# scored 46.0 and became its scene's only download attempt because the
+# GTA-entry regexes never see it (misspelled "Gran" + hashtag "#GTA6"
+# has no word boundary), so the entry gate cannot catch it; this check
+# can. A bare passing mention in a description ("better than Fortnite")
+# does not block — only a title mention or a footage-provenance phrase
+# does. Channel is not consulted: a channel's name is weak evidence
+# about any one video's pixels.
+_CROSS_GAME_NAMES = (
+    r"wwe\s*2k(?:\s*\d{2,4})?",
+    r"fortnite",
+    r"minecraft",
+    r"roblox",
+    r"garry'?s\s*mod|gmod",
+    r"the\s+sims(?:\s*\d+)?",
+)
+_CROSS_GAME_TITLE_RES = tuple(
+    re.compile(r"\b(?:" + name + r")\b", re.IGNORECASE)
+    for name in _CROSS_GAME_NAMES
+)
+_CROSS_GAME_PROVENANCE_RES = tuple(
+    re.compile(
+        r"\b(?:in|using|made\s+in|recreated\s+in|remade\s+in|built\s+in)\s+(?:"
+        + name + r")\b",
+        re.IGNORECASE,
+    )
+    for name in _CROSS_GAME_NAMES
+)
+
+
+def _cross_game_footage(candidate: Dict[str, Any]) -> bool:
+    """True when a candidate's footage is from a non-GTA game."""
+    title = str(candidate.get("title") or "")
+    description = str(candidate.get("description") or "")
+    for pattern in _CROSS_GAME_TITLE_RES:
+        if pattern.search(title):
+            return True
+    for pattern in _CROSS_GAME_PROVENANCE_RES:
+        if pattern.search(description):
+            return True
+    return False
+
+
+def _gaming_exact_title_gate(candidate: Dict[str, Any], subject: str, scene_text: str,
+                             context: Optional[Dict[str, Any]] = None) -> bool:
+    """True when a gaming candidate must be blocked before download.
+
+    Round 15 (user order: topic track): numbered entries of one franchise
+    are the same topic — a GTA V clip passes for a GTA VI scene, as do
+    IV/III, and a franchise-only mention ("GTA gameplay" roundup) passes
+    as general topic footage; vision judges the actual frames, and
+    ranking still prefers the scene's own game. Only era entries stay
+    blocked: a 2002 Vice City cutscene or a San Andreas clip is blocked
+    for every GTA VI scene (no scene in a GTA VI story is about those
+    entries). A candidate that never mentions the franchise (real-world
+    B-roll) is not gated here — the subject/niche checks below judge it.
+    Scenes naming no game at all are not gated.
+
+    Cross-game footage is blocked first (see _cross_game_footage): a
+    WWE 2K26 / Fortnite / Minecraft clip borrowing GTA character names
+    is footage of that game, not of the scene's game, even when its GTA
+    mention is misspelled or hashtagged past the entry regexes.
+    """
+    scene_games = _scene_subject_games(scene_text, subject, context)
+    if not scene_games:
+        return False
+    if _cross_game_footage(candidate):
+        return True
+    text = " ".join([
+        str(candidate.get("title") or ""),
+        str(candidate.get("description") or ""),
+        str(candidate.get("channel") or candidate.get("uploader") or ""),
+    ])
+    candidate_games = _gta_entries(text)
+    if not candidate_games:
+        # Round 15: a franchise-only mention is general topic footage,
+        # not a provable mismatch — it passes the gate and vision judges
+        # the actual frames.
+        return False
+    # Round 15: only era entries stay blocked for scenes not about them.
+    era_entries = {"vice_city", "san_andreas", "liberty_city_stories"}
+    era = candidate_games & era_entries
+    if era:
+        return not bool(era & scene_games)
+    return False
 
 
 def _dedupe(values: Iterable[str]) -> List[str]:
@@ -1185,11 +1524,12 @@ def _hard_block_reason(candidate: Dict[str, Any]) -> str:
     # (for example, ``20.0``).  Do not let a formatting detail abort the whole
     # retrieval branch before any candidate is downloaded.
     try:
+        # Spec (Vidzeo Local): YouTube min source duration 20s.
         min_source_duration = float(
-            os.environ.get("VIDZEO_YT_MIN_SOURCE_DURATION", "12") or 12
+            os.environ.get("VIDZEO_YT_MIN_SOURCE_DURATION", "20") or 20
         )
     except (TypeError, ValueError):
-        min_source_duration = 12.0
+        min_source_duration = 20.0
     if duration and duration < min_source_duration:
         return "too_short"
     package_reason = _captioned_source_reason(candidate)
@@ -1453,7 +1793,121 @@ def _verified_publisher_affinity(candidate: Dict[str, Any], subject: str) -> flo
     return 40.0 if subject == channel or subject.startswith(channel + ' ') else 0.0
 
 
-def _score_candidate(candidate: Dict[str, Any], subject: str, scene_text: str, query: str, context: Optional[Dict[str, Any]] = None) -> float:
+# Memo for ``_score_candidate`` (run 7: the same (scene, candidate) pair is
+# scored three times — assignment, the download pool re-sort, and the
+# layered-options build — at ~0.17 s CPU per distinct candidate before the
+# regex-cache fix above, so one 11-scene job re-paid the full classifier
+# cost twice over). The score is a pure function of the candidate's
+# metadata, the scene text, and the retrieval context, so the wrapper
+# caches the float plus the small mutation diff the scorer stamps on the
+# candidate (``v2_reject_reason``, ``v2_soft_source_penalty``, game tags,
+# ...) and replays it on a hit — a repeat scoring must be indistinguishable
+# from a fresh one, including the side effects the assignment loop reads.
+# Bounded (8192 entries, cleared when full) and keyed on every input that
+# can change the score, including the scoring env flags, so a flag change
+# mid-process cannot serve a stale verdict. Kill-switch:
+# ``VIDZEO_YT_SCORE_CACHE=0``.
+_SCORE_CANDIDATE_CACHE_MAX = 8192
+_score_candidate_cache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any], Tuple[str, ...]]] = {}
+_SCORE_CACHE_DELETED = object()
+
+
+def _score_candidate_cache_key(
+    candidate: Dict[str, Any],
+    subject: str,
+    scene_text: str,
+    query: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, ...]:
+    ctx = context if isinstance(context, Mapping) else {}
+    requirement = ctx.get("visual_requirement")
+    requirement = requirement if isinstance(requirement, Mapping) else {}
+    try:
+        positive_terms = tuple(str(term) for term in (ctx.get("retrieval_positive_terms") or ()))
+    except TypeError:
+        positive_terms = ()
+    try:
+        negative_terms = tuple(str(term) for term in (ctx.get("retrieval_negative_terms") or ()))
+    except TypeError:
+        negative_terms = ()
+    try:
+        incoming_penalty = float(candidate.get("v2_soft_source_penalty") or 0.0)
+    except (TypeError, ValueError):
+        incoming_penalty = 0.0
+    return (
+        str(candidate.get("video_id") or candidate.get("id") or ""),
+        str(candidate.get("title") or "")[:300],
+        str(candidate.get("description") or "")[:500],
+        str(candidate.get("channel") or candidate.get("uploader") or "")[:200],
+        str(candidate.get("duration") or ""),
+        bool(candidate.get("prep_manifest_injected")),
+        incoming_penalty,
+        str(subject or ""),
+        str(scene_text or ""),
+        str(query or ""),
+        str(ctx.get("domain_category") or ""),
+        str(ctx.get("container_subject") or ctx.get("primary_container_subject") or ""),
+        str(ctx.get("domain_anchor") or ""),
+        str(ctx.get("global_subject") or ""),
+        str(ctx.get("container_type") or ""),
+        bool(ctx.get("bite_clip")),
+        bool(ctx.get("intro_unique")),
+        str(requirement.get("requirement_hash") or ""),
+        positive_terms,
+        negative_terms,
+        str(os.environ.get("VIDZEO_YT_LENIENT_ACCEPTANCE", "1") or "1"),
+        str(os.environ.get("VIDZEO_YT_REJECT_METADATA_TALKING_HEAD", "0") or "0"),
+        str(os.environ.get("VIDZEO_YT_MIN_METADATA_SCORE", "-120.0") or "-120.0"),
+    )
+
+
+def _score_candidate(
+    candidate: Dict[str, Any],
+    subject: str,
+    scene_text: str,
+    query: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> float:
+    if str(os.environ.get("VIDZEO_YT_SCORE_CACHE", "1") or "1").strip().lower() in {
+        "0", "false", "off", "no",
+    }:
+        return _score_candidate_compute(candidate, subject, scene_text, query, context)
+    try:
+        key = _score_candidate_cache_key(candidate, subject, scene_text, query, context)
+    except Exception:
+        return _score_candidate_compute(candidate, subject, scene_text, query, context)
+    cached = _score_candidate_cache.get(key)
+    if cached is not None:
+        score, diff, deleted = cached
+        candidate.pop("v2_reject_reason", None)
+        for name in deleted:
+            candidate.pop(name, None)
+        for name, value in diff.items():
+            candidate[name] = copy.deepcopy(value)
+        return score
+    before = dict(candidate)
+    score = _score_candidate_compute(candidate, subject, scene_text, query, context)
+    try:
+        diff: Dict[str, Any] = {}
+        deleted: Tuple[str, ...] = tuple(
+            name for name in before if name not in candidate
+        )
+        for name, value in candidate.items():
+            try:
+                changed = name not in before or bool(before[name] != value)
+            except Exception:
+                changed = True
+            if changed:
+                diff[name] = copy.deepcopy(value)
+        if len(_score_candidate_cache) >= _SCORE_CANDIDATE_CACHE_MAX:
+            _score_candidate_cache.clear()
+        _score_candidate_cache[key] = (score, diff, deleted)
+    except Exception:
+        pass
+    return score
+
+
+def _score_candidate_compute(candidate: Dict[str, Any], subject: str, scene_text: str, query: str, context: Optional[Dict[str, Any]] = None) -> float:
     candidate.pop('v2_reject_reason', None)
     title = candidate.get("title", "") or ""
     desc = candidate.get("description", "") or ""
@@ -1569,6 +2023,43 @@ def _score_candidate(candidate: Dict[str, Any], subject: str, scene_text: str, q
     gta_v_support = _gta_v_supporting_gameplay(candidate, subject, scene_text, context)
     if gta_v_support:
         candidate["gta_v_supporting_gameplay"] = True
+    # Scene-relative game match (the proof job's rule): the candidate names
+    # a game the scene is about. Stamped for the ledger and for the
+    # download/vision stages, which read it off ranked options.
+    scene_games = _scene_subject_games(scene_text, subject, context)
+    candidate_games = _gta_entries(f"{title} {desc} {channel}")
+    scene_game_match = bool(scene_games and candidate_games and (scene_games & candidate_games))
+    if scene_games:
+        candidate["scene_subject_games"] = sorted(scene_games)
+    if candidate_games:
+        candidate["candidate_games"] = sorted(candidate_games)
+    # Exact-title gate (gaming, pre-download): a GTA VI scene accepts
+    # same-franchise footage; only era entries (2002 Vice City, San
+    # Andreas) must never become the accepted cut for a GTA VI scene.
+    if _gaming_exact_title_gate(candidate, subject, scene_text, context):
+        candidate["v2_reject_reason"] = (
+            "cross_game_footage"
+            if _cross_game_footage(candidate)
+            else "gaming_exact_title_missing"
+        )
+        return -999.0
+    # Relevance guard (was dead code: zero production callers). A candidate
+    # from a different niche — or a different entry of the same franchise —
+    # is a hard reject at rank time, before any download is spent on it.
+    try:
+        from .universal_clip_classifier import detect_niche_conflict
+        conflict, expected_niche, candidate_niche = detect_niche_conflict(
+            f"{subject} {scene_text}", f"{title} {desc}",
+            scene_entries=scene_games,
+        )
+        if conflict:
+            candidate["v2_reject_reason"] = "niche_conflict"
+            candidate["v2_niche_conflict"] = {
+                "expected": expected_niche, "candidate": candidate_niche,
+            }
+            return -999.0
+    except Exception:
+        pass
     # Retrieval queries are positive phrases; commentary/reaction policy is
     # enforced here from the returned candidate metadata, never from search
     # operators that can hide otherwise usable gameplay.
@@ -1682,6 +2173,18 @@ def _score_candidate(candidate: Dict[str, Any], subject: str, scene_text: str, q
     subject_match = bool(
         subject and not _subject_is_weak(subject) and _text_mentions_subject(text, subject)
     )
+    if not subject_match and scene_game_match:
+        # Scene-relative subject match: the container subject names one
+        # entry (GTA VI) while the scene's narration is about another
+        # (GTA V's sales in scene 0). A candidate naming the scene's game
+        # in full matches the scene's subject even though it never names
+        # the container subject — otherwise the container subject would
+        # always outrank the game the scene is actually about.
+        for game in sorted(scene_games & candidate_games):
+            game_title = _GTA_ENTRY_TITLES.get(game) or ""
+            if game_title and _text_mentions_subject(text, game_title):
+                subject_match = True
+                break
     from .visual_requirement import beverage_category_aliases
     if beverage_category_aliases(subject):
         subject_match = bool(re.search(r'\b(?:beers?|ales?|brewing|brewer(?:y|ies)|pubs?)\b', text))
@@ -1730,6 +2233,29 @@ def _score_candidate(candidate: Dict[str, Any], subject: str, scene_text: str, q
         if anchor and not _subject_is_weak(anchor) and _text_mentions_subject(text, anchor):
             anchor_match = True
             break
+    # Round 15 (topic track): a candidate naming a numbered entry of the
+    # same franchise as the topic anchor is topic-related even when it
+    # does not repeat the anchor phrase — "Grand Theft Auto V" for a
+    # "Grand Theft Auto VI" anchor. Era entries (2002 Vice City, San
+    # Andreas) are not franchise matches; the exact-title gate still
+    # blocks those. This rescues general topic clips from the -180 floor
+    # and the scene_subject_mismatch reject below.
+    franchise_match = False
+    if not anchor_match:
+        anchor_entries = set()
+        for anchor_key in ("primary_container_subject", "domain_anchor", "container_subject"):
+            anchor = (context or {}).get(anchor_key) or ""
+            if anchor:
+                anchor_entries |= _gta_entries(str(anchor))
+        if anchor_entries:
+            candidate_entries = _gta_entries(text)
+            _numbered_franchise_entries = {"vi", "v", "iv", "iii"}
+            franchise_match = bool(
+                (anchor_entries & _numbered_franchise_entries)
+                and (candidate_entries & _numbered_franchise_entries)
+            )
+    if franchise_match:
+        candidate["franchise_topic_match"] = True
     # In a multi-subject/listicle row the local entity is the authoritative
     # retrieval key.  A global/domain anchor (for example Cristiano Ronaldo)
     # is useful for context, but it must not rescue a candidate that does not
@@ -1754,10 +2280,28 @@ def _score_candidate(candidate: Dict[str, Any], subject: str, scene_text: str, q
             or bool((context or {}).get("container_subject"))
         )
     )
-    if scene_subject_distinct and not subject_match and not gta_v_support:
+    # Prep-manifest carve-out (see inject_prep_manifest_candidates): a
+    # prep cut carries no title/description, so the metadata subject
+    # checks below would reject it for not naming the subject — even
+    # though its subject evidence is stronger than a title keyword (a
+    # transcript-matched moment for a scene whose text overlaps this
+    # scene). The carve-out only lifts these two metadata-subject
+    # returns; every hard block (_hard_block_reason, domain conflicts,
+    # package vetoes) and the live visual gate still apply.
+    # Round 15 (topic track): only a SAME-FRANCHISE numbered entry
+    # rescues a candidate here (franchise_match below). An anchor match
+    # does NOT: the anchor is the video topic, and a candidate matching
+    # it can still be the wrong entity for the scene — a Ronaldo clip
+    # matches the "Cristiano Ronaldo FIFA World Cup" anchor but is the
+    # wrong person for a Haaland scene, and must still die as a
+    # scene_subject_mismatch (Nov 16 wrong-entity rule, still in force).
+    # The scene subject stays a ranking preference (subject_match /
+    # scene_game_match bonuses below), not a hard gate, for candidates
+    # that clear this reject.
+    if scene_subject_distinct and not subject_match and not franchise_match and not gta_v_support and not scene_game_match and not _is_prep_manifest_candidate(candidate):
         candidate["v2_reject_reason"] = "scene_subject_mismatch"
         return -999.0
-    if subject and not _subject_is_weak(subject) and not subject_match and not anchor_match and not gta_v_support:
+    if subject and not _subject_is_weak(subject) and not subject_match and not anchor_match and not franchise_match and not gta_v_support and not scene_game_match and not _is_prep_manifest_candidate(candidate):
         return -180.0
     visual_signal = _visual_signal_score(text, context)
     commentary_hits = [term for term in _COMMENTARY_TERMS if term in text]
@@ -1819,6 +2363,19 @@ def _score_candidate(candidate: Dict[str, Any], subject: str, scene_text: str, q
                 anchor_title = True
                 break
         score += 55.0 if anchor_title else 40.0
+    elif franchise_match:
+        # Same-franchise topic credit, below the anchor credit: general
+        # topic footage ranks below footage naming the topic itself.
+        score += 30.0
+    if scene_game_match:
+        # Scene-subject-first ranking: footage of the game the scene is
+        # about outranks same-franchise footage of another entry. A GTA V
+        # clip for a GTA V-history scene therefore ranks above a GTA VI
+        # trailer for that scene, and vice versa for a VI-content scene.
+        # Deliberately outside the `category == "gaming"` branch below:
+        # planner rows often carry no domain_category, and the bonus is
+        # about the scene's game, not the job's niche label.
+        score += 60.0
     scene_terms = [t for t in re.findall(r"[a-z0-9]+", _norm(scene_text)) if len(t) > 3 and t not in _WEAK_SUBJECT_TERMS]
     query_terms = [t for t in re.findall(r"[a-z0-9]+", _norm(query)) if len(t) > 3]
     score += min(25.0, 4.0 * sum(1 for t in set(scene_terms[:8] + query_terms[:8]) if t in text))
@@ -1916,6 +2473,36 @@ def _get_authenticated_youtube_session(
         return _adapt_youtube_cookie_jar(youtube_session)
     if not enabled:
         return None
+    # Configured pool: VIDZEO_YT_COOKIE_FILES list + cookies directory,
+    # plus the hardcoded repo-root cookies.json fallback, shared per
+    # process so rotation and per-account health survive across
+    # searches and downloads. next_attachable() returns the best
+    # loadable jar even when the account's last probe reported
+    # signed_out: the operator's cookies are attached best-effort
+    # instead of going fully anonymous. Only load_error / throttled
+    # accounts fall back to public access below.
+    from services.youtube_session import get_configured_pool
+    pool = get_configured_pool()
+    if pool.paths:
+        index, jar = pool.next_attachable()
+        adapted = _adapt_youtube_cookie_jar(jar)
+        if adapted is not None:
+            adapted._vidzeo_session_pool = pool
+            adapted._vidzeo_session_index = index
+            try:
+                snap = pool.health_snapshot()
+                status = str(snap[index].get("status") or "") if 0 <= index < len(snap) else ""
+            except Exception:
+                status = ""
+            if status and status != "verified":
+                print(f"   [yt-v2] YouTube cookies attached best-effort (account {index + 1} reports {status}); YouTube may still throttle", flush=True)
+            else:
+                print(f"   [yt-v2] authenticated YouTube session enabled (account {index + 1})", flush=True)
+            return adapted
+        print("   [yt-v2] configured YouTube accounts unavailable; using public search", flush=True)
+        if str(os.environ.get("VIDZEO_YT_REQUIRE_SESSION") or "").lower() in {"1", "true", "yes", "on"}:
+            raise RuntimeError("Configured YouTube accounts could not be verified. Reconnect an account before retrying.")
+        return None
     try:
         from services.youtube_session import ensure_verified_session
     except Exception:
@@ -1973,8 +2560,33 @@ def _adapt_youtube_cookie_jar(session_jar: Any) -> Any:
         return None
 
 
+def _install_shared_youtube_session(ydl: Any) -> bool:
+    """Resolve the shared pool session and attach it to an existing YoutubeDL.
+
+    One-line accessor for call sites that build their own YoutubeDL
+    (notably the chapter-metadata subprocess, which runs in a fresh
+    process and previously ran anonymous).  Never raises and never
+    writes cookies to disk: no session means public access, exactly
+    like every other entry point.
+    """
+    try:
+        session_jar = _get_authenticated_youtube_session()
+    except Exception:
+        return False
+    if session_jar is None:
+        return False
+    try:
+        _install_youtube_session(ydl, session_jar)
+    except Exception:
+        return False
+    return True
+
+
 def _install_youtube_session(ydl: Any, session_jar: Any) -> None:
     """Attach the broker's in-memory cookie jar without writing plaintext cookies."""
+    if getattr(session_jar, "_vidzeo_session_pool", None) is not None:
+        from services.youtube_session import _clone_jar
+        session_jar = _clone_jar(session_jar)
     session_jar = _adapt_youtube_cookie_jar(session_jar)
     if session_jar is None:
         return
@@ -1988,11 +2600,366 @@ def _install_youtube_session(ydl: Any, session_jar: Any) -> None:
         print(f"   [yt-v2] could not attach authenticated session ({type(exc).__name__})")
 
 
+def _persist_youtube_session_cookies(used_jar: Any, session_jar: Any = None,
+                                     pool: Any = None, index: Any = None) -> None:
+    """Best-effort cookie write-back after a jar was used against YouTube.
+
+    YouTube rotates session tokens via Set-Cookie; the rotated values live
+    only in the jar yt-dlp mutated, so write them back to the pool file the
+    jar came from or the next process start loads dead tokens. ``used_jar``
+    is the jar yt-dlp actually used (``ydl.cookiejar`` after the request);
+    ``session_jar`` is the accessor jar that still carries the pool/index
+    attributes (clones made for yt-dlp lose them). Never raises, never
+    logs values; a skipped write-back only costs the next rotation.
+    """
+    try:
+        from services.youtube_cookie_persistence import persist_session_jar
+        persist_session_jar(used_jar, session_jar=session_jar, pool=pool, index=index)
+    except Exception as exc:
+        print(f"   [yt-v2] cookie write-back skipped ({type(exc).__name__})", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# YouTube metadata-extraction cache (Worker D: yt-speed).
+#
+# The probe and the final download extract the SAME video, and every
+# format-fallback retry re-extracted it again: 5-20s per extraction on this
+# proxy, paid twice per accepted clip (probe + final) and again per failed
+# format rung. One extraction serves them all: the first download extracts
+# metadata (download=False) and stores the info dict; later downloads for
+# the same video + player-client list run ``process_ie_result`` on a deepcopy
+# and skip the network round-trip entirely. Verified against the bundled
+# yt-dlp: ``process_video_result`` re-selects formats from the info dict on
+# every call using the CALLER's own ``format`` option, so a dict extracted
+# under the probe's 360p selector is still correct for the final HD
+# download — as long as the stored copy is stripped of the first caller's
+# ``requested_*`` selections (done in ``_youtube_store_info``) and never
+# mutated in place (every use deep-copies).
+#
+# TTL 30 min by default (VIDZEO_YT_INFO_CACHE_TTL_SECONDS, clamped
+# 60-3600s): googlevideo URLs expire in ~6h, so 30 min is conservative.
+# Keyed by video id + player-client list, because the returned formats
+# depend on the client. On any download failure the entry is evicted so the
+# next attempt re-extracts fresh instead of retrying a stale format URL.
+# ---------------------------------------------------------------------------
+_YOUTUBE_INFO_CACHE: Dict[Tuple[str, Tuple[str, ...]], Tuple[float, Dict[str, Any]]] = {}
+_YOUTUBE_INFO_CACHE_LOCK = threading.Lock()
+_YOUTUBE_INFO_CACHE_MAX_ENTRIES = 256
+_YOUTUBE_INFO_CACHE_STRIP_KEYS = ("requested_formats", "requested_downloads", "requested_subtitles")
+_YOUTUBE_VIDEO_ID_RE = re.compile(
+    r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/|/v/)([A-Za-z0-9_-]{6,})"
+)
+
+
+def _youtube_info_cache_ttl_seconds() -> float:
+    try:
+        ttl = float(os.environ.get("VIDZEO_YT_INFO_CACHE_TTL_SECONDS", "1800") or 1800)
+    except (TypeError, ValueError):
+        ttl = 1800.0
+    return max(60.0, min(3600.0, ttl))
+
+
+def _youtube_info_cache_key(url: Any, clients: Any) -> Tuple[str, Tuple[str, ...]]:
+    try:
+        text = str(url or "")
+    except Exception:
+        text = ""
+    match = _YOUTUBE_VIDEO_ID_RE.search(text)
+    video_id = match.group(1) if match else text
+    try:
+        client_tuple = tuple(str(c) for c in (clients or ()))
+    except TypeError:
+        client_tuple = (str(clients),)
+    return (video_id, client_tuple)
+
+
+def _materialize_youtube_info(value: Any, _seen: Optional[set] = None) -> Any:
+    """Return ``value`` with every lazy yt-dlp container realized as plain data.
+
+    yt-dlp's YouTube extractor stores per-format ``fragments`` as a
+    ``LazyList`` wrapping a generator (``_video.py``: ``f['fragments'] =
+    LazyList(gen({}))`` for DASH formats, and ``build_fragments`` returns a
+    ``LazyList`` over a generator expression). ``copy.deepcopy`` cannot copy
+    a live generator (``TypeError: cannot pickle 'generator' object``), so
+    any info dict carrying such a format used to fail inside
+    :func:`_youtube_download_with_cached_info` — and the format loop
+    misreported it as a format-spec failure, retried the next selector,
+    and failed identically (run 6, 3-scene worker: both format candidates
+    "failed", download lost). Materialize BEFORE any deepcopy or cache
+    store: a ``LazyList`` is exhausted into a plain list (``exhaust()``
+    itself discards the generator to make the list pickle-able), bare
+    generators are realized the same way, and every other value passes
+    through untouched. Live-stream ``fragments`` (a ``functools.partial``,
+    not a generator) is left alone — it is still needed at download time.
+    """
+    if isinstance(value, Mapping):
+        if _seen is None:
+            _seen = set()
+        if id(value) in _seen:
+            return value
+        _seen.add(id(value))
+        try:
+            return {
+                key: _materialize_youtube_info(item, _seen)
+                for key, item in value.items()
+            }
+        finally:
+            _seen.discard(id(value))
+    if isinstance(value, (list, tuple)):
+        if _seen is None:
+            _seen = set()
+        if id(value) in _seen:
+            return value
+        _seen.add(id(value))
+        try:
+            return [_materialize_youtube_info(item, _seen) for item in value]
+        finally:
+            _seen.discard(id(value))
+    # yt-dlp LazyList (duck-typed so a missing/renamed yt-dlp still works):
+    # exhaust it — the exhausted list holds the same items, with the
+    # generator discarded, so the result deep-copies cleanly.
+    if type(value).__name__ == "LazyList" and callable(getattr(value, "exhaust", None)):
+        try:
+            items = list(value.exhaust())
+        except Exception:
+            return []
+        return [_materialize_youtube_info(item, _seen) for item in items]
+    if isinstance(value, types.GeneratorType):
+        try:
+            items = list(value)
+        except Exception:
+            return []
+        return [_materialize_youtube_info(item, _seen) for item in items]
+    return value
+
+
+def _youtube_cached_info(url: Any, clients: Any) -> Optional[Dict[str, Any]]:
+    """Return a deepcopy of the cached info dict for ``url``, or None."""
+    key = _youtube_info_cache_key(url, clients)
+    now = time.time()
+    ttl = _youtube_info_cache_ttl_seconds()
+    with _YOUTUBE_INFO_CACHE_LOCK:
+        entry = _YOUTUBE_INFO_CACHE.get(key)
+        if entry is None:
+            return None
+        stored_at, info = entry
+        if now - stored_at > ttl:
+            _YOUTUBE_INFO_CACHE.pop(key, None)
+            return None
+        try:
+            return copy.deepcopy(info)
+        except Exception:
+            # A stored entry that cannot be copied (e.g. cached before the
+            # LazyList materializer landed) is unusable, not fatal: drop
+            # it and let the caller re-extract instead of failing the scene.
+            _YOUTUBE_INFO_CACHE.pop(key, None)
+            return None
+
+
+def _youtube_store_info(url: Any, clients: Any, info: Dict[str, Any]) -> None:
+    """Store a pristine copy of ``info`` (selections stripped) in the cache.
+
+    The stored copy is materialized first (see
+    :func:`_materialize_youtube_info`): a raw ``copy.deepcopy`` of an
+    info dict with LazyList fragments raises ``cannot pickle 'generator'
+    object`` and used to silently skip the store, leaving the same
+    unpicklable dict to fail the download below.
+    """
+    try:
+        stored = _materialize_youtube_info(info)
+    except Exception:
+        return
+    if not isinstance(stored, dict):
+        return
+    for stale_key in _YOUTUBE_INFO_CACHE_STRIP_KEYS:
+        stored.pop(stale_key, None)
+    key = _youtube_info_cache_key(url, clients)
+    with _YOUTUBE_INFO_CACHE_LOCK:
+        if len(_YOUTUBE_INFO_CACHE) >= _YOUTUBE_INFO_CACHE_MAX_ENTRIES:
+            oldest = min(_YOUTUBE_INFO_CACHE.items(), key=lambda item: item[1][0], default=None)
+            if oldest is not None:
+                _YOUTUBE_INFO_CACHE.pop(oldest[0], None)
+        _YOUTUBE_INFO_CACHE[key] = (time.time(), stored)
+
+
+def _youtube_evict_info(url: Any, clients: Any) -> None:
+    with _YOUTUBE_INFO_CACHE_LOCK:
+        _YOUTUBE_INFO_CACHE.pop(_youtube_info_cache_key(url, clients), None)
+
+
+def _youtube_download_with_cached_info(ydl: Any, url: str, clients: Any) -> None:
+    """Download ``url`` with ``ydl``, reusing a cached metadata extraction.
+
+    Drop-in replacement for ``ydl.download([url])`` for single-video URLs.
+    First call per (video, client list) extracts metadata and stores it;
+    later calls (probe -> final download, format-fallback retry) skip the
+    extraction and feed the cached dict to ``process_ie_result``. A failure
+    on the cached path evicts the entry and falls through to a fresh plain
+    download: the cached copy is unusable, not the video, and the old
+    ``raise`` turned one bad cache entry into a lost scene (run 6: the
+    "cannot pickle 'generator' object" from a LazyList ``fragments``
+    entry surfaced as a format-spec failure on EVERY selector).
+    Minimal yt-dlp doubles in tests may only implement ``download``; they
+    take the plain path unchanged.
+    """
+    if not (hasattr(ydl, "extract_info") and hasattr(ydl, "process_ie_result")):
+        ydl.download([url])
+        return
+    try:
+        cached = _youtube_cached_info(url, clients)
+    except Exception:
+        cached = None
+    if cached is not None:
+        try:
+            ydl.process_ie_result(cached, download=True)
+            return
+        except Exception:
+            _youtube_evict_info(url, clients)
+            # Fall through to a fresh extraction + plain download below.
+    try:
+        info = ydl.extract_info(url, download=False)
+    except Exception:
+        ydl.download([url])
+        return
+    if isinstance(info, dict):
+        # Materialize BEFORE the formats check and any deepcopy: a
+        # LazyList ``formats`` (or LazyList ``fragments`` inside it)
+        # fails both ``isinstance(..., list)`` and ``copy.deepcopy``.
+        try:
+            info = _materialize_youtube_info(info)
+        except Exception:
+            ydl.download([url])
+            return
+    if isinstance(info, dict) and isinstance(info.get("formats"), list):
+        _youtube_store_info(url, clients, info)
+        # The download=False pass above already ran format selection once
+        # under this ydl's selector; strip it so the real download below
+        # re-selects from the pristine format list (same as the cached path).
+        for stale_key in _YOUTUBE_INFO_CACHE_STRIP_KEYS:
+            info.pop(stale_key, None)
+        try:
+            ydl.process_ie_result(copy.deepcopy(info), download=True)
+        except Exception:
+            # A residual unpicklable value (e.g. a live stream's
+            # ``functools.partial`` fragments) must not fail the scene:
+            # yt-dlp's own download path handles the fresh info dict
+            # without our copy.
+            ydl.download([url])
+    else:
+        # Not a plain video info dict (playlist/search result): fall back
+        # to the normal path rather than guessing at its shape.
+        ydl.download([url])
+
+
+def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation, output_dir, raw_prefix):
+    """Retry a sign-in requirement with one other verified account."""
+    def download(jar):
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        attempt_opts = dict(opts, extractor_args={
+            **(opts.get("extractor_args") or {}),
+            "youtube": {
+                **((opts.get("extractor_args") or {}).get("youtube") or {}),
+                "player_client": _youtube_player_clients(jar),
+            },
+        })
+        with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+            _install_youtube_session(ydl, jar)
+            # The jar yt-dlp actually used: _install_youtube_session clones
+            # the pool jar, and yt-dlp mutates that clone in place with any
+            # rotated Set-Cookie values. Read it from __dict__ so the
+            # cached_property is never triggered for an anonymous download.
+            installed = ydl.__dict__.get("cookiejar")
+            _youtube_download_with_cached_info(
+                ydl, url, attempt_opts["extractor_args"]["youtube"]["player_client"],
+            )
+        return installed if installed is not None else jar
+
+    try:
+        used_jar = download(session_jar)
+        _persist_youtube_session_cookies(used_jar, session_jar)
+    except Exception as exc:
+        pool = getattr(session_jar, "_vidzeo_session_pool", None)
+        detail = str(exc).casefold()
+        sign_in = any(phrase in detail for phrase in (
+            "sign in to confirm your age", "age-restricted", "login required",
+            "sign in to view", "sign in to watch",
+        ))
+        throttled = any(phrase in detail for phrase in (
+            "too many requests", "http error 429", "429", "ipblocked",
+            "confirm you're not a bot",
+        ))
+        _raw_index = getattr(session_jar, "_vidzeo_session_index", None)
+        try:
+            _pool_index = int(_raw_index) if _raw_index is not None else -1
+        except (TypeError, ValueError):
+            _pool_index = -1
+        if pool is not None and throttled and not sign_in:
+            # Record the throttle so the pool skips this account until
+            # its cooldown elapses; the next call rotates to a healthy one.
+            try:
+                pool.mark_throttled(_pool_index, reason="youtube-throttled")
+            except (TypeError, ValueError):
+                pass
+        if pool is None or not sign_in or "not a bot" in detail:
+            raise
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        index, backup = pool.next_verified(_pool_index)
+        if backup is None:
+            raise
+        for stale in output_dir.glob(raw_prefix + "*"):
+            stale.unlink(missing_ok=True)
+        print(f"   [yt-session] retrying sign-in-required footage with verified account {index + 1}", flush=True)
+        used_backup = download(backup)
+        _persist_youtube_session_cookies(used_backup, pool=pool, index=index)
+
+
 def _youtube_player_clients(session_jar: Any = None) -> List[str]:
     """Resolve the yt-dlp player_client list for video/probe downloads.
 
-    When an authenticated session is active, the standard 'web' client respects
-    browser cookies and avoids embedded client player rate-limiting (throttling).
+    Measured live (Nov 18, proxy, yt-dlp 2026.10.26) on the Panama log's
+    failing videos (chyjcZe0qW4, emJNfH19MXY, m8TkcWhmByg, YzFGkdPmDZU):
+
+    - The old multi-client lists returned only 5 formats — 4 storyboard
+      images plus 360p progressive (18) — whenever the JavaScript challenge
+      solver was not in play, so every HD selector failed on BOTH rungs
+      ("Requested format is not available"). Prepending tv_embedded to the
+      same list does NOT fix it: tv_embedded-first in a list measured
+      identically (5 formats, 0 avc1 HD). The multi-client list itself is
+      the poison; a bare ``tv_embedded`` alone returns 48-77 formats with
+      avc1 HD present, with no JS runtime at all.
+    - ``tv_embedded`` does not support cookies: yt-dlp strips it from the
+      requested list whenever the session is authenticated ("Skipping
+      unsupported client"), falling back to its authed defaults. Listing it
+      for the authenticated branch would be dead config.
+    - With the node/EJS challenge solver (which the pipeline already wires
+      in), every sane list returns full formats authenticated (37 formats,
+      avc1 95/96/136/137 on chyjcZe0qW4); without it, NO cookie-supporting
+      list returns playable formats, so the authenticated branch keeps
+      depending on the solver rather than pretending a client tweak can
+      replace it.
+    - ``web_embedded`` is NOT in the authenticated list any more (run 4,
+      Nov 18-19): all 6 download verifications died with
+      ``KeyError('INNERTUBE_CONTEXT')`` on the first client. Root cause is
+      inside yt-dlp 2026.10.26 (the latest release): for an embedded
+      client, ``_download_ytcfg`` fetches the embed page and calls the
+      unguarded ``_fix_embedded_ytcfg(ytcfg)``, which does a bare
+      ``ytcfg['INNERTUBE_CONTEXT']``. Whenever YouTube serves an embed
+      page without a ytcfg (degraded/consent/bot-check page — run 4's hour
+      also showed a session-probe ReadTimeout and a search timeout), that
+      raises a raw KeyError, which is NOT an ExtractorError, so yt-dlp's
+      per-client loop aborts instead of falling through to tv_samsung/web
+      and the whole extraction dies. ``web`` and ``tv_samsung`` never take
+      that path (only the ``*_embedded`` variant triggers it), and with
+      the solver they return full formats authenticated, so dropping
+      web_embedded removes the throw site without losing formats.
+
+    Anonymous downloads therefore use bare ``tv_embedded`` (full formats
+    with no JS dependency — its ``_download_ytcfg`` short-circuits on the
+    missing URL-map entry before the embedded fixup, so it cannot raise
+    this KeyError); authenticated downloads use (web, tv_samsung).
+    ``VIDZEO_YT_PLAYER_CLIENTS`` still overrides both when set.
     """
     configured = str(os.environ.get("VIDZEO_YT_PLAYER_CLIENTS") or "").strip()
     if configured:
@@ -2001,8 +2968,8 @@ def _youtube_player_clients(session_jar: Any = None) -> List[str]:
             return clients
     adapted = _adapt_youtube_cookie_jar(session_jar) if session_jar is not None else None
     if adapted is not None:
-        return ["android", "web", "web_embedded", "web_creator", "mweb"]
-    return ["android", "web_embedded", "web_creator", "mweb"]
+        return ["web", "tv_samsung"]
+    return ["tv_embedded"]
 
 
 def _search_cache_path(query: str) -> Path:
@@ -2072,6 +3039,19 @@ _SEARCH_FLIGHTS: Dict[str, threading.Event] = {}
 _SEARCH_MEMORY: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
 
+def _youtube_metadata_socket_timeout() -> int:
+    """Per-attempt socket timeout (seconds) for YouTube metadata fetches.
+
+    Round 12 default 60 s (was 15 s). See the call site in
+    ``_search_youtube_uncached`` for the job-9ab2eb05 evidence.
+    ``VIDZEO_YT_METADATA_SOCKET_TIMEOUT`` restores the old value.
+    """
+    try:
+        return int(os.environ.get("VIDZEO_YT_METADATA_SOCKET_TIMEOUT", "60") or 60)
+    except (TypeError, ValueError):
+        return 60
+
+
 def _search_youtube_uncached(
     query: str,
     max_results: int = 12,
@@ -2100,6 +3080,14 @@ def _search_youtube_uncached(
                 pass
             restored.append(row)
         return restored[:max(1, int(max_results or 12))]
+    if _network_disabled_by_runtime():
+        diagnostic = _record_youtube_network_failure('search')
+        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        return []
+    if _current_youtube_network_diagnostic():
+        # A previous uncached query already established that this worker's
+        # network cannot reach YouTube. Cached query rows above still work.
+        return []
     try:
         from services.yt_dlp_runtime import load_yt_dlp
         yt_dlp = load_yt_dlp()
@@ -2111,7 +3099,15 @@ def _search_youtube_uncached(
         "no_warnings": True,
         "extract_flat": True,
         "skip_download": True,
-        "socket_timeout": int(os.environ.get("VIDZEO_YT_METADATA_SOCKET_TIMEOUT", "15") or 15),
+        # Socket timeout is the per-attempt bound for each metadata fetch.
+        # Round 12 (Nov 23): job 9ab2eb05's transcript leg died on 15s
+        # read timeouts in a slow hour (yt-dlp "Read timed out.
+        # (read timeout=15.0)" on every candidate) while the same calls
+        # answer in ~9.5s in a good hour and ~20s for a transcript fetch
+        # live. 60s keeps a slow hour from zeroing the lane; the
+        # transcript deadline (300s) still bounds the lane as a whole.
+        # VIDZEO_YT_METADATA_SOCKET_TIMEOUT restores the old value.
+        "socket_timeout": _youtube_metadata_socket_timeout(),
         "retries": int(os.environ.get("VIDZEO_YT_METADATA_RETRIES", "2") or 2),
     }
     opts.update(_youtube_js_runtime_options())
@@ -2138,6 +3134,9 @@ def _search_youtube_uncached(
         with yt_dlp.YoutubeDL(opts) as ydl:
             _install_youtube_session(ydl, session_jar)
             data = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
+            # Search is the highest-volume YouTube use: persist any tokens
+            # YouTube rotated on this request before the jar is discarded.
+            _persist_youtube_session_cookies(ydl.__dict__.get("cookiejar"), session_jar)
         entries = []
         for item in (data or {}).get("entries") or []:
             if not item:
@@ -2155,7 +3154,14 @@ def _search_youtube_uncached(
             _store_search_results(query, [dict(item) for item in entries])
         return [dict(item or {}, query_text=query) for item in entries]
     except Exception as exc:
-        print(f"   [yt-v2] search failed '{query[:70]}': {str(exc)[:120]}")
+        diagnostic = _record_youtube_network_failure('search', exc)
+        if diagnostic['code'] in {
+            'network_disabled_by_sandbox', 'dns_resolution_failed',
+            'outbound_network_unavailable',
+        }:
+            print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        else:
+            print(f"   [yt-v2] search failed '{query[:70]}': {str(exc)[:120]}", flush=True)
         return []
 
 
@@ -3434,6 +4440,11 @@ def _download_youtube_probe(
         or probe_host.endswith(".localhost")
     ):
         return False
+    if _network_disabled_by_runtime() or _current_youtube_network_diagnostic():
+        diagnostic = _record_youtube_network_failure('probe')
+        candidate['_transport_failure'] = diagnostic['code']
+        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        return False
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     raw_prefix = output_path.stem + ".raw."
@@ -3444,7 +4455,7 @@ def _download_youtube_probe(
             pass
     output_path.unlink(missing_ok=True)
     try:
-        probe_seconds = max(1.0, min(4.0, float(duration or 2.0)))
+        probe_seconds = max(1.0, min(32.0, float(duration or 2.0)))
         probe_start = max(0.0, float(start or 0.0))
     except (TypeError, ValueError):
         probe_seconds, probe_start = 2.0, 0.0
@@ -3458,31 +4469,38 @@ def _download_youtube_probe(
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
-            "format": '/'.join(_youtube_quality_formats() + _archival_quality_formats(candidate)),
+            "format": "18/best[height<=360][ext=mp4]/bestvideo[height<=360][ext=mp4]/best[height<=360]/best",
             "merge_output_format": "mp4",
             "outtmpl": raw_template,
             "download_ranges": download_range_func(
                 None,
                 [(probe_start, probe_start + probe_seconds + 0.4)],
             ),
-            "force_keyframes_at_cuts": False,
+            "force_keyframes_at_cuts": True,
             "extractor_args": {"youtube": {"player_client": _youtube_player_clients(session_jar)}},
             "external_downloader_args": {
                 "ffmpeg_i": ["-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
             },
+            # 30 s, not 5 s: the old 5 s default failed 3/3 probe downloads
+            # live (Nov 19, run-4 IDs — every API-page read timed out at
+            # 5 s, 40 s burned per attempt) while the same downloads
+            # completed at a 30 s socket timeout. 30 s is also the floor
+            # the final-download legs already use
+            # (_youtube_transport_timeout_defaults, min 30 s); the probe
+            # wall budget still bounds total probe time.
             "socket_timeout": int(
                 os.environ.get(
                     "VIDZEO_YT_PROBE_SOCKET_TIMEOUT",
-                    str(_youtube_transport_timeout_defaults()[0]),
+                    "30",
                 )
-                or _youtube_transport_timeout_defaults()[0]
+                or 30
             ),
             "retries": int(
                 os.environ.get(
                     "VIDZEO_YT_PROBE_RETRIES",
-                    str(_youtube_transport_timeout_defaults()[1]),
+                    "2",
                 )
-                or _youtube_transport_timeout_defaults()[1]
+                or 2
             ),
             "ffmpeg_location": _ffmpeg_bin("ffmpeg"),
         }
@@ -3490,11 +4508,11 @@ def _download_youtube_probe(
 
         if stream_downloads:
             opts["concurrent_fragment_downloads"] = 1
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            _install_youtube_session(ydl, session_jar)
-            if cancellation is not None:
-                cancellation.raise_if_cancelled()
-            ydl.download([_candidate_url(candidate)])
+        if cancellation is not None:
+            opts['progress_hooks'] = [lambda _status: cancellation.raise_if_cancelled()]
+        _download_with_youtube_session(
+            yt_dlp, opts, probe_url, session_jar, cancellation, output_path.parent, raw_prefix,
+        )
         raw_files = sorted(
             output_path.parent.glob(raw_prefix + "*"),
             key=lambda path: path.stat().st_mtime,
@@ -3512,18 +4530,25 @@ def _download_youtube_probe(
         if raw is None:
             return False
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            _ffmpeg_bin("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(raw), "-t", str(probe_seconds), "-an",
             "-c:v", "libx264", "-preset", "ultrafast", str(output_path)
         ]
-        subprocess.run(cmd, check=True, timeout=15)
+        subprocess.run(cmd, check=True, timeout=35)
         return output_path.is_file() and output_path.stat().st_size > 1024
     except Exception as exc:
-        print(
-            f"   [yt-v2] probe failed '{str(candidate.get('title') or '')[:55]}': "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
-        )
+        if cancellation is not None and cancellation.cancelled():
+            cancellation.raise_if_cancelled()
+        if _youtube_host_dns_failure(exc) or _network_disabled_by_runtime():
+            diagnostic = _record_youtube_network_failure('probe', exc)
+            candidate['_transport_failure'] = diagnostic['code']
+            print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        else:
+            print(
+                f"   [yt-v2] probe failed '{str(candidate.get('title') or '')[:55]}': "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
         output_path.unlink(missing_ok=True)
         return False
     finally:
@@ -3568,49 +4593,104 @@ def _youtube_quality_limits() -> Tuple[int, int]:
 
 
 def _ranged_download_worker_limit(requested: int, available_mb: int, total_bytes: int) -> int:
-    """Fit native HD range transfers independently from Chromium render workers."""
-    # Range transfers normally remux AVC rather than decode a full master.
-    # Reserve OS/UI headroom and a conservative decode/screen allowance per
-    # worker; one worker remains the minimum on genuinely constrained hosts.
-    # The egress proxy serializes concurrent connections, so the win from
-    # more workers is bounded — but on this VM the old flat 2-worker cap for
-    # every host under 12 GB total was the binding constraint (12 ranged
-    # downloads at 2 workers = 6 sequential rounds of slow yt-dlp work).
-    # Tier the small-host cap by total memory instead: under 6 GB stays at
-    # 2, 6-12 GB gets 4, and the per-worker allowance ((available-256)//320)
-    # still scales the count down automatically when memory is tight.
-    fit = max(1, (max(0, int(available_mb)) - 256) // 320)
-    if total_bytes < 6 * 1024**3:
-        fit = min(2, fit)
-    elif total_bytes < 12 * 1024**3:
-        fit = min(4, fit)
+    """Fit native HD range transfers on TOTAL host memory, not instantaneous free memory.
+
+    Range transfers normally remux AVC rather than decode a full master, and
+    a worker's ffmpeg RSS is small (measured); YouTube throttling is
+    per-connection, so downloads do not need an instantaneous-free-memory
+    guard. The old ``(available - 256) // 320`` fit collapsed to 1 worker
+    whenever a render or another job held RAM — the Panama job ran at 637 MB
+    available and downloaded strictly serially despite requesting 4 workers.
+    A running job holding memory must not serialize downloads.
+
+    Tiers are therefore set by total RAM: under 6 GiB stays at 2, 6-12 GiB
+    gets 6, 12 GiB and up gets 8 (the requested count still caps it, and
+    ``_requested_download_workers`` caps at 4 per the spec's YT Clip
+    Workers 2-4). Only genuine starvation — available memory below one
+    worker's 320 MB reserve — drops to 1.
+    ``available_mb`` is kept in the signature for its callers; it no longer
+    drives the fit.
+    """
+    try:
+        total_gb = float(total_bytes) / (1024 ** 3)
+    except (TypeError, ValueError):
+        total_gb = 0.0
+    if total_gb < 6:
+        fit = 2
+    elif total_gb < 12:
+        fit = 6
+    else:
+        fit = 8
+    try:
+        available = int(available_mb)
+    except (TypeError, ValueError):
+        available = None
+    if available is not None and available < 320:
+        fit = 1
     return max(1, min(8, int(requested), fit))
+
+
+def mixed_youtube_download_worker_capacity(config=None) -> int:
+    """Return the memory-fitted Mixed Media YouTube download worker count.
+
+    Single home for the wall arithmetic (``app._mixed_youtube_download_worker_capacity``
+    and ``pipeline_v2_media_adapter._mixed_youtube_branch_wall_seconds`` both
+    delegate here): budget transfer waves with the same worker count the
+    downloader itself uses. The old "<12 GB -> 1" branch priced the wall for
+    serial transfers the downloader never runs: on this 7.7 GB host the fit
+    is 4 ranged workers (spec: YT Clip Workers 2-4; total-RAM tiers, and a
+    running job holding memory no longer collapses the fit to 1), so the
+    wall tracks real parallelism. Falls back to 1 when memory is unknown.
+    """
+    settings = config if isinstance(config, dict) else {}
+    try:
+        # Spec (Vidzeo Local thread pools): YT Clip Workers 2-4.
+        requested = max(1, min(4, int(
+            settings.get('yt_download_concurrency')
+            or os.environ.get('VIDZEO_MIXED_YT_DOWNLOAD_CONCURRENCY', '4')
+            or 4
+        )))
+    except (TypeError, ValueError, OverflowError):
+        requested = 1
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        return _ranged_download_worker_limit(
+            requested,
+            int(memory.available / (1024 ** 2)),
+            memory.total,
+        )
+    except (ImportError, OSError, ValueError, TypeError, AttributeError):
+        # If memory is unknown, budget conservatively for one worker. The
+        # worker applies the same safe limit before opening any transfers.
+        return 1
 
 
 def _requested_download_workers(download_concurrency=None) -> int:
     """Requested ranged-download worker count, before the memory fit.
 
-    Default 6, hard cap 8. Env override ``VIDZEO_YT_DOWNLOAD_CONCURRENCY``
-    wins; an explicit ``download_concurrency`` wins over the env.
+    Spec (Vidzeo Local thread pools): YT Clip Workers 2-4. Default 4,
+    hard cap 4. Env override ``VIDZEO_YT_DOWNLOAD_CONCURRENCY`` wins;
+    an explicit ``download_concurrency`` wins over the env.
     """
     try:
         configured = int(
             download_concurrency
             if download_concurrency is not None
-            else os.environ.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY", "6")
-            or 6
+            else os.environ.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY", "4")
+            or 4
         )
     except (TypeError, ValueError):
-        configured = 6
-    return max(1, min(configured, 8))
+        configured = 4
+    return max(1, min(configured, 4))
 
 
 def _ranged_download_workers(download_concurrency=None, *, available_mb=None, total_bytes=None) -> int:
     """How many ranged YouTube downloads run in parallel.
 
-    Default 6, hard cap 8 (was default 4, cap 6). The memory fit from
-    ``_ranged_download_worker_limit`` still applies when host memory is
-    known, so a tight host scales down on its own.
+    Spec (Vidzeo Local thread pools): YT Clip Workers 2-4. The memory
+    fit from ``_ranged_download_worker_limit`` still applies when host
+    memory is known, so a tight host scales down on its own.
     """
     workers = _requested_download_workers(download_concurrency)
     if available_mb is not None and total_bytes is not None:
@@ -3618,18 +4698,137 @@ def _ranged_download_workers(download_concurrency=None, *, available_mb=None, to
     return workers
 
 
+def _yt_download_slot_seconds() -> float:
+    """Planning cost of one download-worker slot: transfer + screening.
+
+    A live ranged download measures 44-76 s on this host (run 6: 71.79 s,
+    76.49 s; run 7 small worker: 44.25 s), and the worker then spends
+    ~5 s on the motion screen plus ~14 s on the overlay screen before the
+    slot frees — so a slot costs ~80 s of transfer plus ~30 s of screening.
+    The per-clip value comes from the stage budget when set
+    (``VIDZEO_YT_PER_CLIP_TIMEOUT``); without it, plan on the measured
+    80 s, never on the 360 s transport hard timeout (a bound, not a
+    planning value — pricing the reserve at 360 s would leave the
+    transcript phase a 15 s floor and starve it instead).
+    """
+    try:
+        per_clip = float(os.environ.get("VIDZEO_YT_PER_CLIP_TIMEOUT") or 0.0)
+    except (TypeError, ValueError):
+        per_clip = 0.0
+    if not per_clip or per_clip <= 0:
+        per_clip = 80.0
+    try:
+        screening = float(os.environ.get("VIDZEO_YT_DOWNLOAD_SCREEN_SECONDS", "30") or 30)
+    except (TypeError, ValueError):
+        screening = 30.0
+    return max(30.0, per_clip) + max(0.0, screening)
+
+
+def _yt_download_reserve_seconds(scene_count: Any, download_workers: Any) -> float:
+    """Seconds of the branch wall the download phase must keep.
+
+    Run 7 (job 6624244a) is why this exists: the 343 s branch wall priced
+    search (35 s) plus three 80 s transfer waves and nothing else, while
+    the worker ran search (~55 s), assignment (~150 s, since fixed by the
+    scoring memo/cache above) and transcripts (up to 120 s) first — so the
+    download pass started with ~55 s left, completed 0 live downloads,
+    and the coordinator routed the quota scenes to web. The reserve prices
+    the waves the remaining live scenes actually need (one slot per wave
+    per worker, plus a 10 s handoff), and the callers below subtract it
+    from the transcript and search budgets instead of sharing one wall
+    across every phase. Restores cost ~0 s of network and are excluded
+    by the caller (it counts live scenes only).
+    """
+    try:
+        workers = max(1, int(download_workers or 1))
+    except (TypeError, ValueError):
+        workers = 1
+    try:
+        count = max(0, int(scene_count or 0))
+    except (TypeError, ValueError):
+        count = 0
+    if not count:
+        return 10.0
+    waves = math.ceil(count / workers)
+    return waves * _yt_download_slot_seconds() + 10.0
+
+
+def _yt_ranged_transcript_deadline_seconds() -> float:
+    """Floor for the ranged-moment transcript phase (seconds).
+
+    Run 9 (job a7f52c58, GTA VI Launch Day, 18 scenes): the ranged
+    deadline floored at 15 s on all four YT workers because the
+    download reserve (225-440 s) ate the ~422 s branch wall before
+    transcripts started, so ``remaining`` was <= 15 s. Transcript
+    completion was 16/60 (27%) and ranged moment evidence 7/45 scenes
+    (16%) — the lane could not pick cut moments, and the 120 s
+    pipeline default (``VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS``, also
+    the pool-first fetch default at the ``build_clip_pools`` call site)
+    never reached the ranged call. The runtime .env already sets that
+    env to 300; it is honoured here only up to the 120 s ranged cap.
+
+    Measured cost: the per-video provider chain is ~15 s in a good
+    hour and ~45 s in a slow one, so 19 videos at 6 ranged workers
+    need ~45 s good / ~135 s slow. A 120 s floor covers the good hour
+    fully and most of a slow one; the old 15 s floor covered barely
+    one wave. The floor is a floor, not a removal: the deadline is
+    still capped at 300 s (round 12, Nov 23: the 120 s cap retained
+    0/8 transcripts in job 9ab2eb05's slow hour — every fetch was
+    still in flight when the deadline fired — so the lane reached zero
+    downloads with 53 ranked candidates in hand) and the branch hard
+    wall still bounds the whole YT branch. Transcripts may now borrow from the download
+    reserve — the reserve over-prices downloads (it charges every live
+    scene a full 110 s slot-wave, while run 9 cache restores cost
+    ~0.15 s and live range downloads run in parallel), and mixed-media
+    downloads are best-effort behind a soft-stop anyway. The run-7
+    invariant (transcripts + reserve fit inside the wall) is
+    deliberately superseded here: it starved transcripts to 27%.
+    """
+    try:
+        configured = float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "300") or 300)
+    except (TypeError, ValueError):
+        configured = 300.0
+    return max(30.0, min(300.0, configured))
+
+
+def _yt_pool_transcript_deadline_seconds() -> float:
+    """Ceiling for the pool-first transcript fetch (seconds).
+
+    Same 300s ceiling as the ranged-moment deadline above (round 12,
+    Nov 23: the old 120s cap retained 0/8 transcripts in job
+    9ab2eb05's slow hour — every fetch was still in flight when the
+    deadline fired — so the lane reached zero downloads with 53 ranked
+    candidates in hand). The runtime .env used to pin
+    VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS=300, and the
+    old call-site cap was also 300s, so one slow transcript batch could
+    hold the whole YT lane for 5 minutes — longer than the 292s
+    discovery budget for a 1-minute video. A 300s batch now covers
+    the measured cost (per-video ~8s good hour / ~45s slow hour at 6
+    workers) and the lane proceeds with heuristic moments for the
+    videos that did not answer in time — the designed fallback, not a
+    skipped check: transcripts pick cut moments, vision still verifies
+    every clip. An explicit per-call deadline below 120s still wins.
+    """
+    try:
+        configured = float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "300") or 300)
+    except (TypeError, ValueError):
+        configured = 300.0
+    return max(0.05, min(300.0, configured))
+
+
 def _youtube_quality_formats(*, source: bool = False, max_filesize: Optional[int] = None) -> List[str]:
     """Build high-quality yt-dlp selectors with graceful format fallbacks."""
     max_height, _output_fps = _youtube_quality_limits()
     min_height = _youtube_min_source_height()
-    # Prefer the configured cap first, then accept 1440p/4K masters when a
-    # source is only published above that cap. Remotion scales the accepted
-    # source down to the output canvas; refusing a 4K-only HD+ source used to
-    # exhaust every retry with "Requested format is not available".
+    # Prefer the configured cap first, then accept a 1440p master when a
+    # source is only published above that cap. The canvas is 1080p, so the
+    # old 2160p rung only bought larger downloads that get downscaled
+    # locally; it is gone. One 1440p rung stays as the last resort because
+    # refusing everything above the cap used to exhaust every retry with
+    # "Requested format is not available" on 4K-only sources.
     height_caps = list(dict.fromkeys((
         max_height,
         max(max_height, 1440),
-        max(max_height, 2160),
     )))
     explicit_name = "VIDZEO_YT_SOURCE_FORMAT" if source else "VIDZEO_YT_FORMAT"
     explicit = str(os.environ.get(explicit_name) or "").strip()
@@ -3714,10 +4913,17 @@ def _youtube_quality_formats(*, source: bool = False, max_filesize: Optional[int
             return list(dict.fromkeys(value for value in candidates if value))
     # Prefer a separate best video + best audio pair. This selects the highest
     # available picture bitrate/resolution instead of silently falling back to
-    # the old 360/720p progressive IDs (18/22).
+    # the old 360/720p progressive IDs (18/22). Only the FIRST alternative
+    # of the primary rung prefers 30 fps: 1080p60 formats are ~30-40%
+    # larger than their 1080p30 twins and the output is normalized to 30 fps
+    # anyway — but a 60fps-only upload (e.g. YzFGkdPmDZU, whose avc1 HD
+    # formats are ALL 60fps) must still resolve on the primary rung, so the
+    # second and third alternatives stay unfiltered. ``[fps<=?30]`` (not
+    # ``[fps<=30]``) admits formats with unknown fps metadata so a missing
+    # fps field can never empty the preference.
     candidates.extend([
         (
-            f"bestvideo[height>={min_height}][height<={max_height}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            f"bestvideo[height>={min_height}][height<={max_height}][vcodec^=avc1][fps<=?30]+bestaudio[ext=m4a]/"
             f"bestvideo[height>={min_height}][height<={max_height}][vcodec^=avc1]+bestaudio/"
             f"best[height>={min_height}][height<={max_height}][vcodec^=avc1]"
         ),
@@ -3793,6 +4999,172 @@ def _youtube_transport_timeout_defaults() -> Tuple[int, int, int, int]:
     )
 
 
+def _youtube_format_retry_is_futile(error_text: str, runtime_categories) -> bool:
+    """True when another format rung cannot rescue a failed download.
+
+    yt-dlp reports an age-gated video as "Requested format is not
+    available" on the first rung while separately logging a sign-in
+    warning — the exception text alone does not say age-gate, so the old
+    code burned a second full extraction on the fallback rung. The
+    session does not unlock age-gated videos (proven live: identical
+    failure with and without cookies), so when the runtime log already
+    carries an authentication warning, the next rung is pointless and
+    the caller should try the next ranked candidate instead.
+    """
+    text = str(error_text or "").lower()
+    if "requested format is not available" not in text:
+        return False
+    try:
+        categories = list(runtime_categories or ())
+    except TypeError:
+        return False
+    return "authentication" in categories
+
+
+def _youtube_ffmpeg_stall_seconds() -> float:
+    """Frozen-byte window before the stall watchdog kills ffmpeg.
+
+    Env ``VIDZEO_YT_FFMPEG_STALL_SECONDS``, default 75s, clamped 60-90s.
+    """
+    try:
+        value = float(os.environ.get("VIDZEO_YT_FFMPEG_STALL_SECONDS", "75") or 75)
+    except (TypeError, ValueError):
+        value = 75.0
+    return max(60.0, min(90.0, value))
+
+
+class _FFmpegStallWatchdog:
+    """Kill a frozen ffmpeg external-downloader during a ranged download.
+
+    yt-dlp drives ranged downloads through an ffmpeg subprocess; when the
+    throttled connection stalls, ffmpeg's byte progress freezes and yt-dlp's
+    progress hooks stop firing, so neither the per-clip timeout nor the
+    hooks reap it (log: 3 manual kills, 8-20 min stalls). This thread
+    watches the clip's raw output files' total size and kills the ffmpeg
+    child once the size has been frozen longer than the stall window.
+
+    Trigger is frozen byte-progress only, never wall time alone: a
+    slow-but-moving transfer is left alone. Zero bytes for the first 180s
+    also counts as stalled (extraction takes ~5-20s, so a spawned ffmpeg
+    with no bytes after 180s is dead); if no ffmpeg exists yet the
+    watchdog keeps watching and the per-clip timeout still bounds the
+    extraction. Scoped to this clip: only ffmpeg children whose command
+    line names this clip's raw prefix AND an http(s) input URL are
+    touched, so the local merge/re-encode ffmpeg (local file input) and
+    the render's ffmpeg are never killed.
+    """
+
+    _POLL_SECONDS = 5.0
+    _ZERO_BYTE_GRACE_SECONDS = 180.0
+
+    def __init__(self, watch_dir, raw_prefix, *, stall_seconds=None):
+        self._watch_dir = Path(watch_dir)
+        self._raw_prefix = str(raw_prefix)
+        if stall_seconds is None:
+            stall_seconds = _youtube_ffmpeg_stall_seconds()
+        try:
+            self._stall_seconds = float(stall_seconds)
+        except (TypeError, ValueError):
+            self._stall_seconds = 75.0
+        self._stop = threading.Event()
+        self._thread = None
+        self.fired = False
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="yt-ffmpeg-stall-watchdog", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=10.0)
+
+    def _raw_total_bytes(self):
+        total = 0
+        try:
+            for path in self._watch_dir.glob(self._raw_prefix + "*"):
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return total
+
+    def _kill_matching_ffmpeg(self):
+        """Terminate this clip's ffmpeg downloader child. True if any died."""
+        try:
+            import psutil
+        except ImportError:
+            return False
+        try:
+            children = psutil.Process().children(recursive=True)
+        except Exception:
+            return False
+        matched = []
+        for child in children:
+            try:
+                if "ffmpeg" not in (child.name() or "").lower():
+                    continue
+                cmdline = " ".join(child.cmdline() or [])
+            except Exception:
+                continue
+            if (self._raw_prefix in cmdline) and "http" in cmdline:
+                matched.append(child)
+        if not matched:
+            return False
+        for child in matched:
+            try:
+                child.terminate()
+            except Exception:
+                continue
+        try:
+            _, alive = psutil.wait_procs(matched, timeout=5.0)
+        except Exception:
+            alive = matched
+        for child in alive or ():
+            try:
+                child.kill()
+            except Exception:
+                continue
+        return True
+
+    def _run(self):
+        started = time.monotonic()
+        last_size = self._raw_total_bytes()
+        last_change = started
+        while not self._stop.wait(self._POLL_SECONDS):
+            size = self._raw_total_bytes()
+            now = time.monotonic()
+            if size != last_size:
+                last_size = size
+                last_change = now
+                continue
+            frozen = now - last_change
+            stalled = (
+                (size > 0 and frozen >= self._stall_seconds)
+                or (size == 0 and now - started >= self._ZERO_BYTE_GRACE_SECONDS)
+            )
+            if not stalled:
+                continue
+            if self._kill_matching_ffmpeg():
+                self.fired = True
+                print(
+                    f"   [yt-v2] ffmpeg stall watchdog killed a frozen transfer "
+                    f"({self._raw_prefix}*, {frozen:.0f}s without byte progress)",
+                    flush=True,
+                )
+                return
+            # Nothing to kill (ffmpeg not spawned yet / already gone): keep
+            # watching — the per-clip timeout still bounds the extraction.
+            last_change = now
+
+
 def _download_clip(
     candidate: Dict[str, Any],
     output_path: Path,
@@ -3846,6 +5218,20 @@ def _download_clip(
     url = _candidate_url(candidate)
     if not url:
         return False
+    if _network_disabled_by_runtime() or _current_youtube_network_diagnostic():
+        diagnostic = _record_youtube_network_failure('download')
+        candidate['_transport_failure'] = diagnostic['code']
+        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+        return False
+    # Round the required scene and transition handle up to an output frame.
+    # FFmpeg -t rounds differently and could produce a cut one frame shorter
+    # than the same request's duration gate.
+    _, target_fps = _youtube_quality_limits()
+    required_duration = max(1.0, float(duration) + 0.4)
+    requested_frames = math.ceil(required_duration * target_fps - 1e-8)
+    requested_duration = requested_frames / target_fps
+    range_start = max(0.0, float(start))
+    range_end = range_start + requested_duration + 1.0
     raw_template = str(output_path.with_suffix(".raw.%(ext)s"))
     raw_prefix = output_path.stem + ".raw."
     part_path = output_path.with_name(
@@ -3889,8 +5275,11 @@ def _download_clip(
             "format": format_candidates[0],
             "logger": runtime_log,
             "merge_output_format": "mp4",
-            "download_ranges": download_range_func(None, [(max(0.0, start), max(1.0, start + duration + 1.0))]),
-            "force_keyframes_at_cuts": False,
+            "download_ranges": download_range_func(None, [(range_start, range_end)]),
+            # Perform a precise seek for a pre-reviewed contact-sheet moment.
+            # Normal ranges retain the source and the final verifier reviews
+            # the actual downloaded frames.
+            "force_keyframes_at_cuts": bool(candidate.get('_contact_window_selected')),
             "extractor_args": {"youtube": {"player_client": _youtube_player_clients(session_jar)}},
             "external_downloader_args": {
                 "ffmpeg_i": [
@@ -3918,87 +5307,136 @@ def _download_clip(
         # whole YouTube worker pool.
         opts["progress_hooks"] = [_download_progress]
         download_error = None
-        for format_index, format_spec in enumerate(format_candidates):
-            if cancellation is not None:
-                cancellation.raise_if_cancelled()
-            _remaining_clip_timeout()
-            if format_index:
-                for stale in output_path.parent.glob(raw_prefix + "*"):
-                    try:
-                        stale.unlink()
-                    except OSError:
-                        pass
-                opts["format"] = format_spec
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    _install_youtube_session(ydl, session_jar)
-                    if cancellation is not None:
-                        cancellation.raise_if_cancelled()
-                    ydl.download([url])
-                download_error = None
-                break
-            except Exception as exc:
-                download_error = exc
-                # A branch-wall cancellation is terminal. Retrying every
-                # format after the coordinator has moved on only creates late
-                # partial files and delays executor quiescence/salvage.
-                if cancellation is not None and cancellation.cancelled():
+        stall_watchdog = _FFmpegStallWatchdog(output_path.parent, raw_prefix)
+        stall_watchdog.start()
+        try:
+            for format_index, format_spec in enumerate(format_candidates):
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
+                _remaining_clip_timeout()
+                if format_index:
+                    for stale in output_path.parent.glob(raw_prefix + "*"):
+                        try:
+                            stale.unlink()
+                        except OSError:
+                            pass
+                    opts["format"] = format_spec
+                try:
+                    _download_with_youtube_session(
+                        yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
+                    )
+                    download_error = None
+                    break
+                except Exception as exc:
+                    download_error = exc
+                    # A branch-wall cancellation is terminal. Retrying every
+                    # format after the coordinator has moved on only creates late
+                    # partial files and delays executor quiescence/salvage.
+                    if cancellation is not None and cancellation.cancelled():
+                        raise
+                    # Authentication and availability failures are independent of
+                    # the requested selector. Retrying the same protected video
+                    # with four more format strings only burns the branch wall and
+                    # makes a healthy web/stock rescue look stuck. Let the caller
+                    # move to the next ranked candidate immediately; the error is
+                    # still retained in the branch audit.
+                    error_text = str(exc or "").lower()
+                    # A transport timeout says the current transfer is unhealthy;
+                    # changing format cannot make that network request faster and
+                    # used to spend the remaining scene wall on a duplicate retry.
+                    # Stamp the kind so the caller can tell a throttled transfer
+                    # (park this video; try the next ranked candidate) from a
+                    # content reject (another timestamp from the same video may
+                    # still be clean). Without the stamp every failure looked
+                    # the same and the scene re-queued the same throttled video
+                    # at another timestamp for up to 6 passes.
+                    if _youtube_host_dns_failure(error_text):
+                        diagnostic = _record_youtube_network_failure('download', exc)
+                        candidate['_transport_failure'] = diagnostic['code']
+                        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+                        raise
+                    if any(marker in error_text for marker in (
+                        'network is unreachable', 'unreachable network',
+                        'no route to host', 'connection refused',
+                        'wsaenetunreach', 'winerror 10051', 'errno 101',
+                    )):
+                        diagnostic = _record_youtube_network_failure('download', exc)
+                        candidate['_transport_failure'] = diagnostic['code']
+                        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+                        raise
+                    if any(marker in error_text for marker in (
+                        "timeout", "timed out", "temporarily unavailable",
+                        "connection reset", "connection aborted",
+                    )):
+                        candidate['_transport_failure'] = 'transport_timeout'
+                        print(
+                            "   [yt-v2] transport timeout/failure; moving to the next ranked candidate",
+                            flush=True,
+                        )
+                        raise
+                    non_selector_failure = any(
+                        marker in error_text
+                        for marker in (
+                            "please sign in",
+                            "sign in to confirm",
+                            "use --cookies",
+                            "confirm you're not a bot",
+                            "video unavailable",
+                            "private video",
+                            "age-restricted",
+                            "this video is not available",
+                        )
+                    )
+                    if non_selector_failure:
+                        candidate['_transport_failure'] = (
+                            'youtube_access_required' if any(marker in error_text for marker in (
+                                'sign in', 'use --cookies', 'age-restricted', "confirm you're not a bot",
+                            )) else 'youtube_source_unavailable'
+                        )
+                        print(
+                            "   [yt-v2] non-selector download failure; "
+                            "skipping format retries for this candidate",
+                            flush=True,
+                        )
+                        raise
+                    if _youtube_format_retry_is_futile(str(exc or ""), runtime_log.categories):
+                        # The extraction already logged a sign-in/age-gate
+                        # warning: no format rung can succeed on this video.
+                        # Skip the remaining rungs and let the caller try the
+                        # next ranked candidate.
+                        candidate['_transport_failure'] = 'youtube_access_required'
+                        print(
+                            "   [yt-v2] format unavailable with an authentication warning; "
+                            "skipping format retries for this candidate",
+                            flush=True,
+                        )
+                        raise
+                    if format_index + 1 < len(format_candidates):
+                        print(
+                            f"   [yt-v2] format '{format_spec}' failed ({str(exc)[:60]}); "
+                            f"retrying fallback format '{format_candidates[format_index + 1]}'",
+                            flush=True,
+                        )
+                        continue
+                    # Both extractions already tried the complete bounded format
+                    # set. Switch source instead of repeating an unbounded rescue.
+                    if 'requested format is not available' in error_text:
+                        candidate['_transport_failure'] = 'youtube_format_unavailable'
                     raise
-                # Authentication and availability failures are independent of
-                # the requested selector. Retrying the same protected video
-                # with four more format strings only burns the branch wall and
-                # makes a healthy web/stock rescue look stuck. Let the caller
-                # move to the next ranked candidate immediately; the error is
-                # still retained in the branch audit.
-                error_text = str(exc or "").lower()
-                if _youtube_host_dns_failure(error_text):
-                    candidate['_transport_failure'] = 'provider_dns_unavailable'
-                # A transport timeout says the current transfer is unhealthy;
-                # changing format cannot make that network request faster and
-                # used to spend the remaining scene wall on a duplicate retry.
-                if any(marker in error_text for marker in (
-                    "timeout", "timed out", "temporarily unavailable",
-                    "connection reset", "connection aborted",
-                    "failed to resolve", "getaddrinfo failed", "name resolution",
-                    "network is unreachable", "no route to host",
-                )):
-                    print(
-                        "   [yt-v2] transport timeout/failure; moving to the next ranked candidate",
-                        flush=True,
-                    )
-                    raise
-                non_selector_failure = any(
-                    marker in error_text
-                    for marker in (
-                        "please sign in",
-                        "use --cookies",
-                        "confirm you're not a bot",
-                        "video unavailable",
-                        "private video",
-                        "age-restricted",
-                        "this video is not available",
-                    )
-                )
-                if non_selector_failure:
-                    print(
-                        "   [yt-v2] non-selector download failure; "
-                        "skipping format retries for this candidate",
-                        flush=True,
-                    )
-                    raise
-                if format_index + 1 < len(format_candidates):
-                    print(
-                        f"   [yt-v2] format '{format_spec}' failed ({str(exc)[:60]}); "
-                        f"retrying fallback format '{format_candidates[format_index + 1]}'",
-                        flush=True,
-                    )
-                    continue
-                # Both extractions already tried the complete bounded format
-                # set. Switch source instead of repeating an unbounded rescue.
-                raise
-        if download_error is not None:
-            raise download_error
+            if download_error is not None:
+                raise download_error
+        finally:
+            stall_watchdog.stop()
+            if stall_watchdog.fired:
+                candidate['_ffmpeg_stall_killed'] = True
     except Exception as exc:
+        # The per-clip wall raises TimeoutError from _remaining_clip_timeout
+        # (progress hooks and the format loop); yt-dlp timeouts surface as
+        # "timeout"/"timed out" in the message. Stamp both as transport
+        # timeouts so the caller parks the video instead of re-queueing it
+        # at another timestamp. Cancellations still raise above.
+        if isinstance(exc, TimeoutError) or "youtube_clip_timeout_after_" in str(exc):
+            candidate['_transport_failure'] = 'transport_timeout'
         if cancellation is not None and cancellation.cancelled():
             # A cooperative cancellation can interrupt yt-dlp between
             # fragments. Remove the partial raw payload so the salvage scan
@@ -4048,8 +5486,6 @@ def _download_clip(
     _record_source_resolution(candidate, source_height)
     if candidate['reduced_resolution_source']:
         print(f"   [yt-v2] accepted {source_height}p {candidate['source_resolution_policy']} for final scene verification", flush=True)
-    requested_duration = max(1.0, float(duration))
-
     # yt-dlp has already produced the requested time range at the best source
     # quality (bounded to 1080p). Do not immediately scale/crop/recompress that
     # range only to make the semantic renderer encode it again. Atomic source
@@ -4058,6 +5494,11 @@ def _download_clip(
     preserve_source = str(
         os.environ.get("VIDZEO_YT_RETRIEVAL_PRESERVE_SOURCE", "1") or "1"
     ).strip().lower() not in {"0", "false", "no", "off"}
+    try:
+        contact_crop = max(0.0, min(15.0, float(candidate.get('contact_crop_pct') or 0)))
+    except (TypeError, ValueError):
+        contact_crop = 0.0
+    preserve_source = preserve_source and contact_crop == 0
     if preserve_source and raw.suffix.lower() == ".mp4":
         try:
             os.replace(raw, part_path)
@@ -4068,24 +5509,23 @@ def _download_clip(
                 ffprobe_path=_ffmpeg_bin("ffprobe"),
                 require_video=True,
                 min_bytes=4096,
-                min_duration=max(0.5, requested_duration * 0.70),
+                min_duration=required_duration - 1e-6,
+                duration_from_video=True,
                 require_decode=True,
                 ffmpeg_path=_ffmpeg_bin('ffmpeg'),
             )
             if promoted.valid:
                 for stale in output_path.parent.glob(raw_prefix + "*"):
-                    stale.unlink(missing_ok=True)
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 print(
                     f"   [yt-v2] source-quality range ready: {output_path.name} "
                     f"({source_height or 'unknown'}p, no retrieval re-encode)",
                     flush=True,
                 )
-                return True
-            # Unit-test process doubles cannot return a real ffprobe payload;
-            # retain their established compatibility without relaxing the
-            # production integrity contract.
-            if promoted.reason == "ffprobe_invalid_result" and _source_has_video_stream(part_path):
-                os.replace(part_path, output_path)
+                candidate['_download_mode'] = 'preserved_source'
                 return True
             print(
                 f"   [yt-v2] source-preserve probe rejected ({promoted.reason}); "
@@ -4103,18 +5543,20 @@ def _download_clip(
                     os.replace(part_path, raw)
                 except OSError:
                     pass
-    _source_height, target_fps = _youtube_quality_limits()
     try:
         target_width = int(os.environ.get("VIDZEO_PROJECT_WIDTH", "1920") or 1920)
         target_height = int(os.environ.get("VIDZEO_PROJECT_HEIGHT", "1080") or 1080)
     except (TypeError, ValueError):
         target_width, target_height = 1920, 1080
+    zoom_crop = (f"crop=trunc(iw*{1 - contact_crop / 100:.4f}/2)*2:"
+                 f"trunc(ih*{1 - contact_crop / 100:.4f}/2)*2,"
+                 if contact_crop else "")
     cmd = [
         _ffmpeg_bin("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(raw), "-t", str(requested_duration), "-an",
-        "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_width}:{target_height},fps={target_fps}",
+        "-i", str(raw), "-frames:v", str(requested_frames), "-an",
+        "-vf", f"{zoom_crop}scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_width}:{target_height},fps={target_fps}",
         "-c:v", "libx264", "-preset", "fast", "-crf", "17",
-        "-pix_fmt", "yuv420p", "-r", str(target_fps), str(part_path),
+        "-pix_fmt", "yuv420p", "-r", str(target_fps), "-g", "30", str(part_path),
     ]
     try:
         if cancellation is not None:
@@ -4145,7 +5587,7 @@ def _download_clip(
             ffprobe_path=_ffmpeg_bin("ffprobe"),
             require_video=True,
             min_bytes=4096,
-            min_duration=max(0.05, requested_duration - (1.0 / target_fps)),
+            min_duration=required_duration - 1e-6,
             expected_duration=requested_duration,
             duration_tolerance=(1.0 / target_fps) + 0.005,
             expected_width=target_width,
@@ -4154,14 +5596,15 @@ def _download_clip(
             ffmpeg_path=_ffmpeg_bin('ffmpeg'),
         )
         if promoted.valid:
+            candidate['_download_mode'] = 'normalized_range'
             return True
-        # A few legacy unit tests use a subprocess double that writes the
-        # requested output but returns ``None``. Real subprocess.run cannot do
-        # that, so retain compatibility without weakening production probes.
-        if promoted.reason == "ffprobe_invalid_result" and _source_has_video_stream(part_path):
-            os.replace(part_path, output_path)
-            return True
-        print(f"   [yt-v2] clip integrity rejection ({promoted.reason}): {output_path.name}")
+        if promoted.reason in {'invalid_duration', 'duration_mismatch'}:
+            candidate['_transport_failure'] = 'youtube_range_duration_invalid'
+        print(
+            f"   [yt-v2] clip integrity rejection ({promoted.reason}): {output_path.name} "
+            f"(observed={promoted.duration:.3f}s, required={required_duration:.3f}s)",
+            flush=True,
+        )
         for _partial in output_path.parent.glob(raw_prefix + "*"):
             try:
                 _partial.unlink()
@@ -4560,11 +6003,9 @@ def _download_source_once(
                     flush=True,
                 )
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    _install_youtube_session(ydl, session_jar)
-                    if cancellation is not None:
-                        cancellation.raise_if_cancelled()
-                    ydl.download([url])
+                _download_with_youtube_session(
+                    yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
+                )
                 download_error = None
                 break
             except Exception as exc:
@@ -5039,8 +6480,34 @@ def _search_container_pools(
     search_timeout_seconds: Optional[float] = None,
     session_jar: Any = None,
     cancellation: Any = None,
+    wall_cap_seconds: Optional[float] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
+    """Search the container pools.
+
+    ``wall_cap_seconds`` (optional, seconds from now) bounds the whole
+    search — first pass plus anonymous retry — so a crawling fan-out in a
+    degraded hour cannot eat the download reserve the caller priced with
+    :func:`_yt_download_reserve_seconds` (run 7: the rounds floor below
+    raised a 55 s allocation to 105 s while downloads were still owed
+    ~170 s). A healthy fan-out finishes early regardless; the cap only
+    bites when queries stall, trading late search recall for clips that
+    can still complete. Callers that do not pass it keep the old
+    behaviour.
+    """
     max_workers = max(2, min(int(os.environ.get("VIDZEO_YT_SEARCH_CONCURRENCY", "8") or 8), 16))
+    # Throttle-safe search concurrency (measured live Nov 19 on the Panama
+    # queries via the egress proxy): a single yt-dlp search costs ~9s
+    # sequential, ~13-21s at 4-way concurrency, but ~37-51s at 10-way --
+    # the proxy serializes concurrent requests, so more workers only
+    # inflate per-search latency (10-way total 59s vs 4-way 56s for the
+    # same 12 queries) while delaying the first completed result. Cap the
+    # fan-out so the first round lands early and partial results exist
+    # before the wall. VIDZEO_YT_SEARCH_MAX_CONCURRENCY raises it.
+    try:
+        _search_max_workers = max(2, min(16, int(os.environ.get("VIDZEO_YT_SEARCH_MAX_CONCURRENCY", "4") or 4)))
+    except (TypeError, ValueError):
+        _search_max_workers = 4
+    max_workers = min(max_workers, _search_max_workers)
     jobs: List[Tuple[str, str]] = []
     for key, rows in groups.items():
         # YouTube needs several independent retrieval families to expose
@@ -5049,6 +6516,12 @@ def _search_container_pools(
         # pool before it could find walkarounds, archive footage, or driving
         # sequences. This remains bounded by the total query cap below.
         query_limit = int(os.environ.get("VIDZEO_YT_V2_QUERIES_PER_CONTAINER", "8") or 8)
+        if len(groups) == 1:
+            # A single-container (single-topic) job has one thin pool: its
+            # 8 scenes share the same queries, so widen the per-container
+            # slice instead of cutting it. Recall first; the total query
+            # cap below still bounds the fan-out.
+            query_limit = max(query_limit, 12)
         if any(_norm(row.get("domain_category") or "") == "disaster" for row in rows):
             # Historic disasters need archive/newsreel variants that are
             # appended after modern raw-footage queries.
@@ -5095,6 +6568,19 @@ def _search_container_pools(
             )
         jobs = capped
 
+    # The stage allocation is a budget, not a measured cost. Panama run 3
+    # (job e053d262) got search<=55s from the stage budget, which assumes a
+    # yt-dlp search answers in ~3s; measured live Nov 19 via the egress
+    # proxy, the same 12-query fan-out needs ~55s in a GOOD hour (~9s per
+    # search sequential, ~18s at 4-way concurrency) and more when degraded,
+    # so the wall was consumed entirely even when searches succeeded -- and
+    # in run 3's degraded hour zero searches finished before the deadline
+    # (0 candidates, 0 futures consumed) while ~284s of branch wall went
+    # unused. The rounds floor below therefore applies to explicit
+    # timeouts too: it raises the wall to what this fan-out actually
+    # costs, bounded by the hard cap (VIDZEO_YT_V2_SEARCH_TIMEOUT_HARD_CAP,
+    # default 240s). Set VIDZEO_YT_SEARCH_SECONDS_PER_QUERY=0 to disable
+    # the fit; the hard cap remains the operator's bound either way.
     timeout_value = search_timeout_seconds
     if timeout_value is None:
         timeout_value = os.environ.get("VIDZEO_YT_V2_SEARCH_TIMEOUT")
@@ -5107,6 +6593,7 @@ def _search_container_pools(
         per_scene = max(0.0, float(os.environ.get("VIDZEO_YT_SCENE_SEARCH_BUDGET_SECONDS") or 0.0) or 0.0)
         if per_scene > 0:
             max_workers = max(2, min(int(os.environ.get("VIDZEO_YT_SEARCH_CONCURRENCY", "8") or 8), 16))
+            max_workers = min(max_workers, _search_max_workers)
             # ~2s per yt-dlp search round; give the whole job a chance to finish,
             # but cap it so a healthy pool never stalls the branch forever.
             scaled = per_scene + int(math.ceil(len(jobs) / max_workers)) * 2.0
@@ -5117,14 +6604,20 @@ def _search_container_pools(
         search_timeout = max(0.0, float(timeout_value or 0.0))
     except (TypeError, ValueError):
         search_timeout = 90.0
-    # A throttled yt-dlp search can consume the whole socket timeout on every
-    # retry (e.g. 20s x 4 = ~85s), so a fan-out deadline shorter than the
-    # worst-case per-search round would cancel the queue before the first
-    # search returns.  Scale the wall deadline from the actual job cost,
-    # bounded so a healthy pool never stalls the branch forever.
-    _socket = max(1.0, float(os.environ.get("VIDZEO_YT_METADATA_SOCKET_TIMEOUT", "8") or 8))
-    _retries = max(0.0, float(os.environ.get("VIDZEO_YT_METADATA_RETRIES", "1") or 1))
-    _worst_per_search = _socket * (1.0 + _retries) + 8.0
+    # Fit the wall to the fan-out's real cost. The old floor used the
+    # worst case socket-timeout x retries (8s x 2 = 24s/search with stale
+    # defaults, vs the real 15s/2 in _search_youtube_uncached and 30s/4
+    # in the production worker env) -- far too pessimistic as a sizing
+    # rule, since a healthy search answers in ~9s sequential / ~18s at
+    # 4-way concurrency via the proxy. Size on the measured throttled
+    # cost instead: one allowance per search round, plus a drain margin.
+    # A healthy fan-out finishes early (the wall is a deadline, not
+    # consumed time); a throttled one gets the rounds it needs instead
+    # of dying with 0 candidates. Bounded by the hard cap below.
+    try:
+        _per_search = max(0.0, float(os.environ.get("VIDZEO_YT_SEARCH_SECONDS_PER_QUERY", "30") or 30))
+    except (TypeError, ValueError):
+        _per_search = 30.0
     _rounds = max(1, int(math.ceil(len(jobs) / max_workers)))
     # Absolute ceiling: never let a crawling search fan-out eat the branch
     # wall (the r9 stall burned 25 minutes this way). The caller's wall still
@@ -5137,16 +6630,57 @@ def _search_container_pools(
         max(search_timeout, float(os.environ.get("VIDZEO_YT_V2_SEARCH_TIMEOUT_HARD_CAP", "240") or 240)),
         _ceiling,
     )
-    if search_timeout > 0:
-        # The rounds floor applies whether or not the caller passed a
-        # timeout: a 36-query fan-out at 8 workers is 5 rounds, and a
-        # caller wall sized for one round cancels the queue before the
-        # first search returns under load. The hard cap still bounds it.
-        search_timeout = max(search_timeout, min(_worst_per_search * _rounds + 15.0, _hard_cap))
+    if search_timeout > 0 and _per_search > 0:
+        # The rounds floor: a 12-query fan-out at 4 workers is 3 rounds,
+        # and a caller wall sized for one round cancels the queue before
+        # the first search returns under load. The hard cap still bounds
+        # it. This applies to explicit timeouts too (see above): the stage
+        # allocation that produced them never measured the per-search cost.
+        search_timeout = max(search_timeout, min(_rounds * _per_search + 15.0, _hard_cap))
+    if wall_cap_seconds is not None:
+        # The caller's wall cap (search + transcripts + downloads share one
+        # branch wall): the floor above may raise the timeout past what the
+        # download reserve allows. Clamp the whole search — first pass and
+        # retry — to the cap, floored so at least one search round can land.
+        try:
+            _wall_cap = float(wall_cap_seconds)
+        except (TypeError, ValueError):
+            _wall_cap = 0.0
+        if _wall_cap > 0:
+            search_timeout = min(search_timeout, max(30.0, _wall_cap))
+            _hard_cap = min(_hard_cap, max(30.0, _wall_cap))
 
-    # Authentication fallback shares one search wall. Giving it a fresh
-    # 60-180 seconds after an exhausted pass starves clip downloads.
-    search_deadline = time.monotonic() + search_timeout
+    # The anonymous retry used to share the first pass's wall, so it
+    # inherited ~0s whenever the first pass consumed its deadline -- in
+    # Panama run 3 it never ran in either worker run (no retry line in
+    # either log). Give it its own budget inside the hard cap instead:
+    # it only fires when the first pass timed out with 0 candidates,
+    # i.e. when there is nothing downstream to protect. The budget is
+    # 30s, not 60s: a cache-served retry (the Panama recovery case —
+    # repeat queries served from the local search cache) answers in
+    # seconds, while a retry that is itself throttled recovers nothing
+    # in test 22 (60s, 0 candidates) and only burns discovery time the
+    # downloads and transcripts still need.
+    try:
+        _retry_budget = max(0.0, float(os.environ.get("VIDZEO_YT_SEARCH_ANON_RETRY_SECONDS", "30") or 30))
+    except (TypeError, ValueError):
+        _retry_budget = 30.0
+    # Round 11 (job 7d1beaba): the "own budget" above is still computed as
+    # leftover (_hard_cap - search_timeout), and the wall-cap clamp forces
+    # _hard_cap == search_timeout whenever the rounds floor raises the
+    # first pass to the cap (24 queries, 6 rounds -> 195 s floored to a
+    # 150 s cap) — so the retry still got 0 s and never ran, exactly the
+    # Panama-run-3 symptom this block was written to fix. Reserve the
+    # retry's slice inside the cap first: shrink the first pass so the
+    # retry keeps its budget. The reservation applies only when the cap
+    # leaves a full 30 s first pass plus the full retry budget: under a
+    # small cap the first pass keeps the whole cap (a token partial retry
+    # is not worth shrinking the primary search), and first pass + retry
+    # still never exceed the wall cap, so the download reserve the cap
+    # protects is untouched.
+    if _retry_budget > 0 and _hard_cap - _retry_budget >= 30.0:
+        search_timeout = min(search_timeout, _hard_cap - _retry_budget)
+    _retry_timeout = min(_retry_budget, max(0.0, _hard_cap - search_timeout))
     timed_out, pools = _run_pool_search_pass(
         jobs,
         session_jar=session_jar,
@@ -5154,8 +6688,7 @@ def _search_container_pools(
         max_workers=max_workers,
         cancellation=cancellation,
     )
-    retry_remaining = max(0.0, search_deadline - time.monotonic())
-    if timed_out and not any(pools.values()) and session_jar is not None and retry_remaining > 0:
+    if timed_out and not any(pools.values()) and session_jar is not None and _retry_timeout > 0:
         # Authenticated fan-out can stall behind YouTube throttling.  A second,
         # anonymous pass is much faster under load and directly recovers the
         # zero-candidate failure mode without burning the branch budget twice.
@@ -5164,7 +6697,6 @@ def _search_container_pools(
             "(detected IP throttling: repeat queries are served from the local search cache)",
             flush=True,
         )
-        _retry_timeout = min(retry_remaining, 180.0)
         _retry_timed_out, pools = _run_pool_search_pass(
             jobs,
             session_jar=None,
@@ -5183,6 +6715,17 @@ def _search_container_pools(
             "(possibly throttled; reruns serve repeat queries from the local search cache)",
             flush=True,
         )
+        if not any(pools.values()):
+            # Round 11: name the blocker — job 7d1beaba's worker log
+            # showed only the line above with an empty attempt audit,
+            # and nothing distinguished "retry skipped" from "retry ran
+            # and also timed out".
+            print(
+                "   [yt-v2] anonymous retry did not run: "
+                f"session_jar={'set' if session_jar is not None else 'none'}, "
+                f"retry_budget={_retry_timeout:.0f}s",
+                flush=True,
+            )
     return pools
 
 
@@ -5278,7 +6821,7 @@ def _run_pool_search_pass(
                 break
         if not cached_query:
             last_network_submission = time.monotonic()
-        results_per_query = int(os.environ.get("VIDZEO_YT_RESULTS_PER_QUERY", "20") or 20)
+        results_per_query = int(os.environ.get("VIDZEO_YT_RESULTS_PER_QUERY", "30") or 30)
         future = executor.submit(_search_job, query, results_per_query)
         if cancellation is not None:
             cancellation.register_future(future)
@@ -5359,6 +6902,353 @@ def _run_pool_search_pass(
     return timed_out, pools
 
 
+# ---------------------------------------------------------------------------
+# Prep-manifest-first candidate injection
+# ---------------------------------------------------------------------------
+# The live YouTube lane can only reuse a prepped cut when live search
+# happens to request that video: the verified-cut cache is keyed by
+# (video_id, start, duration) and is consulted only for candidates the
+# search returned.  When the script is re-split live (Whisper split vs the
+# fallback split at prep time) the live queries never request the prep
+# videos at all, so the lookup never has a chance — Panama run 2 reused
+# 0/6 prep cuts even though the cache held them, because the lane died at
+# the transcript step before any lookup.
+#
+# Injection closes that gap at the pool: when the live lane runs for a
+# scene, the prep manifest's already-verified YouTube cuts for that scene
+# are added to the scene's container pool ALONGSIDE the live search
+# results.  From there everything downstream is unchanged:
+#   * ranking is the existing _score_candidate (see the prep carve-out
+#     there: with no title/description on file, the metadata subject
+#     check would score the candidate -180 and drop it; the prep
+#     transcript moment + scene-text overlap is the subject evidence
+#     instead — the candidate still has to survive every other gate);
+#   * the timestamp is the prep-verified transcript moment, used only
+#     when no fresh transcript moment exists for that video+scene;
+#   * the download step still consults the verified-cut cache first
+#     (exact key, then the overlap cover rule — a cached cut shorter
+#     than the live scene is never restored) and otherwise downloads a
+#     fresh ranged slice at the prep moment;
+#   * overlay / motion / contact-probe / vision gates still run.
+# Prep verification is deterministic ("cache"/"deterministic") — prep
+# never runs vision — so an injected candidate is never treated as
+# vision-verified; the live visual gate remains authoritative.
+#
+# Fail-soft by construction: no manifest, an ambiguous manifest, an
+# unmappable scene, a missing cache file, or any error leaves `pools`
+# untouched, and jobs with no prep manifest are byte-identical in
+# behaviour.  Kill-switch: VIDZEO_YT_PREP_MANIFEST_INJECTION=0.
+
+PREP_MANIFEST_MIN_SCENE_OVERLAP = 0.5
+PREP_MANIFEST_MIN_SCENE_OVERLAP_MARGIN = 0.10
+PREP_MANIFEST_MIN_CUT_BYTES = 8192
+
+
+def prep_manifest_injection_enabled() -> bool:
+    """True unless VIDZEO_YT_PREP_MANIFEST_INJECTION is explicitly off."""
+    return str(
+        os.environ.get("VIDZEO_YT_PREP_MANIFEST_INJECTION", "1") or "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_prep_manifest_candidate(candidate: Any) -> bool:
+    """True for a candidate stamped by :func:`inject_prep_manifest_candidates`.
+
+    The overlap is re-checked here (not just the flag) so a hand-built
+    dict carrying the flag without a qualifying mapping gets no carve-out.
+    """
+    if not isinstance(candidate, dict) or not candidate.get("prep_manifest_injected"):
+        return False
+    try:
+        return float(candidate.get("prep_scene_overlap") or 0.0) >= PREP_MANIFEST_MIN_SCENE_OVERLAP
+    except (TypeError, ValueError):
+        return False
+
+
+def inject_prep_manifest_candidates(
+    pools: Dict[str, List[Dict[str, Any]]],
+    rows: List[Dict[str, Any]],
+    title: str,
+    scene_texts: Optional[List[str]] = None,
+    *,
+    excluded_video_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Inject prep-manifest YouTube cuts into the live container pools.
+
+    ``rows`` are the live scene rows (``_build_scene_rows`` output);
+    ``scene_texts`` defaults to each row's ``scene_text``.  Each prep
+    YouTube entry is mapped to its best live scene by scene-text overlap
+    (:func:`_calculate_scene_text_overlap`); the mapping must clear
+    ``PREP_MANIFEST_MIN_SCENE_OVERLAP`` with a margin over the second-best
+    live scene, so a cut is never attached to the wrong scene of a
+    multi-subject job.  Entries whose cached cut file is gone are skipped
+    (the point is reusing verified media, not re-downloading blind).
+
+    ``excluded_video_ids`` (recovery-wave rejects) are skipped with
+    reason ``excluded_recovery_reject``: the recovery wave excludes a
+    vision-rejected primary from the search pools BEFORE injection, so
+    without this injection re-adds the rejected clip and the recovery
+    wave re-downloads it while the unused prep alternate (test 15 scene
+    0: ``TgtfearX668``) is never attempted. Exclusion must apply to the
+    injected set exactly as it applies to the searched set.
+
+    Candidates are appended to the mapped scene's container pool — pools
+    are per-container, so an injected candidate is visible to the other
+    scenes of the same container as a last-ranked backstop, exactly like
+    any low-scoring live candidate, and is still vision-gated per scene.
+    Returns an audit dict; never raises. ``skipped_entries`` names every
+    banked cut that was NOT injected, with its reason: run 7 silently
+    skipped two (``skipped 1`` in the main worker, ``skipped 5`` in the
+    small worker) and the only trace was the count — one cut's target
+    scene was not in that worker's scene set at all (its best match
+    inside the set cleared neither the overlap floor nor the margin),
+    so no worker ever attempted it. A count cannot tell that story; the
+    per-entry rows can, and the coordinator can see which banked cuts
+    still have no worker.
+    """
+    audit: Dict[str, Any] = {
+        "enabled": False, "injected": 0, "scenes": [], "skipped": 0,
+        "skipped_entries": [], "reason": "",
+    }
+    if not prep_manifest_injection_enabled():
+        audit["reason"] = "disabled"
+        return audit
+    try:
+        from services.advance_prep import load_manifest_for_title
+    except Exception:
+        audit["reason"] = "prep_loader_unavailable"
+        return audit
+    try:
+        manifest = load_manifest_for_title(title) or {}
+        entries = (manifest.get("youtube") or {}).get("entries") or []
+        prep_scenes: Dict[int, str] = {}
+        for scene in manifest.get("scenes") or []:
+            if not isinstance(scene, dict):
+                continue
+            try:
+                # Scene list entries are keyed by "index" (youtube entries
+                # use "scene"); accept either.
+                prep_scenes[int(scene.get("scene", scene.get("index")))] = str(scene.get("text") or "")
+            except (TypeError, ValueError):
+                continue
+        live_texts = list(scene_texts) if scene_texts is not None else [
+            str((row or {}).get("scene_text") or "") for row in (rows or [])
+        ]
+        if not entries or not prep_scenes or not live_texts or not rows:
+            audit["reason"] = "no_mappable_prep_entries"
+            return audit
+        audit["enabled"] = True
+        staged: List[Tuple[str, Dict[str, Any]]] = []
+        excluded_ids = {
+            str(video_id).strip()
+            for video_id in (excluded_video_ids or ())
+            if str(video_id or "").strip()
+        }
+
+        def _record_skip(
+            skip_video_id: str,
+            skip_prep_scene: Any,
+            reason: str,
+            best_overlap: Optional[float] = None,
+            best_live_scene: Optional[int] = None,
+        ) -> None:
+            audit["skipped"] += 1
+            try:
+                audit["skipped_entries"].append({
+                    "video_id": str(skip_video_id or ""),
+                    "prep_scene": skip_prep_scene,
+                    "reason": reason,
+                    "best_overlap": (
+                        round(float(best_overlap), 3)
+                        if best_overlap is not None else None
+                    ),
+                    "best_live_scene": best_live_scene,
+                })
+            except (TypeError, ValueError):
+                pass
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                _record_skip("", None, "invalid_entry")
+                continue
+            video_id = str(entry.get("video_id") or "").strip()
+            try:
+                start = float(entry.get("start"))
+                cut_duration = float(entry.get("duration"))
+                prep_scene = int(entry.get("scene"))
+            except (TypeError, ValueError):
+                _record_skip(video_id, entry.get("scene"), "invalid_entry")
+                continue
+            prep_text = prep_scenes.get(prep_scene, "")
+            cache_path = str(entry.get("path") or "")
+            if not video_id or start < 0 or cut_duration <= 0 or not prep_text:
+                _record_skip(video_id, prep_scene, "invalid_entry")
+                continue
+            if video_id in excluded_ids:
+                # Recovery-wave reject (see the function docstring): the
+                # clip already failed the live visual gate for this job,
+                # so it must not be re-injected as the scene's alternate.
+                _record_skip(video_id, prep_scene, "excluded_recovery_reject")
+                continue
+            try:
+                if not Path(cache_path).is_file() or Path(cache_path).stat().st_size < PREP_MANIFEST_MIN_CUT_BYTES:
+                    _record_skip(video_id, prep_scene, "cache_file_missing")
+                    continue
+            except OSError:
+                _record_skip(video_id, prep_scene, "cache_file_missing")
+                continue
+            scored = sorted(
+                (
+                    (_calculate_scene_text_overlap(prep_text, live_text), idx)
+                    for idx, live_text in enumerate(live_texts)
+                ),
+                reverse=True,
+            )
+            best_overlap, best_idx = scored[0]
+            second_overlap = scored[1][0] if len(scored) > 1 else 0.0
+            if (
+                best_overlap < PREP_MANIFEST_MIN_SCENE_OVERLAP
+                or best_overlap - second_overlap < PREP_MANIFEST_MIN_SCENE_OVERLAP_MARGIN
+            ):
+                # Most commonly this means the cut's true scene is not in
+                # THIS worker's scene set at all (a quota/recovery worker
+                # sees only its subset): its best match inside the subset
+                # is a different scene, below the floor. The cut is not
+                # mis-mapped — it is unmapped here — and the row says so.
+                _record_skip(
+                    video_id, prep_scene,
+                    "below_overlap_floor" if best_overlap < PREP_MANIFEST_MIN_SCENE_OVERLAP else "below_margin",
+                    best_overlap=best_overlap, best_live_scene=int(best_idx),
+                )
+                continue
+            if best_idx >= len(rows):
+                _record_skip(
+                    video_id, prep_scene, "target_scene_out_of_range",
+                    best_overlap=best_overlap, best_live_scene=int(best_idx),
+                )
+                continue
+            row = rows[best_idx] or {}
+            pool_key = _row_pool_key(row)
+            existing = pools.get(pool_key) or []
+            # Exact (video_id, start) dedupe. Compare rounded to the same
+            # 2 dp the candidate is stamped with, and never use `or`
+            # defaults here: a 0.0 timestamp is falsy and would slip past.
+            stamped_start = round(start, 2)
+
+            def _stamped_ts(value: Any) -> Optional[float]:
+                try:
+                    return round(float(value), 2)
+                except (TypeError, ValueError):
+                    return None
+
+            if any(
+                _video_id(item) == video_id
+                and _stamped_ts(item.get("prep_best_timestamp")) == stamped_start
+                for item in existing
+            ):
+                _record_skip(
+                    video_id, prep_scene, "duplicate",
+                    best_overlap=best_overlap, best_live_scene=int(best_idx),
+                )
+                continue
+            if any(
+                _video_id(staged_candidate) == video_id
+                and _stamped_ts(staged_candidate.get("prep_best_timestamp")) == stamped_start
+                for _, staged_candidate in staged
+                if staged_candidate.get("_prep_pool_key") == pool_key
+            ):
+                _record_skip(
+                    video_id, prep_scene, "duplicate",
+                    best_overlap=best_overlap, best_live_scene=int(best_idx),
+                )
+                continue
+            candidate: Dict[str, Any] = {
+                # Real identity only. Title/description/channel are
+                # unknown for a prep cut (the cache stores no video
+                # metadata) and are left blank rather than filled from
+                # the prep search query, which is not the video's title.
+                "video_id": video_id,
+                "id": video_id,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": "",
+                "description": "",
+                "channel": "",
+                "uploader": "",
+                "query_text": str(entry.get("query") or ""),
+                # Prep verification carried on the candidate so the lane
+                # never re-derives it from scratch. The moment is the
+                # transcript-matched, deterministically verified prep
+                # moment; `prep_verification` is "cache"/"deterministic"
+                # (prep never runs vision — the live visual gate still
+                # decides). Duration is deliberately omitted: the source
+                # length is unknown, and a guessed short duration would
+                # trip the too-short hard block.
+                "prep_manifest_injected": True,
+                "prep_best_timestamp": round(start, 2),
+                "best_timestamp": round(start, 2),
+                "prep_cut_duration": round(cut_duration, 2),
+                "prep_scene": prep_scene,
+                "prep_live_scene": best_idx,
+                "prep_scene_overlap": round(best_overlap, 3),
+                "prep_query": str(entry.get("query") or ""),
+                "prep_cache_path": cache_path,
+                "prep_verification": str(entry.get("verification") or ""),
+                "timestamp_evidence": "prep_manifest_verified_moment",
+                "_prep_pool_key": pool_key,
+            }
+            staged.append((pool_key, candidate))
+        for pool_key, candidate in staged:
+            candidate.pop("_prep_pool_key", None)
+            pools.setdefault(pool_key, []).append(candidate)
+            audit["injected"] += 1
+            if candidate["prep_live_scene"] not in audit["scenes"]:
+                audit["scenes"].append(candidate["prep_live_scene"])
+        if not staged:
+            audit["reason"] = "no_entries_mapped"
+        return audit
+    except Exception as exc:
+        audit["reason"] = f"injection_error:{type(exc).__name__}"
+        return audit
+
+
+def _log_prep_manifest_injection_audit(
+    audit: Dict[str, Any], lookup_title: str
+) -> None:
+    """Always log the prep-manifest injection audit, including a 0.
+
+    A silent 0 hid the run-3 title mismatch for a whole job: the YT
+    branch received the topic anchor ("Panama Canal") instead of the
+    full job title, ``load_manifest_for_title`` found no manifest, and
+    the old ``if injected:`` print never fired. Logging the audit (with
+    the reason and the title actually looked up) makes a future no-fire
+    diagnosable from the worker log alone.
+    """
+    skipped_entries = [
+        entry for entry in (audit.get("skipped_entries") or [])
+        if isinstance(entry, dict)
+    ]
+    skipped_detail = ""
+    if skipped_entries:
+        skipped_detail = "; skipped=" + ", ".join(
+            f"{entry.get('video_id') or '?'}:"
+            f"{entry.get('reason') or '?'}"
+            f"(prep_scene={entry.get('prep_scene')},"
+            f" best_overlap={entry.get('best_overlap')},"
+            f" best_live_scene={entry.get('best_live_scene')})"
+            for entry in skipped_entries[:7]
+        )
+    print(
+        "   [yt-v2] prep-manifest injection: "
+        f"{audit.get('injected', 0)} candidate(s) "
+        f"for {len(audit.get('scenes') or [])} scene(s) "
+        f"(skipped {audit.get('skipped', 0)}; "
+        f"reason={audit.get('reason') or 'ok'}; "
+        f"lookup_title={str(lookup_title or '')[:80]!r})"
+        f"{skipped_detail}"
+    )
+
+
 def _assign_candidates(
     rows: List[Dict[str, Any]],
     pools: Dict[str, List[Dict[str, Any]]],
@@ -5400,6 +7290,19 @@ def _assign_candidates(
             for field in ('candidate_evidence', 'requirement_hash', 'semantic_context_pending', 'nearest_match_pending'):
                 candidate.pop(field, None)
             candidate_id = _video_id(candidate)
+            # Prep-manifest candidates are mapped to ONE live scene by
+            # scene-text overlap. Only that scene may take one as its
+            # metadata assignment (primary): its timestamp is that
+            # scene's verified moment, not a per-scene heuristic. Other
+            # scenes of the same container still see it in the raw pool
+            # as a late download option — the pool is shared by design —
+            # but never as primary.
+            if candidate.get("prep_manifest_injected"):
+                try:
+                    if int(candidate.get("prep_live_scene", -1)) != idx:
+                        continue
+                except (TypeError, ValueError):
+                    continue
             # The opening 15 seconds is an editorial hook, not a place to
             # replay one master source. Enforce source diversity there even
             # when the broader job permits same-source bite reuse.
@@ -5407,8 +7310,19 @@ def _assign_candidates(
                 continue
             if not allow_same_source_reuse and candidate_id in assigned_source_ids and not bite_clip:
                 continue
+            # Prep-manifest candidates carry no title/channel/description
+            # metadata by design (never fabricated) and were already
+            # verified at prep time at the mapped moment, so the
+            # requirement match below cannot evaluate them: it returns
+            # 'missing_asset_identity_metadata' for every injected cut and
+            # the assignment drops all of them. On the live path the rows
+            # always carry strict requirements (adapter-built), so without
+            # this exemption the title fix injects 9 into the pool and
+            # assigns 0 (run-4 adapter repro). Skip the metadata gate for
+            # injected cuts; the prep_live_scene mapping above, download
+            # verification, and the visual gates still apply.
             requirement = row.get("visual_requirement")
-            if isinstance(requirement, Mapping):
+            if isinstance(requirement, Mapping) and not candidate.get("prep_manifest_injected"):
                 matched, reason, evidence = candidate_requirement_match(requirement, candidate)
                 if not matched:
                     pending, pending_evidence = candidate_domain_context_pending(
@@ -5509,7 +7423,33 @@ def _assign_candidates(
                 ranked_options.append(r_item)
         if not ranked_options:
             ranked_options = reused_source_scored
+        # A mapped prep-manifest cut is a verified local file: resolving
+        # this scene from it costs zero network time, so it must be the
+        # scene's primary, not a last-ranked backstop behind live
+        # candidates. In job 48cb2324 the injected cuts scored -5.0
+        # (empty title/description/channel) against ~+187 for a live
+        # candidate with matching terms, lost every assignment, and the
+        # lane re-downloaded live candidates over a 343 s branch wall it
+        # could not fit (0/11 resolved). Live candidates stay as ranked
+        # alternates if the prep cut fails a later gate. The loop above
+        # already restricts an injected candidate to its mapped scene
+        # (prep_live_scene == idx), so this only reorders within a row;
+        # the sort is stable, so score order survives inside each group.
+        ranked_options.sort(
+            key=lambda item: 0 if _is_prep_manifest_candidate(item[1]) else 1
+        )
+        # Return up to 3 ranked, timestamped options per scene instead of
+        # top-1-only: the coordinator's vision + reuse logic needs
+        # alternates without a second batch, and a single rejected winner
+        # must not strand the scene. The primary stays assignments[idx];
+        # the full ranked list rides on it as ranked_options (plain copies,
+        # never a self-reference). Alternate timestamps are picked against
+        # a copy of the used-timestamp map so an un-downloaded alternate
+        # never reserves a slot another scene needs.
+        ranked_assignments: List[Dict[str, Any]] = []
         for score, candidate in ranked_options[:16]:
+            if len(ranked_assignments) >= 3:
+                break
             clone = dict(candidate)
             clone["score"] = round(score, 2)
             clone["retrieval_context"] = retrieval_context
@@ -5522,18 +7462,552 @@ def _assign_candidates(
             if intro_unique:
                 clone['bite_clip'] = False
             clip_dur = float(scene_durations[idx] if idx < len(scene_durations) else 4.0)
-            timestamp = _pick_timestamp(clone, idx, used_timestamps, clip_dur)
+            timestamp_used = (
+                used_timestamps
+                if not ranked_assignments
+                else defaultdict(list, {key: list(values) for key, values in used_timestamps.items()})
+            )
+            # A prep-manifest candidate carries its verified transcript
+            # moment instead of a heuristic timestamp: _pick_timestamp
+            # returns None without a source duration, which would drop
+            # the candidate here. The prep moment is used verbatim and
+            # registered against the used-timestamp map like a picked one,
+            # so a later scene cannot re-pick the same moment.
+            prep_timestamp = clone.get("prep_best_timestamp")
+            if prep_timestamp is not None and _is_prep_manifest_candidate(clone):
+                try:
+                    timestamp = float(prep_timestamp)
+                except (TypeError, ValueError):
+                    timestamp = None
+                if timestamp is not None and timestamp < 0:
+                    timestamp = None
+                if timestamp is not None:
+                    for reuse_key in _timestamp_reuse_keys(clone):
+                        timestamp_used[reuse_key].append(timestamp)
+            else:
+                timestamp = _pick_timestamp(clone, idx, timestamp_used, clip_dur)
             if timestamp is None:
                 clone["v2_reject_reason"] = "no_distinct_middle_timestamp_available"
                 continue
             clone["best_timestamp"] = timestamp
-            assignments[idx] = clone
-            assigned_source_ids.add(_video_id(clone))
-            break
+            ranked_assignments.append(clone)
+        if ranked_assignments:
+            primary = ranked_assignments[0]
+            primary["ranked_options"] = [dict(option) for option in ranked_assignments]
+            assignments[idx] = primary
+            assigned_source_ids.add(_video_id(primary))
     if rejection_counts:
         summary = ", ".join(f"{reason}={count}" for reason, count in rejection_counts.most_common(6))
         print(f"   [yt-v2] rank audit: {summary}")
     return assignments
+
+
+_CONTENT_REJECTION_STATUSES = {
+    'motion_or_quality_rejected', 'overlay_or_talking_head_rejected',
+    'contact_vision_rejected',
+}
+
+
+def _same_video_alternate_allowed(attempt_rows, vid, option_count) -> bool:
+    """Whether a failed cut may be retried at another timestamp of the same video.
+
+    A same-video alternate is only useful when the failure was timestamp-local
+    (e.g. an intro talking head or a mid-video blank frame). It is denied when
+    a fresh master exists (``option_count > 1``) and the failure is one of:
+
+    * a static/slideshow master (the whole video is a still);
+    * a video-global rejection (burned-in captions / watermarks fail at every
+      timestamp of the same master);
+    * a second content failure on the same video in this scene (the master is
+      wrong for the scene, not the timestamp).
+
+    When no fresh master exists the alternate is still allowed: it is the
+    scene's only remaining chance.
+    """
+    if not attempt_rows:
+        return False
+    last = attempt_rows[-1] if isinstance(attempt_rows[-1], dict) else {}
+    if str(last.get('status') or '') not in _CONTENT_REJECTION_STATUSES:
+        return False
+    if option_count <= 1:
+        return True
+    reason = str(last.get('rejection_reason') or '').split(':')[0]
+    if reason in {
+        'static_image_or_pan', 'still_or_slideshow', 'still_or_slideshow_frame',
+        'static_frame_hold',
+    }:
+        return False
+    if reason in {'caption_overlay_rejected', 'watermark_detected', 'watermark'}:
+        return False
+    prior_same_video_failures = sum(
+        1 for row in attempt_rows[:-1]
+        if isinstance(row, dict)
+        and str(row.get('video_id') or row.get('candidate_id') or '') == vid
+        and str(row.get('status') or '') in _CONTENT_REJECTION_STATUSES
+    )
+    return prior_same_video_failures < 1
+
+
+def _yt_fallback_min_score(*, lenient_acceptance: bool = False) -> float:
+    """The metadata floor :func:`_assign_candidates` applies.
+
+    The general fallback layer reuses exactly this floor (lenient -179,
+    otherwise ``VIDZEO_YT_MIN_METADATA_SCORE`` / -120): a fallback
+    candidate is held to the same bar as an assigned one, never a lower
+    one smuggled in through the back door.
+    """
+    if lenient_acceptance:
+        return -179.0
+    try:
+        return float(os.environ.get("VIDZEO_YT_MIN_METADATA_SCORE", "-120.0") or -120.0)
+    except (TypeError, ValueError):
+        return -120.0
+
+
+def _yt_layered_scene_options(
+    row: Dict[str, Any],
+    pool: List[Dict[str, Any]],
+    assignment: Optional[Dict[str, Any]],
+    *,
+    subject: str,
+    scene_text: str,
+    retrieval_context: Optional[Dict[str, Any]],
+    lenient_acceptance: bool = False,
+) -> List[Dict[str, Any]]:
+    """Order one scene's candidates into the inline per-scene fallback chain.
+
+    The chain runs INSIDE the per-scene resolution flow (one option per
+    fair-scheduling pass, in this order) — never as a second batch from
+    scratch at the end. It reuses only the already-fetched container pool
+    and on-disk cache: no new searches, so it fits the branch wall.
+
+    Layer 1 ``perfect`` — the assignment's ranked options (primary +
+    alternates): the existing first pass, unchanged. Layer 2 ``general`` —
+    other candidates from the same container pool that clear the same hard
+    floor (``_score_candidate > -999``) and the same metadata floor as
+    assignment, ordered by metadata score: still related to the video
+    (same container subject anchor), but not the scene's specific query
+    match. Layer 3 ``cached`` — pool candidates carrying a verified local
+    prep file (``prep_cache_path``) mapped to THIS scene and not already
+    listed: disk restores, zero network time.
+
+    The scene-specific restriction is enforced, not bypassed: the general
+    layer additionally requires ``_gaming_exact_title_gate`` to be clear,
+    so a 2002 Vice City cutscene stays rejected everywhere and a San
+    Andreas clip stays out of GTA VI scenes; same-franchise numbered
+    entries pass the gate as general topic footage (Round 15). An injected
+    candidate mapped to a DIFFERENT scene is excluded from layers 2/3:
+    its verified moment belongs to that scene.
+    Every returned option is a copy stamped with ``_yt_fallback_layer``.
+    """
+    scene_index = int(row.get("scene_index", -1) or -1)
+    layered: List[Dict[str, Any]] = []
+    seen_vids: set = set()
+
+    def _stamped(option: Dict[str, Any], layer: str) -> Dict[str, Any]:
+        stamped_option = dict(option)
+        stamped_option["_yt_fallback_layer"] = layer
+        return stamped_option
+
+    # Layer 1: the assignment's ranked options, in ranked order.
+    ranked_options = []
+    if isinstance(assignment, Mapping):
+        ranked_options = list(assignment.get("ranked_options") or []) or [assignment]
+    for option in ranked_options:
+        if not isinstance(option, Mapping):
+            continue
+        vid = _video_id(option)
+        if not vid or vid in seen_vids:
+            continue
+        seen_vids.add(vid)
+        layered.append(_stamped(option, "perfect"))
+    try:
+        general_cap = max(
+            0,
+            int(os.environ.get("VIDZEO_YT_GENERAL_FALLBACK_CANDIDATES", "4") or 4),
+        )
+    except (TypeError, ValueError):
+        general_cap = 4
+    minimum_score = _yt_fallback_min_score(lenient_acceptance=lenient_acceptance)
+    general_scored: List[Tuple[float, Dict[str, Any]]] = []
+    cached: List[Dict[str, Any]] = []
+    for raw_option in pool:
+        if not isinstance(raw_option, Mapping):
+            continue
+        vid = _video_id(raw_option)
+        if not vid or vid in seen_vids:
+            continue
+        # Another scene's verified moment is not this scene's fallback.
+        if raw_option.get("prep_manifest_injected"):
+            try:
+                mapped_scene = int(raw_option.get("prep_live_scene", -1))
+            except (TypeError, ValueError):
+                mapped_scene = -1
+            if mapped_scene != scene_index:
+                continue
+        score = _score_candidate(
+            raw_option, subject, scene_text,
+            raw_option.get("query_text") or "", retrieval_context,
+        )
+        if score <= -999.0 or score <= minimum_score:
+            continue
+        if _gaming_exact_title_gate(raw_option, subject, scene_text, retrieval_context):
+            continue
+        if raw_option.get("prep_cache_path"):
+            cached.append(raw_option)
+        else:
+            general_scored.append((score, raw_option))
+    general_scored.sort(key=lambda item: item[0], reverse=True)
+    for _score, option in general_scored[:general_cap]:
+        vid = _video_id(option)
+        seen_vids.add(vid)
+        layered.append(_stamped(option, "general"))
+    for option in cached:
+        vid = _video_id(option)
+        if vid in seen_vids:
+            continue
+        seen_vids.add(vid)
+        layered.append(_stamped(option, "cached"))
+    return layered
+
+
+def _yt_restore_first_order(
+    download_indices: List[int],
+    assignments: List[Optional[Dict[str, Any]]],
+) -> List[int]:
+    """Prep-mapped scenes first in the download queue (stable).
+
+    A disk restore costs ~0.05 s against 70 s+ for a live download, so
+    attempting restores before any network transfer means a branch wall
+    cannot kill a restore that was ready from the start (run 6: scene 5's
+    verified restore only happened in a recovery lane, because the main
+    worker died at the wall before the scene's first pass).
+    """
+    def _has_restore(idx: int) -> bool:
+        assignment = assignments[idx] if 0 <= idx < len(assignments) else None
+        if not isinstance(assignment, Mapping):
+            return False
+        for option in [assignment] + list(assignment.get("ranked_options") or []):
+            if isinstance(option, Mapping) and option.get("prep_cache_path"):
+                return True
+        return False
+
+    return sorted(download_indices, key=lambda idx: 0 if _has_restore(idx) else 1)
+
+
+def _yt_ensure_injected_attempt_audits(
+    attempt_audit: Dict[int, List[Dict[str, Any]]],
+    pools: Dict[str, List[Dict[str, Any]]],
+    assignments: List[Optional[Dict[str, Any]]],
+    *,
+    stopped_reason: str = "",
+    download_scene_cap: int = 0,
+    attempted_indices: Optional[set] = None,
+    output_root: Optional[Any] = None,
+) -> int:
+    """Guarantee every injected candidate an attempt audit, even if it
+    loses, is skipped, or is never scheduled.
+
+    Run 6: scenes 10/11's injected cuts (MArh6jOUu4g / GDuSN0-brZs) have
+    no attempt audit anywhere — the branch wall killed the worker before
+    their first pass, and nothing recorded the miss. For each injected
+    candidate with no audit row, append a ``not_attempted`` row recording
+    WHY (``no_assignment`` / ``download_scene_cap`` / ``branch_wall`` /
+    ``no_download_plan`` / ``never_scheduled``) and write the scene's
+    attempts JSON, so the gap is diagnosable from the audit alone. Never
+    raises. Returns the number of rows added.
+    """
+    added = 0
+    attempted = set(attempted_indices or ())
+    injected: Dict[Tuple[str, float], Dict[str, Any]] = {}
+    for candidates in (pools or {}).values():
+        for candidate in candidates or []:
+            if not isinstance(candidate, Mapping) or not candidate.get("prep_manifest_injected"):
+                continue
+            vid = _video_id(candidate)
+            if not vid:
+                continue
+            try:
+                start = round(float(candidate.get("prep_best_timestamp")), 2)
+            except (TypeError, ValueError):
+                start = 0.0
+            injected.setdefault((vid, start), dict(candidate))
+    for (vid, _start), candidate in sorted(injected.items()):
+        try:
+            scene_index = int(candidate.get("prep_live_scene"))
+        except (TypeError, ValueError):
+            continue
+        rows = attempt_audit.get(scene_index) or []
+        if any(
+            isinstance(item, Mapping)
+            and str(item.get("candidate_id") or item.get("video_id") or "") == vid
+            for item in rows
+        ):
+            continue
+        if not (0 <= scene_index < len(assignments or [])) or assignments[scene_index] is None:
+            reason = "no_assignment"
+        elif download_scene_cap and scene_index not in attempted:
+            reason = "download_scene_cap"
+        elif str(stopped_reason or "") in {"hard_timeout", "soft_ceiling", "soft_timeout"}:
+            reason = "branch_wall"
+        elif scene_index in attempted:
+            reason = "no_download_plan"
+        else:
+            reason = "never_scheduled"
+        try:
+            metadata_score = float(candidate.get("score") or candidate.get("v2_score") or 0.0)
+        except (TypeError, ValueError):
+            metadata_score = 0.0
+        attempt_audit.setdefault(scene_index, []).append({
+            "attempt": len(rows) + 1,
+            "candidate_id": vid,
+            "video_id": vid,
+            "title": "",
+            "channel": "",
+            "query": str(candidate.get("prep_query") or candidate.get("query_text") or "")[:180],
+            "metadata_score": metadata_score,
+            "timestamp": round(float(candidate.get("prep_best_timestamp") or 0.0), 2),
+            "timestamp_evidence": "prep_manifest_verified_moment",
+            "status": "not_attempted",
+            "reason": reason,
+            "failure_kind": "not_scheduled",
+            "resolution_layer": "none",
+            "prep_manifest_injected": True,
+            "prep_live_scene": scene_index,
+            "prep_cache_path": str(candidate.get("prep_cache_path") or ""),
+        })
+        added += 1
+        if output_root is not None:
+            try:
+                audit_path = Path(output_root) / f"youtube_scene_{scene_index + 1:03d}.attempts.json"
+                temporary = audit_path.with_suffix(".tmp")
+                temporary.write_text(
+                    json.dumps(attempt_audit[scene_index], ensure_ascii=False, default=str),
+                    encoding="utf-8",
+                )
+                temporary.replace(audit_path)
+            except (OSError, ValueError, TypeError):
+                pass
+    return added
+
+
+def _yt_assignment_has_usable_timestamp(assignment: Any) -> bool:
+    """True when a scene's assigned candidate already carries a timestamp.
+
+    A verified prep moment (``prep_best_timestamp``) or a provider timestamp
+    (``best_timestamp``) is enough to cut the scene: the download planner
+    falls back to it whenever no transcript moment exists, exactly as it
+    does today when the transcript deadline expires. Only a scene with no
+    timestamp at all must wait for transcripts before it can plan a cut.
+    """
+    if not isinstance(assignment, Mapping):
+        return False
+    for key in ("prep_best_timestamp", "best_timestamp"):
+        try:
+            value = assignment.get(key)
+            if value is not None and float(value) >= 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+class _RangedMomentOverlap:
+    """Run the ranged-transcript phase concurrently with the download wave.
+
+    Measured live (tests 12/14/15): the synchronous transcript phase is a
+    hard barrier of ~130-175 s between ``search complete`` and the first
+    download completing — the phase waits for the slowest transcript (a
+    single erroring video burned ~115 s in test 15) while every scene,
+    including the ones whose timestamps were already verified, waits. The
+    live scene that dominated test 15's pass wall (scene 6, ~158 s of
+    attempts) gained nothing from the wait: its attempts used provider
+    timestamps with empty moments.
+
+    This runs ``prepare_ranged_moments`` on one background worker and lets
+    download planning read moments per scene:
+
+    * a scene WITH a usable timestamp never waits — it plans its cut from
+      that timestamp at once, and picks up ranged moments on a later pass
+      if they have landed by then;
+    * a scene WITHOUT any timestamp waits, bounded by the same ranged
+      deadline the synchronous phase used, then falls back to the heuristic
+      timestamp exactly as before.
+
+    Budgets, acceptance, vision gating and the per-host throttle are
+    untouched: this only overlaps work that was already going to happen.
+    """
+
+    def __init__(self, prepare, rows, assignments, pools, durations, *,
+                 session_jar=None, deadline_seconds=120.0,
+                 download_reserve_seconds=None, cancellation=None):
+        self._prepare = prepare
+        self._rows = rows
+        self._assignments = assignments
+        self._pools = pools
+        self._durations = durations
+        self._session_jar = session_jar
+        self._deadline_seconds = float(deadline_seconds)
+        self._download_reserve_seconds = download_reserve_seconds
+        self._cancellation = cancellation
+        self._started = time.monotonic()
+        self._moments: Dict[int, Any] = {}
+        self._audit: Dict[str, Any] = {'status': 'pending'}
+        self._lock = Lock()
+        self._done = threading.Event()
+        self._executor = None
+        self._future = None
+
+    def start(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yt-ranged-overlap")
+        self._future = self._executor.submit(self._run)
+
+    def _run(self) -> None:
+        try:
+            moments, audit = self._prepare(
+                self._rows, self._assignments, self._pools, self._durations,
+                session_jar=self._session_jar,
+                deadline_seconds=self._deadline_seconds,
+                cancellation=self._cancellation)
+            if self._download_reserve_seconds is not None:
+                audit["download_reserve_seconds"] = round(float(self._download_reserve_seconds), 1)
+            audit["ranged_deadline_seconds"] = round(self._deadline_seconds, 1)
+            with self._lock:
+                self._moments.update(moments)
+                self._audit = audit
+        except BaseException as exc:  # noqa: BLE001 - a failed transcript phase must never stall downloads
+            with self._lock:
+                self._audit = {'status': 'unavailable', 'error_type': type(exc).__name__}
+                if self._download_reserve_seconds is not None:
+                    self._audit["download_reserve_seconds"] = round(float(self._download_reserve_seconds), 1)
+                self._audit["ranged_deadline_seconds"] = round(self._deadline_seconds, 1)
+        finally:
+            self._done.set()
+
+    def moments_for_scene(self, idx: int) -> List[Dict[str, Any]]:
+        """Moments for one scene, waiting only when the scene needs them."""
+        if self._done.is_set():
+            with self._lock:
+                return list(self._moments.get(idx, []) or [])
+        assigned = self._assignments[idx] if 0 <= idx < len(self._assignments) else None
+        if _yt_assignment_has_usable_timestamp(assigned):
+            with self._lock:
+                return list(self._moments.get(idx, []) or [])
+        # Round 15: transcripts are opportunistic, never a gate. When the
+        # assigned source is long enough for a heuristic cut, return whatever
+        # moments have landed and let the download planner cut on the
+        # heuristic timestamp at once; a transcript moment that lands later
+        # is picked up on a later pass. Only a scene with no usable
+        # timestamp AND no heuristic cut waits, bounded by the ranged
+        # deadline, and then falls back the same way.
+        try:
+            source_duration = float((assigned or {}).get("duration") or 0.0)
+        except (TypeError, ValueError):
+            source_duration = 0.0
+        if source_duration >= 15.0:
+            with self._lock:
+                return list(self._moments.get(idx, []) or [])
+        remaining = self._started + self._deadline_seconds - time.monotonic()
+        if remaining > 0:
+            self._done.wait(timeout=remaining)
+        with self._lock:
+            return list(self._moments.get(idx, []) or [])
+
+    def snapshot(self) -> Tuple[Dict[int, Any], Dict[str, Any]]:
+        """Current moments + audit, for the final result (never blocks)."""
+        with self._lock:
+            moments = dict(self._moments)
+            audit = dict(self._audit)
+        if not self._done.is_set():
+            audit.setdefault('status', 'pending')
+            audit['partial'] = True
+            audit['scenes_with_moments'] = len(moments)
+        return moments, audit
+
+    def resolve(self) -> Tuple[Dict[int, Any], Dict[str, Any]]:
+        """Final snapshot after the download wave; stops the worker thread."""
+        moments, audit = self.snapshot()
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        return moments, audit
+
+
+def _yt_download_loop_decision(
+    now: float,
+    *,
+    hard_deadline: Optional[float],
+    soft_ceiling_deadline: Optional[float],
+    soft_deadline: Optional[float],
+    soft_enabled: bool,
+    ready_ratio: float,
+    soft_coverage: float,
+    discovery_stopped: bool,
+) -> Tuple[str, bool]:
+    """Decide the download loop's next step at ``now``.
+
+    Returns ``(action, discovery_stopped)`` where action is one of
+    ``"continue"``, ``"soft_ceiling"``, ``"soft_timeout"``, ``"hard_stop"``.
+
+    The soft (discovery) deadlines stop NEW scene workers only: the loop
+    keeps waiting for in-flight downloads, because downloads are exempt
+    from the discovery budget — a clip verified just before the budget ends
+    must not lose its transfer. Only the hard deadline ends the wait.
+    Once discovery has stopped, later iterations keep returning
+    ``"continue"`` so the drain is never re-triggered.
+    """
+    if hard_deadline is not None and now >= hard_deadline:
+        return "hard_stop", discovery_stopped
+    if discovery_stopped:
+        return "continue", True
+    if (
+        soft_enabled
+        and soft_ceiling_deadline is not None
+        and now >= soft_ceiling_deadline
+    ):
+        return "soft_ceiling", True
+    if (
+        soft_enabled
+        and soft_deadline is not None
+        and now >= soft_deadline
+        and ready_ratio >= soft_coverage
+    ):
+        return "soft_timeout", True
+    return "continue", discovery_stopped
+
+
+def _yt_discovery_deadlines(
+    batch_started_monotonic: float,
+    loop_started_monotonic: float,
+    soft_timeout: float,
+    soft_ceiling: float,
+    hard_timeout: float,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Round 14: anchor the discovery (soft) clock at the download loop's start.
+
+    Search + transcript fetch run before the loop; measuring them
+    against the discovery budget spent job 66b52291's whole 180 s
+    budget before any download could start, so the loop stopped
+    submitting new workers with 0/7 resolved. The soft/ceiling
+    deadlines therefore start at loop start; the hard deadline stays
+    batch-anchored so the loop always ends (and hands off) before the
+    adapter's outer branch wall — a loop-start hard deadline can run
+    past that wall and strand completed cuts. The budget's SIZE is
+    unchanged, only what it measures. Env
+    VIDZEO_YT_DISCOVERY_CLOCK_FROM_LOOP_START (default 1; 0 restores
+    the batch-start anchor for the soft clock too).
+    """
+    try:
+        from_loop = str(os.environ.get("VIDZEO_YT_DISCOVERY_CLOCK_FROM_LOOP_START", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+    except Exception:
+        from_loop = True
+    clock_start = loop_started_monotonic if from_loop else batch_started_monotonic
+    soft = clock_start + soft_timeout if soft_timeout > 0 else None
+    ceiling = clock_start + soft_ceiling if soft_ceiling > 0 else None
+    hard = batch_started_monotonic + hard_timeout if hard_timeout > 0 else None
+    return soft, ceiling, hard
 
 
 def get_youtube_clips(
@@ -5574,6 +8048,13 @@ def get_youtube_clips(
     download_concurrency: Optional[int] = None,
     excluded_video_ids: Optional[List[str]] = None,
     excluded_channel_ids: Optional[List[str]] = None,
+    # Full job title for the prep-manifest injection lookup. ``title``
+    # is the search title and may be just the topic anchor (app.py
+    # derives yt_title from the anchor for single-topic jobs), which
+    # never matches a prep manifest keyed on the full job title. When
+    # given, the injection lookup uses this; search/query planning
+    # still use ``title`` unchanged. Defaults to ``title``.
+    prep_manifest_title: Optional[str] = None,
     **__,
 ) -> List[Optional[str]]:
     del api_key, groq_api_key, video_format
@@ -5590,6 +8071,7 @@ def get_youtube_clips(
     )
     if cancellation is not None:
         cancellation.raise_if_cancelled()
+    _reset_youtube_network_diagnostic()
     if visual_context is None:
         effective_openrouter_key = str(
             openrouter_api_key
@@ -5761,11 +8243,33 @@ def get_youtube_clips(
     )
     if progress_callback:
         progress_callback(0.08, f"YouTube V2: searching {len(groups)} container pools")
+    # The search shares one branch wall with assignment, transcripts, and
+    # downloads. Cap it so a crawling fan-out leaves at least one download
+    # slot plus a transcript floor in the wall (see
+    # ``_yt_download_reserve_seconds``): a healthy fan-out finishes early
+    # regardless; only a stalled one is cut. The hard wall here is the same
+    # value the download loop below enforces (explicit param, else the
+    # stage env, else 900 s).
+    try:
+        _branch_hard_wall = float(
+            hard_timeout_seconds
+            if hard_timeout_seconds is not None
+            else os.environ.get("VIDZEO_YT_V2_HARD_TIMEOUT")
+            or os.environ.get("VIDZEO_YT_BATCH_HARD_TIMEOUT")
+            or 900
+        )
+    except (TypeError, ValueError):
+        _branch_hard_wall = 900.0
+    _search_wall_cap = max(
+        60.0,
+        _branch_hard_wall - _yt_download_slot_seconds() - 15.0,
+    )
     pools = _search_container_pools(
         groups,
         search_timeout_seconds=search_timeout_seconds,
         session_jar=authenticated_session,
         cancellation=cancellation,
+        wall_cap_seconds=_search_wall_cap,
     )
     excluded_videos = set(excluded_video_ids or ())
     excluded_channels = set(excluded_channel_ids or ())
@@ -5776,11 +8280,43 @@ def get_youtube_clips(
             and str(item.get('channel_id') or item.get('uploader_id') or '') not in excluded_channels]
             for key, items in pools.items()}
         print(f'   [yt-v2] excluded {before - sum(map(len, pools.values()))} owned export candidate(s) before ranking')
+    # Prep-manifest-first injection: before the empty-pool early return,
+    # so a total search outage can still proceed on local cached cuts.
+    # The lookup uses the full job title (prep_manifest_title), not the
+    # search title: the search title may be just the topic anchor, which
+    # never matches a manifest keyed on the full job title (run 3:
+    # anchor "Panama Canal" injected 0; full title injected 9).
+    prep_manifest_lookup_title = prep_manifest_title or title
+    prep_injection_audit = inject_prep_manifest_candidates(
+        pools,
+        rows,
+        prep_manifest_lookup_title,
+        [str(row.get("scene_text") or "") for row in rows],
+        # Recovery-wave rejects: apply the same exclusion to the injected
+        # set that the search-pool filter above applied, or injection
+        # re-adds the vision-rejected primary (test 15 scene 0).
+        excluded_video_ids=excluded_videos,
+    )
+    _log_prep_manifest_injection_audit(
+        prep_injection_audit, prep_manifest_lookup_title
+    )
     if cancellation is not None:
         cancellation.raise_if_cancelled()
     total_candidates = sum(len(v) for v in pools.values())
     search_elapsed_seconds = time.monotonic() - batch_started_monotonic
     print(f"   [yt-v2] search complete: {total_candidates} unique candidate(s)")
+    network_diagnostic = _current_youtube_network_diagnostic()
+    if not total_candidates and network_diagnostic:
+        print(f"   [yt-v2] retrieval stopped: {network_diagnostic['message']}", flush=True)
+        return _restore_scene_slots([None] * requested_scene_count, {
+            'resolved': 0,
+            'requested': requested_scene_count,
+            'metadata_selected': 0,
+            'stop_reason': network_diagnostic['code'],
+            'network_diagnostic': network_diagnostic,
+            'search_elapsed_seconds': round(search_elapsed_seconds, 2),
+            'runtime': runtime_receipt(),
+        })
     if progress_callback:
         progress_callback(0.35, f"YouTube V2: ranked {total_candidates} candidates")
     if allow_same_source_reuse is None:
@@ -5796,6 +8332,12 @@ def get_youtube_clips(
     selected = sum(1 for item in assignments if item)
     print(f"   [yt-v2] ranked {selected}/{requested_scene_count} metadata winner(s); download verification pending")
     if str(os.environ.get("VIDZEO_YT_V2_SKIP_DOWNLOAD", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        skipped_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        skipped_not_attempted = _yt_ensure_injected_attempt_audits(
+            skipped_audit, pools, assignments,
+            stopped_reason="download_skipped",
+            attempted_indices=set(),
+        )
         return _restore_scene_slots(
             [None] * requested_scene_count,
             {
@@ -5804,6 +8346,8 @@ def get_youtube_clips(
                 "metadata_selected": selected,
                 "download_skipped": True,
                 "strategy": "progressive_one_download_per_scene",
+                "attempts": {str(index): attempts for index, attempts in skipped_audit.items()},
+                "injected_not_attempted": skipped_not_attempted,
             },
         )
 
@@ -5957,11 +8501,11 @@ def get_youtube_clips(
         download_cancellation = CancellationContext(job_id="youtube-v2")
     pass_download_cancellation = cancellation is not None
     results: List[Optional[str]] = [None] * requested_scene_count
-    # Ranged clips are network bound. Default 6 workers, cap 8; the memory
-    # fit inside _ranged_download_workers still scales a tight host down on
-    # its own (see _ranged_download_worker_limit). A mixed-media job may
-    # raise the count through download_concurrency / the env override.
-    # Keep the pre-fit requested count for the telemetry receipt below.
+    # Ranged clips are network bound. Spec (Vidzeo Local): YT Clip
+    # Workers 2-4; the memory fit inside _ranged_download_workers still
+    # scales a tight host down on its own (see
+    # _ranged_download_worker_limit). Keep the pre-fit requested count
+    # for the telemetry receipt below.
     configured_download_workers = _requested_download_workers(download_concurrency)
     download_workers = _ranged_download_workers(download_concurrency)
     try:
@@ -5994,26 +8538,89 @@ def get_youtube_clips(
     download_used_timestamps: Dict[str, List[float]] = defaultdict(list)
     download_timestamp_owners = defaultdict(set)
     failed_download_counts: Counter = Counter()
-    network_failed_sources = set()
     provider_network_unavailable = threading.Event()
     attempt_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     chapter_cache = {}
     pending_alternate_cuts = {}
     ranged_moments, ranged_moment_audit = {}, {'status': 'disabled'}
+    ranged_overlap = None
     if str(os.environ.get('VIDZEO_YT_RANGED_MOMENTS', '1')).lower() not in {'0', 'false', 'off'}:
         from .youtube_ranged_moments import prepare_ranged_moments
         try:
-            remaining = float(hard_timeout_seconds or 900) - (time.monotonic() - batch_started_monotonic) - 60
-            if remaining > 0:
-                ranged_moments, ranged_moment_audit = prepare_ranged_moments(
-                    [dict(row, pool_key=_row_pool_key(row)) for row in rows], assignments, pools,
-                    scene_durations, session_jar=authenticated_session,
-                    deadline_seconds=min(20., remaining), cancellation=cancellation)
+            # The transcript phase gets its own budget INSIDE the branch
+            # wall — it must not spend the download phase's time. Run 7:
+            # the old code subtracted a flat 60 s, so transcripts could
+            # run up to 120 s while 7 live scenes still needed ~170 s of
+            # download waves; the pass started with ~55 s left and
+            # completed 0 live downloads. The reserve below prices the
+            # waves the remaining live scenes actually need (restores are
+            # excluded: they carry verified prep moments and cost ~0 s of
+            # network). Transcripts stay best-effort within it, floored
+            # at the ranged transcript deadline
+            # (``_yt_ranged_transcript_deadline_seconds``, 120 s by
+            # default) so a tight wall still yields moments; the
+            # heuristic _pick_timestamp fallback still applies when the
+            # deadline expires or a transcript is missing. Run 9 proved
+            # the old 15 s floor starved the lane (16/60 transcripts,
+            # 7/45 scenes with ranged evidence) because the reserve ate
+            # the whole wall before transcripts started — so the floor
+            # is now the 120 s pipeline default and transcripts may
+            # borrow from the reserve; the 120 s cap and the branch hard
+            # wall still bound the phase.
+            # Measured live (Nov 18): the per-video provider chain
+            # costs ~15s in a good hour and ~45s in a slow one, so 12
+            # videos at 6 ranged workers need ~30s good / ~90s slow.
+            # Overlap (Nov 20): the phase above still runs, but on a
+            # background worker while downloads start immediately
+            # (``_RangedMomentOverlap``). The barrier it used to impose
+            # cost ~130-175 s per pass (tests 12/14/15: search-complete
+            # to first download), most of it waiting on one slow or
+            # erroring transcript while scenes with verified timestamps
+            # waited too. ``VIDZEO_YT_RANGED_OVERLAP=0`` restores the
+            # old synchronous barrier.
+            live_scene_count = sum(
+                1 for assigned in assignments
+                if assigned and not assigned.get("prep_manifest_injected")
+            )
+            download_reserve = _yt_download_reserve_seconds(
+                live_scene_count, download_workers
+            )
+            remaining = (
+                float(hard_timeout_seconds or 900)
+                - (time.monotonic() - batch_started_monotonic)
+                - download_reserve
+            )
+            ranged_deadline = min(120.0, max(_yt_ranged_transcript_deadline_seconds(), remaining))
+            if float(hard_timeout_seconds or 900) - (time.monotonic() - batch_started_monotonic) > 0:
+                ranged_rows = [dict(row, pool_key=_row_pool_key(row)) for row in rows]
+                if str(os.environ.get('VIDZEO_YT_RANGED_OVERLAP', '1')).strip().lower() in {'0', 'false', 'off', 'no'}:
+                    ranged_moments, ranged_moment_audit = prepare_ranged_moments(
+                        ranged_rows, assignments, pools,
+                        scene_durations, session_jar=authenticated_session,
+                        deadline_seconds=ranged_deadline, cancellation=cancellation)
+                    ranged_moment_audit["download_reserve_seconds"] = round(download_reserve, 1)
+                    ranged_moment_audit["ranged_deadline_seconds"] = round(ranged_deadline, 1)
+                else:
+                    ranged_overlap = _RangedMomentOverlap(
+                        prepare_ranged_moments, ranged_rows, assignments, pools,
+                        scene_durations, session_jar=authenticated_session,
+                        deadline_seconds=ranged_deadline,
+                        download_reserve_seconds=download_reserve,
+                        cancellation=cancellation)
+                    ranged_overlap.start()
+                    ranged_moments, ranged_moment_audit = ranged_overlap.snapshot()
         except Exception as exc:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
             ranged_moment_audit = {'status': 'unavailable', 'error_type': type(exc).__name__}
-        print(f"   [yt-v2] ranged moment evidence: {ranged_moment_audit.get('scenes_with_moments', 0)}/{requested_scene_count} scenes", flush=True)
+            ranged_overlap = None
+        if ranged_overlap is None:
+            print(f"   [yt-v2] ranged moment evidence: {ranged_moment_audit.get('scenes_with_moments', 0)}/{requested_scene_count} scenes (transcript deadline {ranged_moment_audit.get('ranged_deadline_seconds', 'n/a')}s, download reserve {ranged_moment_audit.get('download_reserve_seconds', 'n/a')}s)", flush=True)
+
+    def _ranged_moments_for_scene(idx: int) -> List[Dict[str, Any]]:
+        if ranged_overlap is not None:
+            return ranged_overlap.moments_for_scene(idx)
+        return list(ranged_moments.get(idx, []) or [])
     for assigned_index, assigned in enumerate(assignments):
         if assigned and assigned.get("best_timestamp") is not None:
             try:
@@ -6022,6 +8629,320 @@ def get_youtube_clips(
                     download_timestamp_owners[(key, float(assigned['best_timestamp']))].add(assigned_index)
             except Exception:
                 pass
+
+    # Verification helpers hoisted out of _download_scene (test-20
+    # fan-out): a download thread must never sit on a vision round
+    # trip while other scenes wait for a download slot. _download_scene
+    # only downloads and files a record in deferred_verifications; the
+    # shared verify pool runs _select_verified_scene per scene as soon
+    # as that scene's downloads finish.
+    deferred_verifications: Dict[int, dict] = {}
+
+    def _finalize_scene_cut(scene_idx: int, win_path: str) -> Tuple[int, Optional[str]]:
+        final_out = output_root / f"yt_clip_scene_{scene_idx + 1:03d}.mp4"
+        original_win_path = str(win_path)
+        try:
+            final_out.unlink(missing_ok=True)
+            Path(win_path).rename(final_out)
+            win_path = str(final_out)
+        except Exception:
+            pass
+        # Keep the attempt ledger authoritative after the primary file is
+        # promoted. Alternate downloaded candidates remain in their own
+        # files and are handed to the shared coordinator for visual
+        # comparison; only the winning primary gets the scene filename.
+        for attempt in reversed(attempt_audit.get(scene_idx, [])):
+            if not isinstance(attempt, dict) or attempt.get("status") != "downloaded":
+                continue
+            attempt_path = str(attempt.get("path") or attempt.get("cleaned_path") or "")
+            if attempt_path and Path(attempt_path).resolve() == Path(original_win_path).resolve():
+                attempt["path"] = str(Path(win_path).resolve())
+                # Renaming an untouched cut is not overlay remediation.
+                # A nonempty cleaned_path previously made the final gate
+                # classify every promoted sharp clip as a blurred asset.
+                attempt["cleaned_path"] = (
+                    str(Path(win_path).resolve()) if attempt.get("overlay_blurred") else ""
+                )
+                attempt["selected"] = True
+                # A transport-only handoff has not been inspected by the
+                # scene-specific vision gate. Never certify it as such.
+                attempt["visual_checked"] = bool(attempt.get("visual_available"))
+                attempt["semantic_verified"] = bool(
+                    attempt.get("visual_available")
+                    and attempt.get("visual_outcome") == "pass"
+                )
+                try:
+                    from services.youtube_clip_provenance import write_clip_provenance
+                    write_clip_provenance(win_path, scene_idx, attempt)
+                except (OSError, ValueError, TypeError):
+                    pass
+                # Keep the on-disk attempt audit in step with the rename:
+                # the per-attempt write records the slot path, and the
+                # salvage trusts the audit by path. Without this rewrite
+                # a finalized clip (yt_clip_scene_NNN.mp4) never matches
+                # its audit row (slot path) and is re-screened anyway.
+                try:
+                    audit_path = output_root / f"youtube_scene_{scene_idx + 1:03d}.attempts.json"
+                    temporary = audit_path.with_suffix(".tmp")
+                    temporary.write_text(
+                        json.dumps(attempt_audit.get(scene_idx, []), ensure_ascii=False, default=str),
+                        encoding="utf-8",
+                    )
+                    temporary.replace(audit_path)
+                except (OSError, ValueError, TypeError):
+                    pass
+                break
+        return scene_idx, win_path
+
+    def _discard_scene_cut(scene_idx: int, target_path: str) -> None:
+        """Unlink a vision-rejected download — unless it is a verified
+        restore. A prep/transport-cache restore cost zero network time;
+        deleting it on a vision non-pass destroys the final salvage
+        scan's chance to consume it when every live alternate fails
+        too (run 6: a verified restore was not consumed). Retain it
+        and mark the audit row instead."""
+        try:
+            resolved_target = str(Path(target_path).resolve())
+        except Exception:
+            resolved_target = str(target_path)
+        for attempt in reversed(attempt_audit.get(scene_idx, [])):
+            if not isinstance(attempt, dict):
+                continue
+            if not (attempt.get("prep_cache_restored") or attempt.get("cache_restored")):
+                continue
+            attempt_paths = set()
+            for key in ("path", "cleaned_path"):
+                value = attempt.get(key)
+                if not value:
+                    continue
+                try:
+                    attempt_paths.add(str(Path(str(value)).resolve()))
+                except Exception:
+                    attempt_paths.add(str(value))
+            if resolved_target in attempt_paths:
+                attempt["retained_after_visual_reject"] = True
+                return
+        try:
+            Path(target_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _verify_timeout_seconds() -> float:
+        """Per-scene verification wait, aligned to the remaining branch budget.
+
+        Test-20 stall guard: a hung vision call must fail open to the
+        scene's best-so-far instead of holding a verify slot (and the
+        scene) past the branch budget. Bounded by the remaining hard
+        deadline and capped (VIDZEO_YT_VERIFY_TIMEOUT_SECONDS, default
+        300s) so one hung call cannot consume a worker slot for an
+        hour. 0 means the budget is already spent: fail open at once.
+        """
+        try:
+            cap = float(os.environ.get("VIDZEO_YT_VERIFY_TIMEOUT_SECONDS", "300") or 300)
+        except (TypeError, ValueError):
+            cap = 300.0
+        cap = max(30.0, min(3600.0, cap))
+        if hard_deadline is None:
+            return cap
+        return max(0.0, min(cap, hard_deadline - time.monotonic()))
+
+    def _run_with_verify_timeout(fn, scene_index: int, *, label: str):
+        """Run fn() bounded by the per-scene verify timeout.
+
+        Returns fn()'s result, or None on timeout/error. The worker
+        thread is never joined: a hung vision call keeps waiting in
+        the background (its verdict lands in the context cache if it
+        ever arrives) while the scene fails open immediately.
+        """
+        timeout = _verify_timeout_seconds()
+        if timeout <= 0:
+            return None
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yt-v2-verify-timeout")
+        try:
+            future = pool.submit(fn)
+            try:
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                print(
+                    f"   [yt-v2] scene {scene_index + 1}: {label} timed out "
+                    f"after {timeout:.0f}s; failing open to best-so-far",
+                    flush=True,
+                )
+                return None
+            except Exception:
+                return None
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _select_verified_scene(idx: int, record: dict) -> Tuple[int, Optional[str]]:
+        """Verify one scene's downloaded candidates and pick the winner.
+
+        The phase-B half of the old _download_scene, run on the shared
+        verify pool instead of the download thread: builds the batch
+        prompt contexts, calls the UNCHANGED _batched_visual_verdicts
+        (bounded by the per-scene verify timeout — a hung call fails
+        open), then applies the exact per-candidate selection logic the
+        inline path used (fail-open, advisory fallback, discards).
+        Verdicts are keyed by video id; a missing verdict fails open
+        exactly as before. Never raises: a failure returns (idx, None)
+        so the scene is re-queued / falls through to web.
+        """
+        try:
+            downloaded = list(record.get("downloaded") or [])
+            downloaded_alternates = list(record.get("downloaded_alternates") or [])
+            subject = rows[idx].get("candidate_subject") or rows[idx].get("section_subject") or rows[idx].get("scene_subject") or ""
+            visual_required = bool(getattr(visual_context, "visual_required", False)) if visual_context is not None else False
+            relevance_only_visual = str(
+                os.environ.get("VIDZEO_YT_RELEVANCE_ONLY", "0")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            candidate_fallbacks: List[Tuple[float, str, Dict[str, Any]]] = []
+            advisory_fallback: Optional[str] = None
+            verdicts: Dict[str, Tuple[bool, float, bool, str]] = {}
+            prompt_by_vid: Dict[str, dict] = {}
+            if downloaded:
+                batch_candidates: List[dict] = []
+                for item in downloaded:
+                    option = item["option"]
+                    vid = item["vid"]
+                    gta_v_support = (bool(rows[idx].get("gta_vi_supporting_gameplay")) and bool(
+                        option.get("gta_v_supporting_gameplay")
+                    )) or _scene_game_match(
+                        # Scene-relative: a GTA V clip for a scene narrating GTA V
+                        # is judged as GTA V footage, not as a wrong-game clip.
+                        option, rows[idx].get("scene_text", ""), subject,
+                        _row_retrieval_context(rows[idx]), "v",
+                    )
+                    batch_candidates.append({
+                        "candidate_id": vid,
+                        "path": item["path"],
+                        "topic": (
+                            "Grand Theft Auto VI documentary supporting gameplay: Grand Theft Auto V"
+                            if gta_v_support else rows[idx].get("section_subject") or subject
+                        ),
+                        "narration": (
+                            f"{rows[idx].get('scene_text', '')} Use clean Grand Theft Auto V gameplay "
+                            "as supporting footage for this Grand Theft Auto VI story; no facecam."
+                            if gta_v_support else rows[idx].get("scene_text", "")
+                        ),
+                        "subject": "Grand Theft Auto V" if gta_v_support else subject,
+                    })
+                prompt_by_vid = {c["candidate_id"]: c for c in batch_candidates}
+                timed = _run_with_verify_timeout(
+                    lambda: _batched_visual_verdicts(
+                        batch_candidates,
+                        idx,
+                        rows[idx].get("section_subject") or subject,
+                        rows[idx].get("scene_text", ""),
+                        subject,
+                        visual_context,
+                        relevance_only=relevance_only_visual,
+                    ),
+                    idx,
+                    label="batched verification",
+                )
+                verdicts = timed if isinstance(timed, dict) else {}
+            for item in downloaded:
+                plan_index = item["plan_index"]
+                option = item["option"]
+                vid = item["vid"]
+                path = item["path"]
+                audit_row = item.get("audit_row")
+                verdict = verdicts.get(
+                    vid, (True, 100.0, False, "vision_unavailable_local_checks_passed")
+                )
+                outcome = _classify_visual_result(*verdict)
+                if outcome == "unavailable" and visual_required and verdict[2]:
+                    prompt_ctx = prompt_by_vid.get(vid, {})
+                    retried = _run_with_verify_timeout(
+                        lambda: _visual_verdict_scored(
+                            path,
+                            idx,
+                            str(prompt_ctx.get("topic") or rows[idx].get("section_subject") or subject),
+                            str(prompt_ctx.get("narration") or rows[idx].get("scene_text", "")),
+                            str(prompt_ctx.get("subject") or subject),
+                            visual_context,
+                            relevance_only=relevance_only_visual,
+                        ),
+                        idx,
+                        label="single verification retry",
+                    )
+                    if retried is not None:
+                        verdict = retried
+                        outcome = _classify_visual_result(*verdict)
+
+                fail_open_raw = rows[idx].get(
+                    "youtube_fail_open_on_visual_unavailable",
+                    os.environ.get("VIDZEO_YT_FAIL_OPEN_ON_VISUAL_UNAVAILABLE", "1"),
+                )
+                fail_open_youtube = (
+                    fail_open_raw if isinstance(fail_open_raw, bool)
+                    else str(fail_open_raw).strip().lower() in {"1", "true", "yes", "on"}
+                )
+                relaxed_raw = rows[idx].get(
+                    "youtube_relaxed_visual_gate",
+                    os.environ.get("VIDZEO_YT_RELAXED_VISUAL_GATE", "1"),
+                )
+                relaxed_youtube = (
+                    relaxed_raw if isinstance(relaxed_raw, bool)
+                    else str(relaxed_raw).strip().lower() in {"1", "true", "yes", "on"}
+                )
+                strict_visual = bool(
+                    getattr(visual_context, "visual_required", False)
+                    or getattr(visual_context, "fail_closed", False)
+                )
+                is_fail_open = bool(
+                    outcome == "unavailable"
+                    and ((relaxed_youtube and fail_open_youtube) or not strict_visual)
+                )
+
+                if isinstance(audit_row, dict):
+                    audit_row.update({
+                        "visual_status": "accepted" if (outcome == "pass" or is_fail_open) else "rejected",
+                        "visual_outcome": "unavailable_fail_open" if is_fail_open else outcome,
+                        "visual_score": round(float(verdict[1] or 0.0), 2),
+                        "visual_available": bool(verdict[2]),
+                        "visual_reason": str(verdict[3] or ("vision_unavailable_fail_open" if is_fail_open else "")),
+                        "plan_index": plan_index,
+                    })
+                v_score = round(float(verdict[1] or 0.0), 2)
+                v_reason = str(verdict[3] or "")
+                fatal_issue = any(tag in v_reason for tag in ("fatal_mismatch", "talking_head", "facecam", "unsafe"))
+
+                if outcome == "pass" or is_fail_open:
+                    for _, old_path, _ in candidate_fallbacks:
+                        _discard_scene_cut(idx, old_path)
+                    return _finalize_scene_cut(idx, path)
+
+                if not fatal_issue and v_score >= 35.0:
+                    candidate_fallbacks.append((v_score, path, option))
+                    if not visual_required:
+                        advisory_fallback = advisory_fallback or path
+                else:
+                    _discard_scene_cut(idx, path)
+
+            if candidate_fallbacks:
+                candidate_fallbacks.sort(key=lambda item: item[0], reverse=True)
+                best_fallback_score, best_fallback_path, best_fallback_opt = candidate_fallbacks[0]
+                for _, rem_path, _ in candidate_fallbacks[1:]:
+                    _discard_scene_cut(idx, rem_path)
+                if best_fallback_score >= 35.0 or not visual_required:
+                    for attempt in reversed(attempt_audit.get(idx, [])):
+                        if isinstance(attempt, dict) and str(attempt.get("path") or "") == str(Path(best_fallback_path).resolve()):
+                            attempt["visual_outcome"] = "advisory_pass"
+                            attempt["visual_status"] = "accepted"
+                            break
+                    return _finalize_scene_cut(idx, best_fallback_path)
+                else:
+                    _discard_scene_cut(idx, best_fallback_path)
+
+            if advisory_fallback:
+                return _finalize_scene_cut(idx, advisory_fallback)
+            if downloaded_alternates:
+                return _finalize_scene_cut(idx, downloaded_alternates[0])
+            return idx, None
+        except Exception as exc:
+            print(f"   [yt-v2] verification failed for scene {idx + 1}: {type(exc).__name__}")
+            return idx, None
 
     def _download_scene(idx: int, candidate: Dict[str, Any]) -> Tuple[int, Optional[str]]:
         if provider_network_unavailable.is_set():
@@ -6043,14 +8964,39 @@ def get_youtube_clips(
             reverse=True,
         )
         tried = set()
-        options = [candidate]
-        options.extend(option for option in pool if option is not candidate)
+        # Inline per-scene fallback chain (see _yt_layered_scene_options):
+        # perfect ranked options first, then general related clips from the
+        # same already-fetched pool, then verified prep-cache restores.
+        # One option per fair-scheduling pass, in this order — a rejected
+        # perfect clip falls to the next layer inline, never to a second
+        # batch from scratch at the end.
+        options = _yt_layered_scene_options(
+            rows[idx],
+            pool,
+            candidate,
+            subject=subject,
+            scene_text=rows[idx].get("scene_text", ""),
+            retrieval_context=retrieval_context,
+            lenient_acceptance=bool(lenient_acceptance),
+        )
         previous_ids = {str(item.get('candidate_id') or '') for item in attempt_audit[idx]}
         fresh_options = [option for option in options if _video_id(option) not in previous_ids]
+        # Transport timeouts are parked, not retried: a video whose transfer
+        # throttled out is not re-queued at another timestamp for up to 6
+        # passes — the scene moves to the next ranked candidate (or, when
+        # the pool is exhausted, to the web lane). Content rejects keep the
+        # same-video alternate-timestamp recovery below, which is a
+        # different failure kind with a different remedy.
+        transport_timed_out_ids = {
+            str(item.get('video_id') or item.get('candidate_id') or '')
+            for item in attempt_audit[idx]
+            if item.get('failure_kind') == 'transport_timeout'
+        }
         # After fresh publishers are exhausted, a later scheduling turn can
         # try another moment from the same master, never its failed timestamp.
         options = fresh_options or [dict(option, best_timestamp=None) for option in options
-                                    if float(option.get('duration') or 0.0) >= 35.0]
+                                    if float(option.get('duration') or 0.0) >= 35.0
+                                    and _video_id(option) not in transport_timed_out_ids]
         # Hard metadata rejects must never be re-downloaded just because vision
         # is enabled.
         options = [
@@ -6079,8 +9025,21 @@ def get_youtube_clips(
         except (TypeError, ValueError):
             progressive_limit = attempt_budget
         # The fair coverage scheduler gives every scene one attempt per pass;
-        # retries are re-queued in round-robin order.
-        attempt_budget = 1
+        # retries are re-queued in round-robin order. Batched vision judges
+        # a scene's candidates together, so a batched pass plans up to
+        # progressive_limit candidates at once (one vision call for the
+        # whole pass) instead of one. Batching off restores one-per-pass.
+        # Only plan a multi-candidate batch when vision will actually judge
+        # it: with no visual context (or transport-only) the scene returns
+        # after the first download, so extra plans only reserve timestamps
+        # and burn tried-slots that other scenes/passes need (run-6
+        # offline replay: 8/13 -> 7/13 when the cap was raised blindly).
+        _vision_will_judge = (
+            visual_context is not None
+            and bool(getattr(visual_context, "enabled", False))
+            and not bool(getattr(visual_context, "youtube_contact_only", False))
+        )
+        attempt_budget = progressive_limit if (_vision_batch_enabled() and _vision_will_judge) else 1
         if not options:
             return idx, None
 
@@ -6096,7 +9055,7 @@ def get_youtube_clips(
             if not vid or vid in tried:
                 continue
             tried.add(vid)
-            moment_options = [moment for moment in ranged_moments.get(idx, [])
+            moment_options = [moment for moment in _ranged_moments_for_scene(idx)
                               if moment['video_id'] == vid]
             if not moment_options and not option.get('chapters') and float(option.get('duration') or 0) >= 90:
                 remaining = hard_deadline - time.monotonic() if hard_deadline is not None else 60
@@ -6196,20 +9155,99 @@ def get_youtube_clips(
                 "clip_duration": round(float(duration), 2),
                 "status": "download_started",
                 "cache_hit": False,
+                # Which inline fallback layer this attempt belongs to
+                # (perfect / general / cached); a disk restore below
+                # upgrades it to "cached" — the layer that actually
+                # resolved the scene, not the layer that nominated it.
+                "resolution_layer": str(option.get("_yt_fallback_layer") or "perfect"),
             }
             attempt_audit[idx].append(audit)
             attempt_started = time.monotonic()
             try:
+                # Inspect a padded low-resolution range before committing to a
+                # high-quality cut. A model-selected range is only evidence
+                # for these exact pixels; the final clip still goes through the
+                # normal transport and scene-level visual checks below.
+                if visual_context is not None and getattr(visual_context, 'enabled', False):
+                    from services.youtube_contact_probe import inspect_candidate
+                    try:
+                        probe_client = visual_context.get_client()
+                    except Exception:
+                        probe_client = None
+                    status, window, probe_audit = inspect_candidate(
+                        option, start, duration, rows[idx].get('scene_text', ''),
+                        output_root / 'contact_probes' / uuid.uuid4().hex,
+                        probe_client, _download_youtube_probe,
+                        _ffmpeg_bin('ffmpeg'), _ffmpeg_bin('ffprobe'),
+                        session_jar=authenticated_session,
+                        stream_downloads=bool(stream_downloads), cancellation=download_cancellation,
+                    )
+                    audit['contact_probe'] = dict(probe_audit, status=status)
+                    if status == 'rejected':
+                        audit.update(status='contact_vision_rejected', failure_kind='content_reject')
+                        return None
+                    if status == 'accepted':
+                        selected_start = float(window['start'])
+                        with download_timestamp_lock:
+                            keys = _timestamp_reuse_keys(option)
+                            gap = max(duration + 1.5, 8.0)
+                            collision = any(
+                                abs(selected_start - old) < gap
+                                and download_timestamp_owners[(k, old)] != {idx}
+                                for k in keys for old in download_used_timestamps[k]
+                            )
+                            if not collision:
+                                for k in keys:
+                                    download_used_timestamps[k].append(selected_start)
+                                    download_timestamp_owners[(k, selected_start)].add(idx)
+                        if collision:
+                            audit.update(status='contact_window_reused', failure_kind='content_reject')
+                            return None
+                        start = selected_start
+                        option['contact_crop_pct'] = window['crop_pct']
+                        option['_contact_window_selected'] = True
+                        audit['timestamp'] = round(start, 2)
+                        audit['timestamp_evidence'] = 'contact_sheet_vision'
                 downloaded = False
+                # A prep-manifest cut is already on disk: the candidate
+                # carries its verified local file in prep_cache_path
+                # (stamped at injection), and copying it costs zero
+                # network time. That path was never read anywhere, so job
+                # 48cb2324 re-downloaded every injected scene over the
+                # network instead of using the banked cut, and the 343 s
+                # branch wall expired with 0/11 resolved. The transport
+                # cache cannot substitute: get_verified_cut refuses a cut
+                # shorter than the live scene, and at the real live
+                # durations (9.5-12.55 s) it returned None for all five
+                # mapped GTA cuts. The motion, overlay, and visual gates
+                # below still run on the copy. Skip when a contact-sheet
+                # window was selected: that window differs from the prep
+                # cut's verified moment.
+                if option.get("prep_manifest_injected") and not option.get("_contact_window_selected"):
+                    prep_cut_path = str(option.get("prep_cache_path") or "")
+                    if prep_cut_path:
+                        try:
+                            prep_file = Path(prep_cut_path)
+                            if prep_file.is_file() and prep_file.stat().st_size >= PREP_MANIFEST_MIN_CUT_BYTES:
+                                shutil.copyfile(str(prep_file), str(out))
+                                downloaded = out.is_file() and out.stat().st_size >= 8192
+                                audit["cache_hit"] = bool(downloaded)
+                                audit["cache_path"] = str(prep_file)
+                                audit["prep_cache_restored"] = bool(downloaded)
+                        except Exception:
+                            downloaded = False
                 # A transport cache hit still goes through the overlay and
                 # scene-specific visual gates below. It only removes the
                 # expensive network/FFmpeg download; it never becomes proof
                 # that a cut is relevant to a different scene.
-                try:
-                    from services.youtube_media_cache import get_verified_cut
-                    cached = get_verified_cut(vid, start, duration)
-                except Exception:
-                    cached = None
+                cached = None
+                if not downloaded:
+                    try:
+                        from services.youtube_media_cache import get_verified_cut
+                        cached = (get_verified_cut(vid, start, duration)
+                                  if not option.get('contact_crop_pct') else None)
+                    except Exception:
+                        cached = None
                 if cached and cached.get("path"):
                     try:
                         shutil.copyfile(str(cached["path"]), str(out))
@@ -6218,6 +9256,7 @@ def get_youtube_clips(
                         audit["cache_path"] = str(cached["path"])
                         if downloaded:
                             audit["status"] = "cache_restored"
+                            audit["cache_restored"] = True
                     except Exception:
                         downloaded = False
                 if not downloaded:
@@ -6237,12 +9276,42 @@ def get_youtube_clips(
             except Exception as exc:
                 if download_cancellation is not None and download_cancellation.cancelled():
                     raise
-                audit.update({"status": "download_exception", "reason": f"{type(exc).__name__}:{exc}"[:240]})
+                # Classify the failure kind on the audit row: a transport
+                # timeout parks the video for the rest of the job, while a
+                # content reject may still be retried at another timestamp.
+                _timed_out = (
+                    option.get('_transport_failure') == 'transport_timeout'
+                    or isinstance(exc, TimeoutError)
+                    or "youtube_clip_timeout_after_" in str(exc)
+                    or "timed out" in str(exc).lower()
+                )
+                audit.update({
+                    "status": "download_exception",
+                    "reason": f"{type(exc).__name__}:{exc}"[:240],
+                    "failure_kind": "transport_timeout" if _timed_out else "download_error",
+                })
                 downloaded = False
             audit['runtime_warning_categories'] = list(option.get('_runtime_warning_categories') or [])
+            if option.get('_download_mode'):
+                audit['download_mode'] = option['_download_mode']
             audit["elapsed_seconds"] = round(time.monotonic() - attempt_started, 2)
+            # Round 15: per-attempt progress — the 4d1d9f9f child logged
+            # nothing between transcripts and the wall kill, so a hung probe
+            # or vision wait was invisible. One line per attempt keeps the
+            # next proof run diagnosable.
+            print(
+                f"   [yt-v2] scene {idx + 1} attempt {audit['attempt']}: "
+                f"{'downloaded' if downloaded else 'failed'} in {audit['elapsed_seconds']}s "
+                f"({vid} @ {round(float(start), 1)}s, {option.get('timestamp_evidence', 'n/a')})",
+                flush=True,
+            )
             if downloaded:
                 audit["status"] = "downloaded"
+                # The resolving layer is the one that produced the bytes:
+                # a prep/transport-cache restore resolves from disk even
+                # when the candidate was nominated by the perfect layer.
+                if audit.get("prep_cache_restored") or audit.get("cache_restored"):
+                    audit["resolution_layer"] = "cached"
                 # Reject still/slideshow downloads before the relatively
                 # expensive OCR/overlay pass, leaving time for another source.
                 motion_quality = _screen_downloaded_motion(str(out.resolve()), option)
@@ -6306,7 +9375,7 @@ def get_youtube_clips(
                 try:
                     from services.youtube_media_cache import put_verified_cut
                     cache_source = str(cleaned_path or out.resolve())
-                    cached_path = put_verified_cut(
+                    cached_path = not option.get('contact_crop_pct') and put_verified_cut(
                         vid, start, duration, cache_source,
                         metadata={
                             "source_url": str(_candidate_url(option) or ""),
@@ -6323,55 +9392,37 @@ def get_youtube_clips(
                     audit["cache_stored"] = False
                 return cleaned_path
             failure = option.get('_transport_failure')
-            audit.update({"status": "download_failed", "reason": failure or "yt_dlp_or_ffmpeg"})
-            if failure == 'provider_dns_unavailable':
+            audit.update({
+                "status": "download_failed",
+                "reason": failure or "yt_dlp_or_ffmpeg",
+                "failure_kind": (
+                    "network_unavailable"
+                    if failure in {
+                        "provider_dns_unavailable", "dns_resolution_failed",
+                        "network_disabled_by_sandbox", "outbound_network_unavailable",
+                    }
+                    else "transport_timeout"
+                    if failure == "transport_timeout"
+                    else "download_error"
+                ),
+            })
+            if failure in {
+                'provider_dns_unavailable', 'dns_resolution_failed',
+                'network_disabled_by_sandbox', 'outbound_network_unavailable',
+            }:
+                _record_youtube_network_failure('download', failure)
                 with download_timestamp_lock:
-                    network_failed_sources.add(vid)
-                    if len(network_failed_sources) >= 2:
-                        provider_network_unavailable.set()
+                    provider_network_unavailable.set()
             try:
                 out.unlink(missing_ok=True)
             except Exception:
                 pass
             with download_timestamp_lock:
-                failed_download_counts[vid] += 1
+                if failure in {'youtube_access_required', 'youtube_source_unavailable', 'youtube_format_unavailable'}:
+                    failed_download_counts[vid] = max(2, failed_download_counts[vid])
+                else:
+                    failed_download_counts[vid] += 1
             return None
-
-        def _finalize_progressive(win_path: str) -> Tuple[int, Optional[str]]:
-            final_out = output_root / f"yt_clip_scene_{idx + 1:03d}.mp4"
-            original_win_path = str(win_path)
-            try:
-                final_out.unlink(missing_ok=True)
-                Path(win_path).rename(final_out)
-                win_path = str(final_out)
-            except Exception:
-                pass
-            # Keep the attempt ledger authoritative after the primary file is
-            # promoted. Alternate downloaded candidates remain in their own
-            # files and are handed to the shared coordinator for visual
-            # comparison; only the winning primary gets the scene filename.
-            for attempt in reversed(attempt_audit.get(idx, [])):
-                if not isinstance(attempt, dict) or attempt.get("status") != "downloaded":
-                    continue
-                attempt_path = str(attempt.get("path") or attempt.get("cleaned_path") or "")
-                if attempt_path and Path(attempt_path).resolve() == Path(original_win_path).resolve():
-                    attempt["path"] = str(Path(win_path).resolve())
-                    # Renaming an untouched cut is not overlay remediation.
-                    # A nonempty cleaned_path previously made the final gate
-                    # classify every promoted sharp clip as a blurred asset.
-                    attempt["cleaned_path"] = (
-                        str(Path(win_path).resolve()) if attempt.get("overlay_blurred") else ""
-                    )
-                    attempt["selected"] = True
-                    attempt["semantic_verified"] = True
-                    attempt["visual_checked"] = True
-                    try:
-                        from services.youtube_clip_provenance import write_clip_provenance
-                        write_clip_provenance(win_path, idx, attempt)
-                    except (OSError, ValueError, TypeError):
-                        pass
-                    break
-            return idx, win_path
 
         # Preserve multiple ranked options and download them one at a time.
         # Transport vision is intentionally disabled here; the shared V2
@@ -6381,11 +9432,36 @@ def get_youtube_clips(
         visual_required = bool(getattr(visual_context, "visual_required", False)) if visual_context is not None else False
         transport_only = bool(
             visual_context is not None
-            and not bool(getattr(visual_context, "enabled", False))
+            and (not bool(getattr(visual_context, "enabled", False))
+                 or bool(getattr(visual_context, 'youtube_contact_only', False)))
+        )
+        # Preserve multiple ranked options and download them one at a time.
+        # Transport vision is intentionally disabled here; the shared V2
+        # coordinator must receive the downloaded alternates so it can compare
+        # the actual pixels across sources instead of inheriting one metadata
+        # winner from YouTube search.
+        visual_required = bool(getattr(visual_context, "visual_required", False)) if visual_context is not None else False
+        transport_only = bool(
+            visual_context is not None
+            and (not bool(getattr(visual_context, "enabled", False))
+                 or bool(getattr(visual_context, 'youtube_contact_only', False)))
         )
         advisory_fallback: Optional[str] = None
         downloaded_alternates: List[str] = []
         candidate_fallbacks: List[Tuple[float, str, Dict[str, Any]]] = []
+        # Batched vision, three phases (was: download one -> vision one ->
+        # decide -> next, one vision request per candidate):
+        #   A. Download every planned candidate for the scene first.
+        #   B. ONE batched vision call judges all of them together.
+        #   C. Decide in ranked order with the same per-candidate logic as
+        #      before. The first passing candidate still wins, so batching
+        #      changes how verdicts arrive, never which candidate wins.
+        #      Scenes run in parallel download workers, so every scene's
+        #      batched request is filed at once.
+        relevance_only_visual = str(
+            os.environ.get("VIDZEO_YT_RELEVANCE_ONLY", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        downloaded: List[dict] = []
         for plan_index, (option, vid, start) in enumerate(plans):
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
@@ -6398,18 +9474,9 @@ def get_youtube_clips(
                 # If cut 1 was rejected (e.g. intro talking head or text overlay) and the video
                 # is long enough, try an alternate clean mid-video B-roll timestamp from the same video.
                 vid_duration = float(option.get("duration") or 0.0)
-                retryable_cut = bool(attempt_audit[idx] and attempt_audit[idx][-1].get('status') in {
-                    'motion_or_quality_rejected', 'overlay_or_talking_head_rejected',
-                })
-                if (retryable_cut and len(options) > 1
-                        and attempt_audit[idx][-1].get('rejection_reason') in {
-                            'static_image_or_pan', 'still_or_slideshow', 'still_or_slideshow_frame',
-                            'static_frame_hold',
-                        }):
-                    # Explore a fresh master before spending another transfer
-                    # on a static guide/slideshow. Intro overlays still get
-                    # their useful same-source mid-video recovery below.
-                    retryable_cut = False
+                retryable_cut = _same_video_alternate_allowed(
+                    attempt_audit[idx], vid, len(options)
+                )
                 time_for_cut = hard_deadline is None or hard_deadline - time.monotonic() > 35
                 # The fair scheduler deliberately sets attempt_budget=1.
                 # Using that budget as the condition made same-source clean
@@ -6446,134 +9513,41 @@ def get_youtube_clips(
             if not path:
                 continue
             if visual_context is None:
-                return _finalize_progressive(path)
+                return _finalize_scene_cut(idx, path)
             if transport_only:
                 # With visual analysis disabled there is no consumer for
                 # alternate pixels.  Finalize the first clip that passed the
                 # deterministic transport/overlay checks instead of
                 # downloading the rest of the ranked pool.
-                return _finalize_progressive(path)
-            relevance_only_visual = str(
-                os.environ.get("VIDZEO_YT_RELEVANCE_ONLY", "0")
-            ).strip().lower() in {"1", "true", "yes", "on"}
-            gta_v_support = bool(rows[idx].get("gta_vi_supporting_gameplay")) and bool(
-                option.get("gta_v_supporting_gameplay")
-            )
-            visual_topic = (
-                "Grand Theft Auto VI documentary supporting gameplay: Grand Theft Auto V"
-                if gta_v_support else rows[idx].get("section_subject") or subject
-            )
-            visual_narration = (
-                f"{rows[idx].get('scene_text', '')} Use clean Grand Theft Auto V gameplay "
-                "as supporting footage for this Grand Theft Auto VI story; no facecam."
-                if gta_v_support else rows[idx].get("scene_text", "")
-            )
-            visual_subject = "Grand Theft Auto V" if gta_v_support else subject
-            verdict = _visual_verdict_scored(
-                path,
-                idx,
-                visual_topic,
-                visual_narration,
-                visual_subject,
-                visual_context,
-                relevance_only=relevance_only_visual,
-            )
-            outcome = _classify_visual_result(*verdict)
-            if outcome == "unavailable" and visual_required and verdict[2]:
-                verdict = _visual_verdict_scored(
-                    path,
-                    idx,
-                    visual_topic,
-                    visual_narration,
-                    visual_subject,
-                    visual_context,
-                    relevance_only=relevance_only_visual,
-                )
-                outcome = _classify_visual_result(*verdict)
-
-            fail_open_raw = rows[idx].get(
-                "youtube_fail_open_on_visual_unavailable",
-                os.environ.get("VIDZEO_YT_FAIL_OPEN_ON_VISUAL_UNAVAILABLE", "1"),
-            )
-            fail_open_youtube = (
-                fail_open_raw if isinstance(fail_open_raw, bool)
-                else str(fail_open_raw).strip().lower() in {"1", "true", "yes", "on"}
-            )
-            relaxed_raw = rows[idx].get(
-                "youtube_relaxed_visual_gate",
-                os.environ.get("VIDZEO_YT_RELAXED_VISUAL_GATE", "1"),
-            )
-            relaxed_youtube = (
-                relaxed_raw if isinstance(relaxed_raw, bool)
-                else str(relaxed_raw).strip().lower() in {"1", "true", "yes", "on"}
-            )
-            strict_visual = bool(
-                getattr(visual_context, "visual_required", False)
-                or getattr(visual_context, "fail_closed", False)
-            )
-            is_fail_open = bool(
-                outcome == "unavailable"
-                and ((relaxed_youtube and fail_open_youtube) or not strict_visual)
-            )
-
-            attempt_audit[idx][-1].update({
-                "visual_status": "accepted" if (outcome == "pass" or is_fail_open) else "rejected",
-                "visual_outcome": "unavailable_fail_open" if is_fail_open else outcome,
-                "visual_score": round(float(verdict[1] or 0.0), 2),
-                "visual_available": bool(verdict[2]),
-                "visual_reason": str(verdict[3] or ("vision_unavailable_fail_open" if is_fail_open else "")),
+                return _finalize_scene_cut(idx, path)
+            # Capture this candidate's audit row now: after the batch phase
+            # the last row belongs to a different candidate.
+            audit_row = attempt_audit[idx][-1] if attempt_audit.get(idx) else None
+            downloaded.append({
                 "plan_index": plan_index,
+                "option": option,
+                "vid": vid,
+                "start": start,
+                "path": path,
+                "audit_row": audit_row,
             })
-            v_score = round(float(verdict[1] or 0.0), 2)
-            v_reason = str(verdict[3] or "")
-            fatal_issue = any(tag in v_reason for tag in ("fatal_mismatch", "talking_head", "facecam", "unsafe"))
-
-            if outcome == "pass" or is_fail_open:
-                for _, old_path, _ in candidate_fallbacks:
-                    try:
-                        Path(old_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                return _finalize_progressive(path)
-
-            if not fatal_issue and v_score >= 35.0:
-                candidate_fallbacks.append((v_score, path, option))
-                if not visual_required:
-                    advisory_fallback = advisory_fallback or path
-            else:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        if candidate_fallbacks:
-            candidate_fallbacks.sort(key=lambda item: item[0], reverse=True)
-            best_fallback_score, best_fallback_path, best_fallback_opt = candidate_fallbacks[0]
-            for _, rem_path, _ in candidate_fallbacks[1:]:
-                try:
-                    Path(rem_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if best_fallback_score >= 35.0 or not visual_required:
-                for attempt in reversed(attempt_audit.get(idx, [])):
-                    if isinstance(attempt, dict) and str(attempt.get("path") or "") == str(Path(best_fallback_path).resolve()):
-                        attempt["visual_outcome"] = "advisory_pass"
-                        attempt["visual_status"] = "accepted"
-                        break
-                return _finalize_progressive(best_fallback_path)
-            else:
-                try:
-                    Path(best_fallback_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        if advisory_fallback:
-            return _finalize_progressive(advisory_fallback)
-        if downloaded_alternates:
-            return _finalize_progressive(downloaded_alternates[0])
+        if downloaded:
+            # Verification is deferred to the shared verify pool
+            # (_select_verified_scene): the download thread must not sit
+            # on a vision round trip while other scenes wait for a
+            # download slot. _consume_download files the record as soon
+            # as this future completes.
+            deferred_verifications[idx] = {
+                "downloaded": downloaded,
+                "downloaded_alternates": downloaded_alternates,
+            }
         return idx, None
 
     download_indices = [idx for idx, candidate in enumerate(assignments) if candidate]
+    # Restores first (see _yt_restore_first_order), BEFORE the scene cap
+    # slices the queue: a capped run must keep the ~0.05 s disk restores,
+    # not drop them for a 70 s live download that the wall then kills.
+    download_indices = _yt_restore_first_order(download_indices, assignments)
     try:
         download_scene_cap = max(0, int(max_download_scenes or 0))
     except (TypeError, ValueError):
@@ -6608,26 +9582,107 @@ def get_youtube_clips(
         soft_ceiling = soft_timeout
     if soft_enabled and hard_timeout <= 0:
         hard_timeout = soft_ceiling
-    # These bounds describe the entire YouTube branch. Starting them only
-    # after search/ranking let a 187-second soft ceiling exceed a 240-second
-    # outer process wall, so completed cuts never reached the visual gate.
-    soft_deadline = batch_started_monotonic + soft_timeout if soft_timeout > 0 else None
-    soft_ceiling_deadline = batch_started_monotonic + soft_ceiling if soft_ceiling > 0 else None
-    hard_deadline = batch_started_monotonic + hard_timeout if hard_timeout > 0 else None
+    # Round 14: the discovery (soft) clock starts when the download
+    # loop can first submit work — see _yt_discovery_deadlines. The
+    # hard deadline stays batch-anchored (the old comment's warning
+    # still holds: a loop-start hard deadline can run past the
+    # adapter's outer branch wall, so completed cuts would never
+    # reach the visual gate). The adapter's branch wall still bounds
+    # the lane.
+    soft_deadline, soft_ceiling_deadline, hard_deadline = _yt_discovery_deadlines(
+        batch_started_monotonic, time.monotonic(), soft_timeout, soft_ceiling, hard_timeout
+    )
 
     executor = ThreadPoolExecutor(max_workers=download_workers, thread_name_prefix="yt-v2-download")
     future_map: Dict[Any, int] = {}
     pending = set()
+    # Verification runs on its own pool (test-20 fan-out): download
+    # threads never block on a vision round trip, so every scene's
+    # verification is filed the moment its downloads finish and the
+    # pool's workers answer them in parallel. Bound 8 to match the pool
+    # ceiling. The pool is created once for the run rather than per
+    # batch, so a verification starts immediately instead of waiting
+    # for a batch boundary.
+    verify_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="yt-v2-verify")
+    verify_future_map: Dict[Any, int] = {}
+    verify_pending: set = set()
+    verify_done_count = 0
+
+    def _verify_downloaded_scenes_parallel(jobs) -> Dict[Any, int]:
+        """File one verification job per scene on the shared verify pool.
+
+        ``jobs`` is an iterable of (scene_index, downloaded_record)
+        from deferred_verifications. Each job calls the unchanged
+        _batched_visual_verdicts (via _select_verified_scene) and
+        stores its verdicts keyed by video id exactly as the inline
+        path did. Returns {future: scene_index} for the submitted
+        jobs; the main loop consumes them via _consume_verification.
+        """
+        submitted: Dict[Any, int] = {}
+        for job_idx, record in jobs:
+            future = verify_executor.submit(_select_verified_scene, job_idx, record)
+            verify_future_map[future] = job_idx
+            verify_pending.add(future)
+            submitted[future] = job_idx
+        return submitted
+
+    def _consume_verification(future: Any) -> None:
+        """Apply one scene's verification outcome: resolve or re-queue."""
+        nonlocal verify_done_count, stopped_reason
+        verify_done_count += 1
+        idx = verify_future_map.get(future)
+        try:
+            resolved_idx, path = future.result()
+            if resolved_idx is not None:
+                idx = resolved_idx
+        except Exception as exc:
+            path = None
+            print(f"   [yt-v2] verification worker failed for scene {(idx or 0) + 1}: {type(exc).__name__}")
+        if idx is None:
+            return
+        if path:
+            results[idx] = path
+            if stop_when_coverage_target_met and soft_coverage > 0:
+                ready_ratio = sum(1 for item in results[:requested_scene_count] if item) / max(1, requested_scene_count)
+                if ready_ratio >= soft_coverage:
+                    stopped_reason = "coverage_target_satisfied"
+                    print(
+                        f"   [yt-v2] accepted clip target reached ({ready_ratio:.0%}); "
+                        "leaving remaining scenes to the parallel image/stock lanes",
+                        flush=True,
+                    )
+        elif not stopped_reason and scene_passes[idx] < _download_pass_cap():
+            download_queue.append(idx)
+        completed_scene_indices.add(idx)
+        if verify_done_count % 4 == 0 or verify_done_count == len(download_indices):
+            ready = sum(1 for p in results if p)
+            print(
+                f"   [yt-v2] verification: {ready}/{requested_scene_count} clips verified "
+                f"({verify_done_count} scene(s) judged)"
+            )
     download_queue = deque(download_indices)
     scene_passes = Counter()
     completed_scene_indices = set()
     attempted_count = 0
     done_count = 0
     stopped_reason = ""
+    # Discovery-budget drain: once the soft (discovery) deadline fires, no
+    # NEW scene worker may start — but in-flight workers (already
+    # probe/vision-verified, mid-download) keep running until the hard
+    # deadline. Downloads are exempt from the discovery budget: a clip
+    # verified just before the budget ends must not lose its transfer to
+    # an 8s grace drain. Only the hard deadline breaks the wait loop.
+    discovery_stopped = False
+
+    def _download_pass_cap() -> int:
+        # Honor the caller's bounded pass budget even for short jobs. The
+        # mixed-media adapter can still supply a smaller quota budget.
+        return max(1, min(max_attempts, candidate_limit))
+
 
     def _submit_available() -> None:
         nonlocal attempted_count
-        while not stopped_reason and download_queue and len(pending) < download_workers:
+        while not discovery_stopped and not stopped_reason and download_queue and len(pending) < download_workers:
             idx = download_queue.popleft()
             scene_passes[idx] += 1
             future = executor.submit(_download_scene, idx, assignments[idx])
@@ -6643,6 +9698,13 @@ def get_youtube_clips(
         except Exception as exc:
             idx, path = future_map[future], None
             print(f"   [yt-v2] download worker failed for scene {idx + 1}: {type(exc).__name__}")
+        # Downloads finished for this scene; if vision still has to
+        # judge them, file the verification on the shared pool now.
+        # The scene is not complete until the verify job decides — do
+        # not re-queue it below.
+        record = deferred_verifications.pop(idx, None)
+        if record is not None and not path:
+            _verify_downloaded_scenes_parallel([(idx, record)])
         if path:
             results[idx] = path
             if stop_when_coverage_target_met and soft_coverage > 0:
@@ -6654,7 +9716,9 @@ def get_youtube_clips(
                         "leaving remaining scenes to the parallel image/stock lanes",
                         flush=True,
                     )
-        elif not stopped_reason and scene_passes[idx] < min(max_attempts, candidate_limit):
+        elif record is not None:
+            pass  # verification pending; _consume_verification decides
+        elif not stopped_reason and scene_passes[idx] < _download_pass_cap():
             download_queue.append(idx)
         completed_scene_indices.add(idx)
         if done_count % 4 == 0 or done_count == len(download_indices):
@@ -6669,12 +9733,43 @@ def get_youtube_clips(
                     f"YouTube V2: {ready}/{requested_scene_count} clips ready",
                 )
 
+    # Round 15: stage-transition log — the 4d1d9f9f child went silent for
+    # ~280 s after transcripts with zero downloads, and the child log showed
+    # no wave-start line at all. Emit one so the next proof run shows the
+    # loop actually started, with the ranged-moment snapshot that fed it.
+    try:
+        _wave_moments, _wave_audit = (
+            ranged_overlap.snapshot()
+            if ranged_overlap is not None
+            else (ranged_moments, ranged_moment_audit)
+        )
+        _wave_moment_scenes = len(_wave_moments or {})
+    except Exception:
+        _wave_audit, _wave_moment_scenes = {}, 0
+    print(
+        f"   [yt-v2] download wave started: {len(download_indices)} scene(s), "
+        f"{download_workers} worker(s), ranged moments landed for {_wave_moment_scenes} scene(s) "
+        f"({_wave_audit.get('status', 'n/a')}) at {round(time.monotonic() - batch_started_monotonic, 1)}s",
+        flush=True,
+    )
     _submit_available()
     try:
-        while pending:
+        while pending or verify_pending:
             if provider_network_unavailable.is_set():
-                stopped_reason = 'provider_network_unavailable'
-                print('   [yt-v2] YouTube DNS failed for two sources; preserving completed clips and handing gaps to other providers', flush=True)
+                diagnostic = _current_youtube_network_diagnostic()
+                stopped_reason = diagnostic.get('code') or 'provider_network_unavailable'
+                if diagnostic:
+                    print(
+                        f"   [yt-v2] stopping YouTube retrieval: {diagnostic['code']}: "
+                        f"{diagnostic['message']} Completed clips are preserved; "
+                        "unresolved scenes are left for the caller's fallback providers.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        '   [yt-v2] YouTube transport is unavailable; preserving completed clips and handing gaps to other providers',
+                        flush=True,
+                    )
                 break
             ready_count = sum(1 for path in results[:requested_scene_count] if path)
             if ready_count >= requested_scene_count:
@@ -6686,38 +9781,57 @@ def get_youtube_clips(
                 break
             ready_ratio = ready_count / max(1, requested_scene_count)
             now = time.monotonic()
-            if hard_deadline is not None and now >= hard_deadline:
+            loop_action, discovery_stopped = _yt_download_loop_decision(
+                now,
+                hard_deadline=hard_deadline,
+                soft_ceiling_deadline=soft_ceiling_deadline,
+                soft_deadline=soft_deadline,
+                soft_enabled=soft_enabled,
+                ready_ratio=ready_ratio,
+                soft_coverage=soft_coverage,
+                discovery_stopped=discovery_stopped,
+            )
+            if loop_action == "hard_stop":
                 stopped_reason = "hard_timeout"
                 break
-            if soft_enabled and soft_ceiling_deadline is not None and now >= soft_ceiling_deadline:
-                stopped_reason = "soft_ceiling"
-                break
-            if (
-                soft_enabled
-                and soft_deadline is not None
-                and now >= soft_deadline
-                and ready_ratio >= soft_coverage
-            ):
-                stopped_reason = "soft_timeout"
-                break
+            if loop_action in ("soft_ceiling", "soft_timeout"):
+                stopped_reason = loop_action
+                print(
+                    f"   [yt-v2] discovery budget reached ({loop_action}); "
+                    "no new scene workers, draining in-flight downloads",
+                    flush=True,
+                )
 
             wait_timeout = 0.25
-            deadlines = [deadline for deadline in (hard_deadline, soft_ceiling_deadline) if deadline is not None]
+            deadlines = [deadline for deadline in (hard_deadline, soft_ceiling_deadline) if deadline is not None and deadline > now]
             if deadlines:
                 wait_timeout = max(0.0, min(wait_timeout, min(deadlines) - now))
-            done, pending = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+            done, not_done = wait(
+                set(pending) | set(verify_pending),
+                timeout=wait_timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            pending = {f for f in not_done if f in future_map}
+            verify_pending = {f for f in not_done if f in verify_future_map}
             if not done:
                 continue
             for future in done:
-                _consume_download(future)
-            if not stopped_reason:
+                if future in verify_future_map:
+                    _consume_verification(future)
+                else:
+                    _consume_download(future)
+            if not discovery_stopped and not stopped_reason:
                 _submit_available()
     finally:
         completed_at_stop = [future for future in pending if future.done()]
         for future in completed_at_stop:
             _consume_download(future)
             pending.discard(future)
-        if stopped_reason and pending:
+        completed_verify_at_stop = [future for future in verify_pending if future.done()]
+        for future in completed_verify_at_stop:
+            _consume_verification(future)
+            verify_pending.discard(future)
+        if stopped_reason and (pending or verify_pending):
             # A hard batch deadline can land immediately after yt-dlp finishes
             # the transfer but before the FFmpeg/overlay gate returns. The old
             # code cancelled those running futures and handed the adapter an
@@ -6735,28 +9849,67 @@ def get_youtube_clips(
                 drain_seconds = 8.0
             drain_deadline = time.monotonic() + drain_seconds
 
-            while pending and drain_seconds > 0:
+            while (pending or verify_pending) and drain_seconds > 0:
                 remaining = drain_deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                done, pending = wait(
-                    pending,
+                done, not_done = wait(
+                    set(pending) | set(verify_pending),
                     timeout=min(0.25, remaining),
                     return_when=FIRST_COMPLETED,
                 )
+                pending = {f for f in not_done if f in future_map}
+                verify_pending = {f for f in not_done if f in verify_future_map}
                 for future in done:
-                    _consume_download(future)
-            if pending:
+                    if future in verify_future_map:
+                        _consume_verification(future)
+                    else:
+                        _consume_download(future)
+            if pending or verify_pending:
                 if download_cancellation is not None and hasattr(download_cancellation, "cancel"):
                     download_cancellation.cancel(
                         f"YouTube V2 stage stopped at {stopped_reason}; terminating late media workers"
                     )
                 for future in pending:
                     future.cancel()
+                for future in verify_pending:
+                    future.cancel()
         # Return completed clip paths immediately.  A provider that ignores
         # cancellation must not make the v2 branch report zero at its wall
         # deadline; its late work is harmlessly isolated in this run folder.
         executor.shutdown(wait=not pending, cancel_futures=True)
+        # Verify jobs are bounded by the per-scene verify timeout; do not
+        # join them here — a hung vision call must not hold the stage.
+        verify_executor.shutdown(wait=False, cancel_futures=True)
+
+    # Overlapped ranged transcripts: take the final snapshot for the audit
+    # (never blocks — a still-running transcript phase is recorded partial
+    # and its moments stay available to later passes through the helper).
+    if ranged_overlap is not None:
+        ranged_moments, ranged_moment_audit = ranged_overlap.resolve()
+        print(f"   [yt-v2] ranged moment evidence: {ranged_moment_audit.get('scenes_with_moments', 0)}/{requested_scene_count} scenes (transcript deadline {ranged_moment_audit.get('ranged_deadline_seconds', 'n/a')}s, download reserve {ranged_moment_audit.get('download_reserve_seconds', 'n/a')}s)", flush=True)
+
+    # Audit guarantee (run 6): every injected candidate gets an attempt
+    # audit even when its scene never got a download pass. Run this BEFORE
+    # the salvage scan so the scan's rejected-path bookkeeping sees the
+    # not_attempted rows (they carry no path, so they cannot exclude a
+    # retained restore) and the returned audit records the miss.
+    injected_not_attempted = _yt_ensure_injected_attempt_audits(
+        attempt_audit,
+        pools,
+        assignments,
+        stopped_reason=stopped_reason,
+        download_scene_cap=download_scene_cap,
+        attempted_indices=set(download_indices),
+        output_root=output_root,
+    )
+    if injected_not_attempted:
+        print(
+            f"   [yt-v2] audit: {injected_not_attempted} injected candidate(s) "
+            f"never attempted ({stopped_reason or 'no pass scheduled'}); "
+            "recorded as not_attempted",
+            flush=True,
+        )
 
     # Final salvage check: if any requested scenes are still unfilled, fill from spare candidate cuts in output_root
     missing_indices = [i for i in range(requested_scene_count) if not results[i]]
@@ -6870,6 +10023,38 @@ def get_youtube_clips(
         )
     except (TypeError, ValueError):
         bite_timestamp_gap_seconds = 8.0
+    # Which inline fallback layer resolved each scene: the winning
+    # attempt (selected=True) — else the last downloaded attempt — else
+    # unresolved. Salvage-filled scenes keep the salvaged cut's layer
+    # when its audit row carries one.
+    resolution_layers: Dict[str, int] = Counter()
+    resolution_layer_by_scene: Dict[str, str] = {}
+    for index in range(requested_scene_count):
+        attempts = attempt_audit.get(index) or []
+        layer = "unresolved"
+        winning = next(
+            (item for item in reversed(attempts)
+             if isinstance(item, Mapping) and item.get("selected")),
+            None,
+        )
+        if winning is None:
+            winning = next(
+                (item for item in reversed(attempts)
+                 if isinstance(item, Mapping) and item.get("status") == "downloaded"),
+                None,
+            )
+        if winning is not None:
+            layer = str(winning.get("resolution_layer") or "perfect")
+        if results[index] and layer == "unresolved":
+            layer = "salvaged"
+        resolution_layer_by_scene[str(index)] = layer
+        resolution_layers[layer] += 1
+    if resolution_layers:
+        print(
+            "   [yt-v2] fallback layers: "
+            + ", ".join(f"{layer}={count}" for layer, count in sorted(resolution_layers.items())),
+            flush=True,
+        )
     return _restore_scene_slots(
         results,
         {
@@ -6879,6 +10064,7 @@ def get_youtube_clips(
             "requested": requested_scene_count,
             "stop_reason": stopped_reason,
             "provider_network_unavailable": provider_network_unavailable.is_set(),
+            "network_diagnostic": _current_youtube_network_diagnostic(),
             "strategy": "coverage_first_round_robin_downloads",
             "search_elapsed_seconds": round(search_elapsed_seconds, 2),
             "download_passes": dict(scene_passes),
@@ -6891,6 +10077,9 @@ def get_youtube_clips(
             "runtime": runtime_receipt(),
             "ranged_moments": ranged_moments,
             "scheduled_download_operations": done_count,
+            "resolution_layers": dict(resolution_layers),
+            "resolution_layer_by_scene": resolution_layer_by_scene,
+            "injected_not_attempted": injected_not_attempted,
             "intro_unique_scene_count": sum(
                 1 for row in rows if bool(row.get("intro_unique") or row.get("is_intro"))
             ),
@@ -6907,12 +10096,21 @@ def get_youtube_clips(
     )
 
 
-def select_best_youtube_candidate(scene_text: str, title: str = "", api_key: str = "", niche: str = "general", **_) -> Dict[str, Any]:
+def select_best_youtube_candidate(scene_text: str, title: str = "", api_key: str = "", niche: str = "general", session_jar: Any = None, youtube_session: Any = None, use_authenticated_session: bool = True, **_) -> Dict[str, Any]:
     del api_key, niche
     subject = (_scene_subject_terms(scene_text, title) or _scene_subject_terms(title, ""))[:1]
     active = subject[0] if subject else title
     query = f"{active} highlights footage"
-    candidates = _search_youtube(query, int(os.environ.get("VIDZEO_YT_RESULTS_PER_QUERY", "12") or 12))
+    # Anonymous spot (fixed Nov 17): this helper used to call
+    # _search_youtube with no session at all, so its search ran
+    # anonymous even when accounts were configured. Resolve the shared
+    # authenticated session exactly like every other search entry point.
+    authenticated_session = _get_authenticated_youtube_session(
+        session_jar=session_jar,
+        youtube_session=youtube_session,
+        enabled=use_authenticated_session,
+    )
+    candidates = _search_youtube(query, int(os.environ.get("VIDZEO_YT_RESULTS_PER_QUERY", "12") or 12), session_jar=authenticated_session)
     ranked = sorted(candidates, key=lambda c: _score_candidate(c, active, scene_text, query), reverse=True)
     selected = ranked[0] if ranked else None
     return {"selected_video": selected, "ranked_candidates": ranked, "query": query}
@@ -7113,18 +10311,24 @@ def _prepare_pool_transcript_moments(
     try:
         # An explicit deadline overrides the shared env wall. The pre-probe
         # transcript fetch passes a tight one so it cannot eat the probe
-        # wall; every other caller keeps the env default.
+        # wall; every other caller keeps the env default. The default is
+        # generous (300s, round 12): caption fetches on throttled egress
+        # routinely need tens of seconds per video, and a 25s default
+        # turned the transcript step into a heuristic fallback for most
+        # scenes. The 300s ceiling (see
+        # _yt_pool_transcript_deadline_seconds) bounds it: the old 120s
+        # ceiling retained 0/8 transcripts in job 9ab2eb05's slow hour.
         transcript_deadline = max(
             0.05,
             min(
-                300.0,
+                _yt_pool_transcript_deadline_seconds(),
                 float(deadline_seconds)
                 if deadline_seconds is not None
-                else float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "25") or 25),
+                else float(os.environ.get("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "300") or 300),
             ),
         )
     except (TypeError, ValueError):
-        transcript_deadline = 25.0
+        transcript_deadline = 300.0
     # Pool-first can proceed with heuristic moments when a transcript provider
     # is slow. Completed documents are retained at this wall deadline.
     try:
@@ -7150,6 +10354,22 @@ def _prepare_pool_transcript_moments(
             "subject": row.get("candidate_subject") or row.get("section_subject") or row.get("scene_subject") or "",
         })
     moments = match_pool_moments(documents, scenes, source_metadata=source_metadata)
+    # Round 13: the moment stage was silent in the worker log — the
+    # progress poller had nothing to report between the transcript
+    # count line and the first transfer, so the heartbeat kept saying
+    # "Searching YouTube" (job 9ab2eb05). Emit the moment accounting
+    # so the heartbeat states the true stage.
+    _moments_total = sum(len(values) for values in (moments or {}).values())
+    _moments_scenes = sum(1 for values in (moments or {}).values() if values)
+    _transcripts_ready = sum(
+        1 for doc in (documents or {}).values() if getattr(doc, "available", False)
+    )
+    print(
+        f"   [yt-moments] matched {_moments_total} moments across "
+        f"{_moments_scenes}/{len(scenes)} scenes "
+        f"({_transcripts_ready} transcripts ready)",
+        flush=True,
+    )
     return documents, moments, source_metadata
 
 
@@ -7164,6 +10384,10 @@ def build_clip_pools(
     use_authenticated_session: bool = True,
     search_timeout_seconds: Optional[float] = None,
     allow_same_source_reuse: bool = True,
+    # Full job title for the prep-manifest injection lookup; see
+    # get_youtube_clips: the search title may be just the topic anchor,
+    # which never matches a manifest keyed on the full job title.
+    prep_manifest_title: Optional[str] = None,
 ) -> ClipPools:
     """Run the one-time metadata search/rank for a set of scenes.
 
@@ -7181,6 +10405,20 @@ def build_clip_pools(
         groups,
         search_timeout_seconds=search_timeout_seconds,
         session_jar=authenticated_session,
+    )
+    # Prep-manifest-first injection. The lookup uses the full job title
+    # (prep_manifest_title), not the search title: the search title may
+    # be just the topic anchor, which never matches a manifest keyed on
+    # the full job title (run 3: anchor injected 0; full title 9).
+    prep_manifest_lookup_title = prep_manifest_title or title
+    prep_injection_audit = inject_prep_manifest_candidates(
+        pools,
+        rows,
+        prep_manifest_lookup_title,
+        [str(row.get("scene_text") or "") for row in rows],
+    )
+    _log_prep_manifest_injection_audit(
+        prep_injection_audit, prep_manifest_lookup_title
     )
     durations = list(scene_durations or [4.0] * len(rows))
     while len(durations) < len(rows):
@@ -7268,6 +10506,157 @@ def _youtube_relaxed_visual_gate_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _verdict_from_clip_analysis(
+    analysis: Any,
+    *,
+    relevance_only: bool = False,
+    verdict_for: Any = None,
+) -> Tuple[bool, float, bool, str]:
+    """Derive the ``(accepted, score, vision_available, reason)`` gate tuple
+    from one finished ``ClipAnalysis``.
+
+    Shared by the single-candidate path (``_visual_verdict_scored``) and
+    the batched path (``_batched_visual_verdicts``) so a batched verdict
+    with the same scores produces exactly the same accept/reject decision
+    as a sequential verdict. Subject-level acceptance is unchanged: a low
+    score only ranks, never rejects; hard rejects stay for fatal mismatch,
+    confident irrelevance, a hard talking-head signal, or the batch model's
+    explicit ``reject`` verdict (``batch_verdict``) — an explicit reject is
+    a veto, never overruled by a high score.
+    """
+    if not getattr(analysis, "vision_available", False):
+        return True, 100.0, False, "vision_unavailable_local_checks_passed"
+    if bool(getattr(analysis, "talking_head", False)) and str(
+        os.environ.get("VIDZEO_YT_REJECT_TALKING_HEAD", "1") or "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}:
+        # A boolean-only reject was starving the footage lane: Qwen can
+        # mark a sports close-up or archival crowd as talking-head with a
+        # weak confidence. Reactions/presenters are still rejected, but
+        # only when the signal clears the same hard threshold as the CPU
+        # overlay gate.
+        try:
+            talking_head_confidence = float(getattr(analysis, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            talking_head_confidence = 0.0
+        try:
+            from services.scene_understanding.analyzers import hard_talking_head_signal
+            hard_presenter = hard_talking_head_signal(
+                True,
+                talking_head_confidence,
+                getattr(analysis, "talking_head_reason", ""),
+                enabled=True,
+            )
+        except Exception:
+            hard_presenter = talking_head_confidence >= 82.0
+        if hard_presenter:
+            return False, float(getattr(analysis, "story_relevance", 0.0) or 0.0), True, "talking_head"
+    if relevance_only or _youtube_relaxed_visual_gate_enabled():
+        relevance = float(getattr(analysis, "story_relevance", 0.0) or 0.0)
+        confidence = float(getattr(analysis, "confidence", 0.0) or 0.0)
+        if bool(getattr(analysis, "fatal_mismatch", False)):
+            return False, relevance, True, "fatal_mismatch"
+        if str(getattr(analysis, "batch_verdict", "") or "").strip().lower() == "reject":
+            # Batched verdicts only: the model explicitly rejected this
+            # candidate for the scene. An explicit reject is a hard veto
+            # even when the numeric scores look passable — never ship
+            # footage the validator itself flagged as wrong for the scene.
+            # It only fires when the scores do not already hard-fail (a
+            # fatal mismatch is reported as fatal_mismatch in both paths,
+            # so the audit reason stays identical to the sequential path).
+            return False, relevance, True, "batch_reject"
+        try:
+            hard_reject_relevance = float(
+                os.environ.get(
+                    "VIDZEO_VISUAL_HARD_REJECT_RELEVANCE" if relevance_only
+                    else "VIDZEO_YT_HARD_REJECT_RELEVANCE",
+                    "25" if relevance_only else "18",
+                ) or (25 if relevance_only else 18)
+            )
+            hard_reject_confidence = float(
+                os.environ.get(
+                    "VIDZEO_VISUAL_HARD_REJECT_CONFIDENCE" if relevance_only
+                    else "VIDZEO_YT_HARD_REJECT_CONFIDENCE",
+                    "70" if relevance_only else "82",
+                ) or (70 if relevance_only else 82)
+            )
+        except (TypeError, ValueError):
+            hard_reject_relevance, hard_reject_confidence = (
+                (25.0, 70.0) if relevance_only else (18.0, 82.0)
+            )
+        if relevance < hard_reject_relevance and confidence >= hard_reject_confidence:
+            return False, relevance, True, "confident_irrelevance"
+        # Watermarks, subtitles, low production value, and uncertain scores
+        # are advisory in the YouTube path. Only a confident semantic miss
+        # or fatal mismatch vetoes the motion candidate.
+        return True, relevance, True, "relevance_keep" if relevance_only else "youtube_relaxed_relevance_keep"
+    verdict = verdict_for(analysis) if callable(verdict_for) else "keep"
+    score = float(getattr(analysis, "final_score", 0.0) or 0.0)
+    if str(getattr(analysis, "batch_verdict", "") or "").strip().lower() == "reject" and verdict == "keep":
+        return False, score, True, "batch_reject"
+    # Keep the audit useful: ``replace`` alone cannot distinguish a
+    # semantic subject mismatch from a low-quality/prefilter rejection.
+    # The caller uses the boolean verdict, while the reason is surfaced in
+    # the manifest and UI log for deterministic debugging.
+    if bool(getattr(analysis, "fatal_mismatch", False)):
+        reason = "fatal_mismatch"
+    elif bool(getattr(analysis, "prefilter_rejected", False)):
+        reason = str(getattr(analysis, "prefilter_reason", "prefilter_rejected") or "prefilter_rejected")
+    elif getattr(analysis, "error", ""):
+        reason = f"analysis_error:{str(getattr(analysis, 'error', ''))[:120]}"
+    else:
+        reason = verdict
+    return verdict == "keep", score, True, reason
+
+
+def _lane_visual_client(visual_context: Any, lane: str = "youtube") -> Any:
+    """Return the vision client charged to ``lane`` for a context.
+
+    Vision lanes (§7.3 resolution): every YT vision call already flows
+    through ``visual_context.get_client()`` -> ``_ContextClient._run``
+    -> ``_reserve_call`` — the clip pipeline receives the context
+    client, not a raw Qwen client, so there is no raw-client bypass to
+    close. What the lane split re-homes is *which context* is charged:
+    when the passed context is a verifier parent that already carries
+    lane children (built by the adapter), YT vision uses the YT lane
+    child's client, so its calls/deadline/semaphore are the YT lane's.
+    Otherwise the context's own client is returned unchanged — in the
+    V2 adapter flow the YT lane's transport context is disabled, so
+    this returns None and lane vision stays off there by design (the
+    coordinator gate is where YT vision happens in V2).
+    """
+    if visual_context is None:
+        return None
+    children = getattr(visual_context, "_lane_children", None)
+    if isinstance(children, dict) and str(lane) in children:
+        try:
+            return children[str(lane)].get_client()
+        except Exception:
+            pass
+    try:
+        if not bool(getattr(visual_context, "enabled", False)):
+            return None
+        return visual_context.get_client()
+    except Exception:
+        return None
+
+
+def _lane_budget_for(visual_context: Any, lane: str = "youtube") -> Any:
+    """Return the LaneVisionBudget for ``lane`` on a context or its child."""
+    children = getattr(visual_context, "_lane_children", None)
+    if isinstance(children, dict) and str(lane) in children:
+        return getattr(children[str(lane)], "_lane_budget", None)
+    return getattr(visual_context, "_lane_budget", None)
+
+
+def _lane_scheduler_for(visual_context: Any) -> Any:
+    """Return the lane scheduler attached to a context (or its parent)."""
+    for obj in (visual_context, getattr(visual_context, "_parent", None)):
+        scheduler = getattr(obj, "lane_scheduler", None) if obj is not None else None
+        if scheduler is not None:
+            return scheduler
+    return None
+
+
 def _visual_verdict_scored(
     path: str,
     scene_index: int,
@@ -7293,13 +10682,15 @@ def _visual_verdict_scored(
         client = None
         if getattr(visual_context, "enabled", False):
             try:
-                client = visual_context.get_client()
+                client = _lane_visual_client(visual_context, "youtube")
             except Exception:
                 client = None
         clip_pipeline = ClipIntelligencePipeline(
             client,
             max_frames=_visual_gate_frames(),
             visual_required=visual_required,
+            lane_budget=_lane_budget_for(visual_context, "youtube"),
+            lane_scheduler=_lane_scheduler_for(visual_context),
         )
     except Exception:
         # The clip has already passed metadata, FFmpeg integrity, overlay and
@@ -7314,81 +10705,185 @@ def _visual_verdict_scored(
             narration=narration,
             subject=subject,
         )
-        if not getattr(analysis, "vision_available", False):
-            return True, 100.0, False, "vision_unavailable_local_checks_passed"
-        if bool(getattr(analysis, "talking_head", False)) and str(
-            os.environ.get("VIDZEO_YT_REJECT_TALKING_HEAD", "1") or "1"
-        ).strip().lower() in {"1", "true", "yes", "on"}:
-            # A boolean-only reject was starving the footage lane: Qwen can
-            # mark a sports close-up or archival crowd as talking-head with a
-            # weak confidence. Reactions/presenters are still rejected, but
-            # only when the signal clears the same hard threshold as the CPU
-            # overlay gate.
-            try:
-                talking_head_confidence = float(getattr(analysis, "confidence", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                talking_head_confidence = 0.0
-            try:
-                from services.scene_understanding.analyzers import hard_talking_head_signal
-                hard_presenter = hard_talking_head_signal(
-                    True,
-                    talking_head_confidence,
-                    getattr(analysis, "talking_head_reason", ""),
-                    enabled=True,
-                )
-            except Exception:
-                hard_presenter = talking_head_confidence >= 82.0
-            if hard_presenter:
-                return False, float(getattr(analysis, "story_relevance", 0.0) or 0.0), True, "talking_head"
-        if relevance_only or _youtube_relaxed_visual_gate_enabled():
-            relevance = float(getattr(analysis, "story_relevance", 0.0) or 0.0)
-            confidence = float(getattr(analysis, "confidence", 0.0) or 0.0)
-            if bool(getattr(analysis, "fatal_mismatch", False)):
-                return False, relevance, True, "fatal_mismatch"
-            try:
-                hard_reject_relevance = float(
-                    os.environ.get(
-                        "VIDZEO_VISUAL_HARD_REJECT_RELEVANCE" if relevance_only
-                        else "VIDZEO_YT_HARD_REJECT_RELEVANCE",
-                        "25" if relevance_only else "18",
-                    ) or (25 if relevance_only else 18)
-                )
-                hard_reject_confidence = float(
-                    os.environ.get(
-                        "VIDZEO_VISUAL_HARD_REJECT_CONFIDENCE" if relevance_only
-                        else "VIDZEO_YT_HARD_REJECT_CONFIDENCE",
-                        "70" if relevance_only else "82",
-                    ) or (70 if relevance_only else 82)
-                )
-            except (TypeError, ValueError):
-                hard_reject_relevance, hard_reject_confidence = (
-                    (25.0, 70.0) if relevance_only else (18.0, 82.0)
-                )
-            if relevance < hard_reject_relevance and confidence >= hard_reject_confidence:
-                return False, relevance, True, "confident_irrelevance"
-            # Watermarks, subtitles, low production value, and uncertain scores
-            # are advisory in the YouTube path. Only a confident semantic miss
-            # or fatal mismatch vetoes the motion candidate.
-            return True, relevance, True, "relevance_keep" if relevance_only else "youtube_relaxed_relevance_keep"
-        verdict = clip_pipeline.verdict_for(analysis)
-        score = float(getattr(analysis, "final_score", 0.0) or 0.0)
-        # Keep the audit useful: ``replace`` alone cannot distinguish a
-        # semantic subject mismatch from a low-quality/prefilter rejection.
-        # The caller uses the boolean verdict, while the reason is surfaced in
-        # the manifest and UI log for deterministic debugging.
-        if bool(getattr(analysis, "fatal_mismatch", False)):
-            reason = "fatal_mismatch"
-        elif bool(getattr(analysis, "prefilter_rejected", False)):
-            reason = str(getattr(analysis, "prefilter_reason", "prefilter_rejected") or "prefilter_rejected")
-        elif getattr(analysis, "error", ""):
-            reason = f"analysis_error:{str(getattr(analysis, 'error', ''))[:120]}"
-        else:
-            reason = verdict
-        return verdict == "keep", score, True, reason
+        return _verdict_from_clip_analysis(
+            analysis,
+            relevance_only=relevance_only,
+            verdict_for=clip_pipeline.verdict_for,
+        )
     except Exception as exc:
         reason = f"rank_error:{type(exc).__name__}"
         return True, 100.0, False, f"{reason}:local_checks_passed"
 
+
+def _vision_batch_enabled() -> bool:
+    """Kill-switch for batched YouTube vision (default ON).
+
+    ``VIDZEO_YT_VISION_BATCH=0`` restores the old sequential per-candidate
+    vision calls exactly; any batch failure also falls back to them.
+    """
+    return str(os.environ.get("VIDZEO_YT_VISION_BATCH", "1") or "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _batched_visual_verdicts(
+    candidates: List[dict],
+    scene_index: int,
+    topic: str,
+    narration: str,
+    subject: str,
+    visual_context: Any,
+    *,
+    relevance_only: bool = False,
+) -> Dict[str, Tuple[bool, float, bool, str]]:
+    """Judge ALL of one scene's downloaded candidates in ONE vision call.
+
+    ``candidates`` is a list of ``{"candidate_id": str, "path": str}`` plus
+    optional per-candidate ``topic`` / ``narration`` / ``subject`` overrides
+    (a GTA V supporting-gameplay candidate is judged as GTA V, not GTA VI).
+    Candidates are grouped by identical prompt context — normally one group,
+    so one vision request — and each group is judged by a single
+    ``analyze_clips_batch`` call. Returns
+    ``{candidate_id: (accepted, score, vision_available, reason)}`` in the
+    exact shape of ``_visual_verdict_scored``, decided by the same
+    ``_verdict_from_clip_analysis``: batching changes how verdicts arrive,
+    never which candidates win.
+
+    Never raises: batching disabled, a batch error, or a missing client all
+    fall back to the existing parallel per-candidate verdicts
+    (``_parallel_visual_verdicts``), and a vision miss fails open exactly
+    as the sequential path does.
+    """
+    if not candidates:
+        return {}
+    if visual_context is None:
+        return {
+            str(c.get("candidate_id") or c.get("path") or ""): (True, 100.0, False, "vision_disabled")
+            for c in candidates
+            if isinstance(c, dict)
+        }
+    if not _vision_batch_enabled():
+        return _parallel_visual_verdicts_by_id(
+            candidates, scene_index, topic, narration, subject, visual_context,
+            relevance_only=relevance_only,
+        )
+    try:
+        from services.visual_intelligence.clip_pipeline import ClipIntelligencePipeline
+
+        visual_required = bool(getattr(visual_context, "visual_required", False))
+        client = None
+        if getattr(visual_context, "enabled", False):
+            try:
+                client = _lane_visual_client(visual_context, "youtube")
+            except Exception:
+                client = None
+        if client is None:
+            # No vision client: judge the candidates singly, exactly as
+            # the old loop did (its _visual_verdict_scored handles a
+            # missing client — fail-open — and test seams patch that
+            # function). Running the batch with a None client would
+            # return vacuous fail-open verdicts instead.
+            return _parallel_visual_verdicts_by_id(
+                candidates, scene_index, topic, narration, subject, visual_context,
+                relevance_only=relevance_only,
+            )
+        clip_pipeline = ClipIntelligencePipeline(
+            client,
+            max_frames=_visual_gate_frames(),
+            visual_required=visual_required,
+            lane_budget=_lane_budget_for(visual_context, "youtube"),
+            lane_scheduler=_lane_scheduler_for(visual_context),
+        )
+    except Exception:
+        return _parallel_visual_verdicts_by_id(
+            candidates, scene_index, topic, narration, subject, visual_context,
+            relevance_only=relevance_only,
+        )
+    # Group by prompt context: one batch call per distinct (topic,
+    # narration, subject). A scene is normally a single group.
+    groups: Dict[tuple, List[dict]] = {}
+    order: List[tuple] = []
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        key = (
+            str(cand.get("topic") or topic or subject),
+            str(cand.get("narration") or narration),
+            str(cand.get("subject") or subject),
+        )
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(cand)
+    out: Dict[str, Tuple[bool, float, bool, str]] = {}
+    try:
+        for key in order:
+            group = groups[key]
+            g_topic, g_narration, g_subject = key
+            clips = [
+                {"candidate_id": str(c.get("candidate_id") or c.get("path") or ""), "path": str(c.get("path") or "")}
+                for c in group
+            ]
+            analyses = clip_pipeline.analyze_clips_batch(
+                scene_index, clips, g_topic, g_narration, g_subject,
+            )
+            for cand in group:
+                candidate_id = str(cand.get("candidate_id") or cand.get("path") or "")
+                if not candidate_id:
+                    continue
+                analysis = analyses.get(candidate_id)
+                if analysis is None:
+                    out[candidate_id] = (True, 100.0, False, "vision_unavailable_local_checks_passed")
+                    continue
+                out[candidate_id] = _verdict_from_clip_analysis(
+                    analysis,
+                    relevance_only=relevance_only,
+                    verdict_for=clip_pipeline.verdict_for,
+                )
+    except Exception:
+        # Never lose the scene to a batch failure: judge the candidates
+        # singly, in parallel, exactly as the old path did.
+        return _parallel_visual_verdicts_by_id(
+            candidates, scene_index, topic, narration, subject, visual_context,
+            relevance_only=relevance_only,
+        )
+    return out
+
+
+def _parallel_visual_verdicts_by_id(
+    candidates: List[dict],
+    scene_index: int,
+    topic: str,
+    narration: str,
+    subject: str,
+    visual_context: Any,
+    *,
+    relevance_only: bool = False,
+) -> Dict[str, Tuple[bool, float, bool, str]]:
+    """Parallel per-candidate verdicts keyed by candidate id.
+
+    Same verdicts as ``_parallel_visual_verdicts`` (slot-indexed), keyed by
+    candidate id for the batched path's fallback. Never raises.
+    """
+    paths = [
+        (i, str(c.get("path") or ""))
+        for i, c in enumerate(candidates)
+        if isinstance(c, dict)
+    ]
+    by_slot = _parallel_visual_verdicts(
+        paths, scene_index, topic, narration, subject, visual_context,
+        relevance_only=relevance_only,
+    )
+    out: Dict[str, Tuple[bool, float, bool, str]] = {}
+    for i, cand in enumerate(candidates):
+        if not isinstance(cand, dict):
+            continue
+        candidate_id = str(cand.get("candidate_id") or cand.get("path") or "")
+        if not candidate_id:
+            continue
+        if i in by_slot:
+            out[candidate_id] = by_slot[i]
+    return out
 
 def _visual_verdict(
     path: str,
@@ -7412,6 +10907,8 @@ def _parallel_visual_verdicts(
     narration: str,
     subject: str,
     visual_context: Any,
+    *,
+    relevance_only: bool = False,
 ) -> Dict[int, Tuple[bool, float, bool, str]]:
     """Run Qwen visual gates for several downloaded clips IN PARALLEL.
 
@@ -7425,13 +10922,17 @@ def _parallel_visual_verdicts(
     if visual_context is None:
         return {idx: (True, 100.0, False, "vision_disabled") for idx, _p in paths}
     try:
-        max_workers = max(1, min(4, int(os.environ.get("VIDZEO_YT_VISUAL_GATE_PARALLEL", "3") or 3)))
+        # Test-20 fan-out: per-candidate verdicts may run up to 8 in
+        # parallel (the pool ceiling); the shared context semaphore is
+        # the binding constraint, not this local cap.
+        max_workers = max(1, min(8, int(os.environ.get("VIDZEO_YT_VISUAL_GATE_PARALLEL", "8") or 8)))
     except Exception:
-        max_workers = 3
+        max_workers = 8
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yt-v2-vision") as executor:
         futures = {
             executor.submit(
-                _visual_verdict_scored, path, scene_index, topic, narration, subject, visual_context
+                _visual_verdict_scored, path, scene_index, topic, narration, subject, visual_context,
+                relevance_only=relevance_only,
             ): idx
             for idx, path in paths
         }
@@ -7466,6 +10967,62 @@ def _classify_visual_result(
         return "hard_fail" if str(reason or "").lower() in {"replace", "reject"} else "uncertain"
 
 
+def _yt_record_unattempted_injected_resolve(
+    state: Any,
+    pools: Any,
+    scene_index: int,
+    *,
+    reason: str,
+) -> int:
+    """Record a not-attempted event for each injected candidate mapped to
+    this scene with no attempt-log row (the ``resolve_clip_for_scene``
+    path). A scene that resolves to ``None`` must still account for its
+    injected cuts, with WHY, instead of leaving them invisible (run 6:
+    scenes 10/11). Never raises. Returns the number of rows added.
+    """
+    if scene_index < 0:
+        return 0
+    try:
+        key = _row_pool_key(pools.rows[scene_index])
+        candidates = pools.pools.get(key) or []
+    except Exception:
+        return 0
+    added = 0
+    with state.lock:
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping) or not candidate.get("prep_manifest_injected"):
+                continue
+            try:
+                if int(candidate.get("prep_live_scene", -1)) != scene_index:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            vid = _video_id(candidate)
+            if not vid:
+                continue
+            if any(
+                isinstance(item, Mapping)
+                and item.get("scene_index") == scene_index
+                and str(item.get("candidate_id") or "") == vid
+                for item in state.attempt_log
+            ):
+                continue
+            state.attempt_log.append({
+                "scene_index": scene_index,
+                "event": "injected_candidate_not_attempted",
+                "candidate_id": vid,
+                "status": "not_attempted",
+                "reason": reason,
+                "resolution_layer": "none",
+                "prep_manifest_injected": True,
+                "prep_live_scene": scene_index,
+                "prep_cache_path": str(candidate.get("prep_cache_path") or ""),
+                "timestamp": round(float(candidate.get("prep_best_timestamp") or 0.0), 2),
+            })
+            added += 1
+    return added
+
+
 def resolve_clip_for_scene(
     scene_index: int,
     pools: ClipPools,
@@ -7496,6 +11053,7 @@ def resolve_clip_for_scene(
     scene_text = row.get("scene_text", "") or ""
     key = _row_pool_key(row)
     assigned = pools.assignments[scene_index] if scene_index < len(pools.assignments) else None
+    assigned_vid = _video_id(assigned) if assigned else ""
 
     with state.lock:
         if scene_index in state.resolved:
@@ -7533,6 +11091,9 @@ def resolve_clip_for_scene(
         options.append(candidate)
     if not options:
         # Every candidate was hard-rejected at metadata level; nothing to gate.
+        _yt_record_unattempted_injected_resolve(
+            state, pools, scene_index, reason="no_eligible_option"
+        )
         return None
 
     run_id = _new_job_run_id("v2rg", f"{scene_index}:{subject}")
@@ -7569,15 +11130,29 @@ def resolve_clip_for_scene(
                 # Validate pre-assigned timestamps against used_timestamps to
                 # prevent multiple scenes from downloading the exact same
                 # segment.  The gap must match _pick_timestamp's spacing.
+                # The state map is pre-seeded with THIS scene's own assigned
+                # moment (make_resolve_state): that registration is not a
+                # collision with another scene — it IS this scene's moment.
+                # Without this carve-out the assigned primary collides with
+                # itself and falls back to _pick_timestamp, which returns
+                # None for an injected cut (no source duration), so the
+                # verified restore never gets a plan at all (run-6 class).
                 reuse_keys = _timestamp_reuse_keys(option)
                 gap_val = max(
                     float(os.environ.get("VIDZEO_YT_REUSE_TIMESTAMP_GAP", "20") or 20),
                     duration + 4.0,
                 )
+                own_start = option.get("best_timestamp")
                 collides = any(
                     abs(float(start) - old) < (gap_val - 0.05)
                     for k in reuse_keys
                     for old in state.used_timestamps.get(k, [])
+                    if not (
+                        vid
+                        and vid == assigned_vid
+                        and own_start is not None
+                        and abs(float(old) - float(own_start)) < 1e-6
+                    )
                 )
                 if collides:
                     # Pre-assigned timestamp conflicts; try to find a fresh one
@@ -7585,13 +11160,17 @@ def resolve_clip_for_scene(
                 else:
                     # Register the valid pre-assigned timestamp
                     for k in reuse_keys:
-                        state.used_timestamps[k].append(float(start))
+                        if float(start) not in state.used_timestamps[k]:
+                            state.used_timestamps[k].append(float(start))
             else:
                 start = _pick_timestamp(option, scene_index, state.used_timestamps, duration)
         if start is None:
             continue
         plans.append((option, vid, float(start)))
     if not plans:
+        _yt_record_unattempted_injected_resolve(
+            state, pools, scene_index, reason="no_download_plan"
+        )
         return None
 
     relaxed_raw = row.get(
@@ -7630,6 +11209,13 @@ def resolve_clip_for_scene(
                 is_relaxed=relaxed_youtube,
             )
         plans.sort(key=_plan_predownload_score, reverse=True)
+
+    # A mapped injected cut is a verified local file: it must head the
+    # plan order, not sit last because its metadata score is -50. The
+    # predownload sort above ranks it last on metadata alone (run 6: a
+    # verified restore lost its scene to a live download). Stable sort,
+    # so predownload order survives inside each group.
+    plans.sort(key=lambda item: 0 if _is_prep_manifest_candidate(item[0]) else 1)
 
     try:
         progressive_limit = max(1, min(6, int(os.environ.get("VIDZEO_YT_PROGRESSIVE_ATTEMPTS", "4") or 4)))
@@ -7704,6 +11290,14 @@ def resolve_clip_for_scene(
             f"yt_clip_scene_{scene_index + 1:03d}.cand{_safe_youtube_path_token(vid)}.mp4"
         )
         fingerprint = f"{scene_index}:{vid}:{round(float(start), 2)}"
+        # Inline fallback layer for the audit: the mapped prep restore is
+        # the cached layer, the ranked assignment is perfect, any other
+        # pool candidate is general.
+        plan_layer = (
+            "cached" if _is_prep_manifest_candidate(option)
+            else "perfect" if vid and vid == assigned_vid
+            else "general"
+        )
         with state.lock:
             if fingerprint in state.attempted_candidates:
                 return None
@@ -7714,16 +11308,40 @@ def resolve_clip_for_scene(
                 "timestamp": round(float(start), 2),
                 "fingerprint": fingerprint,
                 "status": "download_started",
+                "resolution_layer": plan_layer,
             }
             state.attempt_log.append(audit)
         started = time.monotonic()
-        if _download_clip(
+        # A prep-manifest cut is already on disk: copy it before any
+        # network download, exactly like the batch path. Without this the
+        # resolve path re-downloaded every injected scene over the network
+        # (the batch path's 0e4ff6a fix never reached this function).
+        restored = False
+        if _is_prep_manifest_candidate(option):
+            prep_cut_path = str(option.get("prep_cache_path") or "")
+            if prep_cut_path:
+                try:
+                    prep_file = Path(prep_cut_path)
+                    if prep_file.is_file() and prep_file.stat().st_size >= PREP_MANIFEST_MIN_CUT_BYTES:
+                        shutil.copyfile(str(prep_file), str(out))
+                        restored = out.is_file() and out.stat().st_size >= 8192
+                        audit["cache_hit"] = bool(restored)
+                        audit["cache_path"] = str(prep_file)
+                        audit["prep_cache_restored"] = bool(restored)
+                except Exception:
+                    restored = False
+        downloaded = restored
+        if not downloaded and _download_clip(
             option,
             out,
             start,
             duration,
             session_jar=authenticated_session,
         ):
+            downloaded = True
+        if downloaded:
+            if restored:
+                audit["resolution_layer"] = "cached"
             audit.update({"status": "downloaded", "elapsed_seconds": round(time.monotonic() - started, 2)})
             return str(out.resolve())
         with state.lock:
@@ -7743,42 +11361,85 @@ def resolve_clip_for_scene(
             state.resolved[scene_index] = win_path
         return win_path
 
+    # Batched vision, three phases (was: download one -> vision one ->
+    # decide -> next, one vision request per candidate):
+    #   A. Download every planned candidate for the scene first.
+    #   B. ONE batched vision call judges all of them together.
+    #   C. Decide in ranked order with the same per-candidate logic as
+    #      before (weighted score, advisory fallback, hard-fail
+    #      blacklisting, prep-restore retention). The first passing
+    #      candidate still wins, so batching changes how verdicts arrive,
+    #      never which candidate wins. Scenes run in parallel threads, so
+    #      every scene's batched request is filed at once.
     advisory_fallback: Optional[str] = None
+    downloaded: List[dict] = []
     for plan_index, (option, vid, start) in enumerate(plans):
         path = _download_one(option, vid, start)
         if not path:
             continue
         if visual_context is None:
             return _finish_progressive(path)
-        gta_v_support = bool(row.get("gta_vi_supporting_gameplay")) and bool(
-            option.get("gta_v_supporting_gameplay")
-        )
-        visual_topic = (
-            "Grand Theft Auto VI documentary supporting gameplay: Grand Theft Auto V"
-            if gta_v_support else subject
-        )
-        visual_narration = (
-            f"{scene_text} Use clean Grand Theft Auto V gameplay as supporting footage "
-            "for this Grand Theft Auto VI story; reject facecams."
-            if gta_v_support else scene_text
-        )
-        visual_subject = "Grand Theft Auto V" if gta_v_support else subject
-        verdict = _visual_verdict_scored(
-            path,
+        downloaded.append({
+            "plan_index": plan_index,
+            "option": option,
+            "vid": vid,
+            "start": start,
+            "path": path,
+        })
+    verdicts: Dict[str, Tuple[bool, float, bool, str]] = {}
+    prompt_by_vid: Dict[str, dict] = {}
+    if downloaded:
+        batch_candidates: List[dict] = []
+        for item in downloaded:
+            option = item["option"]
+            vid = item["vid"]
+            gta_v_support = (bool(row.get("gta_vi_supporting_gameplay")) and bool(
+                option.get("gta_v_supporting_gameplay")
+            )) or _scene_game_match(
+                # Scene-relative: a GTA V clip for a scene narrating GTA V
+                # is judged as GTA V footage, not as a wrong-game clip.
+                option, scene_text, subject, _row_retrieval_context(row), "v",
+            )
+            batch_candidates.append({
+                "candidate_id": vid,
+                "path": item["path"],
+                "topic": (
+                    "Grand Theft Auto VI documentary supporting gameplay: Grand Theft Auto V"
+                    if gta_v_support else subject
+                ),
+                "narration": (
+                    f"{scene_text} Use clean Grand Theft Auto V gameplay as supporting footage "
+                    "for this Grand Theft Auto VI story; reject facecams."
+                    if gta_v_support else scene_text
+                ),
+                "subject": "Grand Theft Auto V" if gta_v_support else subject,
+            })
+        verdicts = _batched_visual_verdicts(
+            batch_candidates,
             scene_index,
-            visual_topic,
-            visual_narration,
-            visual_subject,
+            subject,
+            scene_text,
+            subject,
             visual_context,
+        )
+        prompt_by_vid = {c["candidate_id"]: c for c in batch_candidates}
+    for item in downloaded:
+        plan_index = item["plan_index"]
+        option = item["option"]
+        vid = item["vid"]
+        path = item["path"]
+        verdict = verdicts.get(
+            vid, (True, 100.0, False, "vision_unavailable_local_checks_passed")
         )
         outcome = _classify_visual_result(*verdict)
         if outcome == "unavailable" and visual_required and verdict[2]:
+            prompt_ctx = prompt_by_vid.get(vid, {})
             verdict = _visual_verdict_scored(
                 path,
                 scene_index,
-                visual_topic,
-                visual_narration,
-                visual_subject,
+                str(prompt_ctx.get("topic") or subject),
+                str(prompt_ctx.get("narration") or scene_text),
+                str(prompt_ctx.get("subject") or subject),
                 visual_context,
             )
             outcome = _classify_visual_result(*verdict)
@@ -7868,6 +11529,20 @@ def resolve_clip_for_scene(
             if advisory_fallback is None:
                 advisory_fallback = path
                 continue
+        # A verified restore is a local file that cost zero network time:
+        # never delete it on a vision non-pass. Retain it (marked in the
+        # audit) so a later salvage / same-scene recovery can still
+        # consume it instead of falling through to a graphic.
+        with state.lock:
+            restored_row = next(
+                (row_audit for row_audit in reversed(state.attempt_log)
+                 if row_audit.get("scene_index") == scene_index
+                 and row_audit.get("candidate_id") == vid),
+                None,
+            )
+            if restored_row is not None and restored_row.get("prep_cache_restored"):
+                restored_row["retained_after_visual_reject"] = True
+                continue
         try:
             Path(path).unlink(missing_ok=True)
         except Exception:
@@ -7875,4 +11550,7 @@ def resolve_clip_for_scene(
 
     if advisory_fallback:
         return _finish_progressive(advisory_fallback)
+    _yt_record_unattempted_injected_resolve(
+        state, pools, scene_index, reason="no_passing_candidate"
+    )
     return None

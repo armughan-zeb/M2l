@@ -136,7 +136,10 @@ def test_yandex_robot_check_is_reported_and_other_sources_remain_enabled():
     # collection, so assert the durable circuit state rather than stdout.
     assert source._circuit_open is True
     assert source._robot_failure_count >= 1
-    assert {name for name, kind in _enabled_fast_sources()} >= {"bing_hybrid", "flickr_api", "wikimedia"}
+    # Muse-search (Nov 22, test-30 fix): wikimedia is folded into the
+    # muse_search wave, so the lane that must stay up after a Yandex
+    # robot check is muse_search, not the standalone wikimedia lane.
+    assert {name for name, kind in _enabled_fast_sources()} >= {"bing_hybrid", "flickr_api", "muse_search"}
     # Openverse is no longer a default lane (api.openverse.org 504s through
     # the egress proxy); the robot check must still leave the other lanes up.
 
@@ -198,6 +201,61 @@ def test_failed_original_skips_preview_on_unseen_host(monkeypatch, tmp_path):
     assert len(calls) == 1
 
 
+def test_download_bulk_retries_transient_failure_then_falls_back(tmp_path):
+    """A network blip retries instead of failing once; a host that keeps
+    failing returns an error row (the caller moves to the next candidate)
+    instead of raising and blocking the job."""
+    from services.web_image.hybrid_search import download_bulk
+
+    body = b"fixture image" * 1024
+    hits = {"flaky": 0, "dead": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path.startswith("/flaky"):
+                hits["flaky"] += 1
+                if hits["flaky"] == 1:
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+            else:
+                hits["dead"] += 1
+                self.send_response(500)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        rows = download_bulk(
+            [
+                f"http://127.0.0.1:{server.server_port}/flaky.jpg",
+                f"http://127.0.0.1:{server.server_port}/dead.jpg",
+            ],
+            tmp_path, max_concurrent=1, timeout_seconds=5,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert hits["flaky"] == 2, "the transient 500 must be retried once"
+    assert rows[0][1] is not None
+    assert rows[0][1].read_bytes() == body
+    assert hits["dead"] == 2, "a dead host is retried, then gives up"
+    assert rows[1][1] is None
+    assert "HTTP 500" in rows[1][2]
+
+
 def test_download_bulk_enforces_byte_cap_before_buffering(tmp_path):
     """Oversized image responses must fail without creating a local artifact."""
     from services.web_image.hybrid_search import download_bulk
@@ -228,6 +286,163 @@ def test_download_bulk_enforces_byte_cap_before_buffering(tmp_path):
     assert result[0][1] is None
     assert "too large" in result[0][2]
     assert not list(tmp_path.iterdir())
+
+
+def test_timeouts_do_not_open_host_circuit(tmp_path, monkeypatch):
+    """Timeouts are shared slow egress, not a host refusal (test 23).
+
+    Three slow hosts timing out must NOT open the circuit: in test 23
+    50 timeouts across every host at once tripped the 3-failure circuit
+    and 56 further attempts then died instantly on it, while the
+    circuit's refusals (403 opens at once, 429 defers 30s) are untouched.
+    A fast URL on the same host must still download afterwards.
+    """
+    from services.web_image import hybrid_search
+
+    body = b"fixture image" * 1024
+
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/fast"):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            # Sleep longer than the per-attempt timeout so every attempt
+            # times out; the batch wall (3x the timeout) still fits three
+            # parallel URLs x two attempts.
+            time.sleep(8)
+
+        def log_message(self, *_args):
+            pass
+
+    limiter = hybrid_search.DownloadLimiter(total=4, per_host=3)
+    monkeypatch.setattr(hybrid_search, "_DOWNLOAD_LIMITER", limiter)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        host = f"127.0.0.1:{server.server_port}"
+        rows = hybrid_search.download_bulk(
+            [f"{base}/slow{i}.jpg" for i in range(3)],
+            tmp_path, max_concurrent=3, timeout_seconds=3,
+        )
+        assert all(row[1] is None and row[2] == "timeout" for row in rows), rows
+        assert limiter.cooldowns.get(host, 0) <= time.monotonic(), (
+            "timeouts must not open the host circuit"
+        )
+        fast = hybrid_search.download_bulk(
+            [f"{base}/fast.jpg"], tmp_path, max_concurrent=1, timeout_seconds=5,
+        )
+        assert fast[0][1] is not None, fast[0][2]
+        assert fast[0][1].read_bytes() == body
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_slow_first_attempt_retries_with_fresh_budget(tmp_path, monkeypatch):
+    """The retry must get a full budget, not the first attempt's remainder.
+
+    Old code computed one deadline per URL, so a first attempt that timed
+    out left ~0s for the retry (and the retry gate broke out before it
+    even ran).  A host that answers on the second try must now succeed.
+    """
+    from services.web_image import hybrid_search
+
+    body = b"fixture image" * 1024
+    hits = {"n": 0}
+    hits_lock = threading.Lock()
+
+    class SlowFirst(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            with hits_lock:
+                hits["n"] += 1
+                first = hits["n"] == 1
+            if first:
+                time.sleep(2)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *_args):
+            pass
+
+    limiter = hybrid_search.DownloadLimiter(total=4, per_host=3)
+    monkeypatch.setattr(hybrid_search, "_DOWNLOAD_LIMITER", limiter)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowFirst)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/slow.jpg"
+        rows = hybrid_search.download_bulk(
+            [url], tmp_path, max_concurrent=1, timeout_seconds=1,
+        )
+        assert hits["n"] == 2, "the retry must actually run"
+        assert rows[0][1] is not None, rows[0][2]
+        assert rows[0][1].read_bytes() == body
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_web_image_download_timeout_default_is_120s(monkeypatch):
+    """The per-image download default is 120s (round 8, test 35: the 60s
+    budget was censored at the line — median transfer 61.0s, 25/26 chunks
+    landed 0; the slow-hour bracket is ~60-120s); fast mode is 60s (the
+    old non-fast default); the env override and the 3-300s clamp still
+    hold. (Was 60s/30s, clamp 3-120s, before round 8.)"""
+    from services.web_image import resolver
+
+    monkeypatch.delenv("VIDZEO_WEB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", raising=False)
+    assert resolver._web_image_download_timeout_seconds(False) == 120.0
+    assert resolver._web_image_download_timeout_seconds(True) == 60.0
+    monkeypatch.setenv("VIDZEO_WEB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "12")
+    assert resolver._web_image_download_timeout_seconds(False) == 12.0
+    monkeypatch.setenv("VIDZEO_WEB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "100")
+    assert resolver._web_image_download_timeout_seconds(False) == 100.0
+    monkeypatch.setenv("VIDZEO_WEB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "200")
+    assert resolver._web_image_download_timeout_seconds(False) == 200.0
+    monkeypatch.setenv("VIDZEO_WEB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "400")
+    assert resolver._web_image_download_timeout_seconds(False) == 300.0
+    monkeypatch.setenv("VIDZEO_WEB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "1")
+    assert resolver._web_image_download_timeout_seconds(False) == 3.0
+    monkeypatch.setenv("VIDZEO_WEB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "garbage")
+    assert resolver._web_image_download_timeout_seconds(False) == 120.0
+
+
+def test_download_batch_wall_seconds_scales_with_timeout(monkeypatch):
+    """Test 25: the 90s batch wall was the binding killer, not the 60s
+    per-URL timeout. A scene batch holds up to 12 URLs through 3/host
+    slots at 60s/attempt: the old min(90, timeout*3) wall let ~4 URLs
+    attempt and truncated every retry to ~30s. The new 180s cap lets
+    ~9 attempt with a full retry budget. Fast mode (8s) still gets its
+    24s wall and a 30s timeout still gets 90s — only timeouts above
+    30s see a longer wall."""
+    from services.web_image import hybrid_search
+
+    monkeypatch.delenv("VIDZEO_WEB_DOWNLOAD_BATCH_WALL_SECONDS", raising=False)
+    assert hybrid_search._download_batch_wall_seconds(60.0) == 180.0
+    assert hybrid_search._download_batch_wall_seconds(30.0) == 90.0
+    assert hybrid_search._download_batch_wall_seconds(8.0) == 24.0
+    monkeypatch.setenv("VIDZEO_WEB_DOWNLOAD_BATCH_WALL_SECONDS", "120")
+    assert hybrid_search._download_batch_wall_seconds(60.0) == 120.0
+    monkeypatch.setenv("VIDZEO_WEB_DOWNLOAD_BATCH_WALL_SECONDS", "9999")
+    assert hybrid_search._download_batch_wall_seconds(60.0) == 180.0
+    monkeypatch.setenv("VIDZEO_WEB_DOWNLOAD_BATCH_WALL_SECONDS", "10")
+    assert hybrid_search._download_batch_wall_seconds(60.0) == 30.0
+    monkeypatch.setenv("VIDZEO_WEB_DOWNLOAD_BATCH_WALL_SECONDS", "garbage")
+    assert hybrid_search._download_batch_wall_seconds(60.0) == 180.0
 
 
 def test_denied_origin_opens_circuit_without_blocking_healthy_download(tmp_path, monkeypatch):
@@ -282,3 +497,122 @@ def test_denied_origin_opens_circuit_without_blocking_healthy_download(tmp_path,
             server.shutdown()
             thread.join(timeout=2)
             server.server_close()
+
+
+def test_download_transfer_gets_fresh_budget_after_slot_wait(tmp_path, monkeypatch):
+    """A download that waits most of its budget for a limiter slot must
+    still get a full transfer budget once the slot is held (test 25).
+
+    With 8 scene workers sharing 12 download slots, most attempts spent
+    ~55s of their 60s budget waiting for a slot and then got ~5s to
+    transfer an image that needed ~8s: 40/86 attempts died as "timeout"
+    with zero images landed, although the bytes were available. The wait
+    is bounded by the attempt deadline; the transfer now gets a fresh
+    timeout_seconds of its own, capped only by the batch wall.
+    """
+    from services.web_image.hybrid_search import _DOWNLOAD_LIMITER, download_bulk
+
+    monkeypatch.setenv("VIDZEO_NET_RETRIES", "1")  # one attempt: no retry mask
+    body = b"fixture image" * 2048
+    chunks, delay = 10, 0.2  # ~2s transfer
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            step = len(body) // chunks
+            for i in range(chunks):
+                chunk = body[i * step:(i + 1) * step] if i < chunks - 1 else body[i * step:]
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                time.sleep(delay)
+
+        def log_message(self, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host = f"127.0.0.1:{server.server_port}"
+    acquired = threading.Event()
+    held = []
+    held_lock = threading.Lock()
+
+    def hold_slots():
+        async def _hold():
+            async with _DOWNLOAD_LIMITER.slot(host, time.monotonic() + 30):
+                with held_lock:
+                    held.append(1)
+                    if len(held) == 3:
+                        acquired.set()
+                await asyncio.sleep(9.0)
+
+        async def _hold_all():
+            await asyncio.gather(*[_hold() for _ in range(3)])
+
+        asyncio.run(_hold_all())
+
+    holder = threading.Thread(target=hold_slots, daemon=True)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=10), "slot holders never acquired"
+        rows = download_bulk(
+            [f"http://{host}/slow.jpg"], tmp_path,
+            max_concurrent=1, timeout_seconds=10,
+        )
+    finally:
+        holder.join(timeout=15)
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert rows[0][1] is not None, f"download failed: {rows[0][2]}"
+    assert rows[0][1].read_bytes() == body
+
+
+def test_download_transfer_still_bounded_by_batch_wall(tmp_path, monkeypatch):
+    """The fresh transfer budget must not let a slow host hold the batch
+    past its wall: with a 30s batch wall (the clamp floor), a 40s drip
+    still fails fast instead of running to completion."""
+    from services.web_image.hybrid_search import download_bulk
+
+    monkeypatch.setenv("VIDZEO_NET_RETRIES", "1")
+    monkeypatch.setenv("VIDZEO_WEB_DOWNLOAD_BATCH_WALL_SECONDS", "30")
+    body = b"fixture image" * 2048
+    chunks, delay = 10, 4.0  # ~40s transfer, past the 30s wall
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            step = len(body) // chunks
+            for i in range(chunks):
+                chunk = body[i * step:(i + 1) * step] if i < chunks - 1 else body[i * step:]
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                time.sleep(delay)
+
+        def log_message(self, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        started = time.monotonic()
+        rows = download_bulk(
+            [f"http://127.0.0.1:{server.server_port}/slow.jpg"], tmp_path,
+            max_concurrent=1, timeout_seconds=60,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert rows[0][1] is None
+    assert elapsed < 40, f"transfer ran {elapsed:.1f}s, past the 30s batch wall"

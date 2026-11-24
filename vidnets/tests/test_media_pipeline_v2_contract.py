@@ -430,6 +430,38 @@ def test_youtube_high_identity_does_not_override_severe_overlay():
     assert decision["accepted"] is False
 
 
+def test_strict_scene_never_admitted_from_unverified_clip(tmp_path):
+    # GTA VI run2 scene 1: a clean cached GTA 6 trailer with zero vision
+    # verdicts was admitted as deterministic_degraded and then killed by the
+    # final contract as visual_verification_pending. A strict scene must fail
+    # here, honestly, so the web lane / next candidate can resolve it.
+    from services.media_resolution_coordinator import _verification_result
+
+    clip = tmp_path / "scene_0001.mp4"
+    clip.write_bytes(b"fake-clip")
+    scene = {
+        "text": "Welcome back to Vice City, in the state of Leonida.",
+        "source_policy": {"youtube_relaxed_visual_gate": False, "visual_verification_required": True},
+        "visual_requirement": {"canonical_entity": "Vice City", "strict_identity": True},
+    }
+    candidate = {
+        "source": "youtube", "provider": "youtube", "path": str(clip),
+        "overlay_clean": True,
+    }
+
+    def verifier(_scene, _candidate):
+        return {
+            "accepted": False, "status": "vision_unavailable",
+            "reason": "vision unavailable", "final_score": 0,
+        }
+
+    accepted, _reason, _score, decision = _verification_result(scene, candidate, verifier)
+    assert accepted is False
+    assert decision["accepted"] is False
+    assert decision["status"] == "vision_unavailable"
+    assert decision["reason"] == "strict_identity_requires_live_semantic_verification"
+
+
 def test_storyboard_media_coordinator_sends_bounded_top_k_finalists_to_qwen(monkeypatch):
     monkeypatch.setenv('VIDZEO_VISUAL_FINALIST_LIMIT', '6')
     from services.media_resolution_coordinator import resolve_storyboard_media_v2

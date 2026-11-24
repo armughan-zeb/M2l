@@ -251,6 +251,89 @@ def _tokens(value: Any) -> list[str]:
     return [token for token in _norm(value).split() if token]
 
 
+# action_terms must name what the camera can show — verbs and visible
+# nouns — never the subject itself. The old code took the first 6
+# non-stopword tokens, so a GTA VI scene got ['grand', 'theft', 'auto',
+# 'most', 'anticipated', 'video']: the title, a superlative, a participle
+# adjective, and a format word. None of those is an action.
+_ACTION_VERBS = {
+    # Base forms and irregular past forms; regular -ing/-ed forms are
+    # caught by morphology in _action_terms.
+    "keep", "kept", "sell", "sold", "make", "made", "take", "took", "taken",
+    "bring", "brought", "show", "showed", "shown", "break", "broke", "broken",
+    "arrive", "arrived", "walk", "walked", "drive", "drove", "driven",
+    "run", "ran", "fly", "flew", "flown", "sail", "sailed", "build", "built",
+    "launch", "launched", "release", "released", "delay", "delayed",
+    "push", "pushed", "return", "returned", "begin", "began", "begun",
+    "reveal", "revealed", "feature", "featured", "include", "included",
+    "follow", "followed", "lead", "led", "win", "won", "set", "put",
+    "give", "gave", "given", "find", "found", "tell", "told", "say", "said",
+    "go", "went", "gone", "come", "came", "see", "saw", "seen", "watch",
+    "watched", "play", "played", "work", "worked", "live", "lived",
+    "die", "died", "kill", "killed", "fight", "fought", "escape", "escaped",
+    "chase", "chased", "shoot", "shot", "sing", "sang", "sung", "dance",
+    "danced", "cook", "cooked", "pour", "poured", "brew", "brewed",
+    "climb", "climbed", "swim", "swam", "swum", "march", "marched",
+    "race", "raced", "crash", "crashed", "sink", "sank", "sunk",
+    "cross", "crossed", "travel", "travelled", "enter", "entered",
+    "leave", "left", "meet", "met", "join", "joined", "open", "opened",
+    "close", "closed", "rise", "rose", "risen", "fall", "fell", "fallen",
+}
+_ACTION_VISIBLE_NOUNS = {
+    "aerial", "neon", "streets", "street", "city", "beach", "island",
+    "keys", "prison", "gates", "police", "chase", "mission", "gameplay",
+    "console", "controller", "crowd", "fans", "stadium",
+    "bridge", "harbor", "ship", "airport", "aircraft", "rocket",
+    "laboratory", "factory", "engine", "cabin", "cab", "interior",
+    "exterior", "wheels", "screen", "interface", "dashboard", "charger",
+    "battery", "solar", "panels", "race", "field", "courtroom", "rubble",
+    "rescue", "snowstorm", "blizzard", "whiteout", "carriage", "cars",
+    "chapel", "insignia", "procession", "throne", "banquet", "regalia",
+    "document", "portrait", "car", "vehicle", "vehicles", "skyline",
+    "downtown", "highway", "ocean", "swamp", "swamps", "night",
+}
+# -ing/-ed participles that are adjectives or time words, never actions.
+_ACTION_PARTICIPLE_DENYLIST = {
+    "anticipated", "expected", "supposed", "alleged", "beloved",
+    "dedicated", "related", "based", "known", "called", "titled",
+    "named", "morning", "evening", "during", "something", "anything",
+    "nothing", "king", "ring", "spring",
+}
+# Format/generic words that describe the medium, not the shot.
+_ACTION_FORMAT_WORDS = {
+    "video", "videos", "game", "games", "footage", "trailer", "documentary",
+    "film", "movie", "clip", "clips", "most", "more", "best", "biggest",
+    "first", "second", "third", "decade", "years", "year", "million",
+    "hundred", "copies", "series", "episode", "season",
+}
+
+
+def _action_terms(scene_text: str, excluded_tokens) -> list[str]:
+    """Verbs and visible nouns from the scene text — never the subject.
+
+    Positive selection only: a token qualifies as a verb (lexicon or
+    -ing/-ed morphology) or a visible noun; anything else is dropped.
+    The subject's own tokens, stopwords, generic subjects and format
+    words never qualify.
+    """
+    excluded = {str(token or "").lower() for token in (excluded_tokens or ())}
+    actions: list[str] = []
+    for token in _unique(_tokens(scene_text)):
+        if len(token) < 4 or token in _STOPWORDS or token in _GENERIC_SUBJECTS:
+            continue
+        if token in excluded or token in _ACTION_FORMAT_WORDS:
+            continue
+        if token in _ACTION_VERBS or token in _ACTION_VISIBLE_NOUNS:
+            actions.append(token)
+        elif token.endswith("ing") and len(token) > 5 and token not in _ACTION_PARTICIPLE_DENYLIST:
+            actions.append(token)
+        elif token.endswith("ed") and len(token) > 5 and token not in _ACTION_PARTICIPLE_DENYLIST:
+            actions.append(token)
+        if len(actions) >= 6:
+            break
+    return actions
+
+
 def _contains_phrase(text: str, phrase: str) -> bool:
     if not phrase:
         return False
@@ -652,6 +735,24 @@ def _script_subject(script: str) -> str:
     return ""
 
 
+# Bare pronouns / demonstratives that must never become a scene identity.
+# A pronoun carries no searchable entity: it only ever refers back to the
+# film's established subject. Kept in one place so the contract, the rebase
+# and the query cleaner all refuse the same words.
+_PRONOUN_WORDS = frozenset({
+    'they', 'he', 'she', 'we', 'you', 'i', 'it', 'his', 'her', 'hers',
+    'their', 'theirs', 'its', 'this', 'these', 'those', 'there', 'here',
+    'who', 'whom', 'what', 'which', 'my', 'our', 'your', 'me', 'him',
+    'them', 'us',
+})
+
+
+def _is_pronoun_subject(value: str) -> bool:
+    """True when ``value`` is a bare pronoun (or only pronouns)."""
+    tokens = [token for token in re.findall(r"[A-Za-z]+", str(value or ""))]
+    return bool(tokens) and all(token.lower() in _PRONOUN_WORDS for token in tokens)
+
+
 def scene_subject_contract(title: str, scene_text: str, context: Mapping[str, Any] | None = None) -> Dict[str, Any]:
     """Resolve a grounded local subject independently of the film's niche.
 
@@ -681,7 +782,18 @@ def scene_subject_contract(title: str, scene_text: str, context: Mapping[str, An
     evidence_words = {word_stem(word) for word in _tokens(evidence or text)}
     compositional = bool(directed_type in {'component', 'object', 'process', 'activity', 'mechanism', 'concept'}
                          and subject_words and subject_words.issubset(evidence_words))
-    grounded = bool(subject and (_contains_phrase(normalized, _norm(subject)) or compositional)
+    # Nov 22 (d1ece590 stall fix): a bare pronoun must never ground as a
+    # scene-local identity. The mechanical planner used to emit
+    # scene_subject='They' for narration "They drove.", and the substring
+    # match below ("they" appears verbatim in the scene text) then grounded
+    # it as grounded_director, so the requirement became canonical_entity
+    # 'They' and every provider query for the scene was garbage. Pronouns
+    # retain the established film identity: refuse them here and the
+    # contract falls back to film_context, exactly as the docstring above
+    # already promises.
+    subject_is_pronoun = _is_pronoun_subject(subject)
+    grounded = bool(subject and not subject_is_pronoun
+                    and (_contains_phrase(normalized, _norm(subject)) or compositional)
                     and evidence_valid
                     and not is_source_attribution_subject(subject, text))
     origin = 'grounded_director' if grounded else ''
@@ -1212,6 +1324,10 @@ class VisualRequirementV1:
     schema_version: str = "visual_requirement.v2"
     canonical_entity: str = ""
     subject_type: str = "concept"
+    # Scene-relative game key (e.g. "gta_v"): the game THIS scene narrates,
+    # derived from its own narration. The relevance gate compares a
+    # candidate's game against this, not the video title's game.
+    scene_subject_game: str = ""
     domain: str = ""
     ambiguity_status: str = "resolved"
     domain_evidence: Tuple[str, ...] = field(default_factory=tuple)
@@ -1282,6 +1398,7 @@ class VisualRequirementV1:
             schema_version=str(values.get("schema_version") or "visual_requirement.v2"),
             canonical_entity=_text(values.get("canonical_entity") or values.get("entity") or values.get("subject")),
             subject_type=_text(values.get("subject_type") or "concept"),
+            scene_subject_game=_text(values.get("scene_subject_game") or ""),
             domain=_text(values.get("domain") or ""),
             ambiguity_status=_text(values.get("ambiguity_status") or "resolved"),
             domain_evidence=tuple(values.get("domain_evidence") or ()),
@@ -1414,6 +1531,32 @@ def build_visual_requirement(
                 if re.match(r'^(?:on|in|at|for|road|everyday|reliability|practical|engineering|driving|history|story|explained)\b', suffix):
                     canonical = anchor
                     break
+    # Scene-relative game (GTA VI fix): the scene's own narration decides
+    # which game this requirement is about, not the video title. A scene
+    # narrating GTA V sales carries gta_v even in a GTA VI film, so the
+    # relevance gate can allow GTA V footage there and only there. When
+    # the requirement's subject IS a game and the scene's game differs,
+    # the scene's game is the canonical identity (aliases are built from
+    # it below, and __post_init__ adds its GTA aliases at construction).
+    scene_game_key = ""
+    try:
+        scene_game_key = str((semantic_context or {}).get("scene_subject_game") or "").strip().lower()
+    except Exception:
+        scene_game_key = ""
+    if not scene_game_key:
+        try:
+            from .vidzeo_brain import scene_subject_game_for_scene
+            scene_game_key = str(scene_subject_game_for_scene(scene_text, title).get("key") or "")
+        except Exception:
+            scene_game_key = ""
+    if scene_game_key and subject_type == "video_game":
+        try:
+            from .vidzeo_brain import game_canonical_title, game_keys_named_in_text
+            scene_game_title = game_canonical_title(scene_game_key)
+            if scene_game_title and scene_game_key not in game_keys_named_in_text(canonical):
+                canonical = scene_game_title
+        except Exception:
+            pass
     # The full script is valid evidence for the global subject and domain,
     # but it is not scene-local evidence for a year, model, era, or vehicle
     # class. Using the first year in the full narration used to stamp (for
@@ -1494,10 +1637,14 @@ def build_visual_requirement(
     elif subject_type == "rail_crew":
         required_terms.extend(("railway crew", "conductor", "locomotive engineer"))
     required_terms.extend(value for key, value in attrs.items() if key in {"year", "decade", "model", "model_or_make", "vehicle_class"})
-    actions = [
-        token for token in _unique(_tokens(scene_text))
-        if token not in _STOPWORDS and token not in _GENERIC_SUBJECTS and len(token) >= 4
-    ][:6]
+    # Verbs and visible nouns only — never the subject's own tokens
+    # (grand/theft/auto), superlatives (most), participle adjectives
+    # (anticipated) or format words (video/game). See _action_terms.
+    actions = _action_terms(
+        scene_text,
+        (*_tokens(canonical), *_tokens(subject), *_tokens(title),
+         *(token for alias in aliases for token in _tokens(alias))),
+    )
     strict = bool(canonical or subject_type in {"automobile", "animal", "ship", "rail_crew", "person"})
     if subject_type == 'concept' and _is_generic_process(canonical):
         strict = False
@@ -1513,6 +1660,7 @@ def build_visual_requirement(
     requirement = VisualRequirementV1(
         canonical_entity=canonical,
         subject_type=subject_type,
+        scene_subject_game=scene_game_key,
         domain=domain,
         ambiguity_status=ambiguity_status,
         domain_evidence=domain_evidence,
@@ -1625,6 +1773,17 @@ def requirement_from_scene(scene: Mapping[str, Any], *, title: str = "", script:
 def provider_query_variants(requirement: Mapping[str, Any], *, provider: str) -> list[str]:
     req = VisualRequirementV1.from_mapping(requirement)
     identity = req.canonical_entity or "documentary subject"
+    # Scene-relative game: provider variants seek the game THIS scene
+    # narrates, not the title's game. A GTA V-history scene's variants
+    # must name GTA V.
+    if req.subject_type == "video_game" and req.scene_subject_game:
+        try:
+            from .vidzeo_brain import game_canonical_title, game_keys_named_in_text
+            scene_game_title = game_canonical_title(req.scene_subject_game)
+            if scene_game_title and req.scene_subject_game not in game_keys_named_in_text(identity):
+                identity = scene_game_title
+        except Exception:
+            pass
     attrs = req.required_attributes
 
     def domain_query_qualifier() -> str:
@@ -2351,24 +2510,16 @@ def candidate_nearest_match(
             re.search(r"\bgrand theft auto\s*v\b", normalized)
             or re.search(r"(?<![a-z0-9])gta\s*(?:v|5)(?![a-z0-9])", normalized)
         )
+        # Round 15 (Nov 24, user order: topic track): same-franchise footage
+        # is a valid nearest match. A GTA V clip for a GTA VI job is
+        # topic-related (same franchise/niche) and reaches the visual gate,
+        # which judges the actual frames; the old game_installment_mismatch
+        # rejection required the scene to explicitly compare the two games.
+        # The 2002 Vice City cutscene stays blocked elsewhere
+        # (_GTA_VICE_CITY_2002_RE / era rule); non-GTA games are still
+        # rejected above (gta_req and not gta_candidate).
         if gta_vi_requested and gta_v_candidate:
-            authored_scene_context = _norm(" ".join(req.positive_evidence))
-            explicit_comparison = bool(
-                re.search(r"\b(?:gta\s*(?:v|5)|grand theft auto\s*v)\b", authored_scene_context)
-                and re.search(
-                    r"\b(?:compare|comparison|compared|previous|predecessor|prior|earlier|legacy|side by side|baseline|reference|supporting example)\b",
-                    authored_scene_context,
-                )
-                and not re.search(r"\b(?:avoid|exclude|reject|no|not|never|without|instead of|do not use)\b", authored_scene_context)
-            )
-            if not explicit_comparison:
-                return False, "game_installment_mismatch", {
-                    **base,
-                    "conflicting_entity": True,
-                    "required_game": "Grand Theft Auto VI",
-                    "candidate_game": "Grand Theft Auto V",
-                    "nearest_match": False,
-                }
+            base["nearest_basis"] = "same_franchise_version"
         if not gta_req and not identity_overlap:
             return False, "canonical_entity_mismatch", {**base, "nearest_match": False}
         base.update({"domain_signal": "gaming", "game_hits": game_hits[:8]})

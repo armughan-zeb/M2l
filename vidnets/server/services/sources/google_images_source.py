@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
-from .base_source import BaseSource, ImageCandidate, _accept_language
+from .base_source import BaseSource, ImageCandidate, _accept_language, request_proxies
 
 
 _IMGURL_RE = re.compile(r"(?:imgurl|mediaurl)=([^&\"']+)", re.I)
@@ -64,6 +64,7 @@ class GoogleImagesSource(BaseSource):
         query: str,
         limit: int = 12,
         filters: Optional[Dict] = None,
+        direct: bool = False,
     ) -> List[ImageCandidate]:
         del filters
         clean = self._clean_query(query, max_words=10)
@@ -74,6 +75,7 @@ class GoogleImagesSource(BaseSource):
                 self.SEARCH_URL,
                 params={"tbm": "isch", "q": clean, "safe": "active"},
                 timeout=float(os.environ.get("VIDZEO_GOOGLE_IMAGES_TIMEOUT_SECONDS", "5") or 5),
+                proxies=request_proxies(direct),
             )
             if response.status_code != 200:
                 self.record_failure()

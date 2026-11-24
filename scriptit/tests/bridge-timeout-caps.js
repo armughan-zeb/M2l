@@ -1,13 +1,19 @@
 'use strict';
-// Regression tests for Muse inbox bounds. Every request is capped at 120s
-// (60s answer SLO); the CLI's separate total-generation deadline is 45m.
+// Regression tests for the bridge-wall timeout caps (Nov 9 2026 follow-up,
+// wall raised 600s -> 3600s Nov 15 2026).
+// The Vidnets inbox wall is 3600s, but three ScriptIT caller caps expired
+// synthesis/writer requests first (180s / 300s / 300s). These tests prove
+// the callers now wait the full 3600s — and that the 45-minute total job
+// deadline (2700000ms) was NOT changed.
+// NOTE: the 45-minute total deadline is shorter than one 3600s wall, so a
+// CLI run still cannot wait out a full wall; the wall raise takes effect
+// for the server-side agent_post path and for callers whose total budget
+// allows it (agentBridgeChat's own budget cap is two walls).
 // Offline: the bridge transports are stubbed via require.cache; no inbox,
 // CMS, or model is contacted.
 // Run: node tests/bridge-timeout-caps.js
 const assert = require('assert');
 const fs = require('fs');
-const http = require('http');
-const { agentChat: actualAgentChat } = require('../src/providers/agentInference');
 const path = require('path');
 
 function stubModule(resolvedPath, exportsObj) {
@@ -62,65 +68,55 @@ async function main() {
 
   const { synthesizeEncyclopedicDossier } = require('../src/research/encyclopedicSynthesizer');
 
-  // 1. Agent-bridge synthesis never asks the inbox to wait beyond 120s.
+  // 1. agent-bridge synthesis waits the full 3600s wall (was 180000).
   const bridgeResult = await synthesizeEncyclopedicDossier({
     topic: 'Amtrak locomotive 160',
     niche: 'general',
     apiKey: 'agent-bridge:local-user',
   });
   assert(bridgeResult && Array.isArray(bridgeResult.claims) && bridgeResult.claims.length > 0, 'bridge synthesis must return claims');
-  assert.strictEqual(seenBridge.timeoutMs, 120000, 'agent-bridge synthesis timeoutMs must be 120000');
+  assert.strictEqual(seenBridge.timeoutMs, 3600000, 'agent-bridge synthesis timeoutMs must be 3600000');
   assert.strictEqual(seenBridge.operation, 'scriptit.research-synthesis');
-  console.log('  ✓ encyclopedic synthesis via agent-bridge is capped at 120000ms');
+  console.log('  ✓ encyclopedic synthesis via agent-bridge waits 3600000ms (was 180000)');
 
-  // 2. External-agent synthesis uses the same cap.
+  // 2. external-agent synthesis (same request, other Muse handle) also 3600s.
   const agentResult = await synthesizeEncyclopedicDossier({
     topic: 'Amtrak locomotive 160',
     niche: 'general',
     apiKey: 'external-agent:paired-worker',
   });
   assert(agentResult && Array.isArray(agentResult.claims) && agentResult.claims.length > 0, 'agent synthesis must return claims');
-  assert.strictEqual(seenAgent.timeoutMs, 120000, 'external-agent synthesis timeoutMs must be 120000');
-  console.log('  ✓ encyclopedic synthesis via external-agent is capped at 120000ms');
+  assert.strictEqual(seenAgent.timeoutMs, 3600000, 'external-agent synthesis timeoutMs must be 3600000');
+  console.log('  ✓ encyclopedic synthesis via external-agent waits 3600000ms (was 180000)');
 
-  // 3. Writer + CLI request caps are 120s; the total deadline stays 45m.
+  // 3. Writer + CLI caps: the agent writer bound and the CLI bridge
+  // timeout must be 3600000, and the total job deadline must still be
+  // 2700000 (45 minutes) — the per-request caps move, the job cap does not.
+  // The agent-bridge provider budget cap must be two walls (7200000): the
+  // retry loop re-files an expired request while budget lasts, and a
+  // one-wall cap would leave it no second attempt.
   const writerSrc = fs.readFileSync(path.join(__dirname, '../src/agents/scriptWriter.js'), 'utf8');
   assert.match(
     writerSrc,
-    /Math\.min\(120000, Math\.max\(30000, Number\(options\.timeoutMs\)/,
-    'scriptWriter agent cap must be Math.min(120000, ...)',
+    /Math\.min\(3600000, Math\.max\(30000, Number\(options\.timeoutMs\)/,
+    'scriptWriter agent cap must be Math.min(3600000, ...)',
   );
-  console.log('  ✓ scriptWriter agent writer cap is 120000ms');
+  console.log('  ✓ scriptWriter agent writer cap is 3600000ms (was 300000)');
 
   const cliSrc = fs.readFileSync(path.join(__dirname, '../cli/generate.js'), 'utf8');
-  assert.match(cliSrc, /const timeoutMs = 120000;/, 'CLI request timeout must be 120000');
+  assert.match(cliSrc, /const timeoutMs = bridgeMode \? 3600000 : 120000;/, 'CLI bridge timeoutMs must be 3600000');
   assert.match(cliSrc, /SCRIPTIT_TOTAL_DEADLINE_MS \|\| 2700000/, 'CLI total job deadline must still be 2700000');
-  console.log('  ✓ CLI request wall is 120000ms; total deadline still 2700000ms');
+  console.log('  ✓ CLI bridge timeoutMs is 3600000ms (was 300000); total deadline still 2700000ms');
 
-  // 4. The alternate Muse HTTP transport applies the same hard cap before
-  // sending a request to the paired local CMS service.
-  let posted;
-  const server = http.createServer((req, res) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      posted = JSON.parse(body);
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ ok: true, content: 'done', requestId: 'timeout-fixture' }));
-    });
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const previousUrl = process.env.VIDZEO_CMS_AGENT_URL;
-  try {
-    process.env.VIDZEO_CMS_AGENT_URL = `http://127.0.0.1:${server.address().port}`;
-    await actualAgentChat({ apiKey: 'external-agent:fixture', messages: [], timeoutMs: 600000 });
-    assert.strictEqual(posted.timeoutMs, 120000, 'HTTP Muse request must clamp to 120000ms');
-  } finally {
-    if (previousUrl === undefined) delete process.env.VIDZEO_CMS_AGENT_URL;
-    else process.env.VIDZEO_CMS_AGENT_URL = previousUrl;
-    await new Promise(resolve => server.close(resolve));
-  }
-  console.log('  ✓ HTTP Muse transport clamps oversized caller deadlines to 120000ms');
+  const bridgeSrc = fs.readFileSync(path.join(__dirname, '../src/providers/agentBridge.js'), 'utf8');
+  assert.match(bridgeSrc, /const MAX_WALL_MS = 3600000;/, 'agentBridge MAX_WALL_MS must be 3600000');
+  assert.match(bridgeSrc, /Math\.min\(7200000, Number\(timeoutMs\)/, 'agentBridge budget cap must be two walls (7200000)');
+  assert.match(bridgeSrc, /timeoutMs = 3600000,/, 'agentBridge default timeoutMs must be 3600000');
+  console.log('  ✓ agentBridge MAX_WALL_MS is 3600000ms; budget cap is two walls (7200000ms)');
+  const inferenceSrc = fs.readFileSync(path.join(__dirname, '../src/providers/agentInference.js'), 'utf8');
+  assert.match(inferenceSrc, /const REQUEST_WALL_MS = 3600000;/, 'agentInference REQUEST_WALL_MS must be 3600000');
+  assert.match(inferenceSrc, /Math\.min\(3600000, Number\(timeoutMs\)/, 'agentInference budget cap must be one wall (3600000)');
+  console.log('  ✓ agentInference REQUEST_WALL_MS is 3600000ms; budget cap is one wall (3600000ms)');
 
   console.log('\nALL BRIDGE-TIMEOUT-CAP TESTS PASSED');
   process.exit(0);

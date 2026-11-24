@@ -582,7 +582,10 @@ def test_nearest_match_handoff_rejects_wrong_named_person_role():
     assert evidence["nearest_match"] is False
 
 
-def test_nearest_match_handoff_rejects_gta_v_for_gta_vi_without_explicit_comparison():
+def test_nearest_match_handoff_accepts_gta_v_for_gta_vi_as_same_franchise_topic():
+    # Round 15: same-franchise footage is a valid topic-track nearest match;
+    # the old game_installment_mismatch rejection is gone. Vision still
+    # judges the frames before the clip ships.
     requirement = build_visual_requirement(
         title="Grand Theft Auto VI trailer",
         script="Grand Theft Auto VI is the next Rockstar Games video game.",
@@ -592,12 +595,13 @@ def test_nearest_match_handoff_rejects_gta_v_for_gta_vi_without_explicit_compari
         requirement,
         {"provider": "youtube", "title": "Grand Theft Auto V gameplay driving footage"},
     )
-    assert not matched
-    assert reason == "game_installment_mismatch"
-    assert evidence["nearest_match"] is False
+    assert matched
+    assert reason == "nearest_context_pending_visual_required"
+    assert evidence["nearest_match"] is True
+    assert evidence["nearest_basis"] == "same_franchise_version"
 
 
-def test_nearest_match_handoff_allows_gta_v_only_for_explicit_prior_game_comparison():
+def test_nearest_match_handoff_accepts_gta_v_for_explicit_prior_game_comparison():
     requirement = build_visual_requirement(
         title="Grand Theft Auto VI trailer",
         script="Grand Theft Auto VI returns to Vice City.",
@@ -840,3 +844,21 @@ def test_rail_operator_footage_is_not_accepted_for_another_operator():
     )
     assert "amtrak" in bnsf_req["forbidden_subjects"]
     assert "csx" in bnsf_req["forbidden_subjects"]
+
+
+def test_gta_scene_one_action_terms_are_verbs_not_title_words():
+    """GTA VI scene 1 (real narration): action_terms must be verbs/visible
+    nouns (kept, waiting, sold, fans), never the title, a superlative, a
+    participle adjective, or a format word."""
+    scene_text = (
+        "Grand Theft Auto Six is the most anticipated video game of the decade, "
+        "and Rockstar Games has kept fans waiting for more than ten years since "
+        "Grand Theft Auto Five, a game that has sold more than two hundred million copies."
+    )
+    req = build_visual_requirement(
+        title="Grand Theft Auto VI", script=scene_text, scene_text=scene_text,
+    )
+    terms = list(req["action_terms"])
+    assert terms, "a GTA scene must yield action terms"
+    assert not {"grand", "theft", "auto", "most", "anticipated", "video"} & set(terms)
+    assert {"kept", "waiting", "sold"} & set(terms)

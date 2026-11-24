@@ -112,7 +112,7 @@ export function Globe3D({ scene = {}, visualDNA = {}, props = {} }) {
   return <AbsoluteFill style={{ background: 'radial-gradient(ellipse at 50% 52%, #102A38 0%, #071721 45%, #041018 100%)', overflow: 'hidden' }}>
     <AbsoluteFill style={{ opacity: .38, backgroundImage: 'radial-gradient(rgba(169,203,218,.34) .8px, transparent 1px)', backgroundSize: '89px 89px', backgroundPosition: '16px 21px' }} />
     <div style={{ position: 'absolute', width: diameter * 1.42, height: diameter * 1.42, left: width * .5 - diameter * .71, top: height * .505 - diameter * .71, borderRadius: '50%', border: '1px solid rgba(121,171,194,.16)', boxShadow: '0 0 0 42px rgba(121,171,194,.025), 0 0 0 90px rgba(121,171,194,.017)' }} />
-    <div style={{ position: 'absolute', width: diameter, height: diameter, left, top, transform: `scale(${sphereScale})`, transformOrigin: '50% 50%', filter: 'drop-shadow(0 24px 68px rgba(0,0,0,.74))' }}>
+    <div style={{ position: 'absolute', width: diameter, height: diameter, left, top, transform: `scale(${sphereScale})`, transformOrigin: '50% 50%', boxShadow: '0 24px 68px rgba(0,0,0,.74)' }}>
       <Img src={srcFor(frames[index])} style={{ width: diameter, height: diameter, objectFit: 'contain' }} />
       {nextIndex !== index && frameBlend > 0 && <Img src={srcFor(frames[nextIndex])} style={{ position: 'absolute', inset: 0, width: diameter, height: diameter, objectFit: 'contain', opacity: frameBlend }} />}
       <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', boxShadow: 'inset -24px -16px 44px rgba(1,11,20,.32), inset 6px 7px 18px rgba(112,207,250,.13), 0 0 19px rgba(93,168,211,.28)', pointerEvents: 'none' }} />

@@ -20,16 +20,17 @@ observed running, no
 OpenRouter key in the environment — see `lib/museInference.js`), and
 `MUSE_AUTO_LOOP=1` never exempts that check. `node muse-agent.js doctor`
 checks the same bridge and FAILS when it is absent. A job whose inference
-goes unanswered fails closed. Every scene must have accepted real media.
-If a completed edit has incomplete coverage, the render wrapper can attempt
-one bounded media re-plan with fresh queries (see
+goes unanswered fails closed; a job with 0 real-media scenes is never
+delivered as graphics. Before failing for 0 real-media scenes the
+render wrapper attempts one bounded media re-plan with fresh queries (see
 `render-vidnets-linux.js`).
 
 **Filter-best (Nov 9, 2026).** Vidnets' native mixed-media flow is used
 as built: LLM writes queries from the scenes → search YouTube clips +
 web images → filter the BEST (rank, keep the best real media; reject
 only clearly-wrong footage) → Remotion edits. Vision is advisory by
-default (`MUSE_MEDIA_STRICT=0`). See `rules.md`, `workflow.md`, and `HYBRID_WIRING.md`
+default (`MUSE_MEDIA_STRICT=0`); the only hard rule is the delivery
+rule above. See `rules.md`, `workflow.md`, and `HYBRID_WIRING.md`
 ("Filter-best").
 
 **Simplified pipeline (Nov 9, 2026).** One data pass (all research
@@ -45,7 +46,8 @@ before a 0-real-media fail), one monitor. All knobs live in
 
 **Health monitor.** Running `setup.sh` installs the `vidnets-health-monitor`
 cron at `~/hooks/scripts/vidnets-health-monitor.sh` and schedules it every
-minute, so inbox age is checked within the 60-second operator SLO. It checks
+minute, so inbox age is checked well inside the 600-second agent-bridge
+request floor. It checks
 the daemon (alive + connected), Vidnets `:5010` (healthy + memory
 admission), the CMS (reachable + outage duration), the inbox-watch hook
 (enabled), stale/past-half-TTL inbox requests, and disk/tmp space. It
@@ -194,8 +196,10 @@ Use this when the Muse environment exposes commands. Configure the adapters in
 With either inference transport configured, the daemon owns one resident dispatcher for
 the shared ScriptIT and Vidnets inbox. It watches for new requests, polls every second
 as a fallback, and refills slots as calls finish. It supports up to eight concurrent
-calls (`MUSE_INBOX_CONCURRENCY` can lower that), with a 60-second answer target and a
-120-second request lifetime. Run `node muse-agent.js doctor` with the worker
+calls (`MUSE_INBOX_CONCURRENCY` can lower that), and agent-bridge requests
+keep the 600-second floor (`VIDZEO_AGENT_MIN_WALL_SECONDS`) — the polling
+inbox watcher alone needs ~4.5 min to wake a worker, so a shorter wall would
+expire answers mid-composition. Run `node muse-agent.js doctor` with the worker
 running to verify that the configured Muse transport actually answers a probe.
 Unanswered probes pause new claims. Saved jobs still reconnect and report progress.
 

@@ -69,7 +69,10 @@ def test_mechanical_queries_carry_loco_number():
     assert "160" in " ".join(rows[0]["query_variants"])
 
 
-def test_hybrid_search_ddg_failure_keeps_bing_rows(monkeypatch):
+def test_hybrid_search_never_calls_duckduckgo(monkeypatch):
+    # DuckDuckGo was removed Nov 19, 2026 (bot-gates this egress):
+    # search_hybrid must not call search_ddg at all, and Bing rows
+    # still come back.
     bing_rows = [{
         "title": "Amtrak 160",
         "image_url": "https://images.example.com/amtrak-160.jpg",
@@ -80,7 +83,7 @@ def test_hybrid_search_ddg_failure_keeps_bing_rows(monkeypatch):
         return list(bing_rows)
 
     def _ddg(_query, _limit=20):
-        raise RuntimeError("DDG vqd token unavailable (bot check or markup change)")
+        raise AssertionError("search_ddg must not be called by the live lane")
 
     monkeypatch.setattr(hybrid_search, "search_bing", _bing)
     monkeypatch.setattr(hybrid_search, "search_ddg", _ddg)
@@ -90,21 +93,20 @@ def test_hybrid_search_ddg_failure_keeps_bing_rows(monkeypatch):
 
 def test_hybrid_search_dedups_same_path_signed_urls(monkeypatch):
     def _bing(_query, _limit=20):
-        return [{
-            "title": "one",
-            "image_url": "https://cdn.example.com/img/amtrak.jpg?sig=aaa&size=large",
-            "source": "bing_hybrid",
-        }]
-
-    def _ddg(_query, _limit=20):
-        return [{
-            "title": "same image, other signature",
-            "image_url": "https://cdn.example.com/img/amtrak.jpg?sig=bbb&size=thumb",
-            "source": "ddg_hybrid",
-        }]
+        return [
+            {
+                "title": "one",
+                "image_url": "https://cdn.example.com/img/amtrak.jpg?sig=aaa&size=large",
+                "source": "bing_hybrid",
+            },
+            {
+                "title": "same image, other signature",
+                "image_url": "https://cdn.example.com/img/amtrak.jpg?sig=bbb&size=thumb",
+                "source": "bing_hybrid",
+            },
+        ]
 
     monkeypatch.setattr(hybrid_search, "search_bing", _bing)
-    monkeypatch.setattr(hybrid_search, "search_ddg", _ddg)
     out = hybrid_search.search_hybrid(["Amtrak locomotive 160"], limit_per_query=5)
     assert len(out["Amtrak locomotive 160"]) == 1
 

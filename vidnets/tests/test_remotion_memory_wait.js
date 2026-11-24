@@ -4,16 +4,31 @@ const os = require('node:os');
 const {waitForRenderMemory, adaptiveConcurrency, renderSectionHasher, renderBrowserSession} = require('../scripts/render-remotion-manifest');
 
 test('memory admission releases only the owned browser before waiting', async () => {
-  const free = os.freemem;
+  const free = os.freemem, total = os.totalmem, cpu = os.availableParallelism;
+  const saved = {...process.env};
   let released = 0;
   try {
-    os.freemem = () => (released ? 900 : 200) * 1024 ** 2;
+    for (const key of Object.keys(process.env)) if (key.startsWith('VIDZEO_REMOTION_')) delete process.env[key];
+    os.totalmem = () => 8 * 1024 ** 3;
+    os.availableParallelism = () => 8;
+    // Nov 16, 2026 (GTA VI ef306926): the post-release level used to be
+    // 900 MB, which admitted a serial render with a 64 MB media cache
+    // Remotion rejects. After the low-memory gate tuning (reserve 5%,
+    // decoder 128 MB, worker 192 MB, overhead/margin 64 MB) the bar is
+    // ~1114 MB on an 8 GB machine, so 1150 MB admits a serial 1080p
+    // render with the 240 MB media-cache floor met.
+    os.freemem = () => (released ? 1150 : 200) * 1024 ** 2;
     const plan = await waitForRenderMemory({width:1920,height:1080}, {}, {
       freshMemory:true, memoryWaitMs:1000, releaseOwnedResources:async () => {released++;},
     });
     assert.equal(released,1);
     assert.equal(plan.concurrency,1);
-  } finally {os.freemem = free;}
+    assert.ok(plan.media_cache_bytes >= 240 * 1024 ** 2);
+  } finally {
+    os.freemem = free; os.totalmem = total; os.availableParallelism = cpu;
+    for (const key of Object.keys(process.env)) if (key.startsWith('VIDZEO_REMOTION_')) delete process.env[key];
+    Object.assign(process.env, saved);
+  }
 });
 
 test('one owned browser serves selection and sections, with fresh browser after resource recovery', async () => {
@@ -66,10 +81,24 @@ test('parallel encoding follows remaining memory rather than a fixed four-GB ban
     assert.ok(plan.concurrency <= plan.memory_limit && plan.concurrency <= plan.cpu_limit);
     assert.equal(plan.disallow_parallel_encoding, false);
     assert.equal(plan.video_cache_bytes, 256 * 1024 ** 2);
+    // Nov 16, 2026 (GTA VI ef306926, working-set fix): 900 MB free now
+    // admits a serial render — the media cache CONFIG is always the full
+    // 256 MB cap and the working set fits in headroom (900 available +
+    // free swap against the ~873 MB bar) — but parallel encoding stays
+    // disallowed under pressure. Only levels below the 512 MB floor wait.
     os.freemem = () => 900 * 1024 ** 2;
+    const tight = adaptiveConcurrency({width:1920,height:1080}, {}, {freshMemory:true});
+    assert.equal(tight.concurrency, 1);
+    assert.equal(tight.disallow_parallel_encoding, true);
+    assert.ok(tight.media_cache_bytes >= 240 * 1024 ** 2);
+    os.freemem = () => 400 * 1024 ** 2;
+    assert.throws(() => adaptiveConcurrency({width:1920,height:1080}, {}, {freshMemory:true}),
+      e => e.code === 'VIDZEO_LOW_MEMORY');
+    os.freemem = () => 1200 * 1024 ** 2;
     const pressure = adaptiveConcurrency({width:1920,height:1080}, {}, {freshMemory:true});
     assert.equal(pressure.concurrency, 1);
     assert.equal(pressure.disallow_parallel_encoding, true);
+    assert.ok(pressure.media_cache_bytes >= 240 * 1024 ** 2);
   } finally {
     os.freemem = free; os.totalmem = total; os.availableParallelism = cpu;
     for (const key of Object.keys(process.env)) if (key.startsWith('VIDZEO_REMOTION_')) delete process.env[key];

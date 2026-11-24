@@ -811,3 +811,317 @@ def test_export_preflight_rejects_adjacent_repeated_graphic_treatments(monkeypat
 
     assert result["status"] == "fail"
     assert any(error["code"] == "repeated_adjacent_treatment" for error in result["errors"])
+
+
+def test_director_plan_metadata_carries_beats_from_direction():
+    # P1 (fewer-requests): the director returns editorial_* fields with its
+    # scenes, and the plan metadata carries the derived beats, so the
+    # caller can skip the separate vidzeo_editorial_beats_v1 request.
+    scene_texts = [
+        "On 12 March 1989 the dam failed, killing 200 people.",
+        "The river rose slowly through the valley.",
+    ]
+
+    class FakeDirector:
+        model = "test/director"
+        model_chain = [model]
+        attempt_history = []
+        last_model = model
+
+        def chat(self, *, json_schema_name, **_kwargs):
+            if json_schema_name == "vidnets_art_direction_v1":
+                return json.dumps({
+                    "style": "editorial",
+                    "display_font": "Barlow Condensed",
+                    "body_font": "Inter",
+                    "accent_color": "#A64B36",
+                    "visual_motif": "site map and construction details",
+                    "motion_rhythm": "measured",
+                })
+            return json.dumps({"scenes": [
+                {
+                    "scene_index": index,
+                    "type": VisualSceneType.SMART_IMAGE.value,
+                    "variant": "full_bleed_cinematic",
+                    "visual_intent": "Let the image breathe.",
+                    "frame_mode": "media_only",
+                    "overlay_policy": "none",
+                    "editorial_priority": 0.2,
+                    "camera": "slow_push",
+                    "entrance": "fade",
+                    "transition": "cut",
+                    "text_focus": "",
+                    "display_text": "",
+                    "source_span": "",
+                    "emphasis_spans": [],
+                    "placement": "none",
+                    "template_id": "full-bleed",
+                    "template_recipe": None,
+                    "map_shot": {
+                        "enabled": False,
+                        "location_names": [],
+                        "feature_ids": [],
+                        "route_id": "",
+                        "source_ids": [],
+                        "motion_profile": "auto",
+                    },
+                    **({
+                        "editorial_role": "evidence",
+                        "editorial_treatment": "date",
+                        "editorial_emphasis": "12 March 1989",
+                        "editorial_highlight_kind": "milestone",
+                        "editorial_importance": 0.9,
+                    } if index == 0 else {}),
+                }
+                for index in range(2)
+            ]})
+
+    plan = EditingDirector(llm_client=FakeDirector()).plan_documentary(
+        script_text=" ".join(scene_texts),
+        scene_texts=scene_texts,
+        scene_durations=[4.0, 4.0],
+        topic="Dam Failure",
+        category="history",
+    )
+
+    assert plan.director_metadata.get("editorial_beats_source") == "direction"
+    beats = plan.director_metadata.get("editorial_beats") or []
+    assert len(beats) == 2
+    assert beats[0]["emphasis"] and beats[0]["emphasis"] in scene_texts[0]
+    # The normalizer may substitute the deterministic fallback's kind when
+    # it rejects the director's phrase; assert the grounded set, not one.
+    assert beats[0]["highlight_kind"] in {"milestone", "key_fact"}
+
+
+def _p2_fake_scenes(count):
+    return [
+        {
+            "scene_index": index,
+            "type": VisualSceneType.SMART_IMAGE.value,
+            "variant": "full_bleed_cinematic",
+            "visual_intent": "Let the image breathe.",
+            "frame_mode": "media_only",
+            "overlay_policy": "none",
+            "editorial_priority": 0.2,
+            "camera": "slow_push",
+            "entrance": "fade",
+            "transition": "cut",
+            "text_focus": "",
+            "display_text": "",
+            "source_span": "",
+            "emphasis_spans": [],
+            "placement": "none",
+            "template_id": "full-bleed",
+            "template_recipe": None,
+            "map_shot": {
+                "enabled": False,
+                "location_names": [],
+                "feature_ids": [],
+                "route_id": "",
+                "source_ids": [],
+                "motion_profile": "auto",
+            },
+        }
+        for index in range(count)
+    ]
+
+
+def test_director_batch_zero_carries_art_direction_without_standalone_call():
+    # P2 (fewer-requests): batch 0 returns the film-level art direction in
+    # the same turn as its scenes, so no vidnets_art_direction_v1 request
+    # is filed at all.
+    scene_texts = [
+        "On 12 March 1989 the dam failed, killing 200 people.",
+        "The river rose slowly through the valley.",
+    ]
+    calls = []
+
+    class FakeDirector:
+        model = "test/director"
+        model_chain = [model]
+        attempt_history = []
+        last_model = model
+
+        def chat(self, *, json_schema_name, **_kwargs):
+            calls.append(json_schema_name)
+            if json_schema_name == "vidnets_art_direction_v1":
+                raise AssertionError("standalone art call must not fire when batch 0 carries art")
+            return json.dumps({
+                "art_direction": {
+                    "style": "editorial",
+                    "display_font": "Barlow Condensed",
+                    "body_font": "Inter",
+                    "accent_color": "#A64B36",
+                    "visual_motif": "batch zero motif",
+                    "motion_rhythm": "measured",
+                    "story_arc": "rise, rupture, reckoning",
+                    "retention_plan": "open on the breach",
+                },
+                "scenes": _p2_fake_scenes(2),
+            })
+
+    plan = EditingDirector(llm_client=FakeDirector()).plan_documentary(
+        script_text=" ".join(scene_texts),
+        scene_texts=scene_texts,
+        scene_durations=[4.0, 4.0],
+        topic="Dam Failure",
+        category="history",
+    )
+
+    assert "vidnets_art_direction_v1" not in calls
+    assert calls.count("vidnets_scene_direction_v1") == 1
+    assert len(plan.scenes) == 2
+    assert plan.director_metadata.get("art_direction", {}).get("visual_motif") == "batch zero motif"
+
+
+def test_director_falls_back_to_standalone_art_call_without_batch_zero_art():
+    # P2: when batch 0 returns no usable art, the standalone art call
+    # fires exactly once as the fallback, and the plan uses its art.
+    scene_texts = [
+        "On 12 March 1989 the dam failed, killing 200 people.",
+        "The river rose slowly through the valley.",
+    ]
+    calls = []
+
+    class FakeDirector:
+        model = "test/director"
+        model_chain = [model]
+        attempt_history = []
+        last_model = model
+
+        def chat(self, *, json_schema_name, **_kwargs):
+            calls.append(json_schema_name)
+            if json_schema_name == "vidnets_art_direction_v1":
+                return json.dumps({
+                    "style": "editorial",
+                    "display_font": "Barlow Condensed",
+                    "body_font": "Inter",
+                    "accent_color": "#A64B36",
+                    "visual_motif": "fallback motif",
+                    "motion_rhythm": "measured",
+                })
+            return json.dumps({"scenes": _p2_fake_scenes(2)})
+
+    plan = EditingDirector(llm_client=FakeDirector()).plan_documentary(
+        script_text=" ".join(scene_texts),
+        scene_texts=scene_texts,
+        scene_durations=[4.0, 4.0],
+        topic="Dam Failure",
+        category="history",
+    )
+
+    assert calls.count("vidnets_art_direction_v1") == 1
+    assert len(plan.scenes) == 2
+    assert plan.director_metadata.get("art_direction", {}).get("visual_motif") == "fallback motif"
+
+
+def _p7_thin_diagram_scenes(count, scene_texts):
+    # Grounded nodes + links per scene, so _grounded_diagram_recovery
+    # keeps the diagram as a specialist after composition fails on the
+    # fake's response; with 3/3 diagrams the excessive rule retains
+    # scene 0 for revision.
+    actors = [
+        ("river gate", "flow"),
+        ("dam wall", "reservoir"),
+        ("spillway", "flood water"),
+    ]
+    scenes = _p2_fake_scenes(count)
+    for index, scene in enumerate(scenes):
+        first, second = actors[index]
+        scene["type"] = "Diagram"
+        scene["frame_mode"] = "diagram"
+        scene["variant"] = "cause_and_effect_flow"
+        scene["diagram_nodes"] = [
+            {"label": first, "source_span": scene_texts[index]},
+            {"label": second, "source_span": scene_texts[index]},
+        ]
+        scene["diagram_links"] = [
+            {"from": first, "to": second, "evidence": scene_texts[index]},
+        ]
+        scene["template_recipe"] = None
+    return scenes
+
+
+def test_director_revision_round_two_names_the_rejection_reason():
+    # P7 (fewer-requests): round 1 rejected a replacement (ungrounded
+    # recipe) and round 2 used to re-file the identical prompt. The
+    # rejection reason must now reach the round-2 prompt per scene, so
+    # the model fixes the cause instead of repeating the rejected
+    # approach. No round 3 is added.
+    scene_texts = [
+        "The river gate controls the flow into the valley.",
+        "The dam wall blocks the reservoir.",
+        "The spillway sends the flood water downstream.",
+    ]
+    revision_prompts = []
+
+    class FakeDirector:
+        model = "test/director"
+        model_chain = [model]
+        attempt_history = []
+        last_model = model
+
+        def chat(self, *, json_schema_name, **_kwargs):
+            if json_schema_name == "vidnets_scene_quality_revision_v1":
+                revision_prompts.append(_kwargs.get("user_prompt") or "")
+                replacement = dict(_p7_thin_diagram_scenes(1, scene_texts)[0])
+                replacement["scene_index"] = 0
+                # Valid recipe shape, but the layer text is not in the
+                # narration, so _recipe_is_grounded rejects it.
+                replacement["template_recipe"] = {
+                    "id": "custom-diagram",
+                    "name": "Custom",
+                    "version": 1,
+                    "layers": [{
+                        "id": "layer-0",
+                        "kind": "text",
+                        "x": 10,
+                        "y": 10,
+                        "width": 30,
+                        "height": 20,
+                        "text": "unrelated mechanism label",
+                    }],
+                }
+                return json.dumps({"scenes": [replacement]})
+            if json_schema_name == "vidnets_art_direction_v1":
+                return json.dumps({
+                    "style": "editorial",
+                    "display_font": "Barlow Condensed",
+                    "body_font": "Inter",
+                    "accent_color": "#A64B36",
+                    "visual_motif": "dam and river",
+                    "motion_rhythm": "measured",
+                })
+            return json.dumps({
+                "art_direction": {
+                    "style": "editorial",
+                    "display_font": "Barlow Condensed",
+                    "body_font": "Inter",
+                    "accent_color": "#A64B36",
+                    "visual_motif": "dam and river",
+                    "motion_rhythm": "measured",
+                    "story_arc": "rise, rupture, reckoning",
+                    "retention_plan": "open on the breach",
+                },
+                "scenes": _p7_thin_diagram_scenes(3, scene_texts),
+            })
+
+    plan = EditingDirector(llm_client=FakeDirector()).plan_documentary(
+        script_text=" ".join(scene_texts),
+        scene_texts=scene_texts,
+        scene_durations=[4.0, 4.0, 4.0],
+        topic="Dam Failure",
+        category="history",
+    )
+
+    assert len(revision_prompts) == 2, "exactly two revision rounds, no round 3"
+    assert "PREVIOUS ATTEMPTS REJECTED" not in revision_prompts[0]
+    assert "PREVIOUS ATTEMPTS REJECTED" in revision_prompts[1]
+    assert "recipe_ungrounded" in revision_prompts[1]
+    assert "Scene 0" in revision_prompts[1]
+    revisions = plan.director_metadata.get("quality_revisions") or []
+    round_one = next((entry for entry in revisions if entry.get("round") == 1), {})
+    assert any(
+        failure.get("scene_index") == 0 and failure.get("reason") == "recipe_ungrounded"
+        for failure in round_one.get("failures") or []
+    )

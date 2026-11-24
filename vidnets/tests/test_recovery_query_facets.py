@@ -118,3 +118,44 @@ def test_inside_cab_viewpoint_phrase_and_cab_interior_survive():
                                    provider='youtube')
     assert "inside the cab" in queries[0].casefold()
     assert "whiteout" in queries[0].casefold()
+
+
+def test_gta_vice_city_queries_carry_aerial_and_neon_streets():
+    """GTA VI scene 2: the viewpoint lives in visual_intent ("Aerial and
+    street-level shots of neon-lit Vice City streets"), not just in the
+    narration. Enriched queries must carry "aerial" and "neon streets"
+    alongside the game title."""
+    from server.services.media_query_strategy import enrich_scene_queries
+    narration = ("The game returns to Vice City, now set in the fictional state of Leonida, "
+                 "a sun-soaked reimagining of Florida filled with beaches, swamps, and neon streets.")
+    req = build_visual_requirement(
+        title="Grand Theft Auto VI", script=narration, scene_text=narration,
+        visual_intent="Aerial and street-level shots of neon-lit Vice City streets",
+    )
+    queries = enrich_scene_queries(
+        ["Vice City Grand Theft Auto VI neon streets night footage"],
+        req, narration, provider='youtube',
+    )
+    joined = " ".join(queries).casefold()
+    assert "grand theft auto vi" in joined
+    assert "aerial" in joined
+    assert "neon streets" in joined
+
+
+def test_gta_lucia_queries_carry_prison_gates():
+    """GTA VI scene 4: "prison gates" is stated in the visual intent, not
+    the narration ("walking out of prison"). It must still reach the query."""
+    from server.services.media_query_strategy import enrich_scene_queries
+    narration = ("At the center of the story are Lucia Caminos and Jason Duval, two partners in crime "
+                 "whose story begins with Lucia walking out of prison and reuniting with Jason.")
+    req = build_visual_requirement(
+        title="Grand Theft Auto VI", script=narration, scene_text=narration,
+        visual_intent="Lucia walking out of the prison gates at dawn",
+    )
+    queries = enrich_scene_queries(
+        ["Lucia Caminos and Jason Duval Grand Theft Auto VI characters"],
+        req, narration, provider='youtube',
+    )
+    joined = " ".join(queries).casefold()
+    assert "grand theft auto vi" in joined
+    assert "prison gates" in joined

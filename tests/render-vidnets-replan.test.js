@@ -31,13 +31,9 @@ test('the re-plan never runs twice: a second 0-real plan fails loudly', () => {
   );
 });
 
-test('a partial plan earns a re-plan and a fully covered plan does not', () => {
+test('the re-plan never runs when the plan already has real media', () => {
   assert.equal(
-    shouldAttemptReplan({ real: 2, total: 3, replanAttempted: false, msRemaining: 30 * 60 * 1000 }),
-    true,
-  );
-  assert.equal(
-    shouldAttemptReplan({ real: 3, total: 3, replanAttempted: false, msRemaining: 30 * 60 * 1000 }),
+    shouldAttemptReplan({ real: 3, replanAttempted: false, msRemaining: 30 * 60 * 1000 }),
     false,
   );
 });

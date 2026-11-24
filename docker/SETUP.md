@@ -45,6 +45,19 @@ docker compose exec worker curl -s http://127.0.0.1:5010/   # Vidnets answers in
 No ports are published to the host by default. To inspect Vidnets from the
 host, uncomment the `ports:` block in `docker-compose.yml` and re-up.
 
+## Fast inference first: the resident worker pool (primary), the host hook (fallback)
+
+Inference answers land in seconds when the resident inference worker pool
+runs. Before the first job, spawn the pool supervisor from
+`scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md` — it spawns
+2–8 worker agents that claim spool requests in parallel and answer each
+with real Muse inference (each worker follows
+`scripts/resident-inference-worker/WORKER_BRIEF.md`). The daemon's
+resident inbox calls the spool transport by
+default (`MUSE_INFERENCE_COMMAND=node /app/scripts/muse-inference-spool.cjs`).
+`start-daemon.sh` warns if no worker heartbeat is fresh; the pool is
+the fix, not the warning.
+
 ## Host Muse hook (setup installs the script)
 
 `setup.sh` installs the repository hook script on the host Muse VM, updates the
@@ -65,9 +78,12 @@ successful probe is recent. To avoid waiting for the host scheduler on each
 inference request, configure a Muse-owned command or HTTP answer service with
 `MUSE_INFERENCE_COMMAND` or `MUSE_INFERENCE_URL`.
 
-The 120 seconds is a failure ceiling, not an expected wait. If answers are
-regularly over 60 seconds, inspect the host hook schedule and operator response
-path before running a production job.
+The agent-bridge request floor is 3600 seconds (`VIDZEO_AGENT_MIN_WALL_SECONDS`):
+with the resident worker down, the polling inbox watcher alone needs ~4.5 min
+to wake a worker, and measured poll-to-delivery lag has reached 42 min — so a
+shorter wall expired answers mid-round-trip. With the worker running, expect
+answers in seconds. A 1-min video needs dozens of round trips; the realistic
+floor is set by downloads and rendering, not inference waits.
 ## What this worker does (and does not do)
 
 - **Script + video only. Thumbnails are skipped** (`VIDZEO_SKIP_THUMBNAILS=1`).
@@ -88,14 +104,15 @@ path before running a production job.
 
 | Symptom | Cause / fix |
 |---|---|
-| `doctor` fails on the hook | Hook missing/disabled on the host — see "Host Muse hook" above. Worker must fail closed here. |
+| `doctor` fails on the hook | Hook missing/disabled on the host — see "Host Muse hook" above. Only fatal when no resident transport is configured; with the spool transport set, the resident worker pool owns the inbox. |
 | `doctor` fails on Vidnets unreachable | Check `./data/runtime/logs/agent-service.log`. |
+| Resident worker pool heartbeat stale | No pool worker agent is running — spawn the pool from `scripts/resident-inference-worker/POOL_SUPERVISOR_BRIEF.md`. Jobs keep working via the hook fallback, just slower. |
 | CMS 502 / 530 / error 1033 | His PC's Cloudflare Tunnel is down. **Do nothing** — the daemon retries in-process, work is never lost. Restart the tunnel on his PC. |
 | Upload HTTP 413 | Master over ~100 MB. The worker auto-transcodes before upload; a 413 means the transcode path was bypassed — check the logs, do not re-upload the same file. |
 | `401` / credential revoked | Re-run `./setup.sh` and re-pair with a fresh key from the CMS. |
 | Container stopped / VM rebooted | `docker compose up -d`. State lives in `./data`; the daemon resumes the saved job from its checkpoint. Never delete `./data` while a job runs. |
 | Out of disk | `./data/runtime/temp` accumulates render scratch; prune it by hand. Never delete `./data/runtime/temp/agent-bridge` while a job runs. |
-| Slow job / "stuck" scene | The historical hook path took ~4.5 min per inference request; that is a failure, not normal. New requests target <60s and expire at 120s. Check `doctor`, hook `last-run`, bridge metrics, and the stage-specific progress logs before retrying. |
+| Slow job / "stuck" scene | First check the resident worker pool heartbeats — if none is fresh, inference round trips fall back to ~4.5 min hook wakes (the 3600s agent-bridge request floor exists because a wake alone can exceed 20 min). Spawn the pool; do not kill the job. The server's debugger reuses already-downloaded vision-checked media first, then same-job approved media, graphic last. If a request does expire, check `doctor`, hook `last-run`, and bridge metrics. |
 | Low-memory test/build failures | The reference box has 4 vCPU / 7.7 GB and render concurrency is pinned to 1. Do not raise it. |
 
 ## Updating
@@ -109,7 +126,11 @@ and `.env`), then `docker compose build && docker compose up -d`.
    (Nov 10, 2026). First build may surface a real failure (slow/heavy
    Python requirements, `npm ci --omit=dev` in `vidnets/`, Chrome download
    at build time). Build it on a Docker host before trusting it.
-2. **Host hook adaptation is designed, not tested** (see above).
+2. **Host hook adaptation is designed, not tested** (see above). The
+   resident worker path is new too: its spool transport and inbox wiring
+   are covered by unit + integration tests (probe answered in <1s in
+   tests), but no live video job has run on it yet — run one before
+   trusting it for production.
 3. **ffmpeg 6.1.1 vs 8.1.2.** Ubuntu 24.04 apt ships 6.1.1; the reference
    VM runs a Hatch-patched 8.1.2 with no public apt source. If a job needs
    8.x behaviour, drop a static ffmpeg 8.x build into the image and set
