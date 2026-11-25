@@ -11895,6 +11895,27 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             if yt_wall_seconds < mixed_hard_cap:
                 print(f"   [budget] Mixed Media transfer waves: {yt_wall_seconds:.0f}s -> {mixed_hard_cap:.0f}s", flush=True)
             yt_wall_seconds = mixed_hard_cap
+            if (
+                str((config or {}).get("llm_provider") or "") == "external_agent"
+                and not config.get("yt_branch_wall_timeout_seconds")
+                and str(yt_environment.get("VIDZEO_YT_COOLDOWN_RETRY", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                try:
+                    agent_wall_cap = max(
+                        yt_wall_seconds,
+                        min(
+                            1800.0,
+                            float(yt_environment.get("VIDZEO_MIXED_YT_AGENT_WALL_CAP_SECONDS", "1200") or 1200),
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    agent_wall_cap = max(yt_wall_seconds, 1200.0)
+                if agent_wall_cap > yt_wall_seconds:
+                    print(
+                        f"   [budget] Mixed Media agent cooldown headroom: {yt_wall_seconds:.0f}s -> {agent_wall_cap:.0f}s",
+                        flush=True,
+                    )
+                    yt_wall_seconds = agent_wall_cap
 
         if is_youtube_only_branch:
             # No fixed branch wall for a YouTube-only agent job (see

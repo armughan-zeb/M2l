@@ -2850,8 +2850,41 @@ def _youtube_download_with_cached_info(ydl: Any, url: str, clients: Any) -> None
         ydl.download([url])
 
 
-def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation, output_dir, raw_prefix):
-    """Retry a sign-in requirement with one other verified account."""
+_ANON_DOWNLOAD_LOCK = threading.Lock()
+_ANON_DOWNLOAD_THROTTLE_UNTIL = 0.0
+
+
+def _anon_download_fallback_ready() -> bool:
+    """True when anonymous tv_embedded fallback is enabled and not cooled-down."""
+    if str(os.environ.get("VIDZEO_YT_DOWNLOAD_ANON_FALLBACK", "1") or "1").strip().lower() in {
+        "0", "false", "off", "no",
+    }:
+        return False
+    with _ANON_DOWNLOAD_LOCK:
+        return time.monotonic() >= _ANON_DOWNLOAD_THROTTLE_UNTIL
+
+
+def _mark_anon_download_throttled(cooldown_seconds: float = 120.0) -> None:
+    global _ANON_DOWNLOAD_THROTTLE_UNTIL
+    with _ANON_DOWNLOAD_LOCK:
+        _ANON_DOWNLOAD_THROTTLE_UNTIL = max(
+            _ANON_DOWNLOAD_THROTTLE_UNTIL,
+            time.monotonic() + max(15.0, float(cooldown_seconds)),
+        )
+
+
+def _download_with_youtube_session(
+    yt_dlp,
+    opts,
+    url,
+    session_jar,
+    cancellation,
+    output_dir,
+    raw_prefix,
+    *,
+    on_retry_reset=None,
+):
+    """Retry sign-in requirements and throttled transfers across accounts or clients."""
     def download(jar):
         if cancellation is not None:
             cancellation.raise_if_cancelled()
@@ -2874,6 +2907,12 @@ def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation,
             )
         return installed if installed is not None else jar
 
+    def _reset_and_clean():
+        for stale in output_dir.glob(raw_prefix + "*"):
+            stale.unlink(missing_ok=True)
+        if callable(on_retry_reset):
+            on_retry_reset()
+
     try:
         used_jar = download(session_jar)
         _persist_youtube_session_cookies(used_jar, session_jar)
@@ -2884,9 +2923,13 @@ def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation,
             "sign in to confirm your age", "age-restricted", "login required",
             "sign in to view", "sign in to watch",
         ))
-        throttled = any(phrase in detail for phrase in (
+        zero_byte_stalled = "youtube_zero_byte_stall" in detail
+        throttled = zero_byte_stalled or any(phrase in detail for phrase in (
             "too many requests", "http error 429", "429", "ipblocked",
             "confirm you're not a bot",
+        ))
+        transport_timeout = zero_byte_stalled or any(phrase in detail for phrase in (
+            "timeout", "timed out", "connection reset", "connection aborted",
         ))
         _raw_index = getattr(session_jar, "_vidzeo_session_index", None)
         try:
@@ -2900,18 +2943,41 @@ def _download_with_youtube_session(yt_dlp, opts, url, session_jar, cancellation,
                 pool.mark_throttled(_pool_index, reason="youtube-throttled")
             except (TypeError, ValueError):
                 pass
-        if pool is None or not sign_in or "not a bot" in detail:
-            raise
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-        index, backup = pool.next_verified(_pool_index)
-        if backup is None:
-            raise
-        for stale in output_dir.glob(raw_prefix + "*"):
-            stale.unlink(missing_ok=True)
-        print(f"   [yt-session] retrying sign-in-required footage with verified account {index + 1}", flush=True)
-        used_backup = download(backup)
-        _persist_youtube_session_cookies(used_backup, pool=pool, index=index)
+
+        # 1. Rotate to another verified account on sign-in OR session throttle.
+        if pool is not None and (sign_in or throttled) and "not a bot" not in detail:
+            index, backup = pool.next_verified(_pool_index)
+            if backup is not None:
+                _reset_and_clean()
+                label = "sign-in-required footage" if sign_in else "throttled download"
+                print(f"   [yt-session] retrying {label} with verified account {index + 1}", flush=True)
+                used_backup = download(backup)
+                _persist_youtube_session_cookies(used_backup, pool=pool, index=index)
+                return
+
+        # 2. If authenticated web/tv_samsung stalled or throttled and no other
+        #    account is available, try one bounded anonymous tv_embedded
+        #    attempt (separate InnerTube client, avoids heated account window).
+        if (
+            session_jar is not None
+            and not sign_in
+            and "not a bot" not in detail
+            and (throttled or transport_timeout)
+            and _anon_download_fallback_ready()
+        ):
+            _reset_and_clean()
+            print("   [yt-session] authenticated transfer stalled/throttled; trying anonymous tv_embedded fallback", flush=True)
+            try:
+                download(None)
+                return
+            except Exception as anon_exc:
+                anon_detail = str(anon_exc).casefold()
+                if any(tok in anon_detail for tok in ("youtube_zero_byte_stall", "429", "too many requests", "timeout", "timed out", "bot")):
+                    _mark_anon_download_throttled(120.0)
+                raise exc from anon_exc
+        raise
 
 
 def _youtube_player_clients(session_jar: Any = None) -> List[str]:
@@ -5043,20 +5109,19 @@ class _FFmpegStallWatchdog:
     child once the size has been frozen longer than the stall window.
 
     Trigger is frozen byte-progress only, never wall time alone: a
-    slow-but-moving transfer is left alone. Zero bytes for the first 180s
-    also counts as stalled (extraction takes ~5-20s, so a spawned ffmpeg
-    with no bytes after 180s is dead); if no ffmpeg exists yet the
-    watchdog keeps watching and the per-clip timeout still bounds the
-    extraction. Scoped to this clip: only ffmpeg children whose command
-    line names this clip's raw prefix AND an http(s) input URL are
-    touched, so the local merge/re-encode ffmpeg (local file input) and
+    slow-but-moving transfer is left alone. Zero bytes once ffmpeg has
+    been running for ``zero_byte_grace_seconds`` (default 35s) also counts
+    as stalled so a throttled 0-byte transfer fails fast instead of burning
+    ~110s across yt-dlp retries. Scoped to this clip: only ffmpeg children
+    whose command line names this clip's raw prefix AND an http(s) input URL
+    are touched, so the local merge/re-encode ffmpeg (local file input) and
     the render's ffmpeg are never killed.
     """
 
     _POLL_SECONDS = 5.0
-    _ZERO_BYTE_GRACE_SECONDS = 180.0
+    _ZERO_BYTE_GRACE_SECONDS = 35.0
 
-    def __init__(self, watch_dir, raw_prefix, *, stall_seconds=None):
+    def __init__(self, watch_dir, raw_prefix, *, stall_seconds=None, zero_byte_grace_seconds=None):
         self._watch_dir = Path(watch_dir)
         self._raw_prefix = str(raw_prefix)
         if stall_seconds is None:
@@ -5065,9 +5130,33 @@ class _FFmpegStallWatchdog:
             self._stall_seconds = float(stall_seconds)
         except (TypeError, ValueError):
             self._stall_seconds = 75.0
+        if zero_byte_grace_seconds is None:
+            try:
+                zero_byte_grace_seconds = float(
+                    os.environ.get("VIDZEO_YT_ZERO_BYTE_GRACE_SECONDS", str(self._ZERO_BYTE_GRACE_SECONDS))
+                    or self._ZERO_BYTE_GRACE_SECONDS
+                )
+            except (TypeError, ValueError):
+                zero_byte_grace_seconds = self._ZERO_BYTE_GRACE_SECONDS
+        self._zero_byte_grace_seconds = max(12.0, min(180.0, float(zero_byte_grace_seconds)))
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._thread = None
         self.fired = False
+        self.zero_byte_stalled = False
+        now = time.monotonic()
+        self._started_at = now
+        self._last_change = now
+        self._ffmpeg_seen_at = None
+
+    def reset(self):
+        with self._lock:
+            now = time.monotonic()
+            self.fired = False
+            self.zero_byte_stalled = False
+            self._started_at = now
+            self._last_change = now
+            self._ffmpeg_seen_at = None
 
     def start(self):
         if self._thread is not None:
@@ -5095,16 +5184,15 @@ class _FFmpegStallWatchdog:
             pass
         return total
 
-    def _kill_matching_ffmpeg(self):
-        """Terminate this clip's ffmpeg downloader child. True if any died."""
+    def _matching_ffmpeg_children(self):
         try:
             import psutil
         except ImportError:
-            return False
+            return []
         try:
             children = psutil.Process().children(recursive=True)
         except Exception:
-            return False
+            return []
         matched = []
         for child in children:
             try:
@@ -5115,7 +5203,16 @@ class _FFmpegStallWatchdog:
                 continue
             if (self._raw_prefix in cmdline) and "http" in cmdline:
                 matched.append(child)
+        return matched
+
+    def _kill_matching_ffmpeg(self):
+        """Terminate this clip's ffmpeg downloader child. True if any died."""
+        matched = self._matching_ffmpeg_children()
         if not matched:
+            return False
+        try:
+            import psutil
+        except ImportError:
             return False
         for child in matched:
             try:
@@ -5134,34 +5231,55 @@ class _FFmpegStallWatchdog:
         return True
 
     def _run(self):
-        started = time.monotonic()
         last_size = self._raw_total_bytes()
-        last_change = started
-        while not self._stop.wait(self._POLL_SECONDS):
+        while True:
+            poll_wait = 1.0 if self.fired else self._POLL_SECONDS
+            if self._stop.wait(poll_wait):
+                return
+            if self.fired:
+                # Prevent yt-dlp retries from spawning another stalled ffmpeg
+                # before the outer download call exits.
+                self._kill_matching_ffmpeg()
+                continue
             size = self._raw_total_bytes()
             now = time.monotonic()
-            if size != last_size:
-                last_size = size
-                last_change = now
-                continue
+            with self._lock:
+                started = self._started_at
+                if size != last_size:
+                    last_size = size
+                    self._last_change = now
+                    continue
+                last_change = self._last_change
+                if size == 0 and self._ffmpeg_seen_at is None and self._matching_ffmpeg_children():
+                    self._ffmpeg_seen_at = now
+                ffmpeg_seen_at = self._ffmpeg_seen_at
             frozen = now - last_change
+            zero_byte_elapsed = (
+                (now - ffmpeg_seen_at)
+                if ffmpeg_seen_at is not None
+                else max(0.0, (now - started) - 35.0)
+            )
             stalled = (
                 (size > 0 and frozen >= self._stall_seconds)
-                or (size == 0 and now - started >= self._ZERO_BYTE_GRACE_SECONDS)
+                or (size == 0 and zero_byte_elapsed >= self._zero_byte_grace_seconds)
             )
             if not stalled:
                 continue
             if self._kill_matching_ffmpeg():
-                self.fired = True
+                with self._lock:
+                    self.fired = True
+                    if size == 0:
+                        self.zero_byte_stalled = True
+                kind = "0-byte throttled transfer" if size == 0 else f"frozen transfer ({frozen:.0f}s without byte progress)"
                 print(
-                    f"   [yt-v2] ffmpeg stall watchdog killed a frozen transfer "
-                    f"({self._raw_prefix}*, {frozen:.0f}s without byte progress)",
+                    f"   [yt-v2] ffmpeg stall watchdog killed a {kind} ({self._raw_prefix}*)",
                     flush=True,
                 )
-                return
+                continue
             # Nothing to kill (ffmpeg not spawned yet / already gone): keep
             # watching — the per-clip timeout still bounds the extraction.
-            last_change = now
+            with self._lock:
+                self._last_change = now
 
 
 def _download_clip(
@@ -5172,6 +5290,7 @@ def _download_clip(
     session_jar: Any = None,
     stream_downloads: bool = False,
     cancellation: Any = None,
+    zero_byte_grace_seconds: Optional[float] = None,
 ) -> bool:
     # Bound the complete per-candidate operation, including yt-dlp retrieval,
     # format fallback, FFmpeg conversion, and integrity probing.  The outer
@@ -5301,12 +5420,20 @@ def _download_clip(
             _remaining_clip_timeout()
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
+            if stall_watchdog.fired:
+                raise TimeoutError(
+                    "youtube_zero_byte_stall" if stall_watchdog.zero_byte_stalled else "youtube_ffmpeg_stall"
+                )
         # yt-dlp invokes progress hooks between fragments, giving us a
         # cooperative escape from slow/stalled downloads without killing the
         # whole YouTube worker pool.
         opts["progress_hooks"] = [_download_progress]
         download_error = None
-        stall_watchdog = _FFmpegStallWatchdog(output_path.parent, raw_prefix)
+        stall_watchdog = _FFmpegStallWatchdog(
+            output_path.parent,
+            raw_prefix,
+            zero_byte_grace_seconds=zero_byte_grace_seconds,
+        )
         stall_watchdog.start()
         try:
             for format_index, format_spec in enumerate(format_candidates):
@@ -5320,9 +5447,11 @@ def _download_clip(
                         except OSError:
                             pass
                     opts["format"] = format_spec
+                    stall_watchdog.reset()
                 try:
                     _download_with_youtube_session(
                         yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
+                        on_retry_reset=stall_watchdog.reset,
                     )
                     download_error = None
                     break
@@ -5332,6 +5461,13 @@ def _download_clip(
                     # format after the coordinator has moved on only creates late
                     # partial files and delays executor quiescence/salvage.
                     if cancellation is not None and cancellation.cancelled():
+                        raise
+                    if stall_watchdog.zero_byte_stalled:
+                        candidate['_transport_failure'] = 'zero_byte_throttle'
+                        print(
+                            "   [yt-v2] 0-byte throttle stall detected; aborting format retries",
+                            flush=True,
+                        )
                         raise
                     # Authentication and availability failures are independent of
                     # the requested selector. Retrying the same protected video
@@ -5365,9 +5501,9 @@ def _download_clip(
                         raise
                     if any(marker in error_text for marker in (
                         "timeout", "timed out", "temporarily unavailable",
-                        "connection reset", "connection aborted",
+                        "connection reset", "connection aborted", "youtube_ffmpeg_stall",
                     )):
-                        candidate['_transport_failure'] = 'transport_timeout'
+                        candidate.setdefault('_transport_failure', 'transport_timeout')
                         print(
                             "   [yt-v2] transport timeout/failure; moving to the next ranked candidate",
                             flush=True,
@@ -5428,6 +5564,8 @@ def _download_clip(
             stall_watchdog.stop()
             if stall_watchdog.fired:
                 candidate['_ffmpeg_stall_killed'] = True
+                if stall_watchdog.zero_byte_stalled:
+                    candidate['_transport_failure'] = 'zero_byte_throttle'
     except Exception as exc:
         # The per-clip wall raises TimeoutError from _remaining_clip_timeout
         # (progress hooks and the format loop); yt-dlp timeouts surface as
@@ -5435,7 +5573,7 @@ def _download_clip(
         # timeouts so the caller parks the video instead of re-queueing it
         # at another timestamp. Cancellations still raise above.
         if isinstance(exc, TimeoutError) or "youtube_clip_timeout_after_" in str(exc):
-            candidate['_transport_failure'] = 'transport_timeout'
+            candidate.setdefault('_transport_failure', 'transport_timeout')
         if cancellation is not None and cancellation.cancelled():
             # A cooperative cancellation can interrupt yt-dlp between
             # fragments. Remove the partial raw payload so the salvage scan
@@ -8097,6 +8235,9 @@ def get_youtube_clips(
     if cancellation is not None:
         cancellation.raise_if_cancelled()
     _reset_youtube_network_diagnostic()
+    global _ANON_DOWNLOAD_THROTTLE_UNTIL
+    with _ANON_DOWNLOAD_LOCK:
+        _ANON_DOWNLOAD_THROTTLE_UNTIL = 0.0
     if visual_context is None:
         effective_openrouter_key = str(
             openrouter_api_key
@@ -8289,13 +8430,46 @@ def get_youtube_clips(
         60.0,
         _branch_hard_wall - _yt_download_slot_seconds() - 15.0,
     )
-    pools = _search_container_pools(
-        groups,
-        search_timeout_seconds=search_timeout_seconds,
-        session_jar=authenticated_session,
-        cancellation=cancellation,
-        wall_cap_seconds=_search_wall_cap,
-    )
+    search_anonymous_first = str(
+        os.environ.get("VIDZEO_YT_SEARCH_ANONYMOUS_FIRST", "1") or "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if search_anonymous_first and authenticated_session is not None:
+        # Run search anonymously first so an 8-query search burst does not heat
+        # the authenticated download cookie session's throttle window. If any
+        # container pool comes back empty, fall back to authenticated_session
+        # only for those missing pools.
+        pools = _search_container_pools(
+            groups,
+            search_timeout_seconds=search_timeout_seconds,
+            session_jar=None,
+            cancellation=cancellation,
+            wall_cap_seconds=_search_wall_cap,
+        )
+        missing_groups = {key: grp for key, grp in groups.items() if not pools.get(key)}
+        if missing_groups:
+            print(
+                f"   [yt-v2] anonymous search left {len(missing_groups)}/{len(groups)} pool(s) empty; "
+                "retrying missing pools with authenticated session",
+                flush=True,
+            )
+            auth_pools = _search_container_pools(
+                missing_groups,
+                search_timeout_seconds=search_timeout_seconds,
+                session_jar=authenticated_session,
+                cancellation=cancellation,
+                wall_cap_seconds=max(30.0, _search_wall_cap * 0.5),
+            )
+            for key, items in (auth_pools or {}).items():
+                if items and not pools.get(key):
+                    pools[key] = items
+    else:
+        pools = _search_container_pools(
+            groups,
+            search_timeout_seconds=search_timeout_seconds,
+            session_jar=authenticated_session,
+            cancellation=cancellation,
+            wall_cap_seconds=_search_wall_cap,
+        )
     excluded_videos = set(excluded_video_ids or ())
     excluded_channels = set(excluded_channel_ids or ())
     if excluded_videos or excluded_channels:
@@ -8567,6 +8741,7 @@ def get_youtube_clips(
     attempt_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     chapter_cache = {}
     pending_alternate_cuts = {}
+    contact_approved_windows: Dict[Tuple[int, str], Tuple[float, float]] = {}
     ranged_moments, ranged_moment_audit = {}, {'status': 'disabled'}
     ranged_overlap = None
     if str(os.environ.get('VIDZEO_YT_RANGED_MOMENTS', '1')).lower() not in {'0', 'false', 'off'}:
@@ -8969,11 +9144,19 @@ def get_youtube_clips(
             print(f"   [yt-v2] verification failed for scene {idx + 1}: {type(exc).__name__}")
             return idx, None
 
-    def _download_scene(idx: int, candidate: Dict[str, Any]) -> Tuple[int, Optional[str]]:
+    def _download_scene(
+        idx: int,
+        candidate: Dict[str, Any],
+        *,
+        allow_transport_retry: bool = False,
+        active_cancellation: Any = None,
+        zero_byte_grace_seconds: Optional[float] = None,
+    ) -> Tuple[int, Optional[str]]:
+        _cancel = active_cancellation if active_cancellation is not None else download_cancellation
         if provider_network_unavailable.is_set():
             return idx, None
-        if download_cancellation is not None:
-            download_cancellation.raise_if_cancelled()
+        if _cancel is not None:
+            _cancel.raise_if_cancelled()
         subject = rows[idx].get("candidate_subject") or rows[idx].get("section_subject") or rows[idx].get("scene_subject") or ""
         key = _row_pool_key(rows[idx])
         retrieval_context = _row_retrieval_context(rows[idx])
@@ -9004,19 +9187,27 @@ def get_youtube_clips(
             retrieval_context=retrieval_context,
             lenient_acceptance=bool(lenient_acceptance),
         )
-        previous_ids = {str(item.get('candidate_id') or '') for item in attempt_audit[idx]}
+        if allow_transport_retry:
+            previous_ids = {
+                str(item.get('candidate_id') or '')
+                for item in attempt_audit[idx]
+                if item.get('failure_kind') != 'transport_timeout'
+            }
+            transport_timed_out_ids = set()
+        else:
+            previous_ids = {str(item.get('candidate_id') or '') for item in attempt_audit[idx]}
+            # Transport timeouts are parked, not retried: a video whose transfer
+            # throttled out is not re-queued at another timestamp for up to 6
+            # passes — the scene moves to the next ranked candidate (or, when
+            # the pool is exhausted, to the web lane). Content rejects keep the
+            # same-video alternate-timestamp recovery below, which is a
+            # different failure kind with a different remedy.
+            transport_timed_out_ids = {
+                str(item.get('video_id') or item.get('candidate_id') or '')
+                for item in attempt_audit[idx]
+                if item.get('failure_kind') == 'transport_timeout'
+            }
         fresh_options = [option for option in options if _video_id(option) not in previous_ids]
-        # Transport timeouts are parked, not retried: a video whose transfer
-        # throttled out is not re-queued at another timestamp for up to 6
-        # passes — the scene moves to the next ranked candidate (or, when
-        # the pool is exhausted, to the web lane). Content rejects keep the
-        # same-video alternate-timestamp recovery below, which is a
-        # different failure kind with a different remedy.
-        transport_timed_out_ids = {
-            str(item.get('video_id') or item.get('candidate_id') or '')
-            for item in attempt_audit[idx]
-            if item.get('failure_kind') == 'transport_timeout'
-        }
         # After fresh publishers are exhausted, a later scheduling turn can
         # try another moment from the same master, never its failed timestamp.
         options = fresh_options or [dict(option, best_timestamp=None) for option in options
@@ -9194,45 +9385,54 @@ def get_youtube_clips(
                 # for these exact pixels; the final clip still goes through the
                 # normal transport and scene-level visual checks below.
                 if visual_context is not None and getattr(visual_context, 'enabled', False):
-                    from services.youtube_contact_probe import inspect_candidate
-                    try:
-                        probe_client = visual_context.get_client()
-                    except Exception:
-                        probe_client = None
-                    status, window, probe_audit = inspect_candidate(
-                        option, start, duration, rows[idx].get('scene_text', ''),
-                        output_root / 'contact_probes' / uuid.uuid4().hex,
-                        probe_client, _download_youtube_probe,
-                        _ffmpeg_bin('ffmpeg'), _ffmpeg_bin('ffprobe'),
-                        session_jar=authenticated_session,
-                        stream_downloads=bool(stream_downloads), cancellation=download_cancellation,
-                    )
-                    audit['contact_probe'] = dict(probe_audit, status=status)
-                    if status == 'rejected':
-                        audit.update(status='contact_vision_rejected', failure_kind='content_reject')
-                        return None
-                    if status == 'accepted':
-                        selected_start = float(window['start'])
-                        with download_timestamp_lock:
-                            keys = _timestamp_reuse_keys(option)
-                            gap = max(duration + 1.5, 8.0)
-                            collision = any(
-                                abs(selected_start - old) < gap
-                                and download_timestamp_owners[(k, old)] != {idx}
-                                for k in keys for old in download_used_timestamps[k]
-                            )
-                            if not collision:
-                                for k in keys:
-                                    download_used_timestamps[k].append(selected_start)
-                                    download_timestamp_owners[(k, selected_start)].add(idx)
-                        if collision:
-                            audit.update(status='contact_window_reused', failure_kind='content_reject')
-                            return None
-                        start = selected_start
-                        option['contact_crop_pct'] = window['crop_pct']
+                    cached_contact = contact_approved_windows.get((idx, vid))
+                    if cached_contact is not None:
+                        start = float(cached_contact[0])
+                        option['contact_crop_pct'] = float(cached_contact[1])
                         option['_contact_window_selected'] = True
                         audit['timestamp'] = round(start, 2)
-                        audit['timestamp_evidence'] = 'contact_sheet_vision'
+                        audit['timestamp_evidence'] = 'contact_sheet_vision_cached'
+                    else:
+                        from services.youtube_contact_probe import inspect_candidate
+                        try:
+                            probe_client = visual_context.get_client()
+                        except Exception:
+                            probe_client = None
+                        status, window, probe_audit = inspect_candidate(
+                            option, start, duration, rows[idx].get('scene_text', ''),
+                            output_root / 'contact_probes' / uuid.uuid4().hex,
+                            probe_client, _download_youtube_probe,
+                            _ffmpeg_bin('ffmpeg'), _ffmpeg_bin('ffprobe'),
+                            session_jar=authenticated_session,
+                            stream_downloads=bool(stream_downloads), cancellation=_cancel,
+                        )
+                        audit['contact_probe'] = dict(probe_audit, status=status)
+                        if status == 'rejected':
+                            audit.update(status='contact_vision_rejected', failure_kind='content_reject')
+                            return None
+                        if status == 'accepted':
+                            selected_start = float(window['start'])
+                            with download_timestamp_lock:
+                                keys = _timestamp_reuse_keys(option)
+                                gap = max(duration + 1.5, 8.0)
+                                collision = any(
+                                    abs(selected_start - old) < gap
+                                    and download_timestamp_owners[(k, old)] != {idx}
+                                    for k in keys for old in download_used_timestamps[k]
+                                )
+                                if not collision:
+                                    for k in keys:
+                                        download_used_timestamps[k].append(selected_start)
+                                        download_timestamp_owners[(k, selected_start)].add(idx)
+                            if collision:
+                                audit.update(status='contact_window_reused', failure_kind='content_reject')
+                                return None
+                            start = selected_start
+                            option['contact_crop_pct'] = window['crop_pct']
+                            option['_contact_window_selected'] = True
+                            contact_approved_windows[(idx, vid)] = (selected_start, float(window.get('crop_pct') or 0.0))
+                            audit['timestamp'] = round(start, 2)
+                            audit['timestamp_evidence'] = 'contact_sheet_vision'
                 downloaded = False
                 # A prep-manifest cut is already on disk: the candidate
                 # carries its verified local file in prep_cache_path
@@ -9289,8 +9489,10 @@ def get_youtube_clips(
                         "session_jar": authenticated_session,
                         "stream_downloads": bool(stream_downloads),
                     }
-                    if pass_download_cancellation:
-                        download_kwargs["cancellation"] = download_cancellation
+                    if pass_download_cancellation and _cancel is not None:
+                        download_kwargs["cancellation"] = _cancel
+                    if zero_byte_grace_seconds is not None:
+                        download_kwargs["zero_byte_grace_seconds"] = zero_byte_grace_seconds
                     downloaded = _download_clip(
                         option,
                         out,
@@ -9299,13 +9501,13 @@ def get_youtube_clips(
                         **download_kwargs,
                     )
             except Exception as exc:
-                if download_cancellation is not None and download_cancellation.cancelled():
+                if _cancel is not None and _cancel.cancelled():
                     raise
                 # Classify the failure kind on the audit row: a transport
                 # timeout parks the video for the rest of the job, while a
                 # content reject may still be retried at another timestamp.
                 _timed_out = (
-                    option.get('_transport_failure') == 'transport_timeout'
+                    option.get('_transport_failure') in {'transport_timeout', 'zero_byte_throttle'}
                     or isinstance(exc, TimeoutError)
                     or "youtube_clip_timeout_after_" in str(exc)
                     or "timed out" in str(exc).lower()
@@ -9356,7 +9558,7 @@ def get_youtube_clips(
                 row_category = str(rows[idx].get("domain_category") or "").strip().lower()
                 cleaned_path, overlay_audit = _clean_downloaded_clip_overlays(
                     str(out.resolve()),
-                    cancellation=download_cancellation,
+                    cancellation=_cancel,
                     gaming_lane=str(rows[idx].get("domain_category") or "").strip().lower() == "gaming",
                     native_overlay_lane=_native_overlay_lane,
                     allow_soft_facecam=row_category in soft_facecam_categories,
@@ -9427,7 +9629,7 @@ def get_youtube_clips(
                         "network_disabled_by_sandbox", "outbound_network_unavailable",
                     }
                     else "transport_timeout"
-                    if failure == "transport_timeout"
+                    if failure in {"transport_timeout", "zero_byte_throttle"}
                     else "download_error"
                 ),
             })
@@ -10008,7 +10210,245 @@ def get_youtube_clips(
                 except Exception:
                     pass
 
-    if stopped_reason:
+    # Cooldown probe + wave retry for YouTube's time-window download throttle.
+    # Search/transcript bursts can heat the account/IP window so Wave 1
+    # transfers stall at 0 bytes while the window is hot, then land normally
+    # once it cools. Reserve only a single cooled-wave allowance (~90s) rather
+    # than the full multi-wave planning reserve (~548s) so cooldown can fire
+    # inside bounded job budgets.
+    cooldown_retry_audit: Dict[str, Any] = {"triggered": False, "probes": 0, "cooled": False, "recovered": 0}
+    _cooldown_default = "0" if os.environ.get("PYTEST_CURRENT_TEST") else "1"
+    cooldown_enabled = str(
+        os.environ.get("VIDZEO_YT_COOLDOWN_RETRY", _cooldown_default) or _cooldown_default
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    parent_cancelled = cancellation is not None and cancellation.cancelled()
+    missing_after_wave = [i for i in range(requested_scene_count) if not results[i]]
+    throttled_missing = [
+        i for i in missing_after_wave
+        if any(
+            isinstance(att, Mapping) and (
+                att.get("failure_kind") == "transport_timeout"
+                or att.get("reason") in {"zero_byte_throttle", "transport_timeout"}
+                or any(tok in str(att.get("reason") or "").lower() for tok in ("429", "too many requests", "youtube_zero_byte_stall", "timed out", "timeout"))
+            )
+            for att in attempt_audit.get(i, [])
+        )
+    ]
+    if (
+        cooldown_enabled
+        and not parent_cancelled
+        and not provider_network_unavailable.is_set()
+        and throttled_missing
+    ):
+        try:
+            wave_reserve = max(
+                45.0,
+                min(180.0, float(os.environ.get("VIDZEO_YT_COOLDOWN_RETRY_WAVE_RESERVE_SECONDS", "90") or 90)),
+            )
+        except (TypeError, ValueError):
+            wave_reserve = 90.0
+        try:
+            max_wait = max(
+                30.0,
+                min(1200.0, float(os.environ.get("VIDZEO_YT_COOLDOWN_MAX_WAIT_SECONDS", "600") or 600)),
+            )
+        except (TypeError, ValueError):
+            max_wait = 600.0
+        try:
+            initial_wait = max(
+                0.0,
+                min(180.0, float(os.environ.get("VIDZEO_YT_COOLDOWN_INITIAL_WAIT_SECONDS", "45") or 45)),
+            )
+        except (TypeError, ValueError):
+            initial_wait = 45.0
+        try:
+            probe_interval = max(
+                0.0,
+                min(180.0, float(os.environ.get("VIDZEO_YT_COOLDOWN_PROBE_INTERVAL_SECONDS", "60") or 60)),
+            )
+        except (TypeError, ValueError):
+            probe_interval = 60.0
+        try:
+            max_probes = max(1, min(12, int(os.environ.get("VIDZEO_YT_COOLDOWN_MAX_PROBES", "8") or 8)))
+        except (TypeError, ValueError):
+            max_probes = 8
+        try:
+            probe_zero_byte_grace = max(
+                12.0,
+                min(45.0, float(os.environ.get("VIDZEO_YT_COOLDOWN_PROBE_GRACE_SECONDS", "25") or 25)),
+            )
+        except (TypeError, ValueError):
+            probe_zero_byte_grace = 25.0
+
+        now_mono = time.monotonic()
+        if hard_deadline is not None:
+            cooldown_deadline = min(hard_deadline - wave_reserve, now_mono + max_wait)
+        else:
+            cooldown_deadline = now_mono + max_wait
+
+        remaining_cooldown = cooldown_deadline - now_mono
+        if remaining_cooldown < max(15.0, min(initial_wait, 25.0)):
+            cooldown_retry_audit["skip_reason"] = f"insufficient_remaining_budget:{remaining_cooldown:.1f}s"
+            print(
+                f"   [yt-v2] cooldown retry skipped: remaining wait budget {remaining_cooldown:.1f}s < 25s",
+                flush=True,
+            )
+        else:
+            cooldown_retry_audit["triggered"] = True
+            if cancellation is not None and hasattr(cancellation, "child"):
+                retry_cancellation = cancellation.child(
+                    f"{getattr(cancellation, 'job_id', '')}:youtube-v2-cooldown"
+                )
+            else:
+                from services.cancellation import CancellationContext
+                retry_cancellation = CancellationContext(job_id="youtube-v2-cooldown")
+
+            with download_timestamp_lock:
+                # Clear transport failure counters & stale failed timestamps so
+                # the cooled wave can retry the top ranked candidates.
+                throttled_vids = {
+                    str(att.get("video_id") or att.get("candidate_id") or "")
+                    for i in throttled_missing
+                    for att in attempt_audit.get(i, [])
+                    if isinstance(att, Mapping) and att.get("failure_kind") == "transport_timeout"
+                }
+                for _vid in throttled_vids:
+                    if _vid:
+                        failed_download_counts.pop(_vid, None)
+                resolved_set = {i for i in range(requested_scene_count) if results[i]}
+                for _k in list(download_timestamp_owners.keys()):
+                    owners = download_timestamp_owners[_k]
+                    owners.intersection_update(resolved_set)
+                    if not owners and _k[0] in download_used_timestamps:
+                        try:
+                            download_used_timestamps[_k[0]].remove(_k[1])
+                        except ValueError:
+                            pass
+            with _ANON_DOWNLOAD_LOCK:
+                _ANON_DOWNLOAD_THROTTLE_UNTIL = 0.0
+
+            def _sleep_cancel_aware(seconds: float) -> bool:
+                end_at = time.monotonic() + max(0.0, seconds)
+                while time.monotonic() < end_at:
+                    if retry_cancellation is not None:
+                        retry_cancellation.raise_if_cancelled()
+                    if provider_network_unavailable.is_set():
+                        return False
+                    time.sleep(min(1.0, max(0.0, end_at - time.monotonic())))
+                return True
+
+            def _run_scene_attempt(target_idx: int, *, grace_seconds: Optional[float] = None) -> Optional[str]:
+                cand = assignments[target_idx]
+                if not cand:
+                    return None
+                r_idx, r_path = _download_scene(
+                    target_idx,
+                    cand,
+                    allow_transport_retry=True,
+                    active_cancellation=retry_cancellation,
+                    zero_byte_grace_seconds=grace_seconds,
+                )
+                rec = deferred_verifications.pop(r_idx, None)
+                if rec is not None and not r_path:
+                    r_idx, r_path = _select_verified_scene(r_idx, rec)
+                return r_path
+
+            probe_idx = next((i for i in throttled_missing if assignments[i]), None)
+            print(
+                f"   [yt-v2] throttle cooldown engaged for {len(throttled_missing)} scene(s): "
+                f"probe=scene {probe_idx + 1 if probe_idx is not None else 'n/a'}, "
+                f"budget={remaining_cooldown:.0f}s, wave_reserve={wave_reserve:.0f}s",
+                flush=True,
+            )
+            cooled = False
+            for probe_num in range(max_probes):
+                rem = cooldown_deadline - time.monotonic()
+                if rem < 10.0:
+                    break
+                wait_for = min(initial_wait if probe_num == 0 else probe_interval, max(0.0, rem - 10.0))
+                if wait_for > 0:
+                    print(
+                        f"   [yt-v2] cooldown wait {wait_for:.0f}s before probe {probe_num + 1}/{max_probes}",
+                        flush=True,
+                    )
+                    if not _sleep_cancel_aware(wait_for):
+                        break
+                if time.monotonic() >= cooldown_deadline or probe_idx is None:
+                    break
+                cooldown_retry_audit["probes"] += 1
+                probe_path = _run_scene_attempt(probe_idx, grace_seconds=probe_zero_byte_grace)
+                if probe_path:
+                    results[probe_idx] = probe_path
+                    cooled = True
+                    cooldown_retry_audit["cooled"] = True
+                    cooldown_retry_audit["recovered"] += 1
+                    for att in reversed(attempt_audit.get(probe_idx, [])):
+                        if isinstance(att, dict) and att.get("status") == "downloaded":
+                            att["cooldown_recovered"] = True
+                            break
+                    print(
+                        f"   [yt-v2] cooldown probe {probe_num + 1} succeeded (scene {probe_idx + 1}); "
+                        "re-running wave for remaining scenes",
+                        flush=True,
+                    )
+                    break
+                print(
+                    f"   [yt-v2] cooldown probe {probe_num + 1}/{max_probes} still throttled "
+                    f"(remaining={max(0.0, cooldown_deadline - time.monotonic()):.0f}s)",
+                    flush=True,
+                )
+
+            if cooled:
+                retry_indices = [i for i in throttled_missing if not results[i] and assignments[i]]
+                if retry_indices:
+                    gentle_workers = max(1, min(2, download_workers))
+                    wave_deadline = (
+                        hard_deadline
+                        if hard_deadline is not None
+                        else time.monotonic() + max(120.0, wave_reserve * 2.0)
+                    )
+                    retry_executor = ThreadPoolExecutor(
+                        max_workers=gentle_workers,
+                        thread_name_prefix="yt-v2-cooldown-wave",
+                    )
+                    retry_futures = {}
+                    try:
+                        for r_idx in retry_indices:
+                            if time.monotonic() >= wave_deadline:
+                                break
+                            fut = retry_executor.submit(_run_scene_attempt, r_idx)
+                            retry_futures[fut] = r_idx
+                        pending_retry = set(retry_futures.keys())
+                        while pending_retry:
+                            rem = wave_deadline - time.monotonic()
+                            if rem <= 0:
+                                break
+                            done_r, pending_retry = wait(
+                                pending_retry,
+                                timeout=min(1.0, rem),
+                                return_when=FIRST_COMPLETED,
+                            )
+                            for fut in done_r:
+                                r_idx = retry_futures[fut]
+                                try:
+                                    r_path = fut.result()
+                                except Exception:
+                                    r_path = None
+                                if r_path:
+                                    results[r_idx] = r_path
+                                    cooldown_retry_audit["recovered"] += 1
+                                    for att in reversed(attempt_audit.get(r_idx, [])):
+                                        if isinstance(att, dict) and att.get("status") == "downloaded":
+                                            att["cooldown_recovered"] = True
+                                            break
+                    finally:
+                        if pending_retry:
+                            retry_cancellation.cancel("cooldown wave hard deadline reached")
+                            for fut in pending_retry:
+                                fut.cancel()
+                        retry_executor.shutdown(wait=not pending_retry, cancel_futures=True)
+
+    if stopped_reason and not cooldown_retry_audit.get("recovered"):
         print(
             f"   [yt-v2] {stopped_reason}; returning completed partial downloads "
             f"({sum(1 for path in results if path)}/{requested_scene_count})"
@@ -10117,6 +10557,7 @@ def get_youtube_clips(
             "overlay_cuts_blur_failed": overlay_blur_failed,
             "transport_cache_hits": sum(1 for attempt in overlay_attempts if attempt.get("cache_hit")),
             "transport_cache_stores": sum(1 for attempt in overlay_attempts if attempt.get("cache_stored")),
+            "cooldown_retry": cooldown_retry_audit,
         },
     )
 
