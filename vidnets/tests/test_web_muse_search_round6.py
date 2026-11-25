@@ -299,6 +299,12 @@ def test_download_direct_retry_default_is_on(monkeypatch):
     assert hybrid_search._download_direct_retry_enabled() is True
 
 
+def test_direct_web_mode_prefers_direct_even_for_unlisted_image_hosts(monkeypatch):
+    monkeypatch.setenv("VIDZEO_WEB_DIRECT_FIRST", "1")
+    assert hybrid_search._download_route_order("images.example") == ["direct", "proxy"]
+    assert hybrid_search._download_route_order("images.example", direct_allowed=False) == ["proxy", "proxy"]
+
+
 def test_download_route_order_is_per_host(monkeypatch):
     """Direct-capable hosts try direct first; unknown hosts proxy-first.
 

@@ -1,5 +1,6 @@
 @echo off
 setlocal
+if not defined VIDZEO_WEB_DIRECT_FIRST set "VIDZEO_WEB_DIRECT_FIRST=1"
 set "VIDZEO_AUTH_MODE=local"
 set "VIDZEO_ALLOW_PACKAGED_LOCAL_AUTH=1"
 set "VIDNETS_AGENT_ROOT=%~dp0"

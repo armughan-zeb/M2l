@@ -20,6 +20,10 @@ def _web_log(message: str) -> None:
     print(f"   [web] {message}", flush=True)
 
 
+def web_direct_first() -> bool:
+    return os.environ.get("VIDZEO_WEB_DIRECT_FIRST", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _web_verbose() -> bool:
     return str(os.environ.get("VIDZEO_WEB_VERBOSE", "0")).strip().lower() in {"1", "true", "yes", "on"}
 

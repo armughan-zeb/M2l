@@ -30,6 +30,8 @@ import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 
+from .runtime import web_direct_first
+
 
 class HostCircuitOpen(RuntimeError):
     pass
@@ -167,7 +169,7 @@ def _download_route_order(host: str, direct_allowed: bool = True) -> List[str]:
     host = str(host or "").strip().lower()
     if not direct_allowed:
         return ["proxy", "proxy"]
-    if host in _download_direct_first_hosts():
+    if web_direct_first() or host in _download_direct_first_hosts():
         return ["direct", "proxy"]
     return ["proxy", "direct"]
 

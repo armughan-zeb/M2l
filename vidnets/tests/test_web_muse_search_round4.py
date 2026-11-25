@@ -301,6 +301,18 @@ def test_direct_retry_enabled_rescues_via_alternate_route():
 # R3 — Openverse is proxy-first and secondary (fix #2)
 # ---------------------------------------------------------------------------
 
+def test_direct_web_mode_respects_explicit_source_overrides(monkeypatch):
+    monkeypatch.setenv("VIDZEO_WEB_DIRECT_FIRST", "1")
+    monkeypatch.delenv("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", raising=False)
+    monkeypatch.delenv("VIDZEO_MUSE_SEARCH_DIRECT_RETRY", raising=False)
+    assert muse_mod.muse_search_openverse_direct_first()
+    assert muse_mod.muse_search_direct_retry_enabled()
+    monkeypatch.setenv("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", "proxy")
+    monkeypatch.setenv("VIDZEO_MUSE_SEARCH_DIRECT_RETRY", "0")
+    assert not muse_mod.muse_search_openverse_direct_first()
+    assert not muse_mod.muse_search_direct_retry_enabled()
+
+
 def test_openverse_proxy_first_by_default(monkeypatch):
     """Default route is proxy; direct-first needs an explicit opt-in.
 

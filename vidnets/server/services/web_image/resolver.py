@@ -855,7 +855,7 @@ from .constants import (
     STOPWORDS,
     SUPPORTED_IMAGE_EXTS,
 )
-from .runtime import _web_log, resolve_gallery_dl
+from .runtime import _web_log, resolve_gallery_dl, web_direct_first
 from .hybrid_search import bing_rows_are_decoy, download_bulk, search_bing
 from .muse_search import (
     muse_search_enabled,
@@ -2433,7 +2433,9 @@ def _discover_universal_urls(
         "timeout_seconds": timeout,
         "wait_until_complete": bool(wait_until_complete),
     }
+    direct_first = web_direct_first()
     for attempt in range(max_attempts):
+        direct = attempt % 2 == 0 if direct_first else attempt > 0
         # Nov 22 (d1ece590 stall fix): never retry after cancellation. When
         # the attempt is finished, every engine "fails" (the job context
         # raises inside the workers), so without this check a cancelled job
@@ -2443,20 +2445,13 @@ def _discover_universal_urls(
         # the caller records the scene error and moves on.
         check_job_active()
         if attempt > 0:
-            # Transient failure on the previous attempt: short backoff, then
-            # retry direct (proxy bypass). The proxy is the failure point
-            # when it times out; direct egress is the working fallback.
             if backoff > 0:
                 time.sleep(backoff)
             _web_log(
                 f"universal scraper retry {attempt + 1}/{max_attempts} "
-                f"for '{str(query)[:48]}' (direct, proxy bypass)"
+                f"for '{str(query)[:48]}' via {'direct' if direct else 'proxy'}"
             )
-        # Attempt 1 via the egress proxy, later attempts direct — passed
-        # explicitly (direct=), because the old web_bypass_proxy()
-        # thread-local flag never reached the pool worker threads that
-        # issue the requests (Nov 18 web-resilience fix).
-        search_kwargs["direct"] = attempt > 0
+        search_kwargs["direct"] = direct
         response = _UNIVERSAL_SCRAPER.search(query, **search_kwargs)
         response = _harvest_late(response)
         # Liveness (Nov 22 stall fix): a batch that settled — even with zero
@@ -2477,7 +2472,7 @@ def _discover_universal_urls(
             break
         _web_log(
             f"universal scraper: all engines failed transiently for "
-            f"'{str(query)[:48]}'; retrying direct (attempt {attempt + 2}/{max_attempts})"
+            f"'{str(query)[:48]}'; retrying (attempt {attempt + 2}/{max_attempts})"
         )
     # ── Never-settle-for-0 rescue pass ─────────────────────────────────
     # The main attempts are exhausted with 0 rows and every engine failed.
@@ -2538,10 +2533,8 @@ def _discover_universal_urls(
         # Same no-retry-after-cancellation rule as the main loop above.
         check_job_active()
         rescue_count += 1
-        # Alternate route: the main attempts end on direct, so rescue 1
-        # goes direct again only if the route health says so — simplest
-        # correct alternation is direct, proxy, direct, ...
-        rescue_direct = (rescue_count % 2 == 1)
+        route_step = max_attempts + rescue_count - 1 if direct_first else rescue_count - 1
+        rescue_direct = route_step % 2 == 0
         delay = _universal_rescue_backoff_seconds(rescue_count)
         if delay > 0:
             time.sleep(delay)
@@ -2621,7 +2614,7 @@ def _discover_source_query(
     gallery_cmd: Optional[List[str]] = None,
     max_timeout: Optional[int] = None,
     wait_until_complete: bool = False,
-    direct: bool = False,
+    direct: Optional[bool] = None,
     universal_bounded: bool = False,
     q_idx: int = 0,
     scene_index: Optional[int] = None,
@@ -2653,6 +2646,8 @@ def _discover_source_query(
         return _discover_gallery_urls(
             source_name, query, gallery_cmd, max_timeout=max_timeout,
         )
+    if direct is None:
+        direct = web_direct_first()
     if source_type == "hybrid":
         return _call_with_direct(_discover_hybrid_urls, source_name, query, direct=direct)
     if source_type == "flickr_api":
@@ -5824,8 +5819,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             # Route-switching retry (Nov 18, web-resilience): the
             # api/hybrid/flickr_api lanes had no retry at all. When a lane
             # comes back empty AND recorded a provider failure during the
-            # call (a transport/bot-gate error, not an answer), retry it
-            # once direct with a jittered backoff. A genuine empty answer
+            # call, retry once using the alternate route. A genuine empty answer
             # — the lane answered, no failure recorded — is never retried.
             # The universal lane is excluded: it already retries plus a
             # rescue pass inside _discover_universal_urls.
@@ -5844,7 +5838,8 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 and hasattr(source_health, "failure_count")
                 else None
             )
-            rows = _call_discover(direct=False)
+            direct_first = web_direct_first()
+            rows = _call_discover(direct=direct_first)
             if (
                 rows
                 or source_type not in ("api", "hybrid", "flickr_api")
@@ -5860,9 +5855,10 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 time.sleep(delay)
             _web_log(
                 f"{source_name} '{q_str[:30]}': empty after provider error; "
-                "retrying once direct (route switch)"
+                f"retrying once via {'proxy' if direct_first else 'direct'}"
             )
-            rows = _call_discover(direct=True)
+            if not _deadline_reached():
+                rows = _call_discover(direct=not direct_first)
             _note_fetch_outcome(source_name, rows, health_before)
             return rows
 

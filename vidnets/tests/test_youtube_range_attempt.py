@@ -69,26 +69,80 @@ def test_range_attempt_runs_yt_dlp_and_delivers_local_media(tmp_path):
     assert list(tmp_path.glob(".yt-attempt-*")) == []
 
 
-def test_pre_transfer_failure_does_not_try_another_session_or_format(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("session_status", "require_session", "expected_routes"), [
+    ("verified", "0", ["signed_in", "public"]),
+    ("unverified", "0", ["public"]),
+    ("verified", "1", ["signed_in"]),
+])
+def test_pre_transfer_timeout_uses_one_bounded_public_attempt(
+    tmp_path, monkeypatch, session_status, require_session, expected_routes,
+):
     class RealPackage:
         __path__ = ["yt_dlp"]
 
     monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
     monkeypatch.setattr(pipeline, "_current_youtube_network_diagnostic", lambda: {})
     monkeypatch.setattr("services.yt_dlp_runtime.load_yt_dlp", RealPackage)
+    monkeypatch.setenv("VIDZEO_YT_REQUIRE_SESSION", require_session)
+    monkeypatch.setenv("VIDZEO_YT_DOWNLOAD_ANON_FALLBACK", "1")
+    monkeypatch.setenv("VIDZEO_YT_PER_CLIP_TIMEOUT", "45")
+    monkeypatch.setenv("VIDZEO_YT_CLIP_GRACE_SECONDS", "20")
+    monkeypatch.setenv("VIDZEO_YT_RANGE_EXTRACTION_TIMEOUT_SECONDS", "40")
+    monkeypatch.setattr(pipeline, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
     calls = []
 
     def stall(options, _url, _clients, jar, _ranges, **kwargs):
-        calls.append((options["format"], jar))
+        calls.append((
+            options["format"], "public" if jar is None else "signed_in",
+            kwargs["extraction_seconds"], kwargs["deadline"],
+        ))
         raise ranged.YouTubeExtractionTimeout("youtube_extraction_timeout_after_40s")
 
     monkeypatch.setattr(pipeline, "download_range_attempt", stall)
     jar = ranged._cookie_jar([])
+    jar._vidzeo_session_status = session_status
     candidate = {"id": "fixture", "url": "https://www.youtube.com/watch?v=fixture"}
     assert not pipeline._download_clip(candidate, tmp_path / "clip.mp4", 5, 3, session_jar=jar)
-    assert len(calls) == 1 and calls[0][1] is jar
+    assert [call[1] for call in calls] == expected_routes
+    assert len({(call[0], call[3]) for call in calls}) == 1
+    if expected_routes == ["signed_in", "public"]:
+        assert [call[2] for call in calls] == [10.0, 55.0]
     assert candidate["_transport_failure"] == "youtube_extraction_timeout"
+    assert pipeline._ANON_DOWNLOAD_THROTTLE_UNTIL == 0.0
 
+
+@pytest.mark.parametrize("public_error", [None, "login required", "Sign in to confirm you're not a bot"])
+def test_unverified_session_uses_signed_in_attempt_only_if_public_requires_login(
+    tmp_path, monkeypatch, public_error,
+):
+    monkeypatch.setenv("VIDZEO_YT_REQUIRE_SESSION", "0")
+    monkeypatch.setenv("VIDZEO_YT_DOWNLOAD_ANON_FALLBACK", "1")
+    monkeypatch.setattr(pipeline, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
+    persisted = []
+    monkeypatch.setattr(pipeline, "_persist_youtube_session_cookies", lambda used, _: persisted.append(used))
+    jar = ranged._cookie_jar([])
+    jar._vidzeo_session_status = "unverified"
+    attempts = []
+
+    def download(_opts, session):
+        attempts.append(session)
+        if session is None and public_error:
+            raise RuntimeError(public_error)
+        return session
+
+    def run():
+        pipeline._download_with_youtube_session(
+            None, {}, "https://www.youtube.com/watch?v=fixture", jar, None, tmp_path,
+            "clip.raw.", attempt_runner=download,
+        )
+
+    if public_error and "not a bot" in public_error:
+        with pytest.raises(RuntimeError, match="not a bot"):
+            run()
+    else:
+        run()
+    assert attempts == ([None, jar] if public_error == "login required" else [None])
+    assert persisted == ([jar] if public_error == "login required" else [])
 
 
 def test_worker_passes_requested_range_and_cookie_in_memory(tmp_path, monkeypatch):

@@ -86,7 +86,12 @@ def _install_fake_scraper(monkeypatch, search_fn, rescue_attempts="0"):
     monkeypatch.setattr(resolver, "_report_provider_failure", lambda *_args: None)
 
 
-def test_retry_fires_on_transient_failure_then_returns_rows(monkeypatch):
+@pytest.mark.parametrize(("direct_first", "route_order"), [
+    ("0", [False, True]),
+    ("1", [True, False]),
+])
+def test_retry_fires_on_transient_failure_then_returns_rows(monkeypatch, direct_first, route_order):
+    monkeypatch.setenv("VIDZEO_WEB_DIRECT_FIRST", direct_first)
     calls = []
 
     def search(query, **options):
@@ -103,8 +108,7 @@ def test_retry_fires_on_transient_failure_then_returns_rows(monkeypatch):
     _install_fake_scraper(monkeypatch, search)
     rows = resolver._discover_universal_urls("Moon phases")
     assert [row["url"] for row in rows] == ["https://images.example/moon.jpg"]
-    # Two attempts: first via proxy, second direct (explicit direct=).
-    assert calls == [False, True]
+    assert calls == route_order
 
 
 def test_retry_is_bounded_on_persistent_failure(monkeypatch):

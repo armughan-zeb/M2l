@@ -2494,6 +2494,7 @@ def _get_authenticated_youtube_session(
                 status = str(snap[index].get("status") or "") if 0 <= index < len(snap) else ""
             except Exception:
                 status = ""
+            adapted._vidzeo_session_status = status
             if status and status != "verified":
                 print(f"   [yt-v2] YouTube cookies attached best-effort (account {index + 1} reports {status}); YouTube may still throttle", flush=True)
             else:
@@ -2856,7 +2857,9 @@ _ANON_DOWNLOAD_THROTTLE_UNTIL = 0.0
 
 
 def _anon_download_fallback_ready() -> bool:
-    """True when anonymous tv_embedded fallback is enabled and not cooled-down."""
+    """Whether public downloads are allowed and the anonymous path is ready."""
+    if os.environ.get("VIDZEO_YT_REQUIRE_SESSION", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
     if str(os.environ.get("VIDZEO_YT_DOWNLOAD_ANON_FALLBACK", "1") or "1").strip().lower() in {
         "0", "false", "off", "no",
     }:
@@ -2874,6 +2877,24 @@ def _mark_anon_download_throttled(cooldown_seconds: float = 120.0) -> None:
         )
 
 
+def _note_public_download_failure(detail: str) -> None:
+    if any(marker in detail for marker in (
+        "youtube_zero_byte_stall", "http error 429", "too many requests", "not a bot",
+    )):
+        _mark_anon_download_throttled()
+
+
+def _youtube_login_required(detail: str) -> bool:
+    return "not a bot" not in detail and any(phrase in detail for phrase in (
+        "sign in to confirm your age", "age-restricted", "login required",
+        "sign in to view", "sign in to watch", "please sign in",
+    ))
+
+
+def _youtube_range_prefers_public(jar: Any) -> bool:
+    return getattr(jar, "_vidzeo_session_status", "") in {"unverified", "signed_out"}
+
+
 def _download_with_youtube_session(
     yt_dlp,
     opts,
@@ -2886,7 +2907,7 @@ def _download_with_youtube_session(
     on_retry_reset=None,
     attempt_runner=None,
 ):
-    """Retry sign-in requirements and throttled transfers across accounts or clients."""
+    """Select a session and recover with bounded alternate attempts."""
     def download(jar):
         if cancellation is not None:
             cancellation.raise_if_cancelled()
@@ -2917,19 +2938,31 @@ def _download_with_youtube_session(
         if callable(on_retry_reset):
             on_retry_reset()
 
+    tried_public = (
+        attempt_runner is not None
+        and _youtube_range_prefers_public(session_jar)
+        and _anon_download_fallback_ready()
+    )
+    if tried_public:
+        try:
+            print("   [yt-session] session unverified; trying public playback first", flush=True)
+            download(None)
+            return
+        except Exception as exc:
+            detail = str(exc).casefold()
+            _note_public_download_failure(detail)
+            if not _youtube_login_required(detail):
+                raise
+            _reset_and_clean()
+
     try:
         used_jar = download(session_jar)
         _persist_youtube_session_cookies(used_jar, session_jar)
-    except YouTubeExtractionTimeout:
-        # A pre-transfer timeout gives no evidence of an account throttle.
-        raise
     except Exception as exc:
         pool = getattr(session_jar, "_vidzeo_session_pool", None)
         detail = str(exc).casefold()
-        sign_in = any(phrase in detail for phrase in (
-            "sign in to confirm your age", "age-restricted", "login required",
-            "sign in to view", "sign in to watch",
-        ))
+        sign_in = _youtube_login_required(detail)
+        extraction_timeout = isinstance(exc, YouTubeExtractionTimeout)
         zero_byte_stalled = "youtube_zero_byte_stall" in detail
         throttled = zero_byte_stalled or any(phrase in detail for phrase in (
             "too many requests", "http error 429", "429", "ipblocked",
@@ -2964,25 +2997,34 @@ def _download_with_youtube_session(
                 _persist_youtube_session_cookies(used_backup, pool=pool, index=index)
                 return
 
-        # 2. If authenticated web/tv_samsung stalled or throttled and no other
-        #    account is available, try one bounded anonymous tv_embedded
-        #    attempt (separate InnerTube client, avoids heated account window).
+        # An extraction timeout is a failed attempt before transfer. Public
+        # footage gets one anonymous attempt on the same configured route.
         if (
             session_jar is not None
+            and not tried_public
             and not sign_in
             and "not a bot" not in detail
-            and (throttled or transport_timeout)
+            and (extraction_timeout or throttled or transport_timeout)
             and _anon_download_fallback_ready()
         ):
             _reset_and_clean()
-            print("   [yt-session] authenticated transfer stalled/throttled; trying anonymous tv_embedded fallback", flush=True)
+            phase = "extraction timed out" if extraction_timeout else "transfer stalled or was throttled"
+            print(f"   [yt-session] authenticated {phase}; trying public playback once", flush=True)
             try:
                 download(None)
                 return
             except Exception as anon_exc:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled()
                 anon_detail = str(anon_exc).casefold()
-                if any(tok in anon_detail for tok in ("youtube_zero_byte_stall", "429", "too many requests", "timeout", "timed out", "bot")):
-                    _mark_anon_download_throttled(120.0)
+                _note_public_download_failure(anon_detail)
+                if extraction_timeout and (
+                    isinstance(anon_exc, TimeoutError)
+                    or _youtube_host_dns_failure(anon_exc)
+                    or _youtube_login_required(anon_detail)
+                    or "not a bot" in anon_detail
+                ):
+                    raise anon_exc from exc
                 raise exc from anon_exc
         raise
 
@@ -5348,6 +5390,7 @@ def _download_clip(
         )))
     except (TypeError, ValueError):
         extraction_seconds = 40.0
+    public_attempt_reserve = 55.0
 
     def _remaining_clip_timeout() -> float:
         remaining = clip_deadline - time.monotonic()
@@ -5461,10 +5504,21 @@ def _download_clip(
         stall_watchdog.start()
 
         def run_ranged_attempt(attempt_opts, jar):
+            extraction_wall = extraction_seconds
+            if jar is None:
+                # Direct-mode observations put successful public clips near
+                # 50s end to end. The total clip deadline still caps this.
+                extraction_wall = max(extraction_wall, public_attempt_reserve)
+            elif not _youtube_range_prefers_public(session_jar) and _anon_download_fallback_ready():
+                # Give a public retry time to extract and transfer inside
+                # this clip's original wall, even in a tight wave.
+                extraction_wall = min(
+                    extraction_wall, max(10.0, _remaining_clip_timeout() - public_attempt_reserve),
+                )
             return download_range_attempt(
                 attempt_opts, url, attempt_opts["extractor_args"]["youtube"]["player_client"],
                 jar, [(range_start, range_end)], work_dir=output_path.parent,
-                extraction_seconds=extraction_seconds, deadline=clip_deadline,
+                extraction_seconds=extraction_wall, deadline=clip_deadline,
                 cancellation=cancellation, check_transfer=lambda: _download_progress(None),
                 on_process=stall_watchdog.bind_attempt,
             )

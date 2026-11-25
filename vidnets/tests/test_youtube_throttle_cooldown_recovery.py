@@ -118,15 +118,18 @@ def test_download_with_session_rotates_on_zero_byte_stall(tmp_path):
     assert len(reset_calls) == 1
 
 
-def test_download_with_session_falls_back_to_anon_tv_embedded(tmp_path):
-    """When no backup verified account exists, a 0-byte stall falls back once
-    to anonymous tv_embedded (jar=None)."""
-    ytv2._ANON_DOWNLOAD_THROTTLE_UNTIL = 0.0
+@pytest.mark.parametrize("failure", [
+    TimeoutError("youtube_zero_byte_stall"),
+    ytv2.YouTubeExtractionTimeout("youtube_extraction_timeout_after_40s"),
+])
+def test_download_with_session_falls_back_to_anon_tv_embedded(tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(ytv2, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
     clients_seen = []
+    throttle_marks = []
 
     class _Pool:
         def mark_throttled(self, index, reason=""):
-            pass
+            throttle_marks.append((index, reason))
 
         def next_verified(self, after=-1):
             return (-1, None)
@@ -145,7 +148,7 @@ def test_download_with_session_falls_back_to_anon_tv_embedded(tmp_path):
         def download(self, urls):
             clients_seen.append(list(self.opts["extractor_args"]["youtube"]["player_client"]))
             if len(clients_seen) == 1:
-                raise TimeoutError("youtube_zero_byte_stall")
+                raise failure
 
     class _Mod:
         def YoutubeDL(self, opts):
@@ -163,8 +166,11 @@ def test_download_with_session_falls_back_to_anon_tv_embedded(tmp_path):
         tmp_path,
         "raw_",
     )
-    assert clients_seen[0] == ["web", "tv_samsung"]
-    assert clients_seen[1] == ["tv_embedded"]
+    assert clients_seen == [["web", "tv_samsung"], ["tv_embedded"]]
+    if isinstance(failure, ytv2.YouTubeExtractionTimeout):
+        assert throttle_marks == []
+    else:
+        assert throttle_marks == [(0, "youtube-throttled")]
 
 
 def test_zero_byte_watchdog_kills_hung_ffmpeg_child(tmp_path):

@@ -116,7 +116,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from services.sources import OpenverseSource, WikimediaSource
 
-from .runtime import _web_log
+from .runtime import _web_log, web_direct_first
 
 
 # ---------------------------------------------------------------------------
@@ -153,9 +153,8 @@ def muse_search_openverse_direct_first() -> bool:
     # Round 4: proxy-first is the default — live probes (Nov 23) show
     # direct TCP never completes on this egress, so direct-first burns
     # the whole adapter timeout on a dead route before proxy is tried.
-    return str(
-        os.environ.get("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", "proxy") or "proxy"
-    ).strip().lower() != "proxy"
+    route = os.environ.get("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", "").strip().lower()
+    return route != "proxy" if route else web_direct_first()
 
 
 def muse_search_direct_retry_enabled() -> bool:
@@ -165,9 +164,8 @@ def muse_search_direct_retry_enabled() -> bool:
     so retrying on it is pure waste. Re-enable with
     ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY=1`` only if direct recovers.
     """
-    return str(
-        os.environ.get("VIDZEO_MUSE_SEARCH_DIRECT_RETRY", "0") or "0"
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    configured = os.environ.get("VIDZEO_MUSE_SEARCH_DIRECT_RETRY", "").strip().lower()
+    return configured in {"1", "true", "yes", "on"} if configured else web_direct_first()
 
 
 def muse_search_openverse_grace_seconds() -> float:
@@ -558,6 +556,7 @@ class MuseSearchManager:
             if self._wave_seconds_override is not None
             else muse_search_wave_seconds()
         )
+        wikimedia_direct_first = web_direct_first()
         openverse_direct_first = (
             self._openverse_direct_first_override
             if self._openverse_direct_first_override is not None
@@ -620,7 +619,7 @@ class MuseSearchManager:
                 if "wikimedia" in providers:
                     wikimedia_future = phase_pool.submit(
                         self._search_one, "wikimedia", clean, limit_per_source,
-                        direct_first=False, timeout=timeout,
+                        direct_first=wikimedia_direct_first, timeout=timeout,
                     )
                     futures[wikimedia_future] = "wikimedia"
                     submitted.add("wikimedia")
@@ -657,7 +656,7 @@ class MuseSearchManager:
                         except Exception:
                             results["wikimedia"] = (
                                 "wikimedia", [], time.monotonic() - started,
-                                "proxy", 0, True,
+                                "direct" if wikimedia_direct_first else "proxy", 0, True,
                             )
                 # Phase 2 — Openverse (secondary) gets the remaining
                 # deadline, capped by the grace once Wikimedia already
