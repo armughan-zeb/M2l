@@ -6015,9 +6015,9 @@ def resolve_existing_provider_branches_v2(
         allow_empty_retry = str(
             config.get(
                 "yt_transport_retry_after_empty",
-                os.environ.get("VIDZEO_YT_TRANSPORT_RETRY_AFTER_EMPTY", "0"),
+                os.environ.get("VIDZEO_YT_TRANSPORT_RETRY_AFTER_EMPTY", "1"),
             )
-            or "0"
+            or "1"
         ).strip().lower() in {"1", "true", "yes", "on"}
         if resolved == 0 and attempt_count == 0 and time.monotonic() - started <= 45.0:
             if not pipeline_v2_active or allow_empty_retry:
@@ -6452,7 +6452,7 @@ def resolve_existing_provider_branches_v2(
                 if soft_admitted:
                     hard_reason = ""
                 elif hard_reason in {"static_image_or_pan", "static_pan", "static_frame_hold", "still_or_slideshow"}:
-                    lenient = bool(config.get("yt_lenient_acceptance")) or str(os.environ.get("VIDZEO_YT_LENIENT_ACCEPTANCE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                    lenient = bool(config.get("yt_lenient_acceptance")) or str(os.environ.get("VIDZEO_YT_LENIENT_ACCEPTANCE", "1")).strip().lower() in {"1", "true", "yes", "on"}
                     if lenient or gaming_lane:
                         hard_reason = ""
             if not hard_reason and overlay.get("reject"):
@@ -6474,7 +6474,7 @@ def resolve_existing_provider_branches_v2(
                         or str(os.environ.get("VIDZEO_YT_ALLOW_BOUNDED_CAPTION_BLUR", "0")).strip().lower() in {"1", "true", "yes", "on"}
                     )
                 )
-                lenient = bool(config.get("yt_lenient_acceptance")) or str(os.environ.get("VIDZEO_YT_LENIENT_ACCEPTANCE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                lenient = bool(config.get("yt_lenient_acceptance")) or str(os.environ.get("VIDZEO_YT_LENIENT_ACCEPTANCE", "1")).strip().lower() in {"1", "true", "yes", "on"}
                 if remediated_caption or (lenient and rej_reason in {"overlay_blur_failed", "watermark_rejected", "overlay_rejected", "burned_in_text_overlay_rejected", "caption_overlay_rejected"}):
                     hard_reason = ""
                 elif gaming_lane and rej_reason in {"caption_overlay_rejected", "burned_in_text_overlay_rejected", "watermark_rejected", "overlay_rejected"}:

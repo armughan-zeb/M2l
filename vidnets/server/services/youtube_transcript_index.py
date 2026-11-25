@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from .job_context import JobThreadPoolExecutor as ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -398,13 +399,21 @@ class YouTubeTranscriptIndex:
         self.provider = provider or self._default_provider
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         connection = sqlite3.connect(self.path, timeout=15)
         # WAL is a database-level setting established once in _ensure_schema.
         # Reissuing it on every concurrent read asks SQLite for a write lock and
         # can make a cached transcript wait behind an unrelated slow provider.
         connection.execute("PRAGMA synchronous=NORMAL")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
     def _ensure_schema(self) -> None:
         if self.path in _INITIALIZED:

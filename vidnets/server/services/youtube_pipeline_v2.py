@@ -147,10 +147,9 @@ def _record_youtube_network_failure(stage: str, error: Any = '') -> Dict[str, st
         code = 'youtube_transport_unavailable'
         message = 'YouTube transport failed; inspect the stage log for the provider error.'
     diagnostic = {'code': code, 'stage': str(stage or 'retrieval'), 'message': message}
-    if code not in {
-        'network_disabled_by_sandbox', 'dns_resolution_failed',
-        'outbound_network_unavailable',
-    }:
+    # Only latch process-wide if outbound networking is explicitly disabled by sandbox runtime policy.
+    # On real cloud/worker VMs, transient DNS or socket errors must never permanently disable YouTube.
+    if code != 'network_disabled_by_sandbox':
         return diagnostic
     with _YT_NETWORK_DIAGNOSTIC_LOCK:
         if not _YT_NETWORK_DIAGNOSTIC:
@@ -6688,27 +6687,53 @@ def _search_container_pools(
         max_workers=max_workers,
         cancellation=cancellation,
     )
-    if timed_out and not any(pools.values()) and session_jar is not None and _retry_timeout > 0:
-        # Authenticated fan-out can stall behind YouTube throttling.  A second,
-        # anonymous pass is much faster under load and directly recovers the
-        # zero-candidate failure mode without burning the branch budget twice.
-        print(
-            "   [yt-v2] pool search timed out with 0 candidates; retrying anonymously "
-            "(detected IP throttling: repeat queries are served from the local search cache)",
-            flush=True,
-        )
-        _retry_timed_out, pools = _run_pool_search_pass(
-            jobs,
-            session_jar=None,
-            search_timeout=_retry_timeout,
-            max_workers=max_workers,
-            cancellation=cancellation,
-        )
-        if _retry_timed_out:
-            print(f"   [yt-v2] anonymous retry also timed out ({_retry_timeout:.0f}s); "
-                  f"continuing with {sum(len(v) for v in pools.values())} candidate(s)")
+    _retry_margin = (
+        _retry_timeout
+        if _retry_timeout > 0
+        else (max(15.0, min(_retry_budget, 30.0)) if _retry_budget > 0 else 0.0)
+    )
+    _empty_jobs = [(k, q) for k, q in jobs if not pools.get(k)]
+    if _empty_jobs and session_jar is not None and _retry_margin > 0:
+        # Authenticated fan-out can stall behind YouTube throttling or session rejection.
+        # A second, anonymous pass is much faster under load and directly recovers empty
+        # container pools without burning the branch budget twice.
+        if not any(pools.values()):
+            print(
+                "   [yt-v2] pool search yielded 0 candidates; retrying anonymously "
+                "(detected IP throttling: repeat queries are served from the local search cache)",
+                flush=True,
+            )
+            _retry_timed_out, pools = _run_pool_search_pass(
+                jobs,
+                session_jar=None,
+                search_timeout=_retry_margin,
+                max_workers=max_workers,
+                cancellation=cancellation,
+            )
+            if _retry_timed_out:
+                print(f"   [yt-v2] anonymous retry also timed out ({_retry_margin:.0f}s); "
+                      f"continuing with {sum(len(v) for v in pools.values())} candidate(s)")
+            else:
+                print(f"   [yt-v2] anonymous retry recovered {sum(len(v) for v in pools.values())} candidate(s)")
         else:
-            print(f"   [yt-v2] anonymous retry recovered {sum(len(v) for v in pools.values())} candidate(s)")
+            print(
+                f"   [yt-v2] retrying {len(_empty_jobs)} empty pool query(ies) anonymously",
+                flush=True,
+            )
+            _retry_timed_out, _partial_pools = _run_pool_search_pass(
+                _empty_jobs,
+                session_jar=None,
+                search_timeout=_retry_margin,
+                max_workers=max_workers,
+                cancellation=cancellation,
+            )
+            _recovered_partial = 0
+            for _k, _vals in _partial_pools.items():
+                if _vals and not pools.get(_k):
+                    pools[_k] = _vals
+                    _recovered_partial += len(_vals)
+            if _recovered_partial:
+                print(f"   [yt-v2] partial anonymous retry recovered {_recovered_partial} candidate(s)", flush=True)
     elif timed_out:
         print(
             f"   [yt-v2] search timeout; continuing with {sum(len(v) for v in pools.values())} candidate(s) "

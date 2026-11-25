@@ -5019,7 +5019,17 @@ def resolve_storyboard_media_v2(
     discovery_absolute_deadline_at = started_at + max(1.0, effective_wall)
     deadline_at = started_at + max(1.0, effective_wall - capped_reserve)
     try:
-        web_fallback_grace = max(0.0, min(300.0, float(web_fallback_grace_seconds or 0.0)))
+        web_fallback_grace = max(
+            0.0,
+            min(
+                300.0,
+                float(
+                    web_fallback_grace_seconds
+                    if web_fallback_grace_seconds is not None
+                    else (os.environ.get("VIDZEO_WEB_FALLBACK_GRACE_SECONDS") or 0.0)
+                ),
+            ),
+        )
     except (TypeError, ValueError):
         web_fallback_grace = 0.0
     # Round 12 (Nov 23, user order: no timeouts at all for the web
@@ -6467,6 +6477,11 @@ def resolve_storyboard_media_v2(
                         timeout=_remaining
                     )
                     gated_outcomes.setdefault((_pidx, _ppath), _outcome)
+                    if not _outcome[2] and _outcome[3] != "skipped_after_media_deadline":
+                        for _c in discovered.get(_pidx, []):
+                            if str(_c.get("path") or "") == _ppath and _normalize_candidate_source(_c) == "youtube":
+                                rejected_youtube_indices.add(_pidx)
+                                break
                 except Exception:
                     continue
         finally:
@@ -7022,14 +7037,18 @@ def resolve_storyboard_media_v2(
                         verified, verify_reason, visual_score, qwen = cached_verdict
                     elif not _quota_clip_budget_open(index, source):
                         verified, verify_reason, visual_score, qwen = (
-                            False, "skipped_after_scene_budget", 0.0,
+                            False,
+                            "skipped_after_scene_budget",
+                            0.0,
                             {"accepted": False, "status": "deadline_exceeded",
                              "reason": "skipped_after_scene_budget",
                              "visual_checked": False},
                         )
                     elif not vision_start_allowed(index):
                         verified, verify_reason, visual_score, qwen = (
-                            False, "skipped_after_vision_start_budget", 0.0,
+                            False,
+                            "skipped_after_vision_start_budget",
+                            0.0,
                             {"accepted": False, "status": "deadline_exceeded",
                              "reason": "skipped_after_vision_start_budget",
                              "visual_checked": False},
@@ -7043,7 +7062,9 @@ def resolve_storyboard_media_v2(
                         )
                     else:
                         verified, verify_reason, visual_score, qwen = (
-                            False, "skipped_after_media_deadline", 0.0,
+                            False,
+                            "skipped_after_media_deadline",
+                            0.0,
                             {"accepted": False, "status": "deadline_exceeded",
                              "reason": "skipped_after_media_deadline",
                              "visual_checked": False},
@@ -7288,7 +7309,7 @@ def resolve_storyboard_media_v2(
             specs = [(source, lane) for source, lane in _compute_cross_lane_specs(index) if lane is not None]
             # Preserve quota preference. Other scenes can use whichever real
             # provider has already returned a candidate without waiting twice.
-            if adaptive_media_review and not _source_policy_value(scene, "youtube_quota", False):
+            if adaptive_media_review:
                 futures = {recovery_futures[index, source]: source for source, _ in specs
                            if (index, source) in recovery_futures}
                 if futures and not any(future.done() for future in futures):
@@ -7297,15 +7318,19 @@ def resolve_storyboard_media_v2(
                     # wait(timeout=inf) raises OverflowError on pending
                     # futures.
                     _adaptive_timeout = web_fallback_deadline_at - time.monotonic()
+                    _wait_cap = 15.0 if _source_policy_value(scene, "youtube_quota", False) else _adaptive_timeout
                     wait(futures,
                          timeout=(
                              None
                              if math.isinf(_adaptive_timeout)
-                             else max(0.0, _adaptive_timeout)
+                             else max(0.0, min(_adaptive_timeout, _wait_cap))
                          ),
                          return_when=FIRST_COMPLETED)
                 ready = {source for future, source in futures.items() if future.done()}
-                specs.sort(key=lambda spec: spec[0] not in ready)
+                if _source_policy_value(scene, "youtube_quota", False) and "youtube" in ready:
+                    specs.sort(key=lambda spec: spec[0] != "youtube")
+                else:
+                    specs.sort(key=lambda spec: spec[0] not in ready)
             for source, lane in specs:
                 consider_recovery(source, lane, "cross_lane_fallback")
                 if accepted:
@@ -8216,11 +8241,16 @@ def resolve_storyboard_media_v2(
                         requirement = scene.get('visual_requirement') or {}
                         if ((isinstance(requirement, Mapping) and requirement.get('strict_identity'))
                                 or scene_requires_visual_verification(scene)) and not _review_bound_to_scene(scene, cand_res):
-                            attempts[index].append({
-                                'source': cand_res.provider, 'stage': 'nearest_verified_neighbor_reuse',
-                                'status': 'rejected_unbound_pixel_review', 'reused_scene_index': target_idx,
-                            })
-                            continue
+                            conflict = bool(
+                                (cand_res.visual_decision or {}).get("entity_conflict")
+                                or (cand_res.visual_decision or {}).get("fatal_mismatch")
+                            )
+                            if conflict:
+                                attempts[index].append({
+                                    'source': cand_res.provider, 'stage': 'nearest_verified_neighbor_reuse',
+                                    'status': 'rejected_unbound_pixel_review', 'reused_scene_index': target_idx,
+                                })
+                                continue
                         nearest_verified_path = str(p)
                         nearest_verified_type = cand_res.media_type or ("video" if p.suffix.lower() in {".mp4", ".webm", ".mov"} else "image")
                         nearest_verified_identity = asset_identity
@@ -8693,14 +8723,14 @@ def resolve_storyboard_media_v2(
     # Bismarck/Titanic detail scene has a verified, topic-correct frame.
     for index, scene in enumerate(rows):
         current = resolutions.get(index)
-        if current is None or current.provider != "neutral" or not scene.get("positive_subjects"):
+        if current is None or current.provider not in {"neutral", "graphic"} or not scene.get("positive_subjects"):
             continue
         container_id = str(scene.get("container_id") or "")
         candidates = [
             (abs(other_index - index), other_index, resolution)
             for other_index, resolution in resolutions.items()
             if other_index != index
-            and resolution.provider != "neutral"
+            and resolution.provider not in {"neutral", "graphic"}
             and resolution.container_id == container_id
             and (
                 not _is_web_source(resolution)
@@ -10011,7 +10041,9 @@ def resolve_storyboard_media_v2(
                             v_verified = bool(v_qwen.get("accepted") or str(v_qwen.get("status") or "").lower() in {"accepted", "pass", "keep", "soft_visual_pass", "deterministic_degraded"})
                             v_score = float(v_qwen.get("final_score") or v_qwen.get("score") or 0.0)
                     if isinstance(v_qwen, Mapping):
-                        if v_qwen.get("unsafe_content") or v_qwen.get("suggestive_content"):
+                        if v_qwen.get("unsafe_content") or v_qwen.get("suggestive_content") or v_qwen.get("watermark"):
+                            continue
+                        if v_qwen.get("visual_checked") and not v_qwen.get("accepted"):
                             continue
                         from .visual_intelligence.semantic_guard import explicit_scene_conflict
                         if explicit_scene_conflict(v_qwen, relaxed=True, scene=_scene):
@@ -10282,7 +10314,11 @@ def resolve_storyboard_media_v2(
             )
             if not chosen_verified and strict_scene:
                 chosen_has_file = bool(chosen_path and Path(chosen_path).is_file() and Path(chosen_path).stat().st_size > 0)
-                conflict = bool(chosen_cand.get("entity_conflict") or chosen_cand.get("fatal_mismatch"))
+                conflict = bool(
+                    chosen_cand.get("entity_conflict")
+                    or chosen_cand.get("fatal_mismatch")
+                    or (isinstance(chosen_qwen, Mapping) and (chosen_qwen.get("watermark") or (chosen_qwen.get("visual_checked") and not chosen_qwen.get("accepted"))))
+                )
                 if chosen_has_file and not conflict:
                     chosen_verified = True
                     chosen_score = max(chosen_score, 60.0)

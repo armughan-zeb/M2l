@@ -6271,7 +6271,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             if wait_until_complete:
                 query_deadline = float("inf")
             else:
-                default_query_seconds = 10.0 if fast_mode else 15.0
+                default_query_seconds = 15.0 if fast_mode else 30.0
                 query_seconds = _bounded_web_seconds(
                     query_seconds_override
                     if query_seconds_override is not None

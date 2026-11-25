@@ -852,8 +852,16 @@ def _discover_cookie_dir_paths(cookie_dir: Any = None) -> List[Path]:
     if configured:
         roots.append(Path(configured).expanduser())
     try:
-        repo_root = Path(__file__).resolve().parents[3]
-        roots.append(repo_root / "cookies.d")
+        vidnets_root = Path(__file__).resolve().parents[2]
+        repo_root = vidnets_root.parent
+        roots.extend([
+            repo_root / "cookies.d",
+            vidnets_root / "cookies.d",
+            Path.cwd() / "cookies.d",
+            repo_root / "cookies",
+            vidnets_root / "cookies",
+            Path.cwd() / "cookies",
+        ])
     except (IndexError, RuntimeError):
         pass
     found: List[Path] = []
@@ -934,23 +942,51 @@ def _cookie_pool_retry_delay_seconds(status: str, *, transient: bool = False) ->
 
 
 def _default_cookie_file_paths() -> List[Path]:
-    """Hardcoded fallback: the operator-shared cookies at the repo root.
+    """Hardcoded fallback: operator-supplied cookies in repo root, vidnets root, or cwd.
 
-    The cookies the operator shares live at ``<repo>/cookies.json``.
-    They must be picked up even when no ``VIDZEO_YT_COOKIE_FILES`` env
-    var is set (fresh machine, lost .env line): the pipeline should
-    use the shared cookies with zero configuration.
+    The cookies the operator shares live at cookies.txt or cookies.json.
+    They must be picked up even when no VIDZEO_YT_COOKIE_FILES env
+    var is set (fresh machine, cloud worker VM, lost .env line): the pipeline
+    should discover available cookies with zero configuration.
     """
+    paths: List[Path] = []
+    seen = set()
     try:
-        candidate = Path(__file__).resolve().parents[3] / "cookies.json"
+        vidnets_root = Path(__file__).resolve().parents[2]
+        repo_root = vidnets_root.parent
     except (IndexError, RuntimeError):
-        return []
-    try:
-        if candidate.is_file():
-            return [candidate]
-    except OSError:
-        pass
-    return []
+        vidnets_root = None
+        repo_root = None
+
+    candidates: List[Path] = [
+        Path.cwd() / "cookies.txt",
+        Path.cwd() / "cookies.json",
+    ]
+    if vidnets_root:
+        candidates.extend([
+            vidnets_root / "cookies.txt",
+            vidnets_root / "cookies.json",
+        ])
+    if repo_root:
+        candidates.extend([
+            repo_root / "cookies.txt",
+            repo_root / "cookies.json",
+            repo_root.parent / "cookies.txt",
+            repo_root.parent / "cookies.json",
+            repo_root.parent / "Management" / "YT CMS" / "cookies.txt",
+            repo_root.parent / "Management" / "YT CMS" / "cookies.json",
+        ])
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                resolved = str(candidate.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    paths.append(candidate)
+        except OSError:
+            pass
+    return paths
 
 
 class ConfiguredYouTubeSessions:
@@ -1315,7 +1351,14 @@ def get_configured_pool(setting: Any = None) -> ConfiguredYouTubeSessions:
     with _LOCK:
         raw_setting = "" if setting is None else str(setting)
         if setting is None:
-            raw_setting = str(os.environ.get("VIDZEO_YT_COOKIE_FILES") or "").strip()
+            raw_setting = (
+                str(os.environ.get("VIDZEO_YT_COOKIE_FILES") or "").strip()
+                or str(os.environ.get("VIDZEO_YT_COOKIES_FILE") or "").strip()
+                or str(os.environ.get("VIDZEO_YT_COOKIES_PATH") or "").strip()
+                or str(os.environ.get("VIDZEO_YT_COOKIE_FILE") or "").strip()
+                or str(os.environ.get("MUSE_YOUTUBE_COOKIES_PATH") or "").strip()
+                or str(os.environ.get("MUSE_COOKIES_PATH") or "").strip()
+            )
         dir_files = tuple(str(path) for path in _discover_cookie_dir_paths())
         key = (raw_setting, dir_files)
         if _CONFIGURED_POOL is None or _CONFIGURED_POOL_KEY != key:
@@ -1361,7 +1404,22 @@ def _verify_and_install(
     # Keep only the non-sensitive probe label on the caller's metadata. This
     # makes rejected imports diagnosable while cookie values remain private.
     meta["verification"] = verification
-    if verified is False or (verified is None and _require_auth_probe()):
+    if verified is False:
+        return None
+    if verified is None and _require_auth_probe():
+        if _jar_is_authenticated(jar) and not str(os.environ.get("VIDZEO_YT_STRICT_AUTH_PROBE", "0")).lower() in {"1", "true"}:
+            # Best-effort fallback on cloud/datacenter VMs where feed/you returns 403 or times out:
+            # The jar contains valid authentication cookies, strictly better than anonymous access.
+            channel_name = meta.get("channel_title") or meta.get("username") or _CURRENT_CHANNEL_TITLE or ""
+            resolved_meta = {
+                **meta,
+                "verified_authenticated": False,
+                "verification": verification or "best_effort_installed",
+                "channel_title": channel_name,
+                "username": channel_name,
+            }
+            persisted = _persist(jar, resolved_meta) if persist else bool(meta.get("persisted", True))
+            return _install_memory_session(jar, {**resolved_meta, "persisted": persisted})
         return None
     channel_name = meta.get("channel_title") or meta.get("username") or _CURRENT_CHANNEL_TITLE or ""
     resolved_meta = {
@@ -1727,19 +1785,30 @@ def ensure_session(
         _cleanup_legacy_plaintext()
         if not _SESSION_META:
             _SESSION_META = _load_cookie_update_state()
+        has_explicit_cookie_files = bool(
+            os.environ.get("VIDZEO_YT_COOKIES_FILE")
+            or os.environ.get("VIDZEO_YT_COOKIES_PATH")
+            or os.environ.get("VIDZEO_YT_COOKIE_FILE")
+            or os.environ.get("MUSE_YOUTUBE_COOKIES_PATH")
+            or os.environ.get("MUSE_COOKIES_PATH")
+            or os.environ.get("VIDZEO_YT_COOKIE_FILES")
+        )
+        if _SESSION_META.get("cookie_update_required") and not force_refresh and not has_explicit_cookie_files:
+            raise YouTubeSessionUnavailable(str(_SESSION_META.get("reason") or "Fresh YouTube cookies are required."))
         # A freshly supplied cookie file is new evidence, not the rejected
         # saved session: try it BEFORE honouring a stale signed-out marker.
         # Otherwise one failed probe permanently blocks every later file
         # install and the pipeline silently falls back to anonymous search.
         # A file that verifies installs and clears the marker; a file that
         # fails verification falls through to the marker error below.
-        explicit_env = (
-            os.environ.get("VIDZEO_YT_COOKIES_FILE")
-            or os.environ.get("VIDZEO_YT_COOKIES_PATH")
-            or os.environ.get("VIDZEO_YT_COOKIE_FILE")
-            or os.environ.get("MUSE_YOUTUBE_COOKIES_PATH")
-            or os.environ.get("MUSE_COOKIES_PATH")
+        env_keys = (
+            "VIDZEO_YT_COOKIES_FILE",
+            "VIDZEO_YT_COOKIES_PATH",
+            "VIDZEO_YT_COOKIE_FILE",
+            "MUSE_YOUTUBE_COOKIES_PATH",
+            "MUSE_COOKIES_PATH",
         )
+        explicit_env = next((os.environ[k] for k in env_keys if k in os.environ), None)
         explicit = str(explicit_env or "").strip()
         candidate_paths = []
         # The configured pool (VIDZEO_YT_COOKIE_FILES list + cookies

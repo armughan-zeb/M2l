@@ -217,6 +217,7 @@ class CookiePersistenceTests(unittest.TestCase):
         self.assertEqual(self._value_of(backup_items, "SAPISID"), SAPISID)
 
     # (e) perms 0600 -------------------------------------------------------
+    @unittest.skipIf(sys.platform == "win32", "POSIX file modes not supported on Windows")
     def test_written_file_and_backup_are_0600(self):
         path = self._json_path()
         self.assertTrue(persist.persist_cookie_jar(_rotated_jar(), path))

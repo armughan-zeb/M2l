@@ -14,6 +14,9 @@ def isolated_render_lock(tmp_path, monkeypatch):
     # Offline tests must not wait on or acquire the operator's live render slot.
     # Individual lock-contract tests can still replace this environment value.
     monkeypatch.setenv('VIDNETS_RENDER_LOCK_FILE', str(tmp_path / 'render-test.lock'))
+    # Offline tests must not make live paid OpenRouter calls or leak ambient API keys.
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    monkeypatch.delenv('VIDZEO_OPENROUTER_API_KEY', raising=False)
 
 
 class _OfflineDirectorProvider:
