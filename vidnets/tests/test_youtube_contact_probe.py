@@ -107,9 +107,12 @@ def test_isolated_worker_receives_contact_vision_context(tmp_path, monkeypatch):
     result = tmp_path / 'result.json'
     request.write_text(json.dumps({'scene_texts': ['cargo ship'], 'youtube_contact_vision': True,
                                    'visual_config': {'llm_provider': 'external_agent'},
-                                   'job_context': {'job_id': 'test-job'}}), encoding='utf-8')
+                                   'job_context': {'job_id': 'test-job'},
+                                   'cooldown_hard_timeout_seconds': 882}), encoding='utf-8')
     monkeypatch.setattr(sys, 'argv', ['worker', str(request), str(result)])
     assert youtube_branch_worker.main() == 0
     assert captured['visual_context'] is context
+    assert captured['cooldown_hard_timeout_seconds'] == 882
+    assert captured['cancellation'].job_id == 'test-job'
     assert context.youtube_contact_only is True
     assert json.loads(result.read_text(encoding='utf-8'))['ok'] is True

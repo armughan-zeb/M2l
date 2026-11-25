@@ -1,5 +1,21 @@
 """Keep discovery from spending the time reserved for actual clip transfers."""
 import math
+import os
+
+
+def mixed_agent_cooldown_wall(config, environment=None):
+    env = os.environ if environment is None else environment
+    if (
+        config.get('llm_provider') != 'external_agent'
+        or config.get('yt_branch_wall_timeout_seconds')
+        or str(env.get('VIDZEO_YT_COOLDOWN_RETRY', '1') or '1').strip().lower()
+        not in {'1', 'true', 'yes', 'on'}
+    ):
+        return 0.0
+    try:
+        return max(0.0, min(1800.0, float(env.get('VIDZEO_MIXED_YT_AGENT_WALL_CAP_SECONDS', '1200') or 1200)))
+    except (TypeError, ValueError):
+        return 1200.0
 
 
 def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_workers=1, vision_reserve_seconds=None):
@@ -24,9 +40,7 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
             settings.get('vision_reserve'),
         )
     if vision_reserve_seconds is None:
-        import os as _os
-
-        vision_reserve_seconds = _os.environ.get("VIDZEO_VISION_RESERVE_SECONDS")
+        vision_reserve_seconds = os.environ.get("VIDZEO_VISION_RESERVE_SECONDS")
     try:
         vision_reserve = max(0.0, float(vision_reserve_seconds or 0.0))
     except (TypeError, ValueError):
@@ -53,6 +67,12 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
     plan = {'yt_search_timeout_seconds': search, 'yt_hard_timeout_seconds': hard}
     if vision_reserve:
         plan['vision_reserve_seconds'] = vision_reserve
+    if settings.get('_yt_cooldown_headroom'):
+        # The adapter supplies a first-wave cap. Keep it and give the cooldown
+        # a separate deadline inside the job-clamped outer wall.
+        recovery_wall = max(60.0, internal - vision_reserve) if vision_reserve else internal
+        if recovery_wall > hard:
+            plan['yt_cooldown_hard_timeout_seconds'] = recovery_wall
     if scene_count > 0 and not settings.get('yt_pool_first'):
         preselected = bool(settings.get('_youtube_quota_preselected'))
         try:

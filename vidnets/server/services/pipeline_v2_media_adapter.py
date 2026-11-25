@@ -8356,6 +8356,16 @@ def resolve_existing_provider_branches_v2(
                        '_web_budget_scene_count': len(coordinator_scenes),
                        'vision_reserve_seconds': _vision_reserve_seconds(config)}
     media_deadline_seconds = _media_stage_deadline_seconds(deadline_config, lane_policy["mode"])
+    youtube_verification_deadline_seconds = media_verification_deadline_seconds
+    if lane_policy["mode"] == "Mixed Media" and primary_youtube_scene_indices:
+        from .youtube_stage_budget import mixed_agent_cooldown_wall
+
+        # The worker still stops discovery at its original deadline. Leave
+        # review time for verified cuts returned by its bounded cooldown wave.
+        youtube_verification_deadline_seconds = max(
+            youtube_verification_deadline_seconds,
+            min(media_deadline_seconds, mixed_agent_cooldown_wall(config)),
+        )
     web_verification_deadline_seconds = None
     if lane_policy["web_enabled"] and str(config.get("llm_provider") or "") == "external_agent":
         # Web collection and its vision batches have their own bounded wall.
@@ -8417,7 +8427,7 @@ def resolve_existing_provider_branches_v2(
         # clip. The discovery budget is recorded in the media plan below.
         youtube_general_pool=youtube_general_pool,
         youtube_discovery_budget_seconds=youtube_discovery_budget_seconds,
-        verification_deadline_seconds=media_verification_deadline_seconds,
+        verification_deadline_seconds=youtube_verification_deadline_seconds,
         web_verification_deadline_seconds=web_verification_deadline_seconds,
     )
     print(

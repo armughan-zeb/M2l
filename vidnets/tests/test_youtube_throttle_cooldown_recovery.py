@@ -306,3 +306,65 @@ def test_cooldown_retry_skips_when_only_content_rejects(tmp_path, monkeypatch):
     )
     assert res[0] is None
     assert res.audit["cooldown_retry"]["triggered"] is False
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_muse_route_outage_uses_reserved_wall_without_retrying_a_blocked_runtime(tmp_path, monkeypatch, blocked):
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+    monkeypatch.setenv("VIDZEO_YT_COOLDOWN_RETRY", "1")
+    monkeypatch.setenv("VIDZEO_YT_COOLDOWN_INITIAL_WAIT_SECONDS", "0")
+    monkeypatch.setenv("VIDZEO_YT_COOLDOWN_PROBE_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("VIDZEO_YT_RANGED_MOMENTS", "0")
+    monkeypatch.setattr(ytv2, "_get_authenticated_youtube_session", lambda **kw: None)
+    monkeypatch.setattr(ytv2, "_screen_downloaded_motion", lambda *a, **kw: {"checked": True, "reject": False})
+    monkeypatch.setattr(ytv2, "_clean_downloaded_clip_overlays", lambda path, **kw: (path, {"checked": True}))
+    monkeypatch.setattr(ytv2, "_search_container_pools", lambda *a, **kw: {
+        "cars": [{
+            "id": f"classic0{i}", "title": f"Classic car {i} driving",
+            "url": f"https://www.youtube.com/watch?v=classic0{i}", "duration": 90.0,
+        } for i in range(3)],
+    })
+    monotonic = time.monotonic
+    elapsed = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic() + elapsed)
+    attempts = []
+
+    def fake_download(candidate, path, start, duration, **kwargs):
+        nonlocal elapsed
+        attempts.append(candidate["id"])
+        if len(attempts) == 1:
+            elapsed += 60.0  # The first wave used all of its 60-second wall.
+            candidate["_transport_failure"] = (
+                "network_disabled_by_sandbox" if blocked else "outbound_network_unavailable"
+            )
+            return False
+        path.write_bytes(b"\x00" * 16384)
+        return True
+
+    monkeypatch.setattr(ytv2, "_download_clip", fake_download)
+    result = ytv2.get_youtube_clips(
+        script="Car zero drives. Car one drives. Car two drives.",
+        title="Classic Cars",
+        num_scenes=3,
+        scene_texts=["Car zero drives", "Car one drives", "Car two drives"],
+        scene_query_overrides=[{"section_subject": "cars", "query": "classic car"}] * 3,
+        output_dir=str(tmp_path),
+        download_candidate_limit=1,
+        max_download_attempts_per_scene=1,
+        download_concurrency=1,
+        hard_timeout_seconds=60.0,
+        cooldown_hard_timeout_seconds=240.0,
+    )
+
+    if blocked:
+        assert not any(result)
+        assert len(attempts) == 1
+        assert result.audit["network_diagnostic"]["code"] == "network_disabled_by_sandbox"
+        assert not result.audit["cooldown_retry"]["triggered"]
+    else:
+        assert all(result)
+        assert attempts[0] == attempts[1]
+        assert set(attempts[1:]) == {"classic00", "classic01", "classic02"}
+        assert result.audit["cooldown_retry"]["trigger"] == "network_unavailable"
+        assert result.audit["cooldown_retry"]["recovered"] == 3
+        assert not result.audit["provider_network_unavailable"]

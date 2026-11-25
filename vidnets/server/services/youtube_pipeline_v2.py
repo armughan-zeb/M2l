@@ -120,7 +120,7 @@ def _network_disabled_by_runtime() -> bool:
 def _record_youtube_network_failure(stage: str, error: Any = '') -> Dict[str, str]:
     """Store a safe, actionable diagnosis and stop repeating a dead network call."""
     detail = str(error or '').lower()
-    if _network_disabled_by_runtime():
+    if _network_disabled_by_runtime() or detail == 'network_disabled_by_sandbox':
         code = 'network_disabled_by_sandbox'
         message = (
             'Outbound networking is disabled for this worker runtime '
@@ -138,7 +138,7 @@ def _record_youtube_network_failure(stage: str, error: Any = '') -> Dict[str, st
             'resolver and outbound DNS (UDP/TCP 53), then HTTPS access (TCP 443).'
         )
     elif any(marker in detail for marker in (
-        'network is unreachable', 'unreachable network', 'no route to host',
+        'outbound_network_unavailable', 'network is unreachable', 'unreachable network', 'no route to host',
         'connection refused', 'wsaenetunreach', 'winerror 10051', 'errno 101',
     )):
         code = 'outbound_network_unavailable'
@@ -8218,6 +8218,7 @@ def get_youtube_clips(
     # given, the injection lookup uses this; search/query planning
     # still use ``title`` unchanged. Defaults to ``title``.
     prep_manifest_title: Optional[str] = None,
+    cooldown_hard_timeout_seconds: Optional[float] = None,
     **__,
 ) -> List[Optional[str]]:
     del api_key, groq_api_key, video_format
@@ -8738,6 +8739,12 @@ def get_youtube_clips(
     download_timestamp_owners = defaultdict(set)
     failed_download_counts: Counter = Counter()
     provider_network_unavailable = threading.Event()
+    network_diagnostic = {}
+    network_failure_codes = {
+        'provider_dns_unavailable', 'dns_resolution_failed',
+        'network_disabled_by_sandbox', 'outbound_network_unavailable',
+    }
+    retryable_transport_kinds = {'transport_timeout', 'network_unavailable'}
     attempt_audit: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     chapter_cache = {}
     pending_alternate_cuts = {}
@@ -9191,7 +9198,8 @@ def get_youtube_clips(
             previous_ids = {
                 str(item.get('candidate_id') or '')
                 for item in attempt_audit[idx]
-                if item.get('failure_kind') != 'transport_timeout'
+                if item.get('failure_kind') not in retryable_transport_kinds
+                and item.get('status') != 'not_attempted'
             }
             transport_timed_out_ids = set()
         else:
@@ -9624,21 +9632,16 @@ def get_youtube_clips(
                 "reason": failure or "yt_dlp_or_ffmpeg",
                 "failure_kind": (
                     "network_unavailable"
-                    if failure in {
-                        "provider_dns_unavailable", "dns_resolution_failed",
-                        "network_disabled_by_sandbox", "outbound_network_unavailable",
-                    }
+                    if failure in network_failure_codes
                     else "transport_timeout"
                     if failure in {"transport_timeout", "zero_byte_throttle"}
                     else "download_error"
                 ),
             })
-            if failure in {
-                'provider_dns_unavailable', 'dns_resolution_failed',
-                'network_disabled_by_sandbox', 'outbound_network_unavailable',
-            }:
-                _record_youtube_network_failure('download', failure)
+            if failure in network_failure_codes:
+                diagnostic = _record_youtube_network_failure('download', failure)
                 with download_timestamp_lock:
+                    network_diagnostic.update(diagnostic)
                     provider_network_unavailable.set()
             try:
                 out.unlink(missing_ok=True)
@@ -9909,7 +9912,10 @@ def get_youtube_clips(
 
     def _submit_available() -> None:
         nonlocal attempted_count
-        while not discovery_stopped and not stopped_reason and download_queue and len(pending) < download_workers:
+        while (
+            not discovery_stopped and not stopped_reason and not provider_network_unavailable.is_set()
+            and download_queue and len(pending) < download_workers
+        ):
             idx = download_queue.popleft()
             scene_passes[idx] += 1
             future = executor.submit(_download_scene, idx, assignments[idx])
@@ -9983,13 +9989,13 @@ def get_youtube_clips(
     try:
         while pending or verify_pending:
             if provider_network_unavailable.is_set():
-                diagnostic = _current_youtube_network_diagnostic()
+                with download_timestamp_lock:
+                    diagnostic = dict(network_diagnostic)
                 stopped_reason = diagnostic.get('code') or 'provider_network_unavailable'
                 if diagnostic:
                     print(
                         f"   [yt-v2] stopping YouTube retrieval: {diagnostic['code']}: "
-                        f"{diagnostic['message']} Completed clips are preserved; "
-                        "unresolved scenes are left for the caller's fallback providers.",
+                        f"{diagnostic['message']} Preserving completed clips while the first wave drains.",
                         flush=True,
                     )
                 else:
@@ -10222,12 +10228,19 @@ def get_youtube_clips(
         os.environ.get("VIDZEO_YT_COOLDOWN_RETRY", _cooldown_default) or _cooldown_default
     ).strip().lower() in {"1", "true", "yes", "on"}
     parent_cancelled = cancellation is not None and cancellation.cancelled()
-    missing_after_wave = [i for i in range(requested_scene_count) if not results[i]]
+    recovery_deadline = hard_deadline
+    if cooldown_hard_timeout_seconds and hard_deadline is not None:
+        recovery_deadline = max(hard_deadline, batch_started_monotonic + cooldown_hard_timeout_seconds)
+    # Never run a second writer on an output whose first-wave future is still
+    # winding down. The other candidates are safe to reuse from this wave.
+    active_scenes = {future_map[f] for f in pending} | {verify_future_map[f] for f in verify_pending}
+    missing_after_wave = [i for i in download_indices if not results[i] and i not in active_scenes]
+    route_failed = provider_network_unavailable.is_set()
     throttled_missing = [
         i for i in missing_after_wave
         if any(
             isinstance(att, Mapping) and (
-                att.get("failure_kind") == "transport_timeout"
+                att.get("failure_kind") in retryable_transport_kinds
                 or att.get("reason") in {"zero_byte_throttle", "transport_timeout"}
                 or any(tok in str(att.get("reason") or "").lower() for tok in ("429", "too many requests", "youtube_zero_byte_stall", "timed out", "timeout"))
             )
@@ -10237,7 +10250,8 @@ def get_youtube_clips(
     if (
         cooldown_enabled
         and not parent_cancelled
-        and not provider_network_unavailable.is_set()
+        and network_diagnostic.get("code") != "network_disabled_by_sandbox"
+        and stopped_reason not in {"coverage_target_satisfied", "quota_satisfied"}
         and throttled_missing
     ):
         try:
@@ -10269,9 +10283,9 @@ def get_youtube_clips(
         except (TypeError, ValueError):
             probe_interval = 60.0
         try:
-            max_probes = max(1, min(12, int(os.environ.get("VIDZEO_YT_COOLDOWN_MAX_PROBES", "8") or 8)))
+            max_probes = max(1, min(2, int(os.environ.get("VIDZEO_YT_COOLDOWN_MAX_PROBES", "2") or 2)))
         except (TypeError, ValueError):
-            max_probes = 8
+            max_probes = 2
         try:
             probe_zero_byte_grace = max(
                 12.0,
@@ -10281,8 +10295,8 @@ def get_youtube_clips(
             probe_zero_byte_grace = 25.0
 
         now_mono = time.monotonic()
-        if hard_deadline is not None:
-            cooldown_deadline = min(hard_deadline - wave_reserve, now_mono + max_wait)
+        if recovery_deadline is not None:
+            cooldown_deadline = min(recovery_deadline - wave_reserve, now_mono + max_wait)
         else:
             cooldown_deadline = now_mono + max_wait
 
@@ -10295,6 +10309,7 @@ def get_youtube_clips(
             )
         else:
             cooldown_retry_audit["triggered"] = True
+            cooldown_retry_audit["trigger"] = "network_unavailable" if route_failed else "transfer_stall"
             if cancellation is not None and hasattr(cancellation, "child"):
                 retry_cancellation = cancellation.child(
                     f"{getattr(cancellation, 'job_id', '')}:youtube-v2-cooldown"
@@ -10310,7 +10325,7 @@ def get_youtube_clips(
                     str(att.get("video_id") or att.get("candidate_id") or "")
                     for i in throttled_missing
                     for att in attempt_audit.get(i, [])
-                    if isinstance(att, Mapping) and att.get("failure_kind") == "transport_timeout"
+                    if isinstance(att, Mapping) and att.get("failure_kind") in retryable_transport_kinds
                 }
                 for _vid in throttled_vids:
                     if _vid:
@@ -10327,15 +10342,12 @@ def get_youtube_clips(
             with _ANON_DOWNLOAD_LOCK:
                 _ANON_DOWNLOAD_THROTTLE_UNTIL = 0.0
 
-            def _sleep_cancel_aware(seconds: float) -> bool:
+            def _sleep_cancel_aware(seconds: float) -> None:
                 end_at = time.monotonic() + max(0.0, seconds)
                 while time.monotonic() < end_at:
                     if retry_cancellation is not None:
                         retry_cancellation.raise_if_cancelled()
-                    if provider_network_unavailable.is_set():
-                        return False
                     time.sleep(min(1.0, max(0.0, end_at - time.monotonic())))
-                return True
 
             def _run_scene_attempt(target_idx: int, *, grace_seconds: Optional[float] = None) -> Optional[str]:
                 cand = assignments[target_idx]
@@ -10354,8 +10366,9 @@ def get_youtube_clips(
                 return r_path
 
             probe_idx = next((i for i in throttled_missing if assignments[i]), None)
+            recovery_label = "network recovery" if route_failed else "transfer cooldown"
             print(
-                f"   [yt-v2] throttle cooldown engaged for {len(throttled_missing)} scene(s): "
+                f"   [yt-v2] {recovery_label} engaged for {len(throttled_missing)} scene(s): "
                 f"probe=scene {probe_idx + 1 if probe_idx is not None else 'n/a'}, "
                 f"budget={remaining_cooldown:.0f}s, wave_reserve={wave_reserve:.0f}s",
                 flush=True,
@@ -10371,10 +10384,10 @@ def get_youtube_clips(
                         f"   [yt-v2] cooldown wait {wait_for:.0f}s before probe {probe_num + 1}/{max_probes}",
                         flush=True,
                     )
-                    if not _sleep_cancel_aware(wait_for):
-                        break
+                    _sleep_cancel_aware(wait_for)
                 if time.monotonic() >= cooldown_deadline or probe_idx is None:
                     break
+                provider_network_unavailable.clear()
                 cooldown_retry_audit["probes"] += 1
                 probe_path = _run_scene_attempt(probe_idx, grace_seconds=probe_zero_byte_grace)
                 if probe_path:
@@ -10392,19 +10405,38 @@ def get_youtube_clips(
                         flush=True,
                     )
                     break
+                last_attempt = (attempt_audit.get(probe_idx) or [{}])[-1]
+                if (
+                    network_diagnostic.get("code") == "network_disabled_by_sandbox"
+                    or last_attempt.get("reason") == "youtube_access_required"
+                ):
+                    break
                 print(
-                    f"   [yt-v2] cooldown probe {probe_num + 1}/{max_probes} still throttled "
+                    f"   [yt-v2] cooldown probe {probe_num + 1}/{max_probes} returned no usable clip "
                     f"(remaining={max(0.0, cooldown_deadline - time.monotonic()):.0f}s)",
                     flush=True,
                 )
 
+            if route_failed and not cooled:
+                provider_network_unavailable.set()
             if cooled:
-                retry_indices = [i for i in throttled_missing if not results[i] and assignments[i]]
+                # A route failure stopped the queue before some quota scenes
+                # could start. They can now use the ranked pool already in hand.
+                retry_indices = [
+                    i for i in missing_after_wave
+                    if not results[i] and (
+                        i in throttled_missing or (
+                            route_failed and all(
+                                att.get("status") == "not_attempted" for att in attempt_audit.get(i, [])
+                            )
+                        )
+                    )
+                ]
                 if retry_indices:
                     gentle_workers = max(1, min(2, download_workers))
                     wave_deadline = (
-                        hard_deadline
-                        if hard_deadline is not None
+                        recovery_deadline
+                        if recovery_deadline is not None
                         else time.monotonic() + max(120.0, wave_reserve * 2.0)
                     )
                     retry_executor = ThreadPoolExecutor(
@@ -10529,7 +10561,8 @@ def get_youtube_clips(
             "requested": requested_scene_count,
             "stop_reason": stopped_reason,
             "provider_network_unavailable": provider_network_unavailable.is_set(),
-            "network_diagnostic": _current_youtube_network_diagnostic(),
+            "network_diagnostic": (dict(network_diagnostic) or _current_youtube_network_diagnostic())
+            if provider_network_unavailable.is_set() else {},
             "strategy": "coverage_first_round_robin_downloads",
             "search_elapsed_seconds": round(search_elapsed_seconds, 2),
             "download_passes": dict(scene_passes),

@@ -713,6 +713,7 @@ class WebOutageTracker:
         self._sleep = sleep if sleep is not None else time.sleep
         self._lock = threading.Lock()
         self._streak = 0
+        self._download_failure_hosts: set[str] = set()
         self._episodes = 0
         self._extension = 0.0
         self._backoff_until = 0.0
@@ -743,7 +744,9 @@ class WebOutageTracker:
         with self._lock:
             return max(0.0, float(self._backoff_until) - time.monotonic())
 
-    def note_outcome(self, *, transport_failed: bool, rows: int) -> bool:
+    def note_outcome(
+        self, *, transport_failed: bool, rows: int, download_hosts: Optional[set[str]] = None,
+    ) -> bool:
         """Record one provider call. Returns True if it declared an outage.
 
         Only a 0-row call that failed on transport counts toward the
@@ -755,12 +758,24 @@ class WebOutageTracker:
             return False
         now = time.monotonic()
         with self._lock:
-            if rows > 0 or not transport_failed:
-                self._streak = 0
-                return False
-            self._streak += 1
-            if self._streak < self._threshold:
-                return False
+            if download_hosts is None:
+                if rows > 0 or not transport_failed:
+                    self._streak = 0
+                    return False
+                self._streak += 1
+                if self._streak < self._threshold:
+                    return False
+                evidence = f"{self._threshold} consecutive search transport failures"
+            else:
+                if rows > 0:
+                    self._download_failure_hosts.clear()
+                    return False
+                if not transport_failed:
+                    return False
+                self._download_failure_hosts.update(download_hosts)
+                if len(self._download_failure_hosts) < 2:
+                    return False
+                evidence = f"image transfers failed across {len(self._download_failure_hosts)} hosts"
             if self._episodes >= self._max_episodes:
                 return False
             if self._extension >= self._max_extension:
@@ -783,12 +798,12 @@ class WebOutageTracker:
             self._backoff_until = now + backoff
             self._extension += backoff
             self._streak = 0
+            self._download_failure_hosts.clear()
             episodes = int(self._episodes)
-            threshold = int(self._threshold)
             extension = float(self._extension)
         _web_log(
             f"[web] EGRESS OUTAGE episode {episodes}/{self._max_episodes}: "
-            f"{threshold} consecutive transport failures, backing off "
+            f"{evidence}, backing off "
             f"{backoff:.0f}s (stage deadline +{extension:.0f}s total)"
         )
         return True
@@ -4478,6 +4493,54 @@ def _download_candidate_batch_tolerant(
         raise
 
 
+def _image_download_transport_failed(error: str) -> bool:
+    text = str(error or "").strip().lower()
+    return text == "timeout" or any(marker in text for marker in (
+        "connection error", "cannot connect to host", "name resolution",
+        "getaddrinfo failed", "name or service not known", "no route to host",
+        "network is unreachable", "host is unreachable", "connection refused",
+        "connection reset", "connect timeout", "read timed out",
+    ))
+
+
+def _download_batch_with_outage_recovery(
+    items, output_dir, *, outage_tracker, cancel_event, deadline, **kwargs,
+) -> List[Tuple[str, Optional[Path], str]]:
+    if outage_tracker is None or not outage_tracker.enabled:
+        return _download_candidate_batch_tolerant(items, output_dir, **kwargs)
+
+    def within_deadline():
+        limit = deadline()
+        return (cancel_event is None or not cancel_event.is_set()) and (
+            limit is None or time.monotonic() < limit
+        )
+
+    outage_tracker.wait_if_outage(cancel_event=cancel_event)
+    if not within_deadline():
+        return []
+    results = _download_candidate_batch_tolerant(items, output_dir, **kwargs)
+    failed_urls = {url for url, path, error in results if not path and _image_download_transport_failed(error)}
+    hosts = {urllib.parse.urlsplit(url).hostname for url in failed_urls} - {None}
+    downloaded = sum(bool(path) for _, path, _ in results)
+    outage_tracker.note_outcome(
+        transport_failed=bool(hosts), rows=downloaded, download_hosts=hosts,
+    )
+    if downloaded or not failed_urls or not outage_tracker.wait_if_outage(cancel_event=cancel_event):
+        return results
+    if not within_deadline():
+        return results
+    # Reuse this scene's ranked candidates after the network wait. The
+    # download cache can reuse a file recovered by a neighboring scene.
+    retry_items = [item for item in items if item["url"] in failed_urls]
+    limit = deadline()
+    if limit is not None:
+        kwargs["timeout_seconds"] = min(kwargs["timeout_seconds"], max(0.1, limit - time.monotonic()))
+    retried = {row[0]: row for row in _download_candidate_batch_tolerant(retry_items, output_dir, **kwargs)}
+    if any(path for _, path, _ in retried.values()):
+        outage_tracker.note_outcome(transport_failed=False, rows=1, download_hosts=set())
+    return [retried.get(row[0], row) for row in results]
+
+
 def _is_definitive_download_error(error: str) -> bool:
     """True when a download failure proves the URL itself is unusable.
 
@@ -5756,6 +5819,8 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             # recover instead of being hammered by every scene worker.
             if outage_tracker is not None:
                 outage_tracker.wait_if_outage(cancel_event=cancel_event)
+            if _deadline_reached():
+                return []
             # Route-switching retry (Nov 18, web-resilience): the
             # api/hybrid/flickr_api lanes had no retry at all. When a lane
             # comes back empty AND recorded a provider failure during the
@@ -7363,9 +7428,12 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             else:
                 candidates_to_fetch.append(candidate)
         if candidates_to_fetch:
-            download_results.extend(_download_candidate_batch_tolerant(
+            download_results.extend(_download_batch_with_outage_recovery(
                 candidates_to_fetch,
                 scene_dir,
+                outage_tracker=outage_tracker,
+                cancel_event=cancel_event,
+                deadline=_effective_deadline_at,
                 max_concurrent=min(
                     max(2, int(os.environ.get("VIDZEO_WEB_SCENE_DOWNLOAD_CONCURRENCY", "4") or 4)),
                     len(candidates_to_fetch),
@@ -7409,8 +7477,11 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
             scene_attempted_urls.update(item["url"] for item in replacements)
             scene_downloaded_candidates += len(replacements)
             top_candidates.extend(replacements)
-            download_results.extend(_download_candidate_batch_tolerant(
+            download_results.extend(_download_batch_with_outage_recovery(
                 replacements, scene_dir,
+                outage_tracker=outage_tracker,
+                cancel_event=cancel_event,
+                deadline=_effective_deadline_at,
                 max_concurrent=min(4, len(replacements)),
                 timeout_seconds=min(_image_download_timeout, remaining_seconds),
                 download_cache=download_cache, download_cache_lock=download_cache_lock,

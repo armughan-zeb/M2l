@@ -31,9 +31,11 @@ def main() -> int:
         if payload.get("pipeline_v2_mode"):
             os.environ["VIDZEO_PIPELINE_V2_MODE"] = "1"
             os.environ["VIDZEO_YT_VISUAL_GATE"] = "0"
+        from services.cancellation import CancellationContext
         from services.youtube_pipeline_v2 import get_youtube_clips
         from services.job_context import job_scope
         job_context = payload.get('job_context') or {}
+        cancellation = CancellationContext(job_id=str(job_context.get('job_id') or 'youtube-worker'))
         job_scope_handle = job_scope(job_context)
         job_scope_handle.__enter__()
         visual_context = None
@@ -79,6 +81,7 @@ def main() -> int:
             soft_timeout_seconds=payload.get("soft_timeout_seconds"),
             soft_ceiling_seconds=payload.get("soft_ceiling_seconds"),
             hard_timeout_seconds=payload.get("hard_timeout_seconds"),
+            cooldown_hard_timeout_seconds=payload.get("cooldown_hard_timeout_seconds"),
             session_jar=payload.get("session_jar"),
             youtube_session=payload.get("youtube_session"),
             use_authenticated_session=bool(payload.get("use_authenticated_session", True)),
@@ -89,7 +92,7 @@ def main() -> int:
             # Contact selection is implemented in the ranged lane; avoid
             # bypassing it through the legacy whole-source pool renderer.
             pool_first=bool(payload.get("pool_first", False)) and not bool(payload.get('youtube_contact_vision')),
-            cancellation=None,
+            cancellation=cancellation,
         )
         output = {
             "ok": True,

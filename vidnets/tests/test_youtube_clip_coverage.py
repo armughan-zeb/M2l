@@ -248,3 +248,15 @@ def test_vision_reserve_shrinks_youtube_hard_wall():
     plain = youtube_stage_budget(900, {}, scene_count=8, download_workers=3)
     assert "vision_reserve_seconds" not in plain
     assert plain["yt_hard_timeout_seconds"] == pytest.approx(882.0)
+
+
+def test_muse_cooldown_keeps_first_wave_and_review_reserve_separate():
+    from services.youtube_stage_budget import mixed_agent_cooldown_wall
+
+    config = {"llm_provider": "external_agent", "yt_hard_timeout_seconds": 480}
+    assert mixed_agent_cooldown_wall(config, {}) == 1200
+    assert mixed_agent_cooldown_wall(config, {"VIDZEO_YT_COOLDOWN_RETRY": "0"}) == 0
+    assert mixed_agent_cooldown_wall({**config, "yt_branch_wall_timeout_seconds": 480}, {}) == 0
+    plan = youtube_stage_budget(1200, {**config, "_yt_cooldown_headroom": True}, vision_reserve_seconds=300)
+    assert plan["yt_hard_timeout_seconds"] == 180
+    assert plan["yt_cooldown_hard_timeout_seconds"] == 882

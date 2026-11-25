@@ -492,3 +492,33 @@ def test_muse_flag_cleared_by_next_wave(monkeypatch):
     rows = manager.search("Panama Canal locks aerial view")
     assert len(rows) == 2
     assert manager.last_wave_transport_failed is False
+
+
+def test_image_transfer_outage_retries_same_candidates_after_backoff(tmp_path, monkeypatch):
+    from services.web_image import resolver
+
+    clock = _FakeClock()
+    tracker = _tracker(monkeypatch, clock, backoff_seconds=5)
+    urls = ["https://images.example/a.jpg", "https://archive.example/b.jpg", "https://denied.example/c.jpg"]
+    calls = []
+
+    def download(items, output_dir, **kwargs):
+        requested = [item["url"] for item in items]
+        calls.append(requested)
+        if len(calls) == 1:
+            return [(urls[0], None, "timeout"), (urls[1], None, "no route to host"), (urls[2], None, "HTTP 403")]
+        # Search can answer while the image CDN route is still recovering.
+        tracker.note_outcome(transport_failed=False, rows=12)
+        return [(url, tmp_path / f"{index}.jpg", "") for index, url in enumerate(requested)]
+
+    monkeypatch.setattr(resolver, "_download_candidate_batch_tolerant", download)
+    results = resolver._download_batch_with_outage_recovery(
+        [{"url": url} for url in urls], tmp_path,
+        outage_tracker=tracker, cancel_event=threading.Event(),
+        deadline=lambda: 1002.0 + tracker.extension_seconds(), timeout_seconds=10,
+    )
+
+    assert calls == [urls, urls[:2]]
+    assert clock.slept == 5.0
+    assert [bool(path) for _, path, _ in results] == [True, True, False]
+    assert results[2][2] == "HTTP 403"

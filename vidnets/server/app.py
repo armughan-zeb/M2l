@@ -10815,6 +10815,7 @@ def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, conf
         'soft_timeout_seconds': config.get('yt_soft_timeout_seconds'),
         'soft_ceiling_seconds': config.get('yt_soft_ceiling_seconds'),
         'hard_timeout_seconds': config.get('yt_hard_timeout_seconds'),
+        'cooldown_hard_timeout_seconds': config.get('yt_cooldown_hard_timeout_seconds'),
         'session_jar': _json_safe_youtube_value(config.get('_yt_session_jar')),
         'youtube_session': _json_safe_youtube_value(config.get('_yt_session')),
         'use_authenticated_session': _enabled(config.get('yt_use_authenticated_session'), default=True),
@@ -11687,6 +11688,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                  soft_timeout_seconds=config.get('yt_soft_timeout_seconds'),
                  soft_ceiling_seconds=config.get('yt_soft_ceiling_seconds'),
                  hard_timeout_seconds=config.get('yt_hard_timeout_seconds'),
+                 cooldown_hard_timeout_seconds=config.get('yt_cooldown_hard_timeout_seconds'),
                  session_jar=config.get('_yt_session_jar'),
                  youtube_session=config.get('_yt_session'),
                 use_authenticated_session=_enabled(config.get('yt_use_authenticated_session'), default=True),
@@ -11895,27 +11897,16 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
             if yt_wall_seconds < mixed_hard_cap:
                 print(f"   [budget] Mixed Media transfer waves: {yt_wall_seconds:.0f}s -> {mixed_hard_cap:.0f}s", flush=True)
             yt_wall_seconds = mixed_hard_cap
-            if (
-                str((config or {}).get("llm_provider") or "") == "external_agent"
-                and not config.get("yt_branch_wall_timeout_seconds")
-                and str(yt_environment.get("VIDZEO_YT_COOLDOWN_RETRY", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-            ):
-                try:
-                    agent_wall_cap = max(
-                        yt_wall_seconds,
-                        min(
-                            1800.0,
-                            float(yt_environment.get("VIDZEO_MIXED_YT_AGENT_WALL_CAP_SECONDS", "1200") or 1200),
-                        ),
-                    )
-                except (TypeError, ValueError):
-                    agent_wall_cap = max(yt_wall_seconds, 1200.0)
-                if agent_wall_cap > yt_wall_seconds:
-                    print(
-                        f"   [budget] Mixed Media agent cooldown headroom: {yt_wall_seconds:.0f}s -> {agent_wall_cap:.0f}s",
-                        flush=True,
-                    )
-                    yt_wall_seconds = agent_wall_cap
+            from services.youtube_stage_budget import mixed_agent_cooldown_wall
+
+            agent_wall_cap = mixed_agent_cooldown_wall(config, yt_environment)
+            config['_yt_cooldown_headroom'] = agent_wall_cap > 0.0
+            if agent_wall_cap > yt_wall_seconds:
+                print(
+                    f"   [budget] Mixed Media agent cooldown headroom: {yt_wall_seconds:.0f}s -> {agent_wall_cap:.0f}s",
+                    flush=True,
+                )
+                yt_wall_seconds = agent_wall_cap
 
         if is_youtube_only_branch:
             # No fixed branch wall for a YouTube-only agent job (see
@@ -12041,8 +12032,10 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         config.update(stage_budget)
         if config.get('yt_per_clip_timeout_seconds'):
             yt_environment['VIDZEO_YT_PER_CLIP_TIMEOUT'] = str(config['yt_per_clip_timeout_seconds'])
+        cooldown_wall = stage_budget.get('yt_cooldown_hard_timeout_seconds')
+        cooldown_log = f", with cooldown<={cooldown_wall:.0f}s" if cooldown_wall else ""
         print(f"   [yt] stage allocation: search<={config['yt_search_timeout_seconds']:.0f}s, "
-              f"complete worker<={config['yt_hard_timeout_seconds']:.0f}s, outer={yt_wall_seconds:.0f}s")
+              f"first wave<={config['yt_hard_timeout_seconds']:.0f}s{cooldown_log}, outer={yt_wall_seconds:.0f}s")
         # A ThreadPoolExecutor timeout only releases the caller; Python cannot
         # kill a worker thread that is blocked in a provider library. Production
         # runs therefore isolate YouTube in a child process and taskkill its

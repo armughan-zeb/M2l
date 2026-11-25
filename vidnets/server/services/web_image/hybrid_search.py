@@ -1330,7 +1330,7 @@ async def _download_bulk_async(
                     except aiohttp.ClientConnectionError as exc:
                         # Transport failure on this route: the next attempt
                         # tries the next route in the per-host order.
-                        last_error = str(exc)[:80] or "connection error"
+                        last_error = f"connection error: {exc}"[:80]
                     except Exception as e:
                         last_error = str(e)[:80]
                     if attempt < max_attempts - 1:
