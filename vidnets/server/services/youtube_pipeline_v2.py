@@ -40,6 +40,7 @@ from .visual_requirement import (
 )
 from .youtube_query_normalizer import normalize_youtube_query, normalize_youtube_queries
 from .yt_dlp_runtime import runtime_receipt, YouTubeRuntimeLog
+from .youtube_range_attempt import YouTubeExtractionTimeout, download_range_attempt
 from .scene_entities import comparison_pair_conflict, explicit_named_pairs
 
 # Candidate scoring (``_score_candidate``) runs the shared clip classifiers
@@ -2883,6 +2884,7 @@ def _download_with_youtube_session(
     raw_prefix,
     *,
     on_retry_reset=None,
+    attempt_runner=None,
 ):
     """Retry sign-in requirements and throttled transfers across accounts or clients."""
     def download(jar):
@@ -2895,6 +2897,8 @@ def _download_with_youtube_session(
                 "player_client": _youtube_player_clients(jar),
             },
         })
+        if attempt_runner is not None:
+            return attempt_runner(attempt_opts, jar)
         with yt_dlp.YoutubeDL(attempt_opts) as ydl:
             _install_youtube_session(ydl, jar)
             # The jar yt-dlp actually used: _install_youtube_session clones
@@ -2916,6 +2920,9 @@ def _download_with_youtube_session(
     try:
         used_jar = download(session_jar)
         _persist_youtube_session_cookies(used_jar, session_jar)
+    except YouTubeExtractionTimeout:
+        # A pre-transfer timeout gives no evidence of an account throttle.
+        raise
     except Exception as exc:
         pool = getattr(session_jar, "_vidzeo_session_pool", None)
         detail = str(exc).casefold()
@@ -5121,9 +5128,12 @@ class _FFmpegStallWatchdog:
     _POLL_SECONDS = 5.0
     _ZERO_BYTE_GRACE_SECONDS = 35.0
 
-    def __init__(self, watch_dir, raw_prefix, *, stall_seconds=None, zero_byte_grace_seconds=None):
+    def __init__(self, watch_dir, raw_prefix, *, stall_seconds=None, zero_byte_grace_seconds=None,
+                 scoped_to_attempt=False):
         self._watch_dir = Path(watch_dir)
         self._raw_prefix = str(raw_prefix)
+        self._scoped_to_attempt = scoped_to_attempt
+        self._attempt_pid = None
         if stall_seconds is None:
             stall_seconds = _youtube_ffmpeg_stall_seconds()
         try:
@@ -5184,13 +5194,19 @@ class _FFmpegStallWatchdog:
             pass
         return total
 
+    def bind_attempt(self, pid):
+        self._attempt_pid = pid
+
     def _matching_ffmpeg_children(self):
+        pid = self._attempt_pid
+        if self._scoped_to_attempt and pid is None:
+            return []
         try:
             import psutil
         except ImportError:
             return []
         try:
-            children = psutil.Process().children(recursive=True)
+            children = psutil.Process(pid).children(recursive=True)
         except Exception:
             return []
         matched = []
@@ -5276,8 +5292,8 @@ class _FFmpegStallWatchdog:
                     flush=True,
                 )
                 continue
-            # Nothing to kill (ffmpeg not spawned yet / already gone): keep
-            # watching — the per-clip timeout still bounds the extraction.
+            # The attempt process owns the pre-transfer deadline. Keep
+            # watching for this attempt's FFmpeg downloader.
             with self._lock:
                 self._last_change = now
 
@@ -5326,6 +5342,12 @@ def _download_clip(
         else max(20.0, min(90.0, per_clip_timeout * 0.25))
     )
     clip_deadline = time.monotonic() + per_clip_timeout + clip_grace
+    try:
+        extraction_seconds = max(5.0, min(90.0, float(
+            os.environ.get("VIDZEO_YT_RANGE_EXTRACTION_TIMEOUT_SECONDS", "40") or 40
+        )))
+    except (TypeError, ValueError):
+        extraction_seconds = 40.0
 
     def _remaining_clip_timeout() -> float:
         remaining = clip_deadline - time.monotonic()
@@ -5429,12 +5451,27 @@ def _download_clip(
         # whole YouTube worker pool.
         opts["progress_hooks"] = [_download_progress]
         download_error = None
+        isolated_attempt = bool(getattr(yt_dlp, "__path__", None))
         stall_watchdog = _FFmpegStallWatchdog(
             output_path.parent,
             raw_prefix,
             zero_byte_grace_seconds=zero_byte_grace_seconds,
+            scoped_to_attempt=isolated_attempt,
         )
         stall_watchdog.start()
+
+        def run_ranged_attempt(attempt_opts, jar):
+            return download_range_attempt(
+                attempt_opts, url, attempt_opts["extractor_args"]["youtube"]["player_client"],
+                jar, [(range_start, range_end)], work_dir=output_path.parent,
+                extraction_seconds=extraction_seconds, deadline=clip_deadline,
+                cancellation=cancellation, check_transfer=lambda: _download_progress(None),
+                on_process=stall_watchdog.bind_attempt,
+            )
+
+        # Real packages run in a killable subprocess. Lightweight injected
+        # YoutubeDL doubles still exercise the session/format flow in-process.
+        run_attempt = run_ranged_attempt if isolated_attempt else None
         try:
             for format_index, format_spec in enumerate(format_candidates):
                 if cancellation is not None:
@@ -5451,7 +5488,7 @@ def _download_clip(
                 try:
                     _download_with_youtube_session(
                         yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
-                        on_retry_reset=stall_watchdog.reset,
+                        on_retry_reset=stall_watchdog.reset, attempt_runner=run_attempt,
                     )
                     download_error = None
                     break
@@ -5461,6 +5498,10 @@ def _download_clip(
                     # format after the coordinator has moved on only creates late
                     # partial files and delays executor quiescence/salvage.
                     if cancellation is not None and cancellation.cancelled():
+                        raise
+                    if isinstance(exc, YouTubeExtractionTimeout):
+                        candidate['_transport_failure'] = 'youtube_extraction_timeout'
+                        print(f"   [yt-v2] {exc}; pre-transfer attempt stopped", flush=True)
                         raise
                     if stall_watchdog.zero_byte_stalled:
                         candidate['_transport_failure'] = 'zero_byte_throttle'
@@ -5565,7 +5606,7 @@ def _download_clip(
             if stall_watchdog.fired:
                 candidate['_ffmpeg_stall_killed'] = True
                 if stall_watchdog.zero_byte_stalled:
-                    candidate['_transport_failure'] = 'zero_byte_throttle'
+                    candidate.setdefault('_transport_failure', 'zero_byte_throttle')
     except Exception as exc:
         # The per-clip wall raises TimeoutError from _remaining_clip_timeout
         # (progress hooks and the format loop); yt-dlp timeouts surface as
@@ -9634,7 +9675,7 @@ def get_youtube_clips(
                     "network_unavailable"
                     if failure in network_failure_codes
                     else "transport_timeout"
-                    if failure in {"transport_timeout", "zero_byte_throttle"}
+                    if failure in {"transport_timeout", "zero_byte_throttle", "youtube_extraction_timeout"}
                     else "download_error"
                 ),
             })
@@ -10239,7 +10280,9 @@ def get_youtube_clips(
     throttled_missing = [
         i for i in missing_after_wave
         if any(
-            isinstance(att, Mapping) and (
+            isinstance(att, Mapping)
+            and att.get("reason") != "youtube_extraction_timeout"
+            and (
                 att.get("failure_kind") in retryable_transport_kinds
                 or att.get("reason") in {"zero_byte_throttle", "transport_timeout"}
                 or any(tok in str(att.get("reason") or "").lower() for tok in ("429", "too many requests", "youtube_zero_byte_stall", "timed out", "timeout"))

@@ -10611,6 +10611,7 @@ class _YoutubeProcessFuture:
                 stdout=worker_log,
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags,
+                start_new_session=os.name != "nt",
                 env=environment,
             )
         if cancellation is not None:
