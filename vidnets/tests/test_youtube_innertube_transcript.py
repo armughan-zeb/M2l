@@ -91,12 +91,9 @@ def test_authenticated_download_clients_exclude_embedded_variant(monkeypatch):
     assert not any(_embedded_variant(client) for client in clients)
 
 
-def test_anonymous_download_client_unchanged(monkeypatch):
-    """Bare tv_embedded stays the anonymous client: its _download_ytcfg
-    short-circuits on the missing URL-map entry before the embedded
-    fixup, so it cannot raise this KeyError."""
+def test_anonymous_download_uses_the_android_player_client(monkeypatch):
     monkeypatch.delenv("VIDZEO_YT_PLAYER_CLIENTS", raising=False)
-    assert _youtube_player_clients(None) == ["tv_embedded"]
+    assert _youtube_player_clients(None) == ["android"]
 
 
 def test_player_client_env_override_still_wins(monkeypatch):

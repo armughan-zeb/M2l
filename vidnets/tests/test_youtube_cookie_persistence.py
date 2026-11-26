@@ -424,8 +424,11 @@ class DownloadHookTests(unittest.TestCase):
         cache_dir = self.tmp / "yt_search_cache"
         with mock.patch.dict(os.environ,
                             {"VIDZEO_YT_SEARCH_CACHE_DIR": str(cache_dir)}):
-            with mock.patch.object(yt_dlp_runtime, "load_yt_dlp",
-                                   return_value=fake_yt_dlp):
+            with (
+                mock.patch.object(yt_dlp_runtime, "load_yt_dlp", return_value=fake_yt_dlp),
+                mock.patch.object(pipeline, "_network_disabled_by_runtime", return_value=False),
+                mock.patch.object(pipeline, "_current_youtube_network_diagnostic", return_value={}),
+            ):
                 entries = pipeline._search_youtube_uncached(
                     "fake query", 1, session_jar=session_jar)
         self.assertEqual(len(entries), 1)

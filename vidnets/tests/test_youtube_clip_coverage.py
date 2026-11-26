@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.youtube_stage_budget import youtube_stage_budget
+from services.youtube_stage_budget import youtube_clip_grace_seconds, youtube_stage_budget
 from services.youtube_clip_provenance import write_clip_provenance, load_clip_provenance
 
 
@@ -33,27 +33,50 @@ def test_cut_provenance_is_bound_to_exact_pixels_and_scene(tmp_path):
     assert not load_clip_provenance(clip, 2)
 
 
-def test_per_transfer_budget_scales_with_actual_download_waves():
-    serial = youtube_stage_budget(240, scene_count=5, download_workers=1)
-    parallel = youtube_stage_budget(240, scene_count=5, download_workers=2)
-    # Both may hit the minimum usable HD transfer window. More workers must
-    # never reduce it; use a larger wall to exercise actual wave scaling.
-    assert serial['yt_per_clip_timeout_seconds'] <= parallel['yt_per_clip_timeout_seconds']
-    assert serial['yt_per_clip_timeout_seconds'] >= 45
-    assert youtube_stage_budget(480, scene_count=5, download_workers=1)['yt_per_clip_timeout_seconds'] < youtube_stage_budget(480, scene_count=5, download_workers=2)['yt_per_clip_timeout_seconds']
+def test_per_transfer_budget_scales_with_actual_download_waves(monkeypatch):
+    monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
+    settings = {'_youtube_quota_preselected': True}
+    serial = youtube_stage_budget(480, settings, scene_count=5, download_workers=1)
+    parallel = youtube_stage_budget(480, settings, scene_count=5, download_workers=2)
+    assert 60 <= serial['yt_per_clip_timeout_seconds'] < parallel['yt_per_clip_timeout_seconds']
     assert 'yt_per_clip_timeout_seconds' not in youtube_stage_budget(240, {'yt_pool_first': True}, scene_count=5)
 
 
-def test_preselected_quota_keeps_useful_transfer_windows_without_truncating_scenes():
+@pytest.mark.parametrize("configured_grace", [None, "40"])
+def test_wave_budget_leaves_time_for_the_workers_actual_merge_grace(monkeypatch, configured_grace):
+    if configured_grace is None:
+        monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("VIDZEO_YT_CLIP_GRACE_SECONDS", configured_grace)
+    plan = youtube_stage_budget(300, {'_youtube_quota_preselected': True}, scene_count=4, download_workers=2)
+    transfer = plan['yt_per_clip_timeout_seconds']
+    assert transfer >= 60
+    assert 2 * (transfer + youtube_clip_grace_seconds(transfer)) + plan['yt_search_timeout_seconds'] + 10 <= plan['yt_hard_timeout_seconds']
+
+
+def test_first_wave_preserves_agent_search_when_download_waves_fit(monkeypatch):
+    monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
+    plan = youtube_stage_budget(480, {
+        "llm_provider": "external_agent",
+        "_youtube_quota_preselected": True,
+        "yt_search_timeout_seconds": 120,
+    }, scene_count=7, download_workers=4)
+    assert plan["yt_search_timeout_seconds"] == 120
+    assert plan["yt_per_clip_timeout_seconds"] >= 60
+
+
+def test_preselected_quota_keeps_useful_transfer_windows_without_truncating_scenes(monkeypatch):
+    monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
     plan = youtube_stage_budget(
         420,
         {'_youtube_quota_preselected': True},
         scene_count=35,
         download_workers=4,
     )
-    assert plan['yt_per_clip_timeout_seconds'] >= 45
+    transfer = plan['yt_per_clip_timeout_seconds']
+    assert transfer >= 60
     assert 'yt_max_download_scenes' not in plan
-    assert plan['yt_search_timeout_seconds'] <= 67
+    assert 4 * (transfer + youtube_clip_grace_seconds(transfer)) + plan['yt_search_timeout_seconds'] + 10 <= plan['yt_hard_timeout_seconds']
     assert plan['yt_hard_timeout_seconds'] < 420
 
 
@@ -212,6 +235,7 @@ def test_source_chapter_probe_reads_only_structured_marker(monkeypatch):
 
 
 def test_unavailable_hd_source_does_not_repeat_every_format(monkeypatch, tmp_path):
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
     import sys
     import types
     from services import youtube_pipeline_v2 as yt
@@ -233,7 +257,8 @@ def test_unavailable_hd_source_does_not_repeat_every_format(monkeypatch, tmp_pat
     monkeypatch.setattr(yt_dlp_runtime, 'load_yt_dlp', lambda: types.SimpleNamespace(YoutubeDL=FakeYoutubeDL))
     assert not yt._download_clip({'id': 'missing', 'webpage_url': 'https://youtube.com/watch?v=missing'},
                                  tmp_path / 'cut.mp4', 20, 4)
-    assert len(calls) == 2
+    assert len(calls) == 3
+    assert calls[0] != calls[1] == calls[2]
     assert 'height<=2160' in calls[1]
     assert calls[1].endswith('bestvideo[height>=720][height<=2160]')
 
@@ -258,5 +283,7 @@ def test_muse_cooldown_keeps_first_wave_and_review_reserve_separate():
     assert mixed_agent_cooldown_wall(config, {"VIDZEO_YT_COOLDOWN_RETRY": "0"}) == 0
     assert mixed_agent_cooldown_wall({**config, "yt_branch_wall_timeout_seconds": 480}, {}) == 0
     plan = youtube_stage_budget(1200, {**config, "_yt_cooldown_headroom": True}, vision_reserve_seconds=300)
-    assert plan["yt_hard_timeout_seconds"] == 180
+    assert plan["yt_hard_timeout_seconds"] == 480
     assert plan["yt_cooldown_hard_timeout_seconds"] == 882
+    shorter = youtube_stage_budget(1200, {"yt_hard_timeout_seconds": 35}, vision_reserve_seconds=300)
+    assert shorter["yt_hard_timeout_seconds"] == 35

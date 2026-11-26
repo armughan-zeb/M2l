@@ -1,9 +1,6 @@
 """Worker D (yt-speed) regressions.
 
-- Player clients: bare tv_embedded anonymously, yt-dlp authed defaults when
-  authenticated (tv_embedded is stripped by yt-dlp without cookies support).
-  Measured live Nov 18: old multi-client lists returned only 360p +
-  storyboards without JS solving; tv_embedded alone returned 48-77 formats.
+- Player clients: Android for public clips, cookie-capable clients for signed-in clips.
 - Extraction cache: one metadata extraction serves probe + final + retries.
 - Memory fit: total-RAM tiers, not instantaneous free RAM.
 - Quality formats: 30 fps preferred on the primary rung, 2160p rung gone.
@@ -39,10 +36,10 @@ def _clear_info_cache():
 # 1. Player clients
 # ---------------------------------------------------------------------------
 
-def test_player_clients_anonymous_uses_bare_tv_embedded(monkeypatch):
+def test_player_clients_anonymous_uses_android(monkeypatch):
     monkeypatch.delenv("VIDZEO_YT_PLAYER_CLIENTS", raising=False)
-    assert ytv2._youtube_player_clients(None) == ["tv_embedded"]
-    assert ytv2._youtube_player_clients() == ["tv_embedded"]
+    assert ytv2._youtube_player_clients(None) == ["android"]
+    assert ytv2._youtube_player_clients() == ["android"]
 
 
 def test_player_clients_authenticated_uses_authed_defaults(monkeypatch):
@@ -173,6 +170,20 @@ def test_cached_info_serves_probe_then_final_with_one_extraction():
     # The cached dict itself carries no selection.
     cached = ytv2._youtube_cached_info(url, clients)
     assert cached is not None and "requested_formats" not in cached
+
+
+def test_failed_metadata_request_is_not_repeated_with_same_client():
+    url = "https://www.youtube.com/watch?v=chyjcZe0qW4"
+
+    class UnavailableYdl(_FakeYdl):
+        def extract_info(self, url, download=False):
+            self.extract_calls += 1
+            raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+    ydl = UnavailableYdl({})
+    with pytest.raises(RuntimeError, match="HTTP Error 429"):
+        ytv2._youtube_download_with_cached_info(ydl, url, ["android"])
+    assert ydl.extract_calls == 1
 
 
 def test_cached_info_key_includes_client_list():

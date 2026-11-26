@@ -59,6 +59,7 @@ def test_range_attempt_runs_yt_dlp_and_delivers_local_media(tmp_path):
         "outtmpl": str(output),
         "ffmpeg_location": ffmpeg,
     }
+    options.update(pipeline._youtube_js_runtime_options())
     ranged.download_range_attempt(
         options, source.as_uri(), [], None, [], work_dir=tmp_path,
         extraction_seconds=12, deadline=time.monotonic() + 20,
@@ -102,9 +103,13 @@ def test_pre_transfer_timeout_uses_one_bounded_public_attempt(
     jar = ranged._cookie_jar([])
     jar._vidzeo_session_status = session_status
     candidate = {"id": "fixture", "url": "https://www.youtube.com/watch?v=fixture"}
-    assert not pipeline._download_clip(candidate, tmp_path / "clip.mp4", 5, 3, session_jar=jar)
+    first_wave_deadline = time.monotonic() + 64
+    assert not pipeline._download_clip(
+        candidate, tmp_path / "clip.mp4", 5, 3, session_jar=jar, deadline_at=first_wave_deadline,
+    )
     assert [call[1] for call in calls] == expected_routes
-    assert len({(call[0], call[3]) for call in calls}) == 1
+    assert {call[3] for call in calls} == {first_wave_deadline}
+    assert len({call[0] for call in calls}) == 1
     if expected_routes == ["signed_in", "public"]:
         assert [call[2] for call in calls] == [10.0, 55.0]
     assert candidate["_transport_failure"] == "youtube_extraction_timeout"
@@ -143,6 +148,42 @@ def test_unverified_session_uses_signed_in_attempt_only_if_public_requires_login
         run()
     assert attempts == ([None, jar] if public_error == "login required" else [None])
     assert persisted == ([jar] if public_error == "login required" else [])
+
+
+@pytest.mark.parametrize("failure, override, expected_clients", [
+    ("Requested format is not available", None, [["android"], ["tv"]]),
+    ("Requested format is not available", "web", [["web"]]),
+    ("Sign in to confirm you're not a bot", None, [["android"]]),
+    ("HTTP Error 429: Too Many Requests", None, [["android"]]),
+])
+def test_public_range_uses_tv_only_when_android_lacks_formats(
+    tmp_path, monkeypatch, failure, override, expected_clients,
+):
+    monkeypatch.delenv("VIDZEO_YT_PLAYER_CLIENTS", raising=False)
+    monkeypatch.setattr(pipeline, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
+    if override:
+        monkeypatch.setenv("VIDZEO_YT_PLAYER_CLIENTS", override)
+    calls = []
+
+    def download(options, session):
+        assert session is None
+        clients = options["extractor_args"]["youtube"]["player_client"]
+        calls.append(clients)
+        if clients != ["tv"]:
+            raise RuntimeError(failure)
+
+    def run():
+        pipeline._download_with_youtube_session(
+            None, {}, "https://www.youtube.com/watch?v=fixture", None, None, tmp_path,
+            "clip.raw.", attempt_runner=download,
+        )
+
+    if len(expected_clients) == 1:
+        with pytest.raises(RuntimeError, match=failure):
+            run()
+    else:
+        run()
+    assert calls == expected_clients
 
 
 def test_worker_passes_requested_range_and_cookie_in_memory(tmp_path, monkeypatch):

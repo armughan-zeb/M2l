@@ -40,6 +40,7 @@ def test_download_rejects_short_range_even_if_decodable(tmp_path, monkeypatch, s
     monkeypatch.setattr("services.yt_dlp_runtime.load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
     monkeypatch.setattr(yt, "_source_video_height", lambda path: 1080)
     monkeypatch.setattr(yt, "_network_disabled_by_runtime", lambda: False)
+    monkeypatch.setattr(yt, "_current_youtube_network_diagnostic", lambda: {})
     if preserve is None:
         monkeypatch.delenv("VIDZEO_YT_RETRIEVAL_PRESERVE_SOURCE", raising=False)
     else:

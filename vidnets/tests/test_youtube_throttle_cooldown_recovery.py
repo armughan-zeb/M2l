@@ -122,7 +122,7 @@ def test_download_with_session_rotates_on_zero_byte_stall(tmp_path):
     TimeoutError("youtube_zero_byte_stall"),
     ytv2.YouTubeExtractionTimeout("youtube_extraction_timeout_after_40s"),
 ])
-def test_download_with_session_falls_back_to_anon_tv_embedded(tmp_path, monkeypatch, failure):
+def test_download_with_session_falls_back_to_public_android(tmp_path, monkeypatch, failure):
     monkeypatch.setattr(ytv2, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
     clients_seen = []
     throttle_marks = []
@@ -166,7 +166,7 @@ def test_download_with_session_falls_back_to_anon_tv_embedded(tmp_path, monkeypa
         tmp_path,
         "raw_",
     )
-    assert clients_seen == [["web", "tv_samsung"], ["tv_embedded"]]
+    assert clients_seen == [["web", "tv_samsung"], ["android"]]
     if isinstance(failure, ytv2.YouTubeExtractionTimeout):
         assert throttle_marks == []
     else:

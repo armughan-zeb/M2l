@@ -254,12 +254,13 @@ def test_assignment_on_real_run7_texts_selects_same_primaries():
 
 def test_download_reserve_math(monkeypatch):
     # Run-7 numbers: 7 live scenes, 5 download workers, 66.7 s per-clip
-    # stage value -> 2 waves x (66.7 + 30 screening) + 10 handoff.
+    # stage value -> 2 waves x (66.7 + 20 merge/probe + 30 screening) + 10 handoff.
+    monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
     monkeypatch.setenv("VIDZEO_YT_PER_CLIP_TIMEOUT", "66.7")
-    assert _yt_download_slot_seconds() == pytest.approx(96.7)
-    assert _yt_download_reserve_seconds(7, 5) == pytest.approx(203.4)
+    assert _yt_download_slot_seconds() == pytest.approx(116.7)
+    assert _yt_download_reserve_seconds(7, 5) == pytest.approx(243.4)
     assert _yt_download_reserve_seconds(0, 5) == 10.0
-    # Default (no stage value): measured 80 s transfer + 30 s screening.
+    # Default: 60 s transfer, 20 s merge/probe, and 30 s screening.
     monkeypatch.delenv("VIDZEO_YT_PER_CLIP_TIMEOUT", raising=False)
     assert _yt_download_slot_seconds() == pytest.approx(110.0)
     assert _yt_download_reserve_seconds(1, 5) == pytest.approx(120.0)
@@ -342,7 +343,7 @@ def test_transcript_deadline_respects_download_reserve(tmp_path, monkeypatch):
     audit = getattr(result, "audit", {}) or {}
     ranged = audit.get("ranged_moment_selection", {})
     workers = audit["download_workers"]
-    assert workers == 5
+    assert workers == 4
     # All 11 scenes are live (no prep injection in this fixture), so the
     # reserve is priced on 11 scenes, NOT on download attempts (a scene
     # retries alternates against stub bytes, so attempts outnumber scenes).
@@ -350,8 +351,8 @@ def test_transcript_deadline_respects_download_reserve(tmp_path, monkeypatch):
     assert ranged["download_reserve_seconds"] == pytest.approx(round(reserve, 1), abs=0.2)
     assert ranged["ranged_deadline_seconds"] == pytest.approx(recorded["deadline_seconds"], abs=0.2)
     # The run-9 policy: the transcript floor (120 s) holds even when
-    # floor + reserve exceeds the wall -- with 5 workers, 11 scenes
-    # need 3 waves (~300 s), so the old arithmetic gave ~23 s and run 9
+    # floor + reserve exceeds the wall. Four workers need three waves
+    # for 11 scenes, so the old arithmetic gave ~23 s and run 9
     # hit the 15 s floor on every worker. The deadline is still capped
     # at 120 s (never unbounded).
     assert recorded["deadline_seconds"] == pytest.approx(120.0, abs=0.2)

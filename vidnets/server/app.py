@@ -12017,26 +12017,25 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         
         from concurrent.futures import TimeoutError as FuturesTimeoutError
         from services.youtube_stage_budget import youtube_stage_budget
-        planned_download_workers = max(1, min(6, int(config.get('yt_download_concurrency') or 4)))
-        try:
-            import psutil
-            from services.youtube_pipeline_v2 import _ranged_download_worker_limit
-            ram = psutil.virtual_memory()
-            planned_download_workers = _ranged_download_worker_limit(planned_download_workers,
-                int(ram.available / (1024**2)), ram.total)
-        except (ImportError, OSError, ValueError, TypeError):
-            planned_download_workers = 1
+        worker_config = dict(config)
+        if not is_mixed_youtube_branch and not worker_config.get("yt_download_concurrency"):
+            worker_config["yt_download_concurrency"] = yt_environment.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY")
+        planned_download_workers = _mixed_youtube_download_worker_capacity(worker_config)
         stage_budget = youtube_stage_budget(yt_wall_seconds, config,
             scene_count=len(scene_texts), download_workers=planned_download_workers)
         if 'yt_max_download_scenes' not in stage_budget:
             config.pop('yt_max_download_scenes', None)
         config.update(stage_budget)
+        config['yt_download_concurrency'] = planned_download_workers
         if config.get('yt_per_clip_timeout_seconds'):
             yt_environment['VIDZEO_YT_PER_CLIP_TIMEOUT'] = str(config['yt_per_clip_timeout_seconds'])
         cooldown_wall = stage_budget.get('yt_cooldown_hard_timeout_seconds')
         cooldown_log = f", with cooldown<={cooldown_wall:.0f}s" if cooldown_wall else ""
+        clip_wall = stage_budget.get('yt_per_clip_timeout_seconds')
+        clip_log = f", clip transport<={clip_wall:.0f}s" if clip_wall else ""
         print(f"   [yt] stage allocation: search<={config['yt_search_timeout_seconds']:.0f}s, "
-              f"first wave<={config['yt_hard_timeout_seconds']:.0f}s{cooldown_log}, outer={yt_wall_seconds:.0f}s")
+              f"first wave<={config['yt_hard_timeout_seconds']:.0f}s{cooldown_log}{clip_log}, "
+              f"planned download workers={planned_download_workers}, outer={yt_wall_seconds:.0f}s")
         # A ThreadPoolExecutor timeout only releases the caller; Python cannot
         # kill a worker thread that is blocked in a provider library. Production
         # runs therefore isolate YouTube in a child process and taskkill its

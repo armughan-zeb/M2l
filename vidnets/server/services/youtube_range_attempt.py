@@ -151,6 +151,9 @@ def download_range_attempt(options, url, clients, jar, ranges, *, work_dir,
             "transfer_marker": str(marker.resolve()),
         }
         payload["options"]["outtmpl"] = os.path.abspath(payload["options"]["outtmpl"])
+        # yt-dlp takes a set for compat_opts. The request boundary is JSON.
+        if "compat_opts" in payload["options"]:
+            payload["options"]["compat_opts"] = sorted(payload["options"]["compat_opts"])
         cached = _youtube_cached_info(url, clients)
         if cached is not None:
             # Non-serializable live metadata is usable only within the process
@@ -206,6 +209,8 @@ def _execute(request, logger):
         request["options"], logger=logger,
         download_ranges=download_range_func(None, request["ranges"]),
     )
+    if "compat_opts" in options:
+        options["compat_opts"] = set(options["compat_opts"])
     marker = Path(request["transfer_marker"])
     with load_yt_dlp().YoutubeDL(options) as ydl:
         _install_youtube_session(ydl, jar)

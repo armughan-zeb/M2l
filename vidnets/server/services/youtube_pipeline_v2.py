@@ -41,6 +41,7 @@ from .visual_requirement import (
 from .youtube_query_normalizer import normalize_youtube_query, normalize_youtube_queries
 from .yt_dlp_runtime import runtime_receipt, YouTubeRuntimeLog
 from .youtube_range_attempt import YouTubeExtractionTimeout, download_range_attempt
+from .youtube_stage_budget import youtube_clip_grace_seconds
 from .scene_entities import comparison_pair_conflict, explicit_named_pairs
 
 # Candidate scoring (``_score_candidate``) runs the shared clip classifiers
@@ -2789,39 +2790,25 @@ def _youtube_evict_info(url: Any, clients: Any) -> None:
 
 
 def _youtube_download_with_cached_info(ydl: Any, url: str, clients: Any) -> None:
-    """Download ``url`` with ``ydl``, reusing a cached metadata extraction.
-
-    Drop-in replacement for ``ydl.download([url])`` for single-video URLs.
-    First call per (video, client list) extracts metadata and stores it;
-    later calls (probe -> final download, format-fallback retry) skip the
-    extraction and feed the cached dict to ``process_ie_result``. A failure
-    on the cached path evicts the entry and falls through to a fresh plain
-    download: the cached copy is unusable, not the video, and the old
-    ``raise`` turned one bad cache entry into a lost scene (run 6: the
-    "cannot pickle 'generator' object" from a LazyList ``fragments``
-    entry surfaced as a format-spec failure on EVERY selector).
-    Minimal yt-dlp doubles in tests may only implement ``download``; they
-    take the plain path unchanged.
-    """
+    """Reuse extracted formats and let the caller decide when a provider retry is useful."""
     if not (hasattr(ydl, "extract_info") and hasattr(ydl, "process_ie_result")):
         ydl.download([url])
         return
-    try:
-        cached = _youtube_cached_info(url, clients)
-    except Exception:
-        cached = None
+    cached = _youtube_cached_info(url, clients)
     if cached is not None:
         try:
             ydl.process_ie_result(cached, download=True)
             return
-        except Exception:
+        except Exception as exc:
+            # A selector can fail even when another can use these formats.
+            detail = str(exc).casefold()
+            if _youtube_formats_unavailable(detail):
+                raise
             _youtube_evict_info(url, clients)
-            # Fall through to a fresh extraction + plain download below.
-    try:
-        info = ydl.extract_info(url, download=False)
-    except Exception:
-        ydl.download([url])
-        return
+            if not isinstance(exc, TypeError) or "cannot pickle" not in detail:
+                raise
+
+    info = ydl.extract_info(url, download=False)
     if isinstance(info, dict):
         # Materialize BEFORE the formats check and any deepcopy: a
         # LazyList ``formats`` (or LazyList ``fragments`` inside it)
@@ -2840,11 +2827,14 @@ def _youtube_download_with_cached_info(ydl: Any, url: str, clients: Any) -> None
             info.pop(stale_key, None)
         try:
             ydl.process_ie_result(copy.deepcopy(info), download=True)
-        except Exception:
-            # A residual unpicklable value (e.g. a live stream's
-            # ``functools.partial`` fragments) must not fail the scene:
-            # yt-dlp's own download path handles the fresh info dict
-            # without our copy.
+        except Exception as exc:
+            detail = str(exc).casefold()
+            if _youtube_formats_unavailable(detail):
+                raise
+            _youtube_evict_info(url, clients)
+            if not isinstance(exc, TypeError) or "cannot pickle" not in detail:
+                raise
+            # The native path also supports results that cannot be copied.
             ydl.download([url])
     else:
         # Not a plain video info dict (playlist/search result): fall back
@@ -2891,6 +2881,13 @@ def _youtube_login_required(detail: str) -> bool:
     ))
 
 
+def _youtube_formats_unavailable(detail: str) -> bool:
+    return any(marker in detail for marker in (
+        "requested format is not available", "no video formats found",
+        "no formats found", "no supported formats", "no player clients",
+    ))
+
+
 def _youtube_range_prefers_public(jar: Any) -> bool:
     return getattr(jar, "_vidzeo_session_status", "") in {"unverified", "signed_out"}
 
@@ -2906,16 +2903,17 @@ def _download_with_youtube_session(
     *,
     on_retry_reset=None,
     attempt_runner=None,
+    allow_public_client_fallback=True,
 ):
     """Select a session and recover with bounded alternate attempts."""
-    def download(jar):
+    def download(jar, clients=None):
         if cancellation is not None:
             cancellation.raise_if_cancelled()
         attempt_opts = dict(opts, extractor_args={
             **(opts.get("extractor_args") or {}),
             "youtube": {
                 **((opts.get("extractor_args") or {}).get("youtube") or {}),
-                "player_client": _youtube_player_clients(jar),
+                "player_client": clients if clients is not None else _youtube_player_clients(jar),
             },
         })
         if attempt_runner is not None:
@@ -2938,6 +2936,27 @@ def _download_with_youtube_session(
         if callable(on_retry_reset):
             on_retry_reset()
 
+    def download_public(allow_alternate=allow_public_client_fallback):
+        try:
+            return download(None)
+        except Exception as exc:
+            detail = str(exc).casefold()
+            logger = opts.get("logger")
+            if (
+                not allow_alternate
+                or os.environ.get("VIDZEO_YT_PLAYER_CLIENTS", "").strip()
+                or not _youtube_formats_unavailable(detail)
+                or _youtube_login_required(detail)
+                or any(marker in detail for marker in ("not a bot", "429", "too many requests", "private video"))
+                or "authentication" in getattr(logger, "categories", ())
+            ):
+                raise
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            _reset_and_clean()
+            print("   [yt-session] Android returned no playable formats; trying the TV client", flush=True)
+            return download(None, clients=["tv"])
+
     tried_public = (
         attempt_runner is not None
         and _youtube_range_prefers_public(session_jar)
@@ -2946,7 +2965,7 @@ def _download_with_youtube_session(
     if tried_public:
         try:
             print("   [yt-session] session unverified; trying public playback first", flush=True)
-            download(None)
+            download_public()
             return
         except Exception as exc:
             detail = str(exc).casefold()
@@ -2956,7 +2975,7 @@ def _download_with_youtube_session(
             _reset_and_clean()
 
     try:
-        used_jar = download(session_jar)
+        used_jar = download_public() if session_jar is None else download(session_jar)
         _persist_youtube_session_cookies(used_jar, session_jar)
     except Exception as exc:
         pool = getattr(session_jar, "_vidzeo_session_pool", None)
@@ -3009,9 +3028,9 @@ def _download_with_youtube_session(
         ):
             _reset_and_clean()
             phase = "extraction timed out" if extraction_timeout else "transfer stalled or was throttled"
-            print(f"   [yt-session] authenticated {phase}; trying public playback once", flush=True)
+            print(f"   [yt-session] authenticated {phase}; trying public playback", flush=True)
             try:
-                download(None)
+                download_public(allow_alternate=True)
                 return
             except Exception as anon_exc:
                 if cancellation is not None:
@@ -3030,60 +3049,14 @@ def _download_with_youtube_session(
 
 
 def _youtube_player_clients(session_jar: Any = None) -> List[str]:
-    """Resolve the yt-dlp player_client list for video/probe downloads.
-
-    Measured live (Nov 18, proxy, yt-dlp 2026.10.26) on the Panama log's
-    failing videos (chyjcZe0qW4, emJNfH19MXY, m8TkcWhmByg, YzFGkdPmDZU):
-
-    - The old multi-client lists returned only 5 formats — 4 storyboard
-      images plus 360p progressive (18) — whenever the JavaScript challenge
-      solver was not in play, so every HD selector failed on BOTH rungs
-      ("Requested format is not available"). Prepending tv_embedded to the
-      same list does NOT fix it: tv_embedded-first in a list measured
-      identically (5 formats, 0 avc1 HD). The multi-client list itself is
-      the poison; a bare ``tv_embedded`` alone returns 48-77 formats with
-      avc1 HD present, with no JS runtime at all.
-    - ``tv_embedded`` does not support cookies: yt-dlp strips it from the
-      requested list whenever the session is authenticated ("Skipping
-      unsupported client"), falling back to its authed defaults. Listing it
-      for the authenticated branch would be dead config.
-    - With the node/EJS challenge solver (which the pipeline already wires
-      in), every sane list returns full formats authenticated (37 formats,
-      avc1 95/96/136/137 on chyjcZe0qW4); without it, NO cookie-supporting
-      list returns playable formats, so the authenticated branch keeps
-      depending on the solver rather than pretending a client tweak can
-      replace it.
-    - ``web_embedded`` is NOT in the authenticated list any more (run 4,
-      Nov 18-19): all 6 download verifications died with
-      ``KeyError('INNERTUBE_CONTEXT')`` on the first client. Root cause is
-      inside yt-dlp 2026.10.26 (the latest release): for an embedded
-      client, ``_download_ytcfg`` fetches the embed page and calls the
-      unguarded ``_fix_embedded_ytcfg(ytcfg)``, which does a bare
-      ``ytcfg['INNERTUBE_CONTEXT']``. Whenever YouTube serves an embed
-      page without a ytcfg (degraded/consent/bot-check page — run 4's hour
-      also showed a session-probe ReadTimeout and a search timeout), that
-      raises a raw KeyError, which is NOT an ExtractorError, so yt-dlp's
-      per-client loop aborts instead of falling through to tv_samsung/web
-      and the whole extraction dies. ``web`` and ``tv_samsung`` never take
-      that path (only the ``*_embedded`` variant triggers it), and with
-      the solver they return full formats authenticated, so dropping
-      web_embedded removes the throw site without losing formats.
-
-    Anonymous downloads therefore use bare ``tv_embedded`` (full formats
-    with no JS dependency — its ``_download_ytcfg`` short-circuits on the
-    missing URL-map entry before the embedded fixup, so it cannot raise
-    this KeyError); authenticated downloads use (web, tv_samsung).
-    ``VIDZEO_YT_PLAYER_CLIENTS`` still overrides both when set.
-    """
+    """Use the working app's Android client for public clips and cookie-capable clients for signed-in clips."""
     configured = str(os.environ.get("VIDZEO_YT_PLAYER_CLIENTS") or "").strip()
-    if configured:
-        clients = [c.strip() for c in configured.split(",") if c.strip()]
-        if clients:
-            return clients
+    clients = [client.strip() for client in configured.split(",") if client.strip()]
+    if clients:
+        return clients
     adapted = _adapt_youtube_cookie_jar(session_jar) if session_jar is not None else None
-    if adapted is not None:
-        return ["web", "tv_samsung"]
-    return ["tv_embedded"]
+    # yt-dlp removes Android from the requested clients when signed in.
+    return ["web", "tv_samsung"] if adapted is not None else ["android"]
 
 
 def _search_cache_path(query: str) -> Path:
@@ -4813,29 +4786,22 @@ def _ranged_download_workers(download_concurrency=None, *, available_mb=None, to
 
 
 def _yt_download_slot_seconds() -> float:
-    """Planning cost of one download-worker slot: transfer + screening.
+    """Reserve one worker slot for transport, merge/probe, and visual screening.
 
-    A live ranged download measures 44-76 s on this host (run 6: 71.79 s,
-    76.49 s; run 7 small worker: 44.25 s), and the worker then spends
-    ~5 s on the motion screen plus ~14 s on the overlay screen before the
-    slot frees — so a slot costs ~80 s of transfer plus ~30 s of screening.
-    The per-clip value comes from the stage budget when set
-    (``VIDZEO_YT_PER_CLIP_TIMEOUT``); without it, plan on the measured
-    80 s, never on the 360 s transport hard timeout (a bound, not a
-    planning value — pricing the reserve at 360 s would leave the
-    transcript phase a 15 s floor and starve it instead).
+    Use the stage's transport budget when present. The working app prices
+    an unconfigured slot at 60s for transport plus merge/probe allowance.
     """
     try:
         per_clip = float(os.environ.get("VIDZEO_YT_PER_CLIP_TIMEOUT") or 0.0)
     except (TypeError, ValueError):
         per_clip = 0.0
-    if not per_clip or per_clip <= 0:
-        per_clip = 80.0
+    if not math.isfinite(per_clip) or per_clip <= 0:
+        per_clip = 60.0
     try:
         screening = float(os.environ.get("VIDZEO_YT_DOWNLOAD_SCREEN_SECONDS", "30") or 30)
     except (TypeError, ValueError):
         screening = 30.0
-    return max(30.0, per_clip) + max(0.0, screening)
+    return per_clip + youtube_clip_grace_seconds(per_clip) + max(0.0, screening)
 
 
 def _yt_download_reserve_seconds(scene_count: Any, download_workers: Any) -> float:
@@ -5349,6 +5315,7 @@ def _download_clip(
     stream_downloads: bool = False,
     cancellation: Any = None,
     zero_byte_grace_seconds: Optional[float] = None,
+    deadline_at: Optional[float] = None,
 ) -> bool:
     # Bound the complete per-candidate operation, including yt-dlp retrieval,
     # format fallback, FFmpeg conversion, and integrity probing.  The outer
@@ -5366,24 +5333,10 @@ def _download_clip(
         )
     except (TypeError, ValueError):
         per_clip_timeout = float(_default_clip_timeout)
-    # Allow a bounded merge/probe tail after transfer.  The old 60-second
-    # minimum made a few stalled ranged downloads occupy every worker until
-    # the outer mixed-media wall expired.  Keep the tail configurable and
-    # short by default; successful source-preserving downloads usually need
-    # only a few seconds, while normalized fallback encodes still get a fair
-    # bounded window.
-    try:
-        configured_grace = float(
-            os.environ.get("VIDZEO_YT_CLIP_GRACE_SECONDS", "") or 0
-        )
-    except (TypeError, ValueError):
-        configured_grace = 0.0
-    clip_grace = (
-        max(15.0, min(120.0, configured_grace))
-        if configured_grace > 0
-        else max(20.0, min(90.0, per_clip_timeout * 0.25))
-    )
+    clip_grace = youtube_clip_grace_seconds(per_clip_timeout)
     clip_deadline = time.monotonic() + per_clip_timeout + clip_grace
+    if deadline_at is not None:
+        clip_deadline = min(clip_deadline, deadline_at)
     try:
         extraction_seconds = max(5.0, min(90.0, float(
             os.environ.get("VIDZEO_YT_RANGE_EXTRACTION_TIMEOUT_SECONDS", "40") or 40
@@ -5422,6 +5375,7 @@ def _download_clip(
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     part_path.unlink(missing_ok=True)
+    candidate['_player_client_attempts'] = []
     for stale in output_path.parent.glob(raw_prefix + "*"):
         try:
             stale.unlink()
@@ -5504,6 +5458,11 @@ def _download_clip(
         stall_watchdog.start()
 
         def run_ranged_attempt(attempt_opts, jar):
+            remaining = _remaining_clip_timeout()
+            clients = attempt_opts["extractor_args"]["youtube"]["player_client"]
+            candidate['_player_client_attempts'].append({
+                "clients": list(clients), "authenticated": jar is not None,
+            })
             extraction_wall = extraction_seconds
             if jar is None:
                 # Direct-mode observations put successful public clips near
@@ -5513,10 +5472,10 @@ def _download_clip(
                 # Give a public retry time to extract and transfer inside
                 # this clip's original wall, even in a tight wave.
                 extraction_wall = min(
-                    extraction_wall, max(10.0, _remaining_clip_timeout() - public_attempt_reserve),
+                    extraction_wall, max(10.0, remaining - public_attempt_reserve),
                 )
             return download_range_attempt(
-                attempt_opts, url, attempt_opts["extractor_args"]["youtube"]["player_client"],
+                attempt_opts, url, clients,
                 jar, [(range_start, range_end)], work_dir=output_path.parent,
                 extraction_seconds=extraction_wall, deadline=clip_deadline,
                 cancellation=cancellation, check_transfer=lambda: _download_progress(None),
@@ -5543,6 +5502,7 @@ def _download_clip(
                     _download_with_youtube_session(
                         yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
                         on_retry_reset=stall_watchdog.reset, attempt_runner=run_attempt,
+                        allow_public_client_fallback=format_index == len(format_candidates) - 1,
                     )
                     download_error = None
                     break
@@ -5650,7 +5610,7 @@ def _download_clip(
                         continue
                     # Both extractions already tried the complete bounded format
                     # set. Switch source instead of repeating an unbounded rescue.
-                    if 'requested format is not available' in error_text:
+                    if _youtube_formats_unavailable(error_text):
                         candidate['_transport_failure'] = 'youtube_format_unavailable'
                     raise
             if download_error is not None:
@@ -9253,6 +9213,7 @@ def get_youtube_clips(
         allow_transport_retry: bool = False,
         active_cancellation: Any = None,
         zero_byte_grace_seconds: Optional[float] = None,
+        deadline_at: Optional[float] = None,
     ) -> Tuple[int, Optional[str]]:
         _cancel = active_cancellation if active_cancellation is not None else download_cancellation
         if provider_network_unavailable.is_set():
@@ -9594,6 +9555,7 @@ def get_youtube_clips(
                     }
                     if pass_download_cancellation and _cancel is not None:
                         download_kwargs["cancellation"] = _cancel
+                        download_kwargs["deadline_at"] = deadline_at if deadline_at is not None else hard_deadline
                     if zero_byte_grace_seconds is not None:
                         download_kwargs["zero_byte_grace_seconds"] = zero_byte_grace_seconds
                     downloaded = _download_clip(
@@ -9622,6 +9584,8 @@ def get_youtube_clips(
                 })
                 downloaded = False
             audit['runtime_warning_categories'] = list(option.get('_runtime_warning_categories') or [])
+            if option.get('_player_client_attempts'):
+                audit['player_client_attempts'] = list(option['_player_client_attempts'])
             if option.get('_download_mode'):
                 audit['download_mode'] = option['_download_mode']
             audit["elapsed_seconds"] = round(time.monotonic() - attempt_started, 2)
@@ -10446,7 +10410,8 @@ def get_youtube_clips(
                         retry_cancellation.raise_if_cancelled()
                     time.sleep(min(1.0, max(0.0, end_at - time.monotonic())))
 
-            def _run_scene_attempt(target_idx: int, *, grace_seconds: Optional[float] = None) -> Optional[str]:
+            def _run_scene_attempt(target_idx: int, *, deadline_at: float,
+                                   grace_seconds: Optional[float] = None) -> Optional[str]:
                 cand = assignments[target_idx]
                 if not cand:
                     return None
@@ -10456,6 +10421,7 @@ def get_youtube_clips(
                     allow_transport_retry=True,
                     active_cancellation=retry_cancellation,
                     zero_byte_grace_seconds=grace_seconds,
+                    deadline_at=deadline_at,
                 )
                 rec = deferred_verifications.pop(r_idx, None)
                 if rec is not None and not r_path:
@@ -10486,7 +10452,9 @@ def get_youtube_clips(
                     break
                 provider_network_unavailable.clear()
                 cooldown_retry_audit["probes"] += 1
-                probe_path = _run_scene_attempt(probe_idx, grace_seconds=probe_zero_byte_grace)
+                probe_path = _run_scene_attempt(
+                    probe_idx, deadline_at=cooldown_deadline, grace_seconds=probe_zero_byte_grace,
+                )
                 if probe_path:
                     results[probe_idx] = probe_path
                     cooled = True
@@ -10545,7 +10513,7 @@ def get_youtube_clips(
                         for r_idx in retry_indices:
                             if time.monotonic() >= wave_deadline:
                                 break
-                            fut = retry_executor.submit(_run_scene_attempt, r_idx)
+                            fut = retry_executor.submit(_run_scene_attempt, r_idx, deadline_at=wave_deadline)
                             retry_futures[fut] = r_idx
                         pending_retry = set(retry_futures.keys())
                         while pending_retry:
