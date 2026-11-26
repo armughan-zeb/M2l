@@ -166,6 +166,8 @@ test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key
   assert.equal(request.llm_provider, 'external_agent');
   assert.equal(request.openrouter_api_key, '');
   assert.equal(request.youtube_accepted_coverage_target, 0.3);
+  assert.equal(request.yt_stop_when_coverage_target_met, undefined);
+  assert.equal(request.preparation_stall_seconds, undefined);
   // Filter-best (Nov 9, 2026): vision is advisory by default — the two
   // strict flags are OFF, so an uncertain verdict never blocks delivery.
   // Named-entity scenes still require a live verdict inside the server

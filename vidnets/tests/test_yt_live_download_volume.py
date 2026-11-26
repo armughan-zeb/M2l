@@ -266,7 +266,8 @@ def test_download_reserve_math(monkeypatch):
     assert _yt_download_reserve_seconds(1, 5) == pytest.approx(120.0)
 
 
-def test_transcript_deadline_respects_download_reserve(tmp_path, monkeypatch):
+@pytest.mark.parametrize("overlap_enabled, expected_deadline", [(True, 120.0), (False, 20.0)])
+def test_transcript_deadline_respects_download_reserve(tmp_path, monkeypatch, overlap_enabled, expected_deadline):
     """End to end: with an 11-scene job and a 325 s wall, the transcript
     deadline keeps its 120 s floor even though the download reserve
     (~300 s) would otherwise squeeze it to ~23 s.
@@ -287,6 +288,7 @@ def test_transcript_deadline_respects_download_reserve(tmp_path, monkeypatch):
     monkeypatch.setenv("VIDZEO_YT_PREP_MANIFEST_INJECTION", "1")
     monkeypatch.setenv("VIDZEO_YT_PER_CLIP_TIMEOUT", "66.7")
     monkeypatch.setenv("VIDZEO_YT_TRANSCRIPT_DEADLINE_SECONDS", "120")
+    monkeypatch.setenv("VIDZEO_YT_RANGED_OVERLAP", "1" if overlap_enabled else "0")
     recorded = {}
 
     def _recording_ranged(*args, **kwargs):
@@ -355,8 +357,8 @@ def test_transcript_deadline_respects_download_reserve(tmp_path, monkeypatch):
     # for 11 scenes, so the old arithmetic gave ~23 s and run 9
     # hit the 15 s floor on every worker. The deadline is still capped
     # at 120 s (never unbounded).
-    assert recorded["deadline_seconds"] == pytest.approx(120.0, abs=0.2)
-    assert recorded["deadline_seconds"] <= 120.0
+    assert recorded["deadline_seconds"] == pytest.approx(expected_deadline, abs=0.2)
+    assert recorded["deadline_seconds"] <= expected_deadline
     assert audit.get("resolved", 0) == len(LIVE_TEXTS)
     assert len([path for path in (result or []) if path]) == len(LIVE_TEXTS)
 

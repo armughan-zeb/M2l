@@ -8809,37 +8809,9 @@ def get_youtube_clips(
     if str(os.environ.get('VIDZEO_YT_RANGED_MOMENTS', '1')).lower() not in {'0', 'false', 'off'}:
         from .youtube_ranged_moments import prepare_ranged_moments
         try:
-            # The transcript phase gets its own budget INSIDE the branch
-            # wall — it must not spend the download phase's time. Run 7:
-            # the old code subtracted a flat 60 s, so transcripts could
-            # run up to 120 s while 7 live scenes still needed ~170 s of
-            # download waves; the pass started with ~55 s left and
-            # completed 0 live downloads. The reserve below prices the
-            # waves the remaining live scenes actually need (restores are
-            # excluded: they carry verified prep moments and cost ~0 s of
-            # network). Transcripts stay best-effort within it, floored
-            # at the ranged transcript deadline
-            # (``_yt_ranged_transcript_deadline_seconds``, 120 s by
-            # default) so a tight wall still yields moments; the
-            # heuristic _pick_timestamp fallback still applies when the
-            # deadline expires or a transcript is missing. Run 9 proved
-            # the old 15 s floor starved the lane (16/60 transcripts,
-            # 7/45 scenes with ranged evidence) because the reserve ate
-            # the whole wall before transcripts started — so the floor
-            # is now the 120 s pipeline default and transcripts may
-            # borrow from the reserve; the 120 s cap and the branch hard
-            # wall still bound the phase.
-            # Measured live (Nov 18): the per-video provider chain
-            # costs ~15s in a good hour and ~45s in a slow one, so 12
-            # videos at 6 ranged workers need ~30s good / ~90s slow.
-            # Overlap (Nov 20): the phase above still runs, but on a
-            # background worker while downloads start immediately
-            # (``_RangedMomentOverlap``). The barrier it used to impose
-            # cost ~130-175 s per pass (tests 12/14/15: search-complete
-            # to first download), most of it waiting on one slow or
-            # erroring transcript while scenes with verified timestamps
-            # waited too. ``VIDZEO_YT_RANGED_OVERLAP=0`` restores the
-            # old synchronous barrier.
+            # Overlapped captions may supply later scenes while downloads
+            # run. For synchronous callers, match the working app's 20s
+            # caption window and leave at least 60s for the transfer.
             live_scene_count = sum(
                 1 for assigned in assignments
                 if assigned and not assigned.get("prep_manifest_injected")
@@ -8847,15 +8819,22 @@ def get_youtube_clips(
             download_reserve = _yt_download_reserve_seconds(
                 live_scene_count, download_workers
             )
-            remaining = (
-                float(hard_timeout_seconds or 900)
-                - (time.monotonic() - batch_started_monotonic)
-                - download_reserve
+            branch_remaining = float(hard_timeout_seconds or 900) - (
+                time.monotonic() - batch_started_monotonic
             )
-            ranged_deadline = min(120.0, max(_yt_ranged_transcript_deadline_seconds(), remaining))
-            if float(hard_timeout_seconds or 900) - (time.monotonic() - batch_started_monotonic) > 0:
+            overlap_enabled = str(os.environ.get('VIDZEO_YT_RANGED_OVERLAP', '1')).strip().lower() not in {
+                '0', 'false', 'off', 'no',
+            }
+            if overlap_enabled:
+                ranged_deadline = min(
+                    branch_remaining, 120.0,
+                    max(_yt_ranged_transcript_deadline_seconds(), branch_remaining - download_reserve),
+                )
+            else:
+                ranged_deadline = min(20.0, branch_remaining - 60.0)
+            if ranged_deadline > 0:
                 ranged_rows = [dict(row, pool_key=_row_pool_key(row)) for row in rows]
-                if str(os.environ.get('VIDZEO_YT_RANGED_OVERLAP', '1')).strip().lower() in {'0', 'false', 'off', 'no'}:
+                if not overlap_enabled:
                     ranged_moments, ranged_moment_audit = prepare_ranged_moments(
                         ranged_rows, assignments, pools,
                         scene_durations, session_jar=authenticated_session,

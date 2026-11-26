@@ -11234,36 +11234,27 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         or config.get("yt_download_hard_timeout_seconds")
         or _quality_batch_timeout
     )
-    if _mixed_media_job and not long_youtube_job:
-        # Five-ish quota clips normally complete well inside this window. It
-        # is long enough for slow connections, but prevents a dead YouTube
-        # worker from consuming the delivery budget needed by web imagery.
-        _quality_source_deadline = max(300, min(480, int(round(300.0 + (90.0 * _quality_ratio)))))
-    else:
-        _quality_source_deadline = max(
-            360,
-            min(900, int(round(360.0 + (120.0 * _quality_ratio)))),
+    if _mixed_media_job:
+        source_deadline = (
+            config.get("yt_pool_source_download_deadline_seconds")
+            or yt_environment.get("VIDZEO_MIXED_YT_POOL_SOURCE_DEADLINE_SECONDS")
+            or yt_environment.get("VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS")
+            or 270
         )
-    if _youtube_only_job or _mixed_media_job:
-        _configured_source_deadline = config.get("yt_pool_source_download_deadline_seconds")
-        if _configured_source_deadline:
-            _source_deadline = _configured_source_deadline
-        else:
-            try:
-                _existing_source_deadline = float(
-                    yt_environment.get("VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS", "0") or 0
-                )
-            except (TypeError, ValueError):
-                _existing_source_deadline = 0.0
-            # The generic process environment can contain a value left by a
-            # previous job. Do not let that stale six-minute setting silently
-            # override the mixed-media fast lane; an explicit mixed override
-            # still wins below.
-            if _mixed_media_job and not long_youtube_job:
-                _source_deadline = _quality_source_deadline
-            else:
-                _source_deadline = max(_quality_source_deadline, _existing_source_deadline)
-        yt_environment["VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS"] = str(_source_deadline)
+        yt_environment["VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS"] = str(source_deadline)
+    elif _youtube_only_job:
+        quality_source_deadline = max(360, min(900, int(round(360.0 + (120.0 * _quality_ratio)))))
+        try:
+            existing_source_deadline = float(
+                yt_environment.get("VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS", "0") or 0
+            )
+        except (TypeError, ValueError):
+            existing_source_deadline = 0.0
+        source_deadline = (
+            config.get("yt_pool_source_download_deadline_seconds")
+            or max(quality_source_deadline, existing_source_deadline)
+        )
+        yt_environment["VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS"] = str(source_deadline)
     try:
         _yt_render_width, _yt_render_height = tuple(config.get("render_resolution") or (1920, 1080))[:2]
         yt_environment["VIDZEO_YT_CLIP_WIDTH"] = str(max(320, int(_yt_render_width)))
@@ -11720,16 +11711,6 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         is_youtube_only_branch = branch_source in {'YouTube', 'YouTube Clips'}
         is_mixed_youtube_branch = branch_source == 'Mixed Media'
         youtube_wait_branch = is_youtube_only_branch or is_mixed_youtube_branch
-        if is_mixed_youtube_branch:
-            # Only override the source download deadline if neither the job
-            # config nor the operator's .env already supplies a value.
-            _mixed_source_deadline = (
-                config.get('yt_pool_source_download_deadline_seconds')
-                or yt_environment.get('VIDZEO_MIXED_YT_POOL_SOURCE_DEADLINE_SECONDS')
-                or yt_environment.get('VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS')
-                or '360'
-            )
-            yt_environment['VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS'] = str(_mixed_source_deadline)
         v2_pipeline_active = True
         if fast_competitive and not (v2_pipeline_active and youtube_wait_branch):
             wall_ceiling = 420.0 if long_youtube_job else 180.0

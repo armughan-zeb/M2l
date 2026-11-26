@@ -1408,7 +1408,13 @@ class QueueManager:
                 delivery_budget = install_delivery_budget(callback_config)
                 try:
                     preparation_stall_seconds = float(callback_config.get('preparation_stall_seconds') or 0)
-                    if not math.isfinite(preparation_stall_seconds):
+                    # Older Muse requests saved an extra 300s UI-idle cutoff.
+                    # Their provider and delivery deadlines supervise work even
+                    # when a healthy preparation phase has nothing new to display.
+                    if not math.isfinite(preparation_stall_seconds) or (
+                        callback_config.get('llm_provider') == 'external_agent'
+                        and callback_config.get('continue_render_while_active') is True
+                    ):
                         preparation_stall_seconds = 0
                 except (TypeError, ValueError):
                     preparation_stall_seconds = 0

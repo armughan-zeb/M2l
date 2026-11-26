@@ -17,7 +17,7 @@ const { minimumVideoDurationSeconds } = require('../lib/mediaRules');
 const { sleep } = require('../lib/sleep');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { readRequestedWorkers } = require('../lib/remotionWorkers');
-const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs } = require('../lib/vidnetsSubmission');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs, STATUS_UNAVAILABLE_MS } = require('../lib/vidnetsSubmission');
 
 const MINUTE = 60 * 1000;
 
@@ -101,12 +101,10 @@ function buildRequest(job, scriptText, packageDir) {
   // auto-degrade it from CPU / available memory at render start
   // (vidnets/scripts/render-remotion-manifest.js adaptiveConcurrency).
   const concurrency = readRequestedWorkers(process.env);
-  const explicitCoverage = Number(process.env.MUSE_YOUTUBE_COVERAGE_TARGET || options.youtubeCoverageTarget);
-  // Respect explicit operator/job coverage target when supplied; when omitted,
-  // let Vidnets resolve the dynamic mixed-media niche policy (e.g. 80% YouTube
-  // for gaming / GTA VI, 75% for sports, 65% for entertainment, 55% for doc).
-  const coverageTarget = Number.isFinite(explicitCoverage)
-    ? Math.max(0.3, Math.min(1, explicitCoverage > 1 ? explicitCoverage / 100 : explicitCoverage))
+  const rawCoverage = options.youtubeCoverageTarget ?? process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
+  const explicitCoverage = Number(rawCoverage);
+  const coverageTarget = rawCoverage != null && String(rawCoverage).trim() !== '' && Number.isFinite(explicitCoverage)
+    ? Math.max(0, Math.min(1, explicitCoverage > 1 ? explicitCoverage / 100 : explicitCoverage))
     : undefined;
   // FILTER-BEST (Nov 9, 2026): Vidnets' native mixed-media design ranks
   // candidates and keeps the best real media per scene — vision is ADVISORY
@@ -117,19 +115,9 @@ function buildRequest(job, scriptText, packageDir) {
   // verdict before the renderer, and a strict job with ANY unresolved
   // scene failed outright (app.py _repair_unresolved_media) instead of
   // degrading. That is the misuse the user corrected: filter-best, not
-  // hard-reject. With both flags false, vision still RUNS (visual_
-  // understanding + final_visual_gate_mode) and still RANKS (final_score);
-  // only named-entity scenes (strict_identity) still require a live
-  // verdict, per scene_requires_visual_verification. The ONE hard rule
-  // lives in the render wrapper, not here: never DELIVER a video with 0
-  // real-media scenes. If real-media recovery is exhausted, Vidnets keeps
-  // the checkpoint for retry. MUSE_MEDIA_STRICT=1 restores the old strict
-  // flags (visual verification for every scene).
+  // hard-reject. Both flags default to off while the candidate vision and
+  // final gate still run. MUSE_MEDIA_STRICT=1 requires candidate verification.
   const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
-  // Render budget scales with the job (lib/vidnetsSubmission.renderBudgetMs:
-  // configured MUSE_RENDER_TIMEOUT_MS with a 600s floor, else duration-scaled
-  // with a 6h floor) instead of a fixed ceiling.
-  const deliveryBudget = Math.ceil(renderBudgetMs(job) / 1000);
 
   const request = {
     title: job.title,
@@ -187,15 +175,19 @@ function buildRequest(job, scriptText, packageDir) {
     semantic_render_concurrency: concurrency,
     concurrency,
     continue_render_while_active: true,
-    preparation_stall_seconds: 300,
-    output_package_dir: packageDir,
-    delivery_budget_seconds: deliveryBudget,
-    delivery_budget_max_cap_seconds: deliveryBudget
+    output_package_dir: packageDir
   };
 
   if (coverageTarget !== undefined) {
     request.youtube_accepted_coverage_target = coverageTarget;
-    request.yt_stop_when_coverage_target_met = true;
+  }
+  // Let Vidnets size its preparation budget from the narration by default.
+  // Support an existing explicit timeout on installations that set one.
+  const configuredBudget = Number(process.env.MUSE_RENDER_TIMEOUT_MS);
+  if (Number.isFinite(configuredBudget) && configuredBudget > 0) {
+    const deliveryBudget = Math.ceil(renderBudgetMs(job) / 1000);
+    request.delivery_budget_seconds = deliveryBudget;
+    request.delivery_budget_max_cap_seconds = deliveryBudget;
   }
   if (options.mixedMediaWeights || options.mediaWeights) {
     request.mixed_media_weights = options.mixedMediaWeights || options.mediaWeights;
@@ -347,16 +339,12 @@ function resultVideoPath(item) {
   return candidates.map(value => String(value || '').trim()).find(value => value && fs.existsSync(value)) || '';
 }
 
-function progressReportForPoll({ progress, detail, lastProgress, lastDetail, lastReportAt, now, heartbeatMs, renderStartedAt }) {
+function progressReportForPoll({ progress, detail, lastProgress, lastDetail, lastReportAt, now, heartbeatMs }) {
   if (progress !== lastProgress || detail !== lastDetail) {
     return { progress, detail, changed: true };
   }
   if (now - lastReportAt >= heartbeatMs) {
-    // Silent phase heartbeat: same % and detail, but the work is live.
-    // The elapsed seconds make the detail change every time, so the CMS
-    // sees it as advancement rather than a repeat.
-    const elapsedSec = Math.floor((now - renderStartedAt) / 1000);
-    return { progress, detail: `${detail} (still working, ${elapsedSec}s elapsed)`, changed: false };
+    return { progress, detail, changed: false };
   }
   return null;
 }
@@ -409,21 +397,13 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   // loop on the dead id. Guarded to once per render call so a second
   // cancellation still fails loudly instead of re-submitting forever.
   let resubmittedAfterCancel = false;
-  // A long silent phase (same % and same detail, e.g. the relevance check
-  // sitting at 61% for ~28 min on Broken Rail attempt 3) sends no advancing
-  // progress, and the CMS stall timer kills the job after 20 min — the
-  // keepalive in jobRunner sends advancing=false, which explicitly never
-  // counts as advancement. So when nothing has changed for this long, send
-  // an advancing update anyway, with a detail that changes every time
-  // (elapsed seconds) so it is not deduped as a repeat.
   const heartbeatMs = Math.max(60000, Number(process.env.MUSE_PROGRESS_HEARTBEAT_MS) || 300000);
-  const deadline = Date.now() + renderBudgetMs(job);
+  let lastStatusAt = performance.now();
   const pollMs = Math.max(500, Number(process.env.MUSE_VIDNETS_POLL_MS) || 1000);
   let statusFailures = 0;
 
   while (true) {
     if (signal?.aborted) throw new Error('Render cancelled by operator');
-    if (Date.now() > deadline) throw new Error('Vidnets render exceeded the configured Muse render budget');
 
     if (!process.env.MUSE_RESIDENT_INBOX) await serviceInbox(vidnetsJobId, workDir, transport, signal, handledInference).catch(error => {
       if (signal?.aborted) throw error;
@@ -436,9 +416,13 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
       item = snapshot.item;
       if (!item?.status) throw new Error('Vidnets returned no job status');
       statusFailures = 0;
+      lastStatusAt = performance.now();
     } catch (error) {
       if (signal?.aborted || /returned (400|401|403|404)\b/i.test(error.message)) throw error;
       statusFailures += 1;
+      if (performance.now() - lastStatusAt >= STATUS_UNAVAILABLE_MS) {
+        throw new Error(`Vidnets status remained unavailable for job ${vidnetsJobId}: ${error.message}`);
+      }
       if (shouldRecoverService(error, statusFailures)) {
         try {
           await vidnets('start --recover', { timeoutMs: 2 * MINUTE, signal, label: 'Vidnets service recovery' });
@@ -455,7 +439,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
     const detail = String(item.progress_text || item.status || '').replace(/\s+/g, ' ').trim().slice(0, 400) || 'Rendering';
     const report = progressReportForPoll({
       progress, detail, lastProgress, lastDetail, lastReportAt,
-      now: Date.now(), heartbeatMs, renderStartedAt,
+      now: Date.now(), heartbeatMs,
     });
     if (report) {
       if (report.changed) {
@@ -463,23 +447,16 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
         lastDetail = detail;
       }
       lastReportAt = Date.now();
-      onProgress?.(report.progress, report.detail);
+      onProgress?.(report.progress, report.detail, report.changed);
     }
 
     if (item.status === 'completed') {
       const videoPath = resultVideoPath(item);
       if (!videoPath) throw new Error('Vidnets completed the job without a readable video_path');
-      const mediaCount = require('../render-vidnets-linux').completedMediaCount(item, videoPath);
-      const strictMedia = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
-      if (!mediaCount || mediaCount.real === 0) {
-        throw new Error('Vidnets completed without evidence of accepted real media in any scene');
-      }
-      if (strictMedia && mediaCount.real !== mediaCount.total) {
-        throw new Error(`Vidnets completed without evidence of accepted real media in every scene (${mediaCount.real}/${mediaCount.total} real)`);
-      }
+      const coverage = require('../render-vidnets-linux').completedMediaCoverage(item, videoPath);
       onProgress?.(100, 'Vidnets render complete');
       return { videoPath, vidnetsJobId, packageDir, meta: {
-        engine: 'vidnets', vidnetsJobId, realScenes: mediaCount.real, totalScenes: mediaCount.total, graphicScenes: mediaCount.graphic
+        engine: 'vidnets', vidnetsJobId, ...coverage
       } };
     }
     const cleanupPending = item.status === 'shutdown_timeout' && item.retryable === true && !item.cancel_requested;

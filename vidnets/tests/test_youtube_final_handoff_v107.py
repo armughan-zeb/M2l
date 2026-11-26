@@ -81,6 +81,19 @@ def test_coordinator_reserves_the_actual_parallel_transfer_wave_budget(monkeypat
     assert _media_stage_deadline_seconds(config, 'Mixed Media') >= wall + 180
 
 
+def test_coordinator_leaves_review_after_the_youtube_cooldown_window(monkeypatch):
+    from services.pipeline_v2_media_adapter import _media_stage_deadline_seconds
+
+    monkeypatch.delenv("VIDZEO_YT_POOL_DIRECT_CLIPS_ONLY", raising=False)
+    config = {
+        "llm_provider": "external_agent",
+        "media_deadline_seconds": 1200,
+        "_youtube_transport_window_seconds": 1200,
+        "vision_reserve_seconds": 300,
+    }
+    assert _media_stage_deadline_seconds(config, "Mixed Media") == 1500
+
+
 def test_static_branding_is_not_action_but_legitimate_branding_remains_usable():
     logo = 'A static graphic of the NFL logo, a shield against a black background.'
     assert explicit_visual_facet_conflict('Before each snap, the offense chooses a formation.', logo) == 'static_branding_for_action_scene'

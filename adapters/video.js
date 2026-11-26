@@ -93,14 +93,17 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
     input,
     cwd: workDir,
     signal,
-    timeoutMs: require('../lib/vidnetsSubmission').renderBudgetMs(job),
+    // The bundled wrapper follows Vidnets, which supervises the render itself.
+    timeoutMs: /^\s*(?:node|node\.exe)\s/i.test(command) && command.includes(path.join(config.ROOT, 'render-vidnets-linux.js'))
+      ? null
+      : require('../lib/vidnetsSubmission').renderBudgetMs(job),
     label: 'Muse render command',
     onStderrLine: line => {
       const parsed = parseRenderProgressLine(line);
       if (!parsed) return;
       log.info('[render] ' + line.trim().slice(0, 500));
       if (parsed.progress === null) {
-        onProgress?.(lastRenderProgress, parsed.detail);
+        onProgress?.(lastRenderProgress, parsed.detail, false);
       } else {
         lastRenderProgress = parsed.progress;
         onProgress?.(parsed.progress, parsed.detail);

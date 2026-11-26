@@ -320,7 +320,7 @@ function describePausedFailure({ vidnetsJobId, reasonText, detail, memoryNote })
     return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (${reason}) — render held for memory.${memoryNote || ''}`;
   }
   if (reason === 'preparation_stall') {
-    return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (preparation_stall) — the preparation-stall detector paused the job after 300s without reported progress. This is a pipeline progress-reporting stall: check the Vidnets server log for the stage that was collecting when it fired.`;
+    return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (preparation_stall) — the configured preparation idle timer expired. Check the Vidnets server log for the active stage.`;
   }
   if (reason === 'backend_restart') {
     return `Vidnets job ${vidnetsJobId} stayed paused after 3 retries (backend_restart) — the Vidnets server restarted the job backend and the retries were exhausted before it resumed. Check the server log; this is not an inference problem.`;
@@ -400,10 +400,6 @@ async function main() {
   let statusFailures = 0;
 
   while (true) {
-    if (Date.now() > deadline) {
-      fail(`Vidnets render exceeded the configured budget for job ${vidnetsJobId}`);
-    }
-
     // A lost status response does not establish that the renderer stopped.
     // The status fetch is a read, not a render step: one transient failure
     // must not kill a healthy render. BNSF attempt 5 died exactly this
@@ -417,6 +413,9 @@ async function main() {
     } catch (error) {
       if (/returned (400|401|403|404)\b/i.test(error.message)) throw error;
       statusFailures += 1;
+      if (Date.now() > deadline && statusFailures > 3) {
+        fail(`Vidnets status remained unavailable for job ${vidnetsJobId}: ${error.message}`);
+      }
       if (shouldRecoverService(error, statusFailures)) {
         log(`Checking whether the local Vidnets service can recover job ${vidnetsJobId}`);
         try {

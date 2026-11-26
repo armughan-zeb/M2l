@@ -4510,6 +4510,12 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
         )
         computed = max(computed, web_wall + 60.0)
 
+    # Give the actual transport window a review tail before applying the
+    # shared non-render allowance. The worker can publish as late as its wall.
+    transport_window = config.get("_youtube_transport_window_seconds")
+    if transport_window is not None:
+        computed = max(computed, transport_window + _vision_reserve_seconds(config))
+
     # The provider branches and the V2 coordinator must share one wall clock.
     # Previously this function returned the configured media ceiling even when
     # the app-wide DeliveryBudget had already spent most of its retrieval
@@ -4770,12 +4776,6 @@ def resolve_existing_provider_branches_v2(
 ) -> tuple[dict[str, Any], dict[int, SceneResolution], VisualDecisionContext]:
     """Route the current provider transports through the strict V2 state machine."""
 
-    # Bounded total media time (test-20 long-tail guard): the resolve
-    # clock starts here. Lane setup below is seconds, so this start is
-    # within seconds of the coordinator's own start; the total deadline
-    # (discovery budget + tail) computed from it bounds every later
-    # YouTube wave and the post-coordinator gate.
-    _media_resolve_started_at = time.monotonic()
     _media_total_deadline_at: float | None = None
     from .documentary_subject import title_hook_subject, collection_title_subject, search_key
     original_title = str(config.get('content_title') or config.get('title') or title)
@@ -5411,6 +5411,7 @@ def resolve_existing_provider_branches_v2(
     # candidates alive until FFmpeg/overlay/visual gates inspect them. Hard
     # package, caption, and subject-mismatch blockers still reject upstream.
     config["yt_stop_on_soft_timeout"] = False
+    config["yt_stop_when_coverage_target_met"] = False
     # Preserve the Mixed Media policy.  The app disables same-source reuse so
     # a real YouTube pool is distributed as distinct cuts; forcing this back
     # to True here made the coordinator collapse the pool into one clip plus
@@ -5523,19 +5524,9 @@ def resolve_existing_provider_branches_v2(
     youtube_primary_attempted_indices: set[int] = set()
     youtube_indices_ref = {"indices": primary_youtube_scene_indices}
     youtube_fallback_mode = {"enabled": False}
-    # Two-track YouTube discovery (user order, Nov 21 2026, capped Nov 22
-    # 2026 to the spec §3.3 branch wall): the discovery budget is 5 minutes
-    # per minute of video (300s/min, configurable via config key
-    # yt_discovery_seconds_per_minute or env
-    # VIDZEO_YT_DISCOVERY_SECONDS_PER_MINUTE), capped at the branch wall
-    # (default 1200s, override via yt_branch_wall_timeout_seconds). It
-    # bounds ONLY discovery (search, rank, transcript, probe, vision).
-    # Downloads are exempt: the branch's soft timeout stops new discovery
-    # at the budget while in-flight downloads drain until the hard timeout
-    # (budget + drain below). Track B (general pool) is disabled by
-    # default (Nov 21 decision, 0 verified clips in tests 18/19) and runs
-    # in parallel with Track A (scene-by-scene) from the same budget when
-    # explicitly enabled; neither waits for the other.
+    # Price the YouTube window by clip duration. The primary lane works
+    # through timed downloads and alternatives inside its branch wall.
+    # The optional general pool has a separate, bounded build.
     from .youtube_discovery_budget import (
         discovery_budget_seconds,
         media_tail_seconds,
@@ -5562,38 +5553,49 @@ def resolve_existing_provider_branches_v2(
     youtube_discovery_hard_seconds = (
         youtube_discovery_budget_seconds + youtube_download_drain_seconds
     )
-    # Bounded total media time (GTA test 18 long-tail guard, job 2451ee04):
-    # the discovery budget bounds discovery only, and the review gate,
-    # recovery lanes, and sequential inline finalization after it used to
-    # run against the 3600s media wall — test 18 spent ~22 min there on 17
-    # sequential inline vision calls after discovery had stopped. The
-    # verification deadline is discovery budget + tail (default 120s) from
-    # resolve start: no post-discovery vision starts past it, and scenes
-    # cut off there resolve with cached/best-so-far verdicts. Downloads
-    # stay exempt (background drain to the hard deadline above); the stage
-    # never waits on them past the total.
+    # Keep the review window open until the primary provider can publish.
+    # A cutoff anchored to discovery alone discarded clips that landed
+    # during the download drain or the agent cooldown.
+    deadline_config = {
+        **config,
+        "_youtube_budget_scene_count": len(primary_youtube_scene_indices),
+        "_web_budget_scene_count": len(scenes),
+        "vision_reserve_seconds": _vision_reserve_seconds(config),
+    }
     youtube_media_tail_seconds = media_tail_seconds(config)
-    media_verification_deadline_seconds = total_media_budget_seconds(
-        youtube_discovery_budget_seconds, config=config
+    youtube_verification_deadline_seconds = total_media_budget_seconds(
+        youtube_discovery_budget_seconds, tail_seconds=youtube_media_tail_seconds,
     )
-    # Absolute end of the total media budget, from the resolve start
-    # above. The fallback batch (below) and the post-coordinator gate
-    # (app.py, via config) both read this: no YouTube wave starts past
-    # it and no authoritative re-verification starts past it.
-    _media_total_deadline_at = (
-        _media_resolve_started_at + float(media_verification_deadline_seconds)
+    if primary_youtube_scene_indices:
+        from .youtube_stage_budget import mixed_agent_cooldown_wall
+
+        try:
+            transport_window = float(config.get("yt_hard_timeout_seconds") or youtube_discovery_hard_seconds)
+        except (TypeError, ValueError):
+            transport_window = youtube_discovery_hard_seconds
+        if lane_policy["mode"] == "Mixed Media":
+            transport_window = max(transport_window, mixed_agent_cooldown_wall(config))
+        deadline_config["_youtube_transport_window_seconds"] = transport_window
+        youtube_verification_deadline_seconds = max(
+            youtube_verification_deadline_seconds,
+            transport_window + deadline_config["vision_reserve_seconds"],
+        )
+    media_deadline_seconds = _media_stage_deadline_seconds(deadline_config, lane_policy["mode"])
+    youtube_verification_deadline_seconds = min(media_deadline_seconds, youtube_verification_deadline_seconds)
+    web_verification_deadline_seconds = None
+    if lane_policy["web_enabled"] and str(config.get("llm_provider") or "") == "external_agent":
+        web_verification_deadline_seconds = min(
+            media_deadline_seconds,
+            _mixed_web_completion_cap_seconds() + deadline_config["vision_reserve_seconds"],
+        )
+    media_verification_deadline_seconds = max(
+        youtube_verification_deadline_seconds, web_verification_deadline_seconds or 0.0,
     )
-    if isinstance(config, dict):
-        config["_media_total_deadline_at"] = _media_total_deadline_at
     print(
-        "   [budget] media verification tail: discovery "
-        f"{youtube_discovery_budget_seconds:.0f}s + tail "
-        f"{youtube_media_tail_seconds:.0f}s = total "
-        f"{media_verification_deadline_seconds:.0f}s; post-discovery vision "
-        "stops at the total",
+        f"   [budget] media review: YouTube<={youtube_verification_deadline_seconds:.0f}s, "
+        f"coordinator<={media_deadline_seconds:.0f}s",
         flush=True,
     )
-    # Track B shared pool (filled by the background builder thread below).
     youtube_general_pool = YouTubeGeneralPool(
         reuse_cap=general_pool_reuse_cap(config)
     )
@@ -5605,8 +5607,8 @@ def resolve_existing_provider_branches_v2(
         Runs in parallel with Track A and never blocks it: the pool is
         filled as its clips verify, and the coordinator claims from
         whatever is ready when a quota scene needs it. The pool build
-        shares the discovery budget (soft timeout) so it self-terminates
-        with Track A; a failed build leaves an empty pool and Track A
+        has its own discovery timeout; a failed build leaves an empty
+        pool and Track A
         proceeds alone.
 
         Disabled by default (Nov 21, 2026): the pool verified 0 clips
@@ -5725,16 +5727,11 @@ def resolve_existing_provider_branches_v2(
             f"{len(youtube_scene_indices)}/{len(scenes)} quota scenes",
         )
         lane_config = dict(config)
-        # Two-track discovery budget: the soft timeout IS the discovery
-        # budget (300s per minute of video). With coverage 0 it fires
-        # regardless of how many clips are ready, so new scene workers stop
-        # at the budget; in-flight downloads drain until the hard timeout.
-        # Downloads are exempt from the discovery budget. Start Track B
-        # (general pool) now so it builds in parallel with Track A.
-        lane_config["yt_soft_timeout_seconds"] = youtube_discovery_budget_seconds
-        lane_config["yt_stop_on_soft_timeout"] = True
-        lane_config["yt_min_resolved_ratio_before_soft_stop"] = 0.0
-        lane_config["yt_hard_timeout_seconds"] = youtube_discovery_hard_seconds
+        # Keep the primary lane open until it finishes or reaches the branch
+        # deadline. The optional general pool can build alongside it.
+        lane_config["yt_hard_timeout_seconds"] = (
+            lane_config.get("yt_hard_timeout_seconds") or youtube_discovery_hard_seconds
+        )
         _start_general_pool_build(lane_config)
         if broad_anchor and provider_topic_title != valid_topic_anchor:
             # The provider reads this field ahead of its title argument.
@@ -8352,38 +8349,13 @@ def resolve_existing_provider_branches_v2(
         row.setdefault("scene_index", index)
         coordinator_scenes.append(row)
 
-    deadline_config = {**config, '_youtube_budget_scene_count': len(primary_youtube_scene_indices),
-                       '_web_budget_scene_count': len(coordinator_scenes),
-                       'vision_reserve_seconds': _vision_reserve_seconds(config)}
-    media_deadline_seconds = _media_stage_deadline_seconds(deadline_config, lane_policy["mode"])
-    youtube_verification_deadline_seconds = media_verification_deadline_seconds
-    if lane_policy["mode"] == "Mixed Media" and primary_youtube_scene_indices:
-        from .youtube_stage_budget import mixed_agent_cooldown_wall
-
-        # The worker still stops discovery at its original deadline. Leave
-        # review time for verified cuts returned by its bounded cooldown wave.
-        youtube_verification_deadline_seconds = max(
-            youtube_verification_deadline_seconds,
-            min(media_deadline_seconds, mixed_agent_cooldown_wall(config)),
-        )
-    web_verification_deadline_seconds = None
-    if lane_policy["web_enabled"] and str(config.get("llm_provider") or "") == "external_agent":
-        # Web collection and its vision batches have their own bounded wall.
-        # The YouTube discovery+tail clock must not expire already downloaded
-        # images before the web resolver can hand them to the coordinator.
-        web_verification_deadline_seconds = min(
-            media_deadline_seconds,
-            _mixed_web_completion_cap_seconds() + _vision_reserve_seconds(config),
-        )
-        if isinstance(config, dict):
-            config["_media_total_deadline_at"] = max(
-                _media_total_deadline_at, time.monotonic() + web_verification_deadline_seconds
-            )
     web_recovery_grace_seconds = _web_fallback_coordinator_grace_seconds(
         config,
         lane_policy,
         media_deadline_seconds,
     )
+    _media_total_deadline_at = time.monotonic() + media_verification_deadline_seconds
+    config["_media_total_deadline_at"] = _media_total_deadline_at
     if web_recovery_grace_seconds > 0.0:
         print(
             "   [budget] web-only recovery tail: "
@@ -8474,13 +8446,12 @@ def resolve_existing_provider_branches_v2(
         # summarized without absolute paths or signed URLs.
         "youtube_discovery_budget_seconds": round(float(youtube_discovery_budget_seconds), 3),
         "youtube_discovery_hard_seconds": round(float(youtube_discovery_hard_seconds), 3),
-        # Bounded total media time (test-18 long-tail guard): discovery
-        # budget + post-discovery tail; no post-discovery vision starts
-        # past this total from resolve start.
+        # Review windows include the time needed for provider publication.
         "youtube_media_tail_seconds": round(float(youtube_media_tail_seconds), 3),
         "media_verification_deadline_seconds": round(
             float(media_verification_deadline_seconds), 3
         ),
+        "youtube_verification_deadline_seconds": round(youtube_verification_deadline_seconds, 3),
         "web_verification_deadline_seconds": (
             round(web_verification_deadline_seconds, 3)
             if web_verification_deadline_seconds is not None else None

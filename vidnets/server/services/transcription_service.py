@@ -167,12 +167,13 @@ def unload_whisper_model():
         _resolved_whisper_model_name = ""
     finally:
         _whisper_init_lock.release()
-    if previous is not None:
-        import gc
-        del previous
-        gc.collect()
-        print("   [whisper] model released from memory")
-    return previous is not None
+    if previous is None:
+        return False
+    import gc
+    del previous
+    gc.collect()
+    print("   [whisper] model released from memory")
+    return True
 
 
 WHISPER_MODEL_NAME = (os.environ.get("VIDZEO_WHISPER_MODEL", "base") or "base").strip()

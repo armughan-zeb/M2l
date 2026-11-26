@@ -1,7 +1,7 @@
 """Preparation-stall detector vs genuine lane activity.
 
 The queue's preparation-stall detector fires after ``preparation_stall_seconds``
-(300s in production) without a ``(progress, text)`` change. Long-running lanes
+without a ``(progress, text)`` change on jobs that opt in. Long-running lanes
 (web collection, YouTube downloads, vision rounds) do real work for longer
 than that while the displayed media count stands still, so the detector
 must read lane activity, not only display progress. These tests pin both
@@ -71,7 +71,8 @@ def test_activity_before_reset_is_ignored():
     assert last_activity() is not None
 
 
-def test_queue_stalls_when_genuinely_idle(tmp_path, monkeypatch):
+@pytest.mark.parametrize("saved_muse_request", [False, True])
+def test_queue_idle_policy_respects_saved_muse_requests(tmp_path, monkeypatch, saved_muse_request):
     manager, original = _manager(tmp_path)
     monkeypatch.setenv("VIDZEO_QUEUE_PREP_WORKERS", "1")
     manager._progress_heartbeat_poll_seconds = 0.05
@@ -80,17 +81,19 @@ def test_queue_stalls_when_genuinely_idle(tmp_path, monkeypatch):
         time.sleep(1.5)
 
     try:
-        item = manager.add_item(
-            {
-                "title": "Idle stage",
-                "script": "A sufficiently long script for an isolated queue job.",
-                "preparation_stall_seconds": 0.5,
-            }
-        )
+        config = {
+            "title": "Idle stage",
+            "script": "A sufficiently long script for an isolated queue job.",
+            "preparation_stall_seconds": 0.5,
+        }
+        if saved_muse_request:
+            config.update(llm_provider="external_agent", continue_render_while_active=True)
+        item = manager.add_item(config)
         manager.start_worker(idle_stage)
-        paused = _wait_for(manager, item["id"], JobStatus.PAUSED)
-        assert paused["status"] == JobStatus.PAUSED
-        assert paused["paused_reason"] == "preparation_stall"
+        expected = JobStatus.COMPLETED if saved_muse_request else JobStatus.PAUSED
+        result = _wait_for(manager, item["id"], expected)
+        assert result["status"] == expected
+        assert result.get("paused_reason") == (None if saved_muse_request else "preparation_stall")
     finally:
         manager.stop_worker()
         _restore(original)

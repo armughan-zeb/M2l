@@ -127,6 +127,7 @@ def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, 
             },
         })
     def coordinator(rows, **kwargs):
+        assert kwargs["verification_deadline_seconds"] >= 600
         cancel = threading.Event()
         kwargs["youtube_lane"](rows[0], cancel)
         recovery = kwargs["youtube_fallback_lane"]
@@ -143,7 +144,9 @@ def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, 
     adapter.resolve_existing_provider_branches_v2(
         {"image_source": source_mode, "visual_understanding": False,
          "global_media_guarantee": False, "_run_temp_dir": str(tmp_path),
-         "youtube_accepted_coverage_target": 1},
+         "youtube_accepted_coverage_target": 1, "yt_hard_timeout_seconds": 480,
+         "yt_stop_on_soft_timeout": True, "yt_stop_when_coverage_target_met": True,
+         "vision_reserve_seconds": 120},
         {"scene_contracts": [{"scene_id": "car", "order": 0, "duration": 4,
                               "text": "Toyota Corolla driving footage."}]},
         title="Toyota Corolla", script="Toyota Corolla driving footage.",
@@ -160,6 +163,9 @@ def test_adapter_prepares_rejected_primary_and_forwards_exclusions(monkeypatch, 
         call for call in calls if not call.get("_youtube_general_pool_build")
     ]
     assert len(primary_calls) == 2
+    assert primary_calls[0]["yt_stop_on_soft_timeout"] is False
+    assert primary_calls[0]["yt_stop_when_coverage_target_met"] is False
+    assert primary_calls[0]["yt_hard_timeout_seconds"] == 480
     assert primary_calls[1]["youtube_excluded_video_ids"] == ["rejected-master"]
     assert primary_calls[1]["_run_temp_dir"].endswith("youtube_content_recovery")
 
