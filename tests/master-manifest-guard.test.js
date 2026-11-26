@@ -9,8 +9,7 @@
 // 277 MB). The delivered manifest even said so — its 10 media_paths all
 // point at temp/jobs/876f0e84/. These tests pin the guard: deliverSaved
 // and pickValidatedMaster must refuse a master whose manifest belongs to
-// another job, or that is 100% graphic fallback, and must deliver the
-// good master.
+// another job. A complete graphic master can be used for its own job.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -159,19 +158,13 @@ test('guard refuses the BNSF wrong manifest for the claiming job f04c6b9f', () =
   assert.equal(check.graphicCount, 10);
 });
 
-test('guard refuses the same manifest on all-graphic grounds even for its own job', () => {
+test('guard records complete graphic assignments and accepts the owning master', () => {
   const pkg = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-own-'));
   const video = writePackage(pkg, wrongManifest());
   const check = guard.validateMasterManifest(video, { vidnetsJobId: '876f0e84' });
-  assert.equal(check.ok, false);
-  assert.match(check.reason, /100% graphic|zero real media/);
-});
-
-test('guard passes the wrong manifest only with an explicit all-graphic override for its own job', () => {
-  const pkg = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-override-'));
-  const video = writePackage(pkg, wrongManifest());
-  const check = guard.validateMasterManifest(video, { vidnetsJobId: '876f0e84', allowAllGraphic: true });
   assert.equal(check.ok, true);
+  assert.equal(check.realCount, 0);
+  assert.equal(check.graphicCount, 10);
 });
 
 test('guard delivers the good f04c6b9f manifest: 15/15 real media, own temp dir', () => {
@@ -185,20 +178,14 @@ test('guard delivers the good f04c6b9f manifest: 15/15 real media, own temp dir'
   assert.deepEqual(check.foreignJobs, []);
 });
 
-// MERGE NOTE (Nov 14, 2026): remote expected this to REJECT the master,
-// but the merged guard (lib/masterManifestGuard.js) only refuses a
-// manifest for a wrong/foreign job id or 100% graphic fallback — a single
-// blank scene is counted, not real, and does not block delivery. Expectation
-// below pins the merged behaviour; if the guard owner restores a
-// missing-scene rejection, restore the reject expectation.
-test('a single missing scene is counted, not real, and does not block delivery when 14/15 are real', () => {
+test('a missing scene assignment blocks delivery even when 14/15 are real', () => {
   const manifest = goodManifest();
   manifest.media_paths[4] = '';
   const check = guard.decideManifestDelivery(manifest, { vidnetsJobId: 'f04c6b9f' });
-  assert.equal(check.ok, true);
+  assert.equal(check.ok, false);
   assert.equal(check.realCount, 14);
   assert.equal(check.assetCount, 15);
-  assert.equal(check.reason, '');
+  assert.match(check.reason, /missing scene media assignments/);
 });
 
 test('guard refuses a manifest whose stamped job id disagrees with the claiming job', () => {
@@ -225,6 +212,7 @@ test('deliverSaved refuses the BNSF wrong master and never uploads it', async ()
   try {
     const job = makeJob();
     const pkg = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-deliver-wrong-'));
+    writeFile(path.join(config.workDir(job.jobId), 'vidnets-job.json'), JSON.stringify({ id: 'f04c6b9f' }));
     const video = writePackage(pkg, wrongManifest());
     const scriptFile = path.join(pkg, 'script.txt');
     writeFile(scriptFile, words(240) + '\n');
@@ -267,7 +255,7 @@ test('deliverSaved delivers the good master and uploads it', async () => {
   }
 });
 
-test('pickValidatedMaster skips an all-graphic candidate and takes a real-media one', async () => {
+test('pickValidatedMaster skips a foreign master and can reuse a complete graphic master for its own job', async () => {
   const restore = patchFfmpeg();
   try {
     const job = makeJob();
@@ -285,6 +273,11 @@ test('pickValidatedMaster skips an all-graphic candidate and takes a real-media 
       job
     );
     assert.equal(nonePicked, '');
+    const owned = await jobRunner.pickValidatedMaster(
+      { masterPath: '', vidnetsMasterPath: '', vidnetsMp4s: [badVideo], vidnetsJobId: '876f0e84' },
+      job
+    );
+    assert.equal(owned, badVideo);
   } finally {
     restore();
   }

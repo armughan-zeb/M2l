@@ -21,12 +21,15 @@ const { runCommand, parseJsonOutput, quoteArg } = require('../lib/command');
 const config = require('../lib/config');
 const log = require('../lib/log');
 const { registerStageProcess } = require('../lib/stageCleanup');
+const { renderBudgetMs } = require('../lib/vidnetsSubmission');
 const vidnets = require('./vidnets');
+
+const BUNDLED_RENDER_COMMAND_RE = /^(\s*(?:node|node\.exe)\s+)(?:["'](?:\.\/)?render-vidnets-linux\.js["']|(?:\.\/)?render-vidnets-linux\.js)(?=\s|$)/i;
 
 function resolveRenderCommand(command, root = config.ROOT) {
   // Job processes run in their own work directory. Resolve only our known
   // bundled renderer, leaving custom commands and their arguments untouched.
-  return String(command).replace(/^(\s*(?:node|node\.exe)\s+)(?:["'](?:\.\/)?render-vidnets-linux\.js["']|(?:\.\/)?render-vidnets-linux\.js)(?=\s|$)/i,
+  return String(command).replace(BUNDLED_RENDER_COMMAND_RE,
     (_match, prefix) => prefix + quoteArg(path.join(root, 'render-vidnets-linux.js')));
 }
 /**
@@ -89,14 +92,14 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
   // The lines are also written to the daemon log, which is where the CMS
   // progress call's recent-log-lines come from (lib/log.js ring).
   let lastRenderProgress = 0;
-  const result = await runCommand(command, {
+  const bundled = BUNDLED_RENDER_COMMAND_RE.test(command) ||
+    /^\s*(?:node|node\.exe)\s/i.test(command) && command.includes(path.join(config.ROOT, 'render-vidnets-linux.js'));
+  const result = await runCommand(resolveRenderCommand(command), {
     input,
     cwd: workDir,
     signal,
     // The bundled wrapper follows Vidnets, which supervises the render itself.
-    timeoutMs: /^\s*(?:node|node\.exe)\s/i.test(command) && command.includes(path.join(config.ROOT, 'render-vidnets-linux.js'))
-      ? null
-      : require('../lib/vidnetsSubmission').renderBudgetMs(job),
+    timeoutMs: bundled ? null : renderBudgetMs(job),
     label: 'Muse render command',
     onStderrLine: line => {
       const parsed = parseRenderProgressLine(line);
@@ -141,7 +144,7 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
 
 async function render(job, scriptText, workDir, options = {}) {
   const command = String(process.env.MUSE_RENDER_COMMAND || '').trim();
-  if (command) return runRenderCommand(resolveRenderCommand(command), job, scriptText, workDir, options);
+  if (command) return runRenderCommand(command, job, scriptText, workDir, options);
 
   // If external Vidnets launcher is explicitly configured, use it. A
   // Vidnets failure is terminal: falling back to the native Remotion

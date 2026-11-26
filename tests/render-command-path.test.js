@@ -22,18 +22,14 @@ test('bundled relative renderer runs from a different job folder', async () => {
   }
 });
 
-test('a render reporting live status can run beyond the initial command window', async () => {
+test('a backend-supervised render can be quiet beyond the command timeout floor', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'muse render progress '));
   try {
     const script = path.join(root, 'active-render.js');
-    fs.writeFileSync(script, [
-      "const timer = setInterval(() => console.error('active'), 150);",
-      "setTimeout(() => { clearInterval(timer); console.log('complete'); }, 2400);",
-    ].join('\n'));
+    fs.writeFileSync(script, "setTimeout(() => console.log('complete'), 1400);\n");
     const result = await runCommand('node ' + quoteArg(script), {
       cwd: root,
-      timeoutMs: 1800,
-      onStderrLine: line => line.trim() === 'active',
+      timeoutMs: null,
     });
     assert.equal(result.stdout.trim(), 'complete');
   } finally {

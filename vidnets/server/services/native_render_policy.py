@@ -1496,7 +1496,7 @@ def render_semantic_documentary_remotion(
             now=time.monotonic(),
             timeout_seconds=timeout_seconds,
         )
-        default_stall_seconds = 300.0 if cfg.get("llm_provider") == "external_agent" else 1200.0
+        default_stall_seconds = 1200.0
         try:
             stall_timeout = float(os.environ.get("VIDZEO_REMOTION_STALL_TIMEOUT_SECONDS", default_stall_seconds))
             if not math.isfinite(stall_timeout):

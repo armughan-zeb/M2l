@@ -19,28 +19,25 @@ agent-bridge inbox, answered by the `vidnets-inbox-watch` hook operator.
 observed running, no
 OpenRouter key in the environment — see `lib/museInference.js`), and
 `MUSE_AUTO_LOOP=1` never exempts that check. `node muse-agent.js doctor`
-checks the same bridge and FAILS when it is absent. A job whose inference
-goes unanswered fails closed; a job with 0 real-media scenes is never
-delivered as graphics. Before failing for 0 real-media scenes the
-render wrapper attempts one bounded media re-plan with fresh queries (see
-`render-vidnets-linux.js`).
+checks the same bridge and fails when it is absent. Vidnets uses bounded
+preparation and allows an advancing Remotion export to finish. The
+default render inactivity window is 20 minutes.
 
 **Filter-best (Nov 9, 2026).** Vidnets' native mixed-media flow is used
 as built: LLM writes queries from the scenes → search YouTube clips +
 web images → filter the BEST (rank, keep the best real media; reject
 only clearly-wrong footage) → Remotion edits. Vision is advisory by
-default (`MUSE_MEDIA_STRICT=0`); the only hard rule is the delivery
-rule above. See `rules.md`, `workflow.md`, and `HYBRID_WIRING.md`
-("Filter-best").
+default (`MUSE_MEDIA_STRICT=0`). Delivery requires complete scene
+assignments, correct job provenance, and a valid encoded master.
+The media audit reports graphic fallback scene and runtime coverage.
 
 **Simplified pipeline (Nov 9, 2026).** One data pass (all research
 providers in parallel once, one shared deadline
 `MUSE_RESEARCH_TIMEOUT_MS`, default 180s), one script (at most
 `MUSE_SCRIPT_MAX_DRAFTS` model calls, default 2: draft 1 + one fix
 pass — a draft that still fails the gate is returned non-publishable
-and the job fails loudly), one media pass per scene (YouTube clips
-first, then web images, then stock; one bounded re-plan per job
-before a 0-real-media fail), one monitor. All knobs live in
+and the job fails loudly), parallel YouTube and web lanes with bounded
+scene recovery, and one monitor. Settings live in
 `.env` / `.env.example`. Full flow and settings:
 `HYBRID_WIRING.md` ("Simplified pipeline").
 

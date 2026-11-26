@@ -265,9 +265,11 @@ test('real scenes count adapter-accepted media; Muse rejection always wins', () 
   assert.equal(mixed.graphic, 2);
 
   assert.equal(countRealScenes(path.join(dir, 'missing')), null);
-  const { completedMediaCount } = require('../render-vidnets-linux');
-  assert.equal(completedMediaCount({ result: {} }, path.join(dir2, 'unrelated.mp4')), null);
-  assert.deepEqual(completedMediaCount({ result: {} }, path.join(dir2, 'x.mp4')), mixed);
+  const { completedMediaCoverage } = require('../render-vidnets-linux');
+  assert.throws(() => completedMediaCoverage({ result: {} }, path.join(dir2, 'unrelated.mp4')), /readable edit plan/);
+  assert.deepEqual(completedMediaCoverage({ result: {} }, path.join(dir2, 'x.mp4')), {
+    realScenes: mixed.real, graphicScenes: mixed.graphic, totalScenes: mixed.total, museVerifiedScenes: mixed.verified,
+  });
 });
 
 test('ScriptIT CLI refuses OpenRouter when Muse inference is compulsory', async () => {

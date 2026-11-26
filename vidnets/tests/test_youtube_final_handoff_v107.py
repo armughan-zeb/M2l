@@ -82,6 +82,7 @@ def test_coordinator_reserves_the_actual_parallel_transfer_wave_budget(monkeypat
 
 
 def test_coordinator_leaves_review_after_the_youtube_cooldown_window(monkeypatch):
+    from services.delivery_budget import DeliveryBudget
     from services.pipeline_v2_media_adapter import _media_stage_deadline_seconds
 
     monkeypatch.delenv("VIDZEO_YT_POOL_DIRECT_CLIPS_ONLY", raising=False)
@@ -92,6 +93,11 @@ def test_coordinator_leaves_review_after_the_youtube_cooldown_window(monkeypatch
         "vision_reserve_seconds": 300,
     }
     assert _media_stage_deadline_seconds(config, "Mixed Media") == 1500
+    monkeypatch.setenv("VIDZEO_AGENT_MIN_WALL_SECONDS", "3600")
+    config["_delivery_budget"] = DeliveryBudget.create(
+        total_seconds=1700, render_reserve_seconds=330, clock=lambda: 0,
+    )
+    assert _media_stage_deadline_seconds(config, "Mixed Media") == 1370
 
 
 def test_static_branding_is_not_action_but_legitimate_branding_remains_usable():

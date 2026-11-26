@@ -278,8 +278,7 @@ def test_non_media_defect_still_fails(tmp_path):
     assert result["substitutions"] == []
 
 
-def test_zero_real_media_scenes_still_hard_fails(tmp_path):
-    """The 0-real rule is untouched: all-graphics still hard-fails."""
+def test_all_graphic_scenes_record_coverage_and_require_files(tmp_path):
     g1 = _write(tmp_path, "g1.jpg", b"graphic one")
     g2 = _write(tmp_path, "g2.jpg", b"graphic two")
     plan = {
@@ -290,7 +289,14 @@ def test_zero_real_media_scenes_still_hard_fails(tmp_path):
             {"provider": "graphic", "resolution_kind": "grounded_graphic_fallback"},
         ]},
     }
-    with pytest.raises(MediaContractError):
+    coverage = validate_documentary_coverage(plan, durations=[3.0, 3.0])
+    assert coverage["passed"] is True
+    assert coverage["emergency_scene_ratio"] == coverage["emergency_duration_ratio"] == 1.0
+    assert coverage["warnings"]
+    with pytest.raises(MediaContractError, match='Expected 3 media slots, found 2'):
+        validate_documentary_coverage(plan, durations=[3.0, 3.0, 3.0])
+    g2.unlink()
+    with pytest.raises(MediaContractError, match='1 missing scene'):
         validate_documentary_coverage(plan, durations=[3.0, 3.0])
 
 

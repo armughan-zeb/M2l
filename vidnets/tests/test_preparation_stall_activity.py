@@ -85,9 +85,9 @@ def test_queue_idle_policy_respects_saved_muse_requests(tmp_path, monkeypatch, s
             "title": "Idle stage",
             "script": "A sufficiently long script for an isolated queue job.",
             "preparation_stall_seconds": 0.5,
+            "llm_provider": "external_agent",
+            "continue_render_while_active": saved_muse_request,
         }
-        if saved_muse_request:
-            config.update(llm_provider="external_agent", continue_render_while_active=True)
         item = manager.add_item(config)
         manager.start_worker(idle_stage)
         expected = JobStatus.COMPLETED if saved_muse_request else JobStatus.PAUSED
@@ -121,6 +121,8 @@ def test_queue_does_not_stall_while_lane_reports_activity(tmp_path, monkeypatch)
                 "title": "Busy lane",
                 "script": "A sufficiently long script for an isolated queue job.",
                 "preparation_stall_seconds": 0.5,
+                "llm_provider": "external_agent",
+                "continue_render_while_active": False,
             }
         )
         manager.start_worker(busy_stage)

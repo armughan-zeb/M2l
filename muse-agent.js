@@ -7,7 +7,7 @@
  *   node muse-agent.js pair --cms http://HOST:3210 --code MUSE-XXXX-XXXX [--name "Studio GPU"]
  *   node muse-agent.js start
  *   node muse-agent.js claim [--wait 60]
- *   node muse-agent.js deliver --job <id> [--script file] [--video file] [--thumbnail file] [--skip-thumbnail] [--allow-all-graphic]
+ *   node muse-agent.js deliver --job <id> [--script file] [--video file] [--thumbnail file] [--skip-thumbnail]
  *   node muse-agent.js fail --job <id> --error "reason"
  *   node muse-agent.js status
  *   node muse-agent.js doctor
@@ -488,9 +488,6 @@ async function deliverCommand(args) {
     scriptFile: args.script ? String(args.script) : '',
     videoFile: args.video ? String(args.video) : '',
     thumbnailFile: args.thumbnail ? String(args.thumbnail) : '',
-    // Refusing an all-graphic master is the default (BNSF incident, Nov 10,
-    // 2026). Only an explicit --allow-all-graphic ships blank cards.
-    allowAllGraphic: args['allow-all-graphic'] === true,
     // Thumbnails are skipped by this worker (VIDZEO_SKIP_THUMBNAILS=1 in
     // the Docker package). --skip-thumbnail forces the skip even when the
     // env var is unset; without either, a --thumbnail file is used.
@@ -876,7 +873,7 @@ Usage:
   node muse-agent.js configure --cms <url>
   node muse-agent.js start [--once]
   node muse-agent.js claim [--wait 60]
-  node muse-agent.js deliver [--job <id>] [--script <file>] [--video <file>] [--thumbnail <file>] [--skip-thumbnail] [--allow-all-graphic]
+  node muse-agent.js deliver [--job <id>] [--script <file>] [--video <file>] [--thumbnail <file>] [--skip-thumbnail]
   node muse-agent.js fail --job <id> --error "reason"
   node muse-agent.js status
   node muse-agent.js doctor

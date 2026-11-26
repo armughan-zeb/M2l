@@ -19,8 +19,6 @@ cp .env.example .env   # then fill in the values below; .env is gitignored
 Settings that must be in `.env` (see `.env.example` for the full list):
 `MUSE_RENDER_COMMAND=node <absolute-repo-path>/render-vidnets-linux.js`,
 `MUSE_VIDNETS_ROOT=<repo>/vidnets`,
-`MUSE_YOUTUBE_COVERAGE_TARGET=0.30` (normal default — gaming 0.80 /
-documentary 0.55 are wired per niche in code),
 `MUSE_MEDIA_STRICT=0` (filter-best; see §3),
 `MUSE_RENDER_CONCURRENCY=1`,
 `TMPDIR=<runtime>/temp` (NOT /tmp — it is a 512 MB tmpfs),
@@ -101,7 +99,8 @@ it without a reason recorded in the commit message. The render wrapper
 (`render-vidnets-linux.js:countRealScenes`) counts a scene as real when
 Vidnets' own adapter accepted it (`media.verified` in the edit plan, or
 a Muse-verified verdict) — an explicit Muse rejection always wins.
-The ONLY hard rule is delivery: 0 real-media scenes fails the job.
+Graphic fallback coverage is recorded in the media audit. Delivery requires
+complete scene assignments, job ownership and a valid master.
 
 ## 4. Settings
 
@@ -109,17 +108,17 @@ Every knob lives in `.env` / `.env.example`. Defaults are production.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MUSE_YOUTUBE_COVERAGE_TARGET` | 0.30 (normal) | Fraction of scenes the planner tries to fill with accepted YouTube clips (code default 0.6); per-niche targets are wired in code — gaming 0.80, documentary 0.55, normal 0.30 |
+| `MUSE_YOUTUBE_COVERAGE_TARGET` | Unset | Override Vidnets' 60% Mixed Media target or the gaming and documentary profiles |
 | `MUSE_MEDIA_STRICT` | 0 | 0 = filter-best (vision advisory); 1 = hard-required (strict retrieval + visual required) |
 | `MUSE_SCRIPT_MAX_DRAFTS` | 2 | Script model calls max (draft 1 + one fix pass) |
 | `MUSE_RESEARCH_TIMEOUT_MS` | 180000 | One shared research deadline for all providers |
-| `MUSE_REPLAN_MIN_REMAINING_MS` | 600000 | Render budget left required to attempt the one bounded media re-plan |
-| `VIDZEO_MAX_GRAPHIC_SCENES` | 5 | Graphic-fallback scenes allowed per video before the audit warns (render still continues; 0 real-media scenes overall is still the only hard fail) |
+| `VIDZEO_MAX_GRAPHIC_SCENES` | 5 | Audit warning threshold for graphic fallback scenes |
 | `VIDZEO_AGENT_MIN_WALL_SECONDS` | 3600 | Floor on agent-bridge inbox request TTLs (server side; raised Nov 15 from 600 — hook wakes alone can exceed 20 min) |
 | `MUSE_RENDER_CONCURRENCY` | 2 (code) / 1 (live `.env`) | Workers sharding ONE video's frames (see §8.4); live pins 1, the tested safe count |
-| `MUSE_RENDER_TIMEOUT_MS` | 21600000 | Overall render budget per job (6 h, matches the CMS hard limit) |
+| `MUSE_RENDER_TIMEOUT_MS` | Unset | Optional Vidnets preparation override and custom renderer command timeout |
+| `VIDZEO_REMOTION_STALL_TIMEOUT_SECONDS` | 1200 | Remotion inactivity window |
 | `TMPDIR` / `VIDZEO_TEMP_DIR` | `<runtime>/temp` | Scratch/temp root (never /tmp) |
-| `VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET` | 0.30 (normal) | Server-side YouTube coverage target (runtime `.env`); per-niche — gaming 0.80, documentary 0.55, normal 0.30 |
+| `VIDZEO_YOUTUBE_ACCEPTED_COVERAGE_TARGET` | Unset | Server-side override for the default Mixed Media target |
 | `VIDZEO_AUTO_REQUEUE_INTERRUPTED` | 1 | Server auto-resumes jobs interrupted by a VM reboot |
 | `VIDZEO_YT_MEDIA_TAIL_SECONDS` | 120 | Media tail after YT discovery: total media budget for a 1-min video is 412s (292s discovery + 120s tail); YT recovery waves + the post-coordinator gate cut off at the total; in-flight downloads exempt |
 | `VIDZEO_YT_GENERAL_POOL_ENABLED` | 0 (False) | General YouTube pool disabled by default — scene-by-scene + web only |
@@ -154,7 +153,6 @@ claims, delivers, or restarts a job mid-render.
 | Low memory / render held | Vidnets holds renders when available memory < ~384 MB estimate | Concurrency 1; wait for memory to free; never raise concurrency on this VM |
 | `/tmp` full (512 MB tmpfs) | Scratch landed in /tmp | `TMPDIR`/`VIDZEO_TEMP_DIR` point at `<runtime>/temp`; `start-daemon.sh` prunes stale scratch on start |
 | 0 real media / all graphics | Discovery returned 0 candidates (search transport) OR strict flags hard-rejected everything | Check the manifest: if every lane returned 0 candidates, it is a transport problem (DNS/proxy), not strictness. If candidates existed but none survived, check `MUSE_MEDIA_STRICT` and the vision verdicts — filter-best must be on |
-| Wrapper fails "0 real-media scenes" | All scenes graphic fallback | One bounded re-plan already ran (or was skipped for lack of budget). Fail the job; re-queue the title only after the cause above is fixed |
 | Vision rejects a correct clip | Operator prompt too strict, or a watermarked/wrong-operator frame | The hook prompt is filter-best (reject only clearly-wrong). A wrong-operator frame (e.g. CSX illustrating Amtrak) is correctly rejected |
 | Pool empties mid-media after a render ends | stop_graceful race (fixed Nov 21, 2026) | A cancelled stop is NOT recalled once a worker has read it. Fix: two-tick render confirm before queueing stops, cancelled stops kept as tombstones, a worker exiting on a seen stop is re-healed immediately (`POOL_SUPERVISOR_BRIEF.md`) |
 

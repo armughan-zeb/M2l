@@ -27,7 +27,6 @@ export MUSE_VIDNETS_COMMAND="${MUSE_VIDNETS_COMMAND:-bash /app/vidnets/VIDNETS_A
 # with real Muse inference in seconds. The host hook is the fallback when
 # the worker is not running. Never point this at a stub.
 export MUSE_INFERENCE_COMMAND="${MUSE_INFERENCE_COMMAND:-node /app/scripts/muse-inference-spool.cjs}"
-export MUSE_YOUTUBE_COVERAGE_TARGET="${MUSE_YOUTUBE_COVERAGE_TARGET:-0.30}"
 export MUSE_MEDIA_STRICT="${MUSE_MEDIA_STRICT:-0}"
 export VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE="${VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE:-12}"
 export VIDZEO_VISUAL_FINALIST_LIMIT="${VIDZEO_VISUAL_FINALIST_LIMIT:-3}"

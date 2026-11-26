@@ -17,7 +17,7 @@ const { minimumVideoDurationSeconds } = require('../lib/mediaRules');
 const { sleep } = require('../lib/sleep');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { readRequestedWorkers } = require('../lib/remotionWorkers');
-const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs, STATUS_UNAVAILABLE_MS } = require('../lib/vidnetsSubmission');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs, STATUS_UNAVAILABLE_MS, progressDetail } = require('../lib/vidnetsSubmission');
 
 const MINUTE = 60 * 1000;
 
@@ -389,7 +389,6 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
   const handledInference = new Map();
   let lastProgress = -1;
   let lastDetail = '';
-  const renderStartedAt = Date.now();
   let lastReportAt = 0;
   // A user-cancelled video job is terminal: the server never retries it
   // and `retry` refuses it. The CMS job itself is the same job, so a
@@ -436,7 +435,7 @@ async function render(job, scriptText, workDir, { signal, onProgress, attempt } 
       continue;
     }
     const progress = Math.max(0, Math.min(100, Number(item.progress) || 0));
-    const detail = String(item.progress_text || item.status || '').replace(/\s+/g, ' ').trim().slice(0, 400) || 'Rendering';
+    const detail = progressDetail(item);
     const report = progressReportForPoll({
       progress, detail, lastProgress, lastDetail, lastReportAt,
       now: Date.now(), heartbeatMs,

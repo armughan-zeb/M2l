@@ -22,12 +22,11 @@
  *   stdout: exactly one JSON object {"videoPath","thumbnailPath","meta"}
  *   logs go to stderr only.
  *
- * Failure policy — fail loudly, never substitute graphics:
+ * Failure policy:
  *   - Vidnets job ends error / cancelled / shutdown_timeout -> throw.
  *   - Vidnets job stays paused after 3 retries -> throw.
  *   - No video file, or video < 1 MB -> throw.
- *   - The finished edit plan has 0 real-media scenes (all graphic
- *     fallbacks) -> throw instead of delivering a graphics-only video.
+ *   - Missing media evidence -> throw.
  *   - No fallback to the native Remotion engine or the solid-colour
  *     ffmpeg placeholder: those are what made live jobs graphics-only.
  *
@@ -41,7 +40,7 @@ const { spawn } = require('child_process');
 const { bridgeRoot, checkMuseInferenceBridge } = require('./lib/museInference');
 const { pendingSummary } = require('./lib/museInbox');
 const { writeJsonAtomic } = require('./lib/config');
-const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, renderBudgetMs } = require('./lib/vidnetsSubmission');
+const { readRenderReceipt, submitRender, shouldRecoverService, shouldRecheckRetry, STATUS_UNAVAILABLE_MS, progressDetail } = require('./lib/vidnetsSubmission');
 
 const VIDNETS_ROOT = String(process.env.MUSE_VIDNETS_ROOT || '').trim()
   || path.join(__dirname, 'vidnets');
@@ -50,54 +49,6 @@ const RUNTIME_ROOT = String(process.env.VIDZEO_RUNTIME_ROOT || '').trim()
 const LAUNCHER = path.join(VIDNETS_ROOT, 'VIDNETS_AGENT.sh');
 
 const MINUTE = 60 * 1000;
-
-// A media re-plan only runs when this much render budget remains: a fresh
-// submit needs time to plan, download and render, and the overall deadline
-// is never extended for it.
-const REPLAN_MIN_REMAINING_MS = 10 * MINUTE;
-
-/**
- * Pure decision: may the wrapper spend its one bounded media re-plan?
- * Only a finished plan with 0 Muse-verified real-media scenes earns one,
- * only once per wrapper run, and only when enough render budget remains.
- * Anything else (a broken render, a missing edit plan, a too-small video)
- * fails immediately instead — retrying those would just repeat the failure.
- */
-function shouldAttemptReplan({ real, replanAttempted, msRemaining, minRemainingMs = REPLAN_MIN_REMAINING_MS }) {
-  if (replanAttempted) return false;
-  if (real !== 0) return false;
-  return Number(msRemaining) >= Number(minRemainingMs);
-}
-
-/**
- * Fresh-query retry request. No server-side re-plan endpoint exists
- * (`retry` only resumes a paused job), so a re-plan is a fresh submit of
- * the same job. `yt_plan_cache_ttl_seconds: 0` bypasses the server's 24h
- * shared scene-plan cache (vidnets/server/app.py `_load_shared_plan_cache`),
- * so the retry gets fresh scene queries/direction instead of replaying the
- * 0-real plan; already-downloaded verified cuts may still be reused from
- * disk, which is fine — the retry's value is fresh planning and fresh
- * vision verdicts, not fresh downloads. `muse_replan_attempt` marks the
- * request for provenance; it is a plain key, never an internal `_` key.
- */
-function buildRetryRequest(request) {
-  return {
-    ...request,
-    yt_plan_cache_ttl_seconds: 0,
-    muse_replan_attempt: 1,
-  };
-}
-
-/**
- * Pure check: did a previous wrapper run already spend this job's one
- * bounded media re-plan? The saved job file records it (replanAttempted: 1)
- * when the re-plan is submitted. A resume reads the file, so the re-plan
- * is per JOB, not per wrapper run — a daemon restart after a re-plan can
- * never earn a second one.
- */
-function replanAlreadyUsed(saved) {
-  return Boolean(saved) && (saved.replanAttempted === 1 || saved.replanAttempted === true);
-}
 
 // /tmp is a 512 MB tmpfs on this VM and it has filled up before (stale
 // scratch blocked bundle verification); Vidnets temp lives on disk under
@@ -253,7 +204,6 @@ function resultVideoPath(item) {
  * Muse rejection (accepted === false, fatal_mismatch, rejected status)
  * always beats the flag: a rejected asset is never real. `verified`
  * still counts Muse-verified scenes separately, for reporting.
- * The delivery rule is the ONLY hard rule: real === 0 fails the job.
  */
 function countRealScenes(packageDir, planPath) {
   if (!packageDir || !fs.existsSync(packageDir)) return null;
@@ -288,10 +238,17 @@ function countRealScenes(packageDir, planPath) {
   return total ? { real, graphic, total, verified } : null;
 }
 
-function completedMediaCount(item, videoPath) {
+function completedMediaCoverage(item, videoPath) {
   const planPath = item.result?.render_metadata?.edit_plan_path
     || videoPath.replace(/\.mp4$/i, '_remotion_edit_plan.json');
-  return countRealScenes(path.dirname(videoPath), planPath);
+  const count = countRealScenes(path.dirname(videoPath), planPath);
+  if (!count) throw new Error('Vidnets completed without a readable edit plan');
+  return {
+    realScenes: count.real,
+    totalScenes: count.total,
+    graphicScenes: count.graphic,
+    museVerifiedScenes: count.verified,
+  };
 }
 
 function readStdin() {
@@ -336,62 +293,41 @@ async function main() {
   if (!job.jobId || !scriptText || !workDir) {
     fail('render-vidnets-linux needs job.jobId, scriptText and workDir on stdin');
   }
-  // Muse inference is compulsory: refuse to submit a job when the
-  // agent-bridge is absent (no hook operator, no inbox, or an OpenRouter
-  // key in the environment). The job fails here, before any render work,
-  // instead of completing with unanswered inference requests.
-  const bridge = checkMuseInferenceBridge(process.env);
-  if (!bridge.ok) {
-    fail('Muse inference bridge is not available: ' + bridge.failures.join('; '));
-  }
-
-  // Temp headroom first: a render that starts with a full /tmp or temp dir
-  // dies halfway with a cryptic error. Fail here, before submitting.
-  try {
-    const space = checkTempSpace();
-    log(`Temp space OK: ${space.tempDir} ${space.tempFreeMb} MB free, /tmp ${space.tmpFreeMb} MB free`);
-  } catch (err) {
-    fail(err.message);
-  }
-
   fs.mkdirSync(workDir, { recursive: true });
   const packageDir = path.join(workDir, 'vidnets');
   fs.mkdirSync(packageDir, { recursive: true });
 
-  // Reuse the repo's own request builder so the Vidnets job is identical
-  // to the one adapters/vidnets.js would submit (external_agent, Mixed
-  // Media, youtube/web/stock priority, strict retrieval).
-  const { buildRequest } = require('./adapters/vidnets');
-  const request = buildRequest(job, scriptText, packageDir);
   const requestFile = path.join(workDir, 'vidnets-request.json');
   const jobFile = path.join(workDir, 'vidnets-job.json');
-  // The one bounded re-plan is per JOB, not per wrapper run: if a previous
-  // run already spent it, the saved receipt says so (replanAttempted: 1) and
-  // a resume must not earn a second one.
   let receipt = readRenderReceipt(jobFile, job.jobId);
   let vidnetsJobId = receipt?.id || '';
-  let replanAttempted = replanAlreadyUsed(receipt);
   const cmsAttempt = Math.max(1, Number(input.attempt) || 1);
   const submit = filePath => vidnets(['submit', filePath], 2 * MINUTE);
   const saveReceipt = fields => {
     receipt = { ...receipt, ...fields, id: vidnetsJobId, jobId: job.jobId, packageDir };
     writeJsonAtomic(jobFile, receipt);
   };
-  if (vidnetsJobId) log(`Re-attaching to existing Vidnets job ${vidnetsJobId} for ${job.jobId}${replanAttempted ? ' (media re-plan already used)' : ''}`);
+  if (vidnetsJobId) log(`Re-attaching to existing Vidnets job ${vidnetsJobId} for ${job.jobId}`);
 
   if (!vidnetsJobId) {
+    const bridge = checkMuseInferenceBridge(process.env);
+    if (!bridge.ok) {
+      fail('Muse inference bridge is not available: ' + bridge.failures.join('; '));
+    }
+    const space = checkTempSpace();
+    log(`Temp space OK: ${space.tempDir} ${space.tempFreeMb} MB free, /tmp ${space.tmpFreeMb} MB free`);
     log('Ensuring Vidnets service is ready');
     await vidnets(['start'], 2 * MINUTE);
+    const { buildRequest } = require('./adapters/vidnets');
+    const request = buildRequest(job, scriptText, packageDir);
     vidnetsJobId = await submitRender({ jobId: job.jobId, filePath: requestFile, request, submit });
     saveReceipt({ cmsAttempt, submittedAt: new Date().toISOString() });
     log(`Vidnets job ${vidnetsJobId} submitted for "${job.title}"`);
   }
 
-  const deadline = Date.now() + renderBudgetMs(job);
+  let lastStatusAt = performance.now();
   const pollMs = Math.max(2000, Number(process.env.MUSE_VIDNETS_POLL_MS) || 5000);
   let retries = Number(receipt.cmsAttempt) === cmsAttempt ? (Number(receipt.pausedRetries) || 0) : 0;
-  // replanAttempted is declared above (restored from the saved job file on
-  // re-attach) so a resume cannot earn a second re-plan.
   let lastProgress = -1;
   let lastDetail = '';
   let lastPendingCheck = 0;
@@ -410,10 +346,11 @@ async function main() {
       snapshot = await vidnets(['job', vidnetsJobId], MINUTE);
       if (!snapshot.item?.status) throw new Error('Vidnets returned no job status');
       statusFailures = 0;
+      lastStatusAt = performance.now();
     } catch (error) {
       if (/returned (400|401|403|404)\b/i.test(error.message)) throw error;
       statusFailures += 1;
-      if (Date.now() > deadline && statusFailures > 3) {
+      if (performance.now() - lastStatusAt >= STATUS_UNAVAILABLE_MS) {
         fail(`Vidnets status remained unavailable for job ${vidnetsJobId}: ${error.message}`);
       }
       if (shouldRecoverService(error, statusFailures)) {
@@ -449,7 +386,7 @@ async function main() {
     }
     const item = snapshot.item || {};
     const progress = Math.max(0, Math.min(100, Number(item.progress) || 0));
-    const detail = String(item.progress_text || item.status || '').replace(/\s+/g, ' ').trim().slice(0, 300) || 'Rendering';
+    const detail = progressDetail(item);
     // Log on stage-text change as well as % change: a render held for
     // memory sits at 0% for minutes, and a % only log goes silent.
     if (progress !== lastProgress || detail !== lastDetail) {
@@ -469,49 +406,8 @@ async function main() {
       if (!videoPath) fail('Vidnets completed the job without a readable video_path');
       const size = fs.statSync(videoPath).size;
       if (size < 1024 * 1024) fail(`Vidnets video is too small to be a real master (${size} bytes)`);
-      const mediaCount = completedMediaCount(item, videoPath);
-      if (!mediaCount) {
-        // No edit plan next to the video means the real-media mix cannot
-        // be verified at all — fail closed instead of accepting on file
-        // size and decode checks alone.
-        fail('Vidnets completed without an edit plan next to the video — the real-media mix cannot be verified. Failing instead of delivering an unverified video.');
-      }
-      log(`Edit plan: ${mediaCount.real}/${mediaCount.total} scenes real media (${mediaCount.verified} Muse-verified), ${mediaCount.graphic} graphic fallback(s)`);
-      // Production policy: the ONLY hard delivery rule is 0 real-media
-      // scenes — never deliver a graphics-only video. A scene counts as
-      // real via the adapter's own acceptance (verified flag) even when
-      // Muse never answered a vision request for it. Partial-real videos
-      // deliver with an advisory, unless MUSE_MEDIA_STRICT=1.
-      if (mediaCount.real < mediaCount.total) {
-        const strict = String(process.env.MUSE_MEDIA_STRICT || '').trim() === '1';
-        const reason = `Vidnets accepted real media in ${mediaCount.real}/${mediaCount.total} scenes. Every scene needs accepted real media.`;
-        const msRemaining = deadline - Date.now();
-        const minRemainingMs = Math.max(0, Number(process.env.MUSE_REPLAN_MIN_REMAINING_MS) || REPLAN_MIN_REMAINING_MS);
-        if (shouldAttemptReplan({ real: mediaCount.real, replanAttempted, msRemaining, minRemainingMs })) {
-          replanAttempted = true;
-          const previousId = vidnetsJobId;
-          const retryRequest = buildRetryRequest(request);
-          const retryRequestFile = path.join(workDir, 'vidnets-request-replan.json');
-          log(`0 real-media scenes — attempting the one bounded media re-plan (fresh queries, plan cache bypassed) with ${Math.round(msRemaining / 60000)} min left in the render budget`);
-          vidnetsJobId = await submitRender({ jobId: job.jobId, filePath: retryRequestFile, request: retryRequest, submit });
-          saveReceipt({
-            cmsAttempt, pausedRetries: 0, submittedAt: new Date().toISOString(),
-            replanOf: previousId, replanAttempted: 1
-          });
-          log(`Media re-plan submitted as Vidnets job ${vidnetsJobId} (re-plan of ${previousId})`);
-          retries = 0;
-          lastProgress = -1;
-          lastPendingCheck = 0;
-          continue;
-        }
-        if (mediaCount.real === 0) {
-          fail(replanAttempted ? `${reason} (0 real-media scenes after bounded media re-plan)` : `${reason} (0 real-media scenes)`);
-        }
-        if (strict) {
-          fail(replanAttempted ? `${reason} (strict mode, after one bounded media re-plan)` : `${reason} (strict mode)`);
-        }
-        log(`Quality advisory: ${mediaCount.real}/${mediaCount.total} real scenes (${mediaCount.graphic} graphic fallbacks). Delivering technically valid video per production policy.`);
-      }
+      const coverage = completedMediaCoverage(item, videoPath);
+      log(`Edit plan: ${coverage.realScenes}/${coverage.totalScenes} scenes real media (${coverage.museVerifiedScenes} Muse-verified), ${coverage.graphicScenes} graphic fallback(s)`);
       let thumbnailPath = '';
       const dir = path.dirname(videoPath);
       try {
@@ -525,11 +421,8 @@ async function main() {
         meta: {
           engine: 'vidnets-linux',
           vidnetsJobId,
-          replanAttempts: replanAttempted ? 1 : 0,
-          realScenes: mediaCount.real,
-          totalScenes: mediaCount.total,
-          graphicScenes: mediaCount.graphic,
-          museVerifiedScenes: mediaCount.verified
+          replanAttempts: receipt.replanAttempted ? 1 : 0,
+          ...coverage
         }
       }) + '\n');
       return;
@@ -610,4 +503,4 @@ if (require.main === module) {
   main().catch(err => fail(err && err.message ? err.message : String(err)));
 }
 
-module.exports = { countRealScenes, completedMediaCount, checkTempSpace, TEMP_MIN_FREE_MB, TMP_MIN_FREE_MB, shouldAttemptReplan, buildRetryRequest, replanAlreadyUsed, REPLAN_MIN_REMAINING_MS, writeVidnetsProgressFile, describePausedFailure };
+module.exports = { countRealScenes, completedMediaCoverage, checkTempSpace, TEMP_MIN_FREE_MB, TMP_MIN_FREE_MB, writeVidnetsProgressFile, describePausedFailure };

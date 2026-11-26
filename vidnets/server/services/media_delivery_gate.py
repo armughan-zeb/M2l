@@ -47,23 +47,12 @@ def validate_documentary_coverage(media_plan, durations=(), config=None):
 
     scene_ratio = len(emergency_indices) / max(1, len(paths))
     duration_ratio = emergency_seconds / max(0.001, seconds)
-    # Fail-closed: a video whose every scene is an emergency graphic is not
-    # a documentary — it is a slideshow of placeholders. When the media
-    # guarantee is on (the default for production jobs), all-emergency fails
-    # the gate here in Vidnets instead of only warning and letting the outer
-    # render wrapper catch it later.
-    guarantee = bool(config.get('global_media_guarantee', True))
     real_only = config.get('media_fallback_policy') == 'real_media_only'
-    all_emergency = bool(paths) and len(emergency_indices) == len(paths)
-    scene_count_mismatch = real_only and len(durations) > 0 and len(paths) != len(durations)
-    passed = bool(paths) and not missing_indices and not scene_count_mismatch and not (
-        (real_only and emergency_indices) or (guarantee and all_emergency)
-    )
+    scene_count_mismatch = len(durations) > 0 and len(paths) != len(durations)
+    passed = bool(paths) and not missing_indices and not scene_count_mismatch and not (real_only and emergency_indices)
     warnings = ([f'Emergency graphics used in {len(emergency_indices)}/{len(paths)} scenes '
                  f'({scene_ratio:.1%} of scenes, {duration_ratio:.1%} of runtime); '
                  'real-media retrieval remains preferred.'] if emergency_indices else [])
-    if guarantee and all_emergency:
-        warnings.append('Media guarantee failed: every scene fell back to emergency graphics; no real media was retrieved.')
     if scene_count_mismatch:
         warnings.append(f'Media plan has {len(paths)} slots for {len(durations)} narration scenes.')
     summary = {

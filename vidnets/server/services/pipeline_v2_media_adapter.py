@@ -3933,7 +3933,7 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
 
     Explicit accepted-coverage overrides and explicit per-channel UI source
     maps control the quota. Generated niche/prebuilt preferences do not lower
-    the default 30% scene-slot target; that target remains best-effort because
+    the default 60% scene-slot target; that target remains best-effort because
     relevance and reuse-clearance checks decide which clips may be accepted.
     """
     explicit_keys = ("youtube_accepted_coverage_target", "youtube_coverage_target", "youtube_target_percentage", "yt_percentage", "footage_percentage", "video_percentage", "youtube_percentage", "youtube_ratio")
@@ -3969,9 +3969,7 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
     # itself lives in config['_documentary_youtube_target'] (stamped by
     # app._apply_documentary_mode_policy) so the number has one source of
     # truth; 0.55 is the fallback. Gaming mode above wins when a job is
-    # both. An explicit per-job coverage key above still wins. Without
-    # this branch, documentary jobs fell through to the 0.30 default
-    # below (or to whatever the retrieval weights happened to say).
+    # both. An explicit per-job coverage key above still wins.
     if _as_bool(config.get("_documentary_mode"), False):
         try:
             stamped = float(config.get("_documentary_youtube_target") or 0.55)
@@ -3990,7 +3988,7 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
 
     # Explicit per-channel UI percentages are authoritative when present.
     # Generated niche/prebuilt weights are preferences; the shared default
-    # target remains 30% and never bypasses candidate relevance checks.
+    # target remains 60% and never bypasses candidate relevance checks.
     candidate_maps = []
     raw_weights = config.get("mixed_media_weights") or config.get("media_weights")
     if isinstance(raw_weights, Mapping):
@@ -4009,7 +4007,7 @@ def _mixed_media_youtube_target_ratio(config: Mapping[str, Any]) -> float:
         except (TypeError, ValueError):
             continue
 
-    return 0.30
+    return 0.60
 
 
 def _automatic_youtube_scene_indices(
@@ -4530,27 +4528,6 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
         delivery_budget = get_delivery_budget(config)
     except Exception:
         delivery_budget = None
-    # Floor: never collapse the media stage below one agent round-trip (or
-    # 300s). A 1s wall terminalises every scene as a graphic fallback and
-    # silently produces a footage-free video. The delivery budget is a soft
-    # target; real footage matters more than the clock.
-    # The old default here was 3600s, contradicting the comment above:
-    # for an external-agent job the coordinator wall was floored at one
-    # hour, so test 22's 13-scene coordinator ran with a 3300s working
-    # deadline (3600s wall minus the 300s vision reserve) against a 412s
-    # discovery+tail budget — the wall never bound anything, and a
-    # stalled run could crawl for an hour before the budget caught it.
-    # The floor is now 300s (one inbox round trip, same value as the
-    # query-brain per-wave wall): the wall for a 1-minute job becomes
-    # the computed/delivery-allowance value (~1470s), and for a 66-scene
-    # job the delivery budget, not this floor, is the bound.
-    if str(config.get('llm_provider') or '') == 'external_agent':
-        try:
-            media_floor = max(60.0, float(os.environ.get("VIDZEO_AGENT_MIN_WALL_SECONDS", "300") or 300))
-        except (TypeError, ValueError):
-            media_floor = 300.0
-    else:
-        media_floor = 300.0
     if delivery_budget is not None:
         try:
             reserve_after = float(
@@ -4563,9 +4540,7 @@ def _media_stage_deadline_seconds(config: Mapping[str, Any], lane_mode: str) -> 
             computed,
             reserve_after_seconds=reserve_after,
         )
-        if available <= 0.0:
-            return media_floor
-        return max(media_floor, min(computed, available))
+        return max(1.0, available)
     return computed
 
 
@@ -5411,7 +5386,6 @@ def resolve_existing_provider_branches_v2(
     # candidates alive until FFmpeg/overlay/visual gates inspect them. Hard
     # package, caption, and subject-mismatch blockers still reject upstream.
     config["yt_stop_on_soft_timeout"] = False
-    config["yt_stop_when_coverage_target_met"] = False
     # Preserve the Mixed Media policy.  The app disables same-source reuse so
     # a real YouTube pool is distributed as distinct cuts; forcing this back
     # to True here made the coordinator collapse the pool into one clip plus
@@ -5524,9 +5498,8 @@ def resolve_existing_provider_branches_v2(
     youtube_primary_attempted_indices: set[int] = set()
     youtube_indices_ref = {"indices": primary_youtube_scene_indices}
     youtube_fallback_mode = {"enabled": False}
-    # Price the YouTube window by clip duration. The primary lane works
-    # through timed downloads and alternatives inside its branch wall.
-    # The optional general pool has a separate, bounded build.
+    # Price the optional general pool by clip duration. The primary lane
+    # uses the same provider budget as Vidnets' regular YouTube branch.
     from .youtube_discovery_budget import (
         discovery_budget_seconds,
         media_tail_seconds,
@@ -5567,14 +5540,27 @@ def resolve_existing_provider_branches_v2(
         youtube_discovery_budget_seconds, tail_seconds=youtube_media_tail_seconds,
     )
     if primary_youtube_scene_indices:
-        from .youtube_stage_budget import mixed_agent_cooldown_wall
-
-        try:
-            transport_window = float(config.get("yt_hard_timeout_seconds") or youtube_discovery_hard_seconds)
-        except (TypeError, ValueError):
-            transport_window = youtube_discovery_hard_seconds
         if lane_policy["mode"] == "Mixed Media":
-            transport_window = max(transport_window, mixed_agent_cooldown_wall(config))
+            from .youtube_stage_budget import mixed_agent_cooldown_wall
+
+            transport_window = max(
+                _effective_mixed_youtube_branch_wall_seconds(deadline_config),
+                mixed_agent_cooldown_wall(config),
+            )
+        else:
+            from .delivery_budget import get_delivery_budget
+
+            transport_window = youtube_discovery_hard_seconds
+            delivery_budget = get_delivery_budget(config)
+            if delivery_budget is not None:
+                # The YouTube-only worker can use the remaining preparation
+                # allowance. Keep verification open through that same clock.
+                transport_window = delivery_budget.allowance(
+                    None,
+                    reserve_after_seconds=(
+                        delivery_budget.render_reserve_seconds + deadline_config["vision_reserve_seconds"]
+                    ),
+                )
         deadline_config["_youtube_transport_window_seconds"] = transport_window
         youtube_verification_deadline_seconds = max(
             youtube_verification_deadline_seconds,
@@ -5727,11 +5713,6 @@ def resolve_existing_provider_branches_v2(
             f"{len(youtube_scene_indices)}/{len(scenes)} quota scenes",
         )
         lane_config = dict(config)
-        # Keep the primary lane open until it finishes or reaches the branch
-        # deadline. The optional general pool can build alongside it.
-        lane_config["yt_hard_timeout_seconds"] = (
-            lane_config.get("yt_hard_timeout_seconds") or youtube_discovery_hard_seconds
-        )
         _start_general_pool_build(lane_config)
         if broad_anchor and provider_topic_title != valid_topic_anchor:
             # The provider reads this field ahead of its title argument.
@@ -5742,6 +5723,8 @@ def resolve_existing_provider_branches_v2(
             # whole film. Applying 60% again budgets only part of that quota.
             lane_config["_youtube_quota_preselected"] = True
             lane_config["youtube_accepted_coverage_target"] = 1.0
+            lane_config["yt_min_resolved_ratio_before_soft_stop"] = 1.0
+            lane_config.setdefault("yt_stop_when_coverage_target_met", True)
             gaming_job = bool(lane_policy.get("gaming_mode"))
             default_candidates = 10 if gaming_job else 6
             default_attempts = 6 if gaming_job else 3

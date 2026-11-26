@@ -49,9 +49,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MUSE_VIDNETS_ROOT=/app/vidnets \
     MUSE_REPO_ROOT=/app \
     MUSE_RENDER_CONCURRENCY=1 \
-    # Nov 10, 2026 standing decisions (see AGENT_TRAINING.md). YT coverage
-    # 0.30: web images are the main source; the old 0.8 was per-job values.
-    MUSE_YOUTUBE_COVERAGE_TARGET=0.30 \
     MUSE_MEDIA_STRICT=0 \
     VIDZEO_VISUAL_TOP_CANDIDATES_PER_SCENE=12 \
     VIDZEO_VISUAL_FINALIST_LIMIT=3 \

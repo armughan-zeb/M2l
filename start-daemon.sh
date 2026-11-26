@@ -28,7 +28,6 @@ export MUSE_RENDER_COMMAND="${MUSE_RENDER_COMMAND:-node $(printf '%q' "$REPO_ROO
 # REAL transport — never with the deleted test stub.
 export MUSE_INFERENCE_COMMAND="${MUSE_INFERENCE_COMMAND:-node $(printf '%q' "$REPO_ROOT/scripts/muse-inference-spool.cjs")}"
 export MUSE_VIDNETS_ROOT="${MUSE_VIDNETS_ROOT:-$REPO_ROOT/vidnets}"
-export MUSE_YOUTUBE_COVERAGE_TARGET="${MUSE_YOUTUBE_COVERAGE_TARGET:-0.30}"
 export MUSE_MEDIA_STRICT="${MUSE_MEDIA_STRICT:-0}"
 export MUSE_RENDER_CONCURRENCY="${MUSE_RENDER_CONCURRENCY:-1}"
 export VIDZEO_TEMP_DIR="${VIDZEO_TEMP_DIR:-${VIDZEO_RUNTIME_ROOT:-$HOME/workspace/vidnets-runtime}/temp}"

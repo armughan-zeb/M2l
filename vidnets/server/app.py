@@ -10869,7 +10869,7 @@ def _mixed_youtube_branch_wall_cap_seconds(config=None, scene_count=0):
                 requested,
                 settings.get("yt_search_timeout_seconds", os.environ.get("VIDZEO_MIXED_YT_SEARCH_TIMEOUT", 150)),
                 download_workers=_mixed_youtube_download_worker_capacity(settings),
-                coverage_target=1.0 if settings.get('_youtube_quota_preselected') else 0.30,
+                coverage_target=1.0 if settings.get('_youtube_quota_preselected') else 0.60,
             )
         except Exception:
             requested = min(requested, 360.0 if int(scene_count) <= 12 else 600.0)
@@ -11234,27 +11234,23 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         or config.get("yt_download_hard_timeout_seconds")
         or _quality_batch_timeout
     )
-    if _mixed_media_job:
-        source_deadline = (
-            config.get("yt_pool_source_download_deadline_seconds")
-            or yt_environment.get("VIDZEO_MIXED_YT_POOL_SOURCE_DEADLINE_SECONDS")
-            or yt_environment.get("VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS")
-            or 270
-        )
-        yt_environment["VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS"] = str(source_deadline)
-    elif _youtube_only_job:
+    short_mixed_media_job = _mixed_media_job and not long_youtube_job
+    if short_mixed_media_job:
+        quality_source_deadline = max(300, min(480, int(round(300.0 + (90.0 * _quality_ratio)))))
+    else:
         quality_source_deadline = max(360, min(900, int(round(360.0 + (120.0 * _quality_ratio)))))
-        try:
-            existing_source_deadline = float(
-                yt_environment.get("VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS", "0") or 0
-            )
-        except (TypeError, ValueError):
-            existing_source_deadline = 0.0
+    if _mixed_media_job or _youtube_only_job:
         source_deadline = (
             config.get("yt_pool_source_download_deadline_seconds")
-            or max(quality_source_deadline, existing_source_deadline)
+            or (_mixed_media_job and yt_environment.get("VIDZEO_MIXED_YT_POOL_SOURCE_DEADLINE_SECONDS"))
         )
-        yt_environment["VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS"] = str(source_deadline)
+        if not source_deadline and not short_mixed_media_job:
+            try:
+                inherited_deadline = float(yt_environment.get("VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS") or 0)
+            except (TypeError, ValueError):
+                inherited_deadline = 0.0
+            source_deadline = max(quality_source_deadline, inherited_deadline)
+        yt_environment["VIDZEO_YT_POOL_SOURCE_DOWNLOAD_DEADLINE_SECONDS"] = str(source_deadline or quality_source_deadline)
     try:
         _yt_render_width, _yt_render_height = tuple(config.get("render_resolution") or (1920, 1080))[:2]
         yt_environment["VIDZEO_YT_CLIP_WIDTH"] = str(max(320, int(_yt_render_width)))

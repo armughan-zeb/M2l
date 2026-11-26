@@ -3,6 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { progressReportForPoll } = require('../adapters/vidnets');
+const { progressDetail } = require('../lib/vidnetsSubmission');
 
 const base = {
   progress: 61,
@@ -11,7 +12,6 @@ const base = {
   lastDetail: 'Checking media relevance',
   lastReportAt: 1000000,
   heartbeatMs: 300000,
-  renderStartedAt: 0,
 };
 
 test('a changed percentage or detail is reported as a change', () => {
@@ -26,16 +26,18 @@ test('an unchanged poll inside the heartbeat window reports nothing', () => {
   assert.equal(progressReportForPoll({ ...base, now: 1299999 }), null);
 });
 
-test('an unchanged poll past the heartbeat window reports a changing detail', () => {
+test('an unchanged poll reports a heartbeat with the same progress', () => {
   const first = progressReportForPoll({ ...base, now: 1300000 });
   assert.equal(first.progress, 61);
   assert.equal(first.changed, false);
-  assert.match(first.detail, /Checking media relevance \(still working, 1300s elapsed\)/);
-  // A later heartbeat has a different elapsed value, so the CMS cannot
-  // dedupe it as a repeat of the first.
+  assert.equal(first.detail, base.detail);
   const second = progressReportForPoll({ ...base, lastReportAt: 1300000, now: 1600000 });
-  assert.match(second.detail, /\(still working, 1600s elapsed\)/);
-  assert.notEqual(second.detail, first.detail);
+  assert.deepEqual(second, first);
+});
+
+test('queue heartbeat text preserves the current stage and genuine counters', () => {
+  assert.equal(progressDetail({ progress_text: 'Checking media: 3/6 - still working (43s); please wait' }), 'Checking media: 3/6');
+  assert.equal(progressDetail({ progress_text: 'Checking media: 4/6' }), 'Checking media: 4/6');
 });
 
 test('the heartbeat interval is honoured from the last report, not from render start', () => {

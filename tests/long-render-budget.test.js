@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const { renderBudgetMs } = require('../lib/vidnetsSubmission');
 const { buildRequest } = require('../adapters/vidnets');
 
-test('long videos receive the same duration-scaled budget through the worker and Vidnets', () => {
+test('Vidnets sizes preparation unless the operator supplies a budget', () => {
   const job = { title: 'Example', targetDurationMinutes: 40, channel: {} };
   assert.equal(renderBudgetMs(job, {}), 30 * 60 * 60 * 1000);
   assert.equal(renderBudgetMs({ targetDurationMinutes: 1 }, {}), 6 * 60 * 60 * 1000);
@@ -16,7 +16,13 @@ test('long videos receive the same duration-scaled budget through the worker and
   for (const name of keyNames) delete process.env[name];
   delete process.env.MUSE_RENDER_TIMEOUT_MS;
   try {
-    assert.equal(buildRequest(job, 'narration', 'fixture').delivery_budget_seconds, 30 * 60 * 60);
+    const request = buildRequest(job, 'narration', 'fixture');
+    assert.equal(request.delivery_budget_seconds, undefined);
+    assert.equal(request.continue_render_while_active, true);
+    process.env.MUSE_RENDER_TIMEOUT_MS = '3600000';
+    const overridden = buildRequest(job, 'narration', 'fixture');
+    assert.equal(overridden.delivery_budget_seconds, 3600);
+    assert.equal(overridden.delivery_budget_max_cap_seconds, 3600);
   } finally {
     for (const [name, value] of keys) {
       if (value === undefined) delete process.env[name];

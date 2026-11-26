@@ -759,7 +759,7 @@ def test_web_fallback_gets_bounded_tail_before_stock_and_can_be_disabled():
         ) == 0.0
 
 
-def test_mixed_media_youtube_default_target_is_30_percent():
+def test_mixed_media_youtube_default_target_is_60_percent():
     config = {
         "_niche_media_policy": {
             "niche": "science",
@@ -771,14 +771,14 @@ def test_mixed_media_youtube_default_target_is_30_percent():
         },
     }
     with mock.patch.dict(os.environ, {}, clear=True):
-        assert _mixed_media_youtube_target_ratio(config) == 0.30
+        assert _mixed_media_youtube_target_ratio(config) == 0.60
         indices = _automatic_youtube_scene_indices(
             config,
             [f"science scene {index}" for index in range(8)],
             title="Science",
             script="A science documentary.",
         )
-    assert len(indices) == 3
+    assert len(indices) == 5
 
 
 def test_documentary_mode_youtube_target_is_55_percent():
@@ -835,9 +835,9 @@ def test_gaming_target_still_80_percent_and_wins_over_documentary():
         "_documentary_youtube_target": 0.55,
     }
     assert _mixed_media_youtube_target_ratio(both) == 0.80
-    # A plain (non-gaming, non-documentary) job still falls back to 0.30.
+    # General Mixed Media follows the local Vidnets default.
     with mock.patch.dict(os.environ, {}, clear=True):
-        assert _mixed_media_youtube_target_ratio({}) == 0.30
+        assert _mixed_media_youtube_target_ratio({}) == 0.60
 
 
 def test_oversized_prebuilt_youtube_group_is_capped_and_spread_across_timeline():
@@ -2480,11 +2480,8 @@ def test_youtube_fallback_retries_rejected_quota_candidates(monkeypatch, tmp_pat
     assert _has_usable(primary_rows[0]) is False
 
 
-def test_media_stage_never_collapses_to_a_one_second_wall_when_budget_is_spent():
-    """An exhausted delivery budget used to hand the media stage a 1s wall,
-    terminalising every scene as a graphic fallback. The stage now keeps at
-    least one agent round-trip (3600s, one agent wall) for agent jobs and
-    300s otherwise."""
+def test_media_stage_respects_exhausted_preparation_budget():
+    """Provider waits cannot reset a preparation budget that has expired."""
     import time
     from services.delivery_budget import DeliveryBudget
     from services.pipeline_v2_media_adapter import _media_stage_deadline_seconds
@@ -2495,9 +2492,9 @@ def test_media_stage_never_collapses_to_a_one_second_wall_when_budget_is_spent()
         return budget
 
     agent_config = {"llm_provider": "external_agent", "_delivery_budget": exhausted_budget()}
-    assert _media_stage_deadline_seconds(agent_config, "Mixed Media") == 3600.0
+    assert _media_stage_deadline_seconds(agent_config, "Mixed Media") == 1.0
     plain_config = {"_delivery_budget": exhausted_budget()}
-    assert _media_stage_deadline_seconds(plain_config, "Mixed Media") == 300.0
+    assert _media_stage_deadline_seconds(plain_config, "Mixed Media") == 1.0
 
 
 def test_unresolved_scene_reuses_verified_real_donor_before_error_gate(tmp_path):

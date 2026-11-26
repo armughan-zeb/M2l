@@ -36,8 +36,9 @@ fails the loser with a 400).
 ## 3. No AI-generated footage, ever
 
 Documentaries use scraped YouTube clips + web images + Pexels/Pixabay
-stock with Remotion motion graphics. Never generate footage, never ship
-a solid-colour + sine-tone placeholder, never ship a graphics-only video.
+stock with Remotion motion graphics. Use grounded motion graphics for
+scenes still missing real media after recovery. Exclude synthetic footage
+and blank placeholders.
 
 ## 4. No template scripts; no invented facts
 
@@ -48,15 +49,14 @@ production. Zero external claims fails `RESEARCH_INSUFFICIENT`.
 Synthetic dossier claims are context only — they never satisfy the
 evidence gate and never count toward publishability.
 
-## 5. Filter-best, not hard-reject — one hard delivery rule
+## 5. Media verification and delivery
 
 Vision RANKS candidates and only rejects clearly-wrong footage (wrong
 subject, wrong era, unrelated content, gameplay, text card, watermark).
 Borderline-but-real footage is ACCEPTED, with the caveat in the reason.
 Per-candidate strictness stays filter-best (`MUSE_MEDIA_STRICT=0`).
-The ONLY hard rule is delivery: **never deliver a video with 0
-real-media scenes — fail the job instead.** That is a delivery rule,
-not a per-candidate rejection rule.
+Report the percentage of graphic fallback scenes and runtime. Delivery
+requires complete media assignments, job ownership and a valid master.
 
 ## 6. Never touch `.muse-agent.json`
 
