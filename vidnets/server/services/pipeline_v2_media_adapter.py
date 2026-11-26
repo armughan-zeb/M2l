@@ -3806,7 +3806,7 @@ def resolve_and_build_media_plan(
 
 def _source_lane_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve the user-selected source mode into authoritative V2 lanes."""
-    raw = str(
+    raw = "Web Images" if config.get("muse_media_mode") == "web-only" else str(
         config.get("image_source")
         or config.get("media_mode")
         or "Mixed Media"
@@ -5540,7 +5540,10 @@ def resolve_existing_provider_branches_v2(
         youtube_discovery_budget_seconds, tail_seconds=youtube_media_tail_seconds,
     )
     if primary_youtube_scene_indices:
-        if lane_policy["mode"] == "Mixed Media":
+        if config.get("muse_clip_job_id"):
+            from .pc_youtube_clips import relay_branch_seconds
+            transport_window = relay_branch_seconds(len(primary_youtube_scene_indices))
+        elif lane_policy["mode"] == "Mixed Media":
             from .youtube_stage_budget import mixed_agent_cooldown_wall
 
             transport_window = max(
@@ -6921,7 +6924,7 @@ def resolve_existing_provider_branches_v2(
     # web/stock scenes may need footage too. The coordinator supplies only
     # failed primary scenes before the single bounded recovery batch starts.
     youtube_only = lane_policy["mode"] == "YouTube Clips"
-    fallback_youtube_scene_indices = list(range(len(scenes))) if (
+    fallback_youtube_scene_indices = list(range(len(scenes))) if config.get("muse_media_mode") != "web-only" and (
         lane_policy["mode"] in {"YouTube Clips", "Mixed Media"}
         or _as_bool(config.get("allow_cross_source_youtube_fallback"), False)
     ) else []

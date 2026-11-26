@@ -8274,6 +8274,7 @@ def get_youtube_clips(
     # still use ``title`` unchanged. Defaults to ``title``.
     prep_manifest_title: Optional[str] = None,
     cooldown_hard_timeout_seconds: Optional[float] = None,
+    muse_clip_job_id: str = "",
     **__,
 ) -> List[Optional[str]]:
     del api_key, groq_api_key, video_format
@@ -8398,7 +8399,7 @@ def get_youtube_clips(
             scene_timing_windows[index] if index < len(scene_timing_windows) else {}
             for index in active_scene_indices
         ]
-    authenticated_session = _get_authenticated_youtube_session(
+    authenticated_session = None if muse_clip_job_id else _get_authenticated_youtube_session(
         session_jar=session_jar,
         youtube_session=youtube_session,
         enabled=use_authenticated_session,
@@ -8606,7 +8607,9 @@ def get_youtube_clips(
             },
         )
 
-    if pool_first is not None:
+    if muse_clip_job_id:
+        pool_first_requested = False
+    elif pool_first is not None:
         pool_first_requested = bool(pool_first)
     else:
         pool_first_requested = str(os.environ.get("VIDZEO_YT_POOL_FIRST", "0")).strip().lower() in {"1", "true", "yes", "on"}
@@ -8794,6 +8797,7 @@ def get_youtube_clips(
     download_timestamp_owners = defaultdict(set)
     failed_download_counts: Counter = Counter()
     provider_network_unavailable = threading.Event()
+    pc_relay_unavailable = threading.Event()
     network_diagnostic = {}
     network_failure_codes = {
         'provider_dns_unavailable', 'dns_resolution_failed',
@@ -9427,7 +9431,7 @@ def get_youtube_clips(
                 # high-quality cut. A model-selected range is only evidence
                 # for these exact pixels; the final clip still goes through the
                 # normal transport and scene-level visual checks below.
-                if visual_context is not None and getattr(visual_context, 'enabled', False):
+                if not muse_clip_job_id and visual_context is not None and getattr(visual_context, 'enabled', False):
                     cached_contact = contact_approved_windows.get((idx, vid))
                     if cached_contact is not None:
                         start = float(cached_contact[0])
@@ -9527,7 +9531,22 @@ def get_youtube_clips(
                             audit["cache_restored"] = True
                     except Exception:
                         downloaded = False
-                if not downloaded:
+                if not downloaded and muse_clip_job_id:
+                    from services.pc_youtube_clips import download_pc_cut
+
+                    if pc_relay_unavailable.is_set():
+                        failure = "pc_clip_relay_unavailable"
+                    else:
+                        downloaded, failure = download_pc_cut(
+                            muse_clip_job_id, vid, out, start, duration, cancellation=_cancel,
+                            deadline_at=deadline_at if deadline_at is not None else hard_deadline,
+                        )
+                    if failure in {"pc_youtube_session_unavailable", "pc_clip_relay_unavailable"}:
+                        pc_relay_unavailable.set()
+                    audit["download_transport"] = "pc_tunnel"
+                    if not downloaded:
+                        option["_transport_failure"] = failure
+                elif not downloaded:
                     download_kwargs = {
                         "session_jar": authenticated_session,
                         "stream_downloads": bool(stream_downloads),

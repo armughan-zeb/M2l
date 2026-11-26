@@ -212,6 +212,13 @@ def _generation_bool(value, default=False):
 def normalize_generation_config(config: dict | None) -> dict:
     """Normalize persisted and incoming jobs to the supported providers."""
     normalized = dict(config or {})
+    if normalized.get('muse_media_mode') == 'web-only':
+        normalized['image_source'] = 'Web Images'
+        normalized['allow_cross_source_youtube_fallback'] = False
+        normalized.pop('muse_clip_job_id', None)
+    elif normalized.get('muse_media_mode') == 'pc-youtube':
+        normalized['image_source'] = 'Mixed Media'
+        normalized['yt_use_authenticated_session'] = False
 
     # Generation V2 keeps the semantic identity of the content separate from
     # the filesystem-safe output name.  Older queue code assigned one sanitized

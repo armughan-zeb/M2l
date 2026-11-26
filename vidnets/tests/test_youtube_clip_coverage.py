@@ -86,6 +86,22 @@ def test_explicit_user_scene_cap_remains_authoritative():
     assert plan['yt_max_download_scenes'] == 7
 
 
+def test_muse_modes_keep_web_and_budget_pc_download_waves():
+    from services.delivery_budget import install_delivery_budget
+    from services.pc_youtube_clips import CLIP_WAIT_SECONDS, relay_branch_seconds
+    from services.pipeline_v2_media_adapter import _source_lane_policy
+
+    web = _source_lane_policy({'muse_media_mode': 'web-only', 'image_source': 'Mixed Media'})
+    assert web['web_enabled'] and not web['youtube_enabled']
+    mixed = _source_lane_policy({'muse_media_mode': 'pc-youtube', 'image_source': 'Mixed Media'})
+    assert mixed['web_enabled'] and mixed['youtube_enabled']
+    assert 720 <= relay_branch_seconds(4) < relay_branch_seconds(40) <= 3000
+    config = {'muse_clip_job_id': 'r_fixture', 'script': 'Test narration', 'llm_provider': 'external_agent'}
+    budget = install_delivery_budget(config, clock=lambda: 0)
+    assert budget.total_seconds - budget.render_reserve_seconds > relay_branch_seconds(4) + 300
+    assert youtube_stage_budget(relay_branch_seconds(4), config)['yt_per_clip_timeout_seconds'] == CLIP_WAIT_SECONDS
+
+
 def test_salvage_retains_original_master_and_timestamp(tmp_path):
     import app
     clip = tmp_path / 'yt_clip_scene_001.mp4'
@@ -100,7 +116,7 @@ def test_salvage_retains_original_master_and_timestamp(tmp_path):
     assert result.audit['cut_audit'][0]['no_blur'] is True
 
 
-@pytest.mark.parametrize('failure_kind', ['download', 'overlay', 'transcript'])
+@pytest.mark.parametrize('failure_kind', ['download', 'overlay', 'transcript', 'pc-relay'])
 def test_every_scene_gets_a_first_attempt_before_retry_and_keeps_its_timestamp(monkeypatch, tmp_path, failure_kind):
     from services import youtube_pipeline_v2 as yt
     from services import youtube_media_cache as cache
@@ -139,10 +155,25 @@ def test_every_scene_gets_a_first_attempt_before_retry_and_keeps_its_timestamp(m
         out.write_bytes(b'x' * 8192)
         return True
 
-    monkeypatch.setattr(yt, '_download_clip', download)
+    pc_job = 'r_fixture' if failure_kind == 'pc-relay' else ''
+    if pc_job:
+        from services import pc_youtube_clips
+
+        def relay(job_id, video_id, out, start, duration, **kwargs):
+            assert job_id == pc_job
+            return download({'id': video_id}, out, start, duration, **kwargs), ''
+
+        def unexpected_download(*_args, **_kwargs):
+            pytest.fail('The relay path attempted a direct Muse download')
+
+        monkeypatch.setattr(pc_youtube_clips, 'download_pc_cut', relay)
+        monkeypatch.setattr(yt, '_download_clip', unexpected_download)
+    else:
+        monkeypatch.setattr(yt, '_download_clip', download)
     result = yt.get_youtube_clips('Corolla road footage', 'Corolla', num_scenes=3,
         scene_texts=['scene0', 'scene1', 'scene2'], scene_durations=[4, 4, 4],
-        visual_context=SimpleNamespace(enabled=False, visual_required=False), pool_first=False,
+        visual_context=SimpleNamespace(enabled=False, visual_required=False), pool_first=bool(pc_job),
+        muse_clip_job_id=pc_job,
         download_candidate_limit=2, max_download_attempts_per_scene=2, output_dir=str(tmp_path))
     first_start = 180 if failure_kind == 'transcript' else 20
     assert calls[:3] == [('bad0', first_start), ('good1', 60), ('good2', 100)]
@@ -151,9 +182,12 @@ def test_every_scene_gets_a_first_attempt_before_retry_and_keeps_its_timestamp(m
     elif failure_kind == 'overlay':
         assert len(calls) == 4 and calls[3][0] == 'bad0'
         assert all(abs(calls[3][1] - start) >= 20 for _source, start in calls[:3])
-    else:
+    elif failure_kind == 'transcript':
         assert len(calls) == 3
         assert result.audit['attempts']['0'][0]['timestamp_evidence'] == 'transcript_match'
+    else:
+        assert len(calls) == 3
+        assert all(attempts[0]['download_transport'] == 'pc_tunnel' for attempts in result.audit['attempts'].values())
     assert result.audit['resolved'] == 3
     assert result.audit['strategy'] == 'coverage_first_round_robin_downloads'
     assert all(load_clip_provenance(path, i) for i, path in enumerate(result))

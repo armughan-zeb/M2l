@@ -53,7 +53,7 @@ function platform() {
 }
 
 function capabilities() {
-  const list = ['script', 'render', 'thumbnail', 'heartbeat', 'remotion-documentary'];
+  const list = ['script', 'render', 'thumbnail', 'heartbeat', 'remotion-documentary', 'pc-youtube-relay'];
   list.push(String(process.env.MUSE_SCRIPT_COMMAND || '').trim() ? 'script-command' : 'autonomous-narration-synthesizer');
   list.push(String(process.env.MUSE_RENDER_COMMAND || '').trim() ? 'render-command' : 'remotion-native');
   list.push(String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() ? 'thumbnail-command' : 'video-frame-thumbnail');

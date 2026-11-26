@@ -10820,6 +10820,7 @@ def _youtube_worker_payload(*, script, title, scene_texts, scene_durations, conf
         'session_jar': _json_safe_youtube_value(config.get('_yt_session_jar')),
         'youtube_session': _json_safe_youtube_value(config.get('_yt_session')),
         'use_authenticated_session': _enabled(config.get('yt_use_authenticated_session'), default=True),
+        'muse_clip_job_id': str(config.get('muse_clip_job_id') or ''),
         'excluded_video_ids': list(config.get('youtube_excluded_video_ids') or []),
         'excluded_channel_ids': list(config.get('youtube_excluded_channel_ids') or []),
         'prefer_whisper_timing': bool(config.get('youtube_prefer_whisper_timing', True)),
@@ -10985,6 +10986,8 @@ def _mixed_media_pool_first_enabled(config, scene_count, env_value=None):
 
 
 def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, script, progress_callback=None, cancellation=None, prep_manifest_title=None):
+    if config.get('muse_media_mode') == 'web-only':
+        return [None] * len(scene_texts)
     # Full job title for the prep-manifest injection lookup. The branch's
     # ``title`` argument is the search title and may be just the topic
     # anchor (the mixed-media adapter rewrites it to e.g. "Panama Canal"),
@@ -11018,6 +11021,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
     else:
         cancellation = CancellationContext(job_id='youtube-branch', parent=job_cancellation)
     scene_count = len(scene_texts or [])
+    pc_clip_job_id = str(config.get('muse_clip_job_id') or '')
     scene_scale = max(1, int(scene_count or 1))
     adaptive_search_concurrency = max(8, min(24, 8 + math.ceil(scene_scale / 8)))
     # YouTube throttles and Windows disk/ffmpeg contention get worse when a long
@@ -11680,6 +11684,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                  session_jar=config.get('_yt_session_jar'),
                  youtube_session=config.get('_yt_session'),
                 use_authenticated_session=_enabled(config.get('yt_use_authenticated_session'), default=True),
+                muse_clip_job_id=pc_clip_job_id,
                 visual_context=visual_context,
                 prefer_whisper_timing=bool(config.get('youtube_prefer_whisper_timing', True)),
                 # YouTube-only app jobs use the shared source pool so the
@@ -11901,6 +11906,13 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                 )
             yt_wall_seconds = uncapped_wall
 
+        if pc_clip_job_id:
+            from services.pc_youtube_clips import relay_branch_seconds
+            # Keep the ranged path for the PC handoff at every film length.
+            config['yt_pool_first'] = False
+            config['_yt_cooldown_headroom'] = False
+            yt_wall_seconds = relay_branch_seconds(scene_count)
+
         # Clamp the branch against the job-wide clock.  Per-stage timeout
         # ceilings are not additive: retrieval must hand control back while
         # there is still enough wall time to assemble the final video.
@@ -11998,6 +12010,9 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         if not is_mixed_youtube_branch and not worker_config.get("yt_download_concurrency"):
             worker_config["yt_download_concurrency"] = yt_environment.get("VIDZEO_YT_DOWNLOAD_CONCURRENCY")
         planned_download_workers = _mixed_youtube_download_worker_capacity(worker_config)
+        if pc_clip_job_id:
+            from services.pc_youtube_clips import CLIP_WORKERS
+            planned_download_workers = min(CLIP_WORKERS, planned_download_workers)
         stage_budget = youtube_stage_budget(yt_wall_seconds, config,
             scene_count=len(scene_texts), download_workers=planned_download_workers)
         if 'yt_max_download_scenes' not in stage_budget:
@@ -12177,6 +12192,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
                           soft_timeout_seconds=retry_config.get('yt_soft_timeout_seconds'),
                           soft_ceiling_seconds=retry_config.get('yt_soft_ceiling_seconds'),
                         hard_timeout_seconds=retry_config.get('yt_hard_timeout_seconds'),
+                        muse_clip_job_id=pc_clip_job_id,
                         visual_context=visual_context,
                         prefer_whisper_timing=bool(retry_config.get('youtube_prefer_whisper_timing', True)),
                         pool_first=bool(retry_config.get('yt_pool_first', str(yt_environment.get('VIDZEO_YT_POOL_FIRST', '0')).strip().lower() in {'1', 'true', 'yes', 'on'})),

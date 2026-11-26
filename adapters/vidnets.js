@@ -93,6 +93,8 @@ function buildRequest(job, scriptText, packageDir) {
   // must never be handed to Vidnets, even if the server would accept it.
   assertNoOpenRouterKey(process.env);
   const options = job.channel?.videoOptions || {};
+  const pcYouTube = job.museMediaMode === 'pc-youtube';
+  const webOnly = job.museMediaMode === 'web-only';
   const minutes = Math.max(1, Number(job.targetDurationMinutes) || 8);
   // Parallel Remotion workers: MUSE_RENDER_CONCURRENCY (aliases
   // VIDZEO_REMOTION_WORKERS / MUSE_REMOTION_WORKERS /
@@ -135,8 +137,8 @@ function buildRequest(job, scriptText, packageDir) {
     vo_mode: 'Use Audiogram',
     tts_model: 'audiogram',
     edge_tts_options: { rate: 0, pitch: 0, volume: 0 },
-    image_source: options.imageSource || 'Mixed Media',
-    media_source_priority: options.mediaSourcePriority || ['youtube', 'web'],
+    image_source: pcYouTube ? 'Mixed Media' : webOnly ? 'Web Images' : options.imageSource || 'Mixed Media',
+    media_source_priority: webOnly ? ['web'] : options.mediaSourcePriority || ['youtube', 'web'],
     media_mode: options.mediaMode || 'automatic',
     pipeline_v2_mode: 'on',
     youtube_rights_mode: 'all_public',
@@ -178,7 +180,15 @@ function buildRequest(job, scriptText, packageDir) {
     output_package_dir: packageDir
   };
 
-  if (coverageTarget !== undefined) {
+  if (pcYouTube) {
+    request.muse_media_mode = 'pc-youtube';
+    request.muse_clip_job_id = job.jobId;
+    request.yt_use_authenticated_session = false;
+  } else if (webOnly) {
+    request.muse_media_mode = 'web-only';
+    request.allow_cross_source_youtube_fallback = false;
+  }
+  if (!webOnly && coverageTarget !== undefined) {
     request.youtube_accepted_coverage_target = coverageTarget;
   }
   // Let Vidnets size its preparation budget from the narration by default.
@@ -189,7 +199,7 @@ function buildRequest(job, scriptText, packageDir) {
     request.delivery_budget_seconds = deliveryBudget;
     request.delivery_budget_max_cap_seconds = deliveryBudget;
   }
-  if (options.mixedMediaWeights || options.mediaWeights) {
+  if (!webOnly && (options.mixedMediaWeights || options.mediaWeights)) {
     request.mixed_media_weights = options.mixedMediaWeights || options.mediaWeights;
   }
   return request;

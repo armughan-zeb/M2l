@@ -85,6 +85,7 @@ def main() -> int:
             session_jar=payload.get("session_jar"),
             youtube_session=payload.get("youtube_session"),
             use_authenticated_session=bool(payload.get("use_authenticated_session", True)),
+            muse_clip_job_id=str(payload.get("muse_clip_job_id") or ""),
             excluded_video_ids=payload.get('excluded_video_ids'),
             excluded_channel_ids=payload.get('excluded_channel_ids'),
             visual_context=visual_context,

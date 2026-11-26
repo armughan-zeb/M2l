@@ -31,6 +31,17 @@ default (`MUSE_MEDIA_STRICT=0`). Delivery requires complete scene
 assignments, correct job provenance, and a valid encoded master.
 The media audit reports graphic fallback scene and runtime coverage.
 
+### Muse media in CMS
+
+On the PC that hosts CMS, open **Muse agents → Muse media**. Web only is
+the default. Select **Include YouTube clips via this PC** to add clips
+from the verified YouTube session in CMS Settings. The worker uses the
+paired CMS HTTPS tunnel for timestamped cuts and retrieves web images
+directly on Muse.
+
+Update both the PC CMS and Muse worker, then restart their services when
+idle. Each dispatched job saves its media setting for recovery.
+
 **Simplified pipeline (Nov 9, 2026).** One data pass (all research
 providers in parallel once, one shared deadline
 `MUSE_RESEARCH_TIMEOUT_MS`, default 180s), one script (at most

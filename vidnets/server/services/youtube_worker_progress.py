@@ -68,6 +68,9 @@ class YouTubeWorkerProgress:
                 match = re.search(r'search complete: (\d+) unique candidate', line)
                 if match and int(match[1]) > 0:
                     self._send(f'phase=search candidates={int(match[1])}')
+                elif 'PC tunnel clip received' in line:
+                    self.transfers += 1
+                    self._send(f'phase=pc_transfer completed={self.transfers}')
                 elif re.search(r'source-quality range ready:', line):
                     self.transfers += 1
                     self._send(f'phase=transfer completed={self.transfers}')
@@ -88,7 +91,9 @@ class YouTubeWorkerProgress:
             if callable(self.progress_callback):
                 values = dict(re.findall(r'(\w+)=(\w+)', counters))
                 phase = values.get('phase')
-                if phase == 'transfer':
+                if phase == 'pc_transfer':
+                    message = f"Received YouTube clips from local PC ({values.get('completed', '0')})"
+                elif phase == 'transfer':
                     message = f"Downloading YouTube footage ({values.get('completed', '0')} clips received)"
                 elif phase in {'verification', 'complete'}:
                     message = f"Checking YouTube footage {values.get('ready', '0')}/{values.get('requested', '0')}"

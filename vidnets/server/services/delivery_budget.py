@@ -225,6 +225,12 @@ def install_delivery_budget(
             parallel_floor = min(7200.0, 900.0 + waves * 90.0)
             total = max(total, 1800.0, parallel_floor)
             total = min(7200.0, total)
+        if config.get('muse_clip_job_id'):
+            from .pc_youtube_clips import relay_branch_seconds
+            # Leave planning, web verification and render admission headroom
+            # around the PC clip lane's deadline.
+            prepare = 1500.0 + relay_branch_seconds(math.ceil(word_count / 16.0))
+            total = min(7200.0, max(total, prepare + min(1800.0, prepare * 0.35)))
     else:
         total = configured_total
 

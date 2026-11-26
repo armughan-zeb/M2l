@@ -75,6 +75,15 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
         # keep the ceiling instead; the branch wall still bounds the stage.
         search = min(search, 35.0)
     plan = {'yt_search_timeout_seconds': search, 'yt_hard_timeout_seconds': hard}
+    if settings.get('muse_clip_job_id'):
+        from .pc_youtube_clips import CLIP_WAIT_SECONDS
+        # The remote runner has an independent download deadline followed by
+        # a streamed transfer. Feed the full slot into transcript reservation.
+        plan['yt_per_clip_timeout_seconds'] = CLIP_WAIT_SECONDS
+        explicit_cap = positive(settings.get('yt_max_download_scenes'), 0)
+        if scene_count > 0 and explicit_cap > 0:
+            plan['yt_max_download_scenes'] = min(scene_count, max(1, int(explicit_cap)))
+        return plan
     if vision_reserve:
         plan['vision_reserve_seconds'] = vision_reserve
     if settings.get('_yt_cooldown_headroom'):
