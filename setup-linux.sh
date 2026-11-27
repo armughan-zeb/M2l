@@ -110,6 +110,9 @@ echo "[Info] Installing worker and ScriptIT runtime dependencies..."
 (cd "$DIR/scriptit" && npm ci --omit=dev --no-audit --no-fund)
 (cd "$DIR/vidnets" && npm ci --omit=dev --no-audit --no-fund)
 (cd "$DIR/remotion-linux" && npm ci --no-audit --no-fund)
+if [ -f "$DIR/doodle-verse/package.json" ]; then
+  (cd "$DIR/doodle-verse" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --omit=dev --no-audit --no-fund)
+fi
 node -e "require.resolve('rss-parser', { paths: [process.argv[1]] }); require.resolve('sql.js', { paths: [process.argv[1]] })" "$DIR/scriptit"
 
 # 8. Install the host hook and monitor before running doctor.

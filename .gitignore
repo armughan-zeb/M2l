@@ -30,7 +30,9 @@ remotion-linux/out/
 # Muse worker state (never commit: contains the worker bearer token)
 .muse-agent.json
 .muse-agent.json.*
-work/
+/work/
+doodle-verse/node_modules/
+doodle-verse/kit/node_modules/
 run/
 *.pid
 

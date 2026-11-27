@@ -1,0 +1,19 @@
+<!doctype html><html><body style="margin:0;background:#9cc8e0"><canvas id=c width=2400 height=1000></canvas>
+<script type=module>
+import {drawChar, drawFx} from './cast.js';
+const C=document.getElementById('c').getContext('2d');
+const specs=[
+ {outfit:'bennett',expr:'grin',specs:1,armR:'show',holdR:'ketchup',facing:1,seed:3},
+ {outfit:'patientA',expr:'pained',armL:'belly',armR:'belly',facing:-1,seed:5,stink:1},
+ {outfit:'patientB',expr:'nervous',facing:-1,seed:8,armR:'cheek'},
+ {outfit:'bennett',expr:'laugh',specs:1,armL:'up',armR:'up',holdR:'pills',seed:3},
+ {outfit:'quack1',expr:'smile',armR:'toss',holdR:'tomato',facing:1,seed:11},
+ {outfit:'vendor',expr:'grin',armL:'hold',holdL:'hotdog',facing:1,seed:13},
+ {outfit:'quack2',expr:'laugh',armR:'offer',holdR:'pills',armL:'hip',facing:1,seed:14},
+ {outfit:'patientA',expr:'shock',mode:'march',phase:0.2,armL:'run',armR:'belly',facing:1,seed:5},
+];
+specs.forEach((s,i)=>{const cv=document.createElement('canvas');cv.width=600;cv.height=1000;drawChar(cv,s);C.drawImage(cv,i*300,0,300,500);});
+const fxs=['burst','steam','bubbles','squirt','sparkle','tumble','zig','pain'];
+fxs.forEach((f,i)=>{const cv=document.createElement('canvas');cv.width=600;cv.height=1000;drawFx(cv,{fx:f,t:0.7});C.drawImage(cv,i*300,500,300,500);});
+window.done=1;
+</script></body></html>

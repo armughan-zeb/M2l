@@ -1,0 +1,9 @@
+{
+  "bg": "bg_A.jpg",
+  "out": "../out/thumbnail_A.jpg",
+  "top": 120,
+  "lines": [
+    { "text": "IT'S NOT", "size": 170, "color": "#FFFFFF" },
+    { "text": "THE PERSON", "size": 190, "color": "#FFD21F" }
+  ]
+}

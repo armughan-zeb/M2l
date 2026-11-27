@@ -7,12 +7,14 @@ node_modules/
 vidnets/node_modules/
 remotion-linux/node_modules/
 scriptit/node_modules/
+doodle-verse/node_modules/
+doodle-verse/kit/node_modules/
 .venv/
 vidnets/.venv/
 **/__pycache__/
 .cache/
-work/
-run/
+/work/
+/run/
 data/
 output/
 artifacts/

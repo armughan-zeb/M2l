@@ -142,7 +142,21 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
   };
 }
 
+const doodle = require('./doodle');
+const { resolveVideoStyle, ENGINES } = require('../lib/videoStyle');
+
 async function render(job, scriptText, workDir, options = {}) {
+  const style = resolveVideoStyle(job);
+  log.info(`Resolved video style: ${style.label} (engine=${style.engine}, style=${style.style}, explicit=${style.explicit})`);
+
+  if (style.engine === ENGINES.DOODLE) {
+    return doodle.render(job, scriptText, workDir, options);
+  }
+
+  if (style.engine !== ENGINES.VIDZEO) {
+    throw new Error(`Unsupported video engine "${style.engine}" for Muse worker; refusing fallback render.`);
+  }
+
   const command = String(process.env.MUSE_RENDER_COMMAND || '').trim();
   if (command) return runRenderCommand(command, job, scriptText, workDir, options);
 

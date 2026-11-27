@@ -1,0 +1,9 @@
+{
+  "name": "muse-doodle-verse-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Shared Playwright runtime for Doodle Verse Animation inside Muse M2l",
+  "dependencies": {
+    "playwright": "1.56.0"
+  }
+}

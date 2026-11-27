@@ -53,11 +53,17 @@ function platform() {
 }
 
 function capabilities() {
-  const list = ['script', 'render', 'thumbnail', 'heartbeat', 'remotion-documentary', 'pc-youtube-relay'];
+  const list = ['script', 'render', 'thumbnail', 'heartbeat', 'remotion-documentary', 'pc-youtube-relay', 'style-routing', 'style:documentary'];
   list.push(String(process.env.MUSE_SCRIPT_COMMAND || '').trim() ? 'script-command' : 'autonomous-narration-synthesizer');
   list.push(String(process.env.MUSE_RENDER_COMMAND || '').trim() ? 'render-command' : 'remotion-native');
   list.push(String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() ? 'thumbnail-command' : 'video-frame-thumbnail');
   if (String(process.env.MUSE_INFERENCE_COMMAND || process.env.MUSE_INFERENCE_URL || '').trim()) list.push('agent-inference');
+  try {
+    const doodle = require('./adapters/doodle');
+    if (doodle.doodleRuntimeStatus().available) {
+      list.push('doodle-verse', 'style:doodle_verse');
+    }
+  } catch { /* ignore if runtime incomplete */ }
   return list;
 }
 
@@ -314,6 +320,20 @@ async function doctorCommand() {
     add('Render adapter', 'fail',
       'No MUSE_RENDER_COMMAND is set. Production renders must use render-vidnets-linux.js ' +
       '(Vidnets + Muse agent-bridge inbox). The native Remotion engine is not a render path.');
+  }
+
+  try {
+    const doodle = require('./adapters/doodle');
+    const st = doodle.doodleRuntimeStatus();
+    if (!st.available) {
+      add('Doodle Verse adapter', 'warn', `Missing files under ${st.root}: ${st.missing.join(', ')}`);
+    } else if (!st.playwrightInstalled) {
+      add('Doodle Verse adapter', 'warn', `Kit ready, but Playwright not installed in ${st.root}. Run npm install in doodle-verse/.`);
+    } else {
+      add('Doodle Verse adapter', 'pass', `Ready (${st.root})`);
+    }
+  } catch (error) {
+    add('Doodle Verse adapter', 'warn', error.message);
   }
 
   // Muse inference is COMPULSORY and is verified for real: Vidnets server
@@ -915,8 +935,12 @@ async function main() {
   }
 }
 
-main().catch(error => {
-  log.error(error.message);
-  if (String(process.env.MUSE_LOG_LEVEL).toLowerCase() === 'debug' && error.stack) console.error(log.redact(error.stack));
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(error => {
+    log.error(error.message);
+    if (String(process.env.MUSE_LOG_LEVEL).toLowerCase() === 'debug' && error.stack) console.error(log.redact(error.stack));
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { capabilities };

@@ -117,6 +117,7 @@ COPY package.json package-lock.json ./
 COPY remotion-linux/package.json remotion-linux/package-lock.json ./remotion-linux/
 COPY vidnets/package.json vidnets/package-lock.json ./vidnets/
 COPY scriptit/package.json scriptit/package-lock.json ./scriptit/
+COPY doodle-verse/package.json doodle-verse/package-lock.json ./doodle-verse/
 # Root + remotion-linux: Remotion 4.0.541 render engine.
 # vidnets --omit=dev: skips Electron 45 (desktop-only devDependency);
 #   the doctor check needs vidnets/node_modules/@remotion/{bundler,renderer},
@@ -126,7 +127,8 @@ COPY scriptit/package.json scriptit/package-lock.json ./scriptit/
 RUN npm ci --no-audit --no-fund \
     && (cd remotion-linux && npm ci --no-audit --no-fund) \
     && (cd vidnets && npm ci --omit=dev --no-audit --no-fund) \
-    && (cd scriptit && npm ci --omit=dev --no-audit --no-fund)
+    && (cd scriptit && npm ci --omit=dev --no-audit --no-fund) \
+    && (cd doodle-verse && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --omit=dev --no-audit --no-fund)
 
 # --- Python dependencies (Vidnets server: Flask, yt-dlp, scrapers, TTS) -----
 # vidnets/server/requirements.txt pins yt-dlp[default]>=2026.10.26 (py>=3.11)

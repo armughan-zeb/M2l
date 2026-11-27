@@ -1,0 +1,5 @@
+numpy
+scipy
+pillow
+edge-tts
+faster-whisper
