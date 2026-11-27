@@ -142,15 +142,15 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
   };
 }
 
-const doodle = require('./doodle');
+const stickman = require('./stickman');
 const { resolveVideoStyle, ENGINES } = require('../lib/videoStyle');
 
 async function render(job, scriptText, workDir, options = {}) {
   const style = resolveVideoStyle(job);
   log.info(`Resolved video style: ${style.label} (engine=${style.engine}, style=${style.style}, explicit=${style.explicit})`);
 
-  if (style.engine === ENGINES.DOODLE) {
-    return doodle.render(job, scriptText, workDir, options);
+  if (style.engine === ENGINES.STICKMAN) {
+    return stickman.render(job, scriptText, workDir, options);
   }
 
   if (style.engine !== ENGINES.VIDZEO) {

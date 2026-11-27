@@ -1,0 +1,28 @@
+{
+ "title": "2 Stickmen Stranded on an Island",
+ "output": "stickmen_island_demo",
+ "profile": "short",
+ "format": "vertical",
+ "voice": "en-US-ChristopherNeural",
+ "speed": 1.05,
+ "captions": "off",
+ "sound": {
+  "mode": "auto",
+  "bed": "jungle",
+  "transitions": true
+ },
+ "lines": [
+  {
+   "text": "Two stickmen got stranded on a tiny tropical island.",
+   "say": "Two stickmen got stranded on a tiny tropical island."
+  },
+  {
+   "text": "While one worked hard building a hut, the other relaxed in the sun.",
+   "say": "While one worked hard building a palm hut, the other relaxed in the sun."
+  },
+  {
+   "text": "And the second it was finished, guess who claimed the top spot.",
+   "say": "And the second it was finished, guess who claimed the top spot!"
+  }
+ ]
+}

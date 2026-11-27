@@ -1,0 +1,18 @@
+{
+ "name": "stickman-cartoon-studio",
+ "version": "1.0.0",
+ "private": true,
+ "type": "module",
+ "description": "2D Cartoon Stickman animation engine matching classic Henry Stickmin / animated shorts stickman style with full-bleed illustrated environments, Edge TTS voiceover, and zero-dep Chrome CDP rendering.",
+ "scripts": {
+  "voice": "python tools/voice_edge.py",
+  "captions": "node tools/plan_captions.mjs",
+  "check": "node tools/capture.mjs check",
+  "lint": "node tools/capture.mjs lint",
+  "cues": "node tools/capture.mjs cues",
+  "mix": "python tools/mix_audio.py",
+  "preview": "node tools/capture.mjs preview",
+  "frames": "node tools/capture.mjs frames review/frames 1,5,9",
+  "video": "node tools/capture.mjs video renders/out.mp4"
+ }
+}

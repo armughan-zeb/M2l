@@ -59,9 +59,9 @@ function capabilities() {
   list.push(String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() ? 'thumbnail-command' : 'video-frame-thumbnail');
   if (String(process.env.MUSE_INFERENCE_COMMAND || process.env.MUSE_INFERENCE_URL || '').trim()) list.push('agent-inference');
   try {
-    const doodle = require('./adapters/doodle');
-    if (doodle.doodleRuntimeStatus().available) {
-      list.push('doodle-verse', 'style:doodle_verse');
+    const stickman = require('./adapters/stickman');
+    if (stickman.stickmanRuntimeStatus().available) {
+      list.push('2d-stickman', 'style:2d_stickman');
     }
   } catch { /* ignore if runtime incomplete */ }
   return list;
@@ -323,17 +323,15 @@ async function doctorCommand() {
   }
 
   try {
-    const doodle = require('./adapters/doodle');
-    const st = doodle.doodleRuntimeStatus();
+    const stickman = require('./adapters/stickman');
+    const st = stickman.stickmanRuntimeStatus();
     if (!st.available) {
-      add('Doodle Verse adapter', 'warn', `Missing files under ${st.root}: ${st.missing.join(', ')}`);
-    } else if (!st.playwrightInstalled) {
-      add('Doodle Verse adapter', 'warn', `Kit ready, but Playwright not installed in ${st.root}. Run npm install in doodle-verse/.`);
+      add('2D Stickman adapter', 'warn', `Missing files under ${st.root}: ${st.missing.join(', ')}`);
     } else {
-      add('Doodle Verse adapter', 'pass', `Ready (${st.root})`);
+      add('2D Stickman adapter', 'pass', `Ready (${st.root})`);
     }
   } catch (error) {
-    add('Doodle Verse adapter', 'warn', error.message);
+    add('2D Stickman adapter', 'warn', error.message);
   }
 
   // Muse inference is COMPULSORY and is verified for real: Vidnets server

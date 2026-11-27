@@ -1,0 +1,51 @@
+{
+ "title": "How to Survive a Tiger Attack",
+ "output": "tiger_survival_stickman_30s",
+ "profile": "wide",
+ "format": "wide",
+ "voice": "en-US-ChristopherNeural",
+ "speed": 1.03,
+ "captions": "phrase",
+ "sound": {
+  "mode": "auto",
+  "bed": "jungle",
+  "transitions": true
+ },
+ "lines": [
+  {
+   "text": "A Bengal tiger attacks from behind at forty miles per hour.",
+   "say": "A Bengal tiger attacks from behind at forty miles per hour.",
+   "caps": "A Bengal tiger *attacks | from *behind | at *forty miles per hour."
+  },
+  {
+   "text": "Rule one: never run, because fleeing instantly triggers its deadly chase instinct.",
+   "say": "Rule one: never run, because fleeing instantly triggers its deadly chase instinct.",
+   "caps": "*Rule one: | *never run, | because fleeing *instantly triggers | its *deadly chase instinct."
+  },
+  {
+   "text": "Stand tall, lock intense eye contact, and spread your jacket wide overhead.",
+   "say": "Stand tall, lock intense eye contact, and spread your jacket wide overhead.",
+   "caps": "*Stand tall, | lock *intense eye contact, | and *spread | your jacket wide *overhead."
+  },
+  {
+   "text": "Back away slowly while shouting loudly or clanging metal to scare it.",
+   "say": "Back away slowly while shouting loudly or clanging metal to scare it.",
+   "caps": "Back away *slowly | while *shouting loudly | or *clanging metal | to *scare it."
+  },
+  {
+   "text": "In India's Sundarbans, villagers wear backward face masks to fool ambush predators.",
+   "say": "In India's Sundarbans, villagers wear backward face masks to fool ambush predators.",
+   "caps": "In India's *Sundarbans, | *villagers wear backward face masks | to fool ambush *predators."
+  },
+  {
+   "text": "If it lunges, strike the sensitive eyes, nose, and ears with force.",
+   "say": "If it lunges, strike the sensitive eyes, nose, and ears with force.",
+   "caps": "If it *lunges, | strike the *sensitive eyes, | *nose, | and ears with *force."
+  },
+  {
+   "text": "Never turn your back—standing your ground saves your life.",
+   "say": "Never turn your back. Standing your ground saves your life.",
+   "caps": "*Never turn your back— | standing your *ground saves your life."
+  }
+ ]
+}
