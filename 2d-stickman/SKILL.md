@@ -50,3 +50,12 @@ Use this skill whenever generating a new 2D Stickman Cartoon video (vertical Sho
    node tools/capture.mjs frames review/check "1.5,5.0,10.0"
    ```
    Inspect extracted JPEGs visually to confirm zero text overlap, clean gloves/hands alignment, and crisp character framing.
+
+## 3. Durable Checkpoints & Resume (Never Lose Completed Work)
+When running under `muse-agent.js` or agent-driven production (`work/<jobId>/stickman-project/`), always persist and check atomic stage checkpoints keyed by `inputDigest` before repeating heavy steps:
+1. **`../script.txt` & `data/stickman-input.json`**: tracks job digest (`title`, `narration`, `voice`, `profile`, `format`, `captions`). Clear stale checkpoints only if this digest changes.
+2. **`script.json`**: reuse existing structured lines on resume instead of re-calling `stickman_script_json`.
+3. **`data/mix.wav`, `data/lines.json`, `data/words.json`**: skip `voice_edge.py` and `plan_captions.mjs` when verified on disk for the active digest.
+4. **`data/shots-plan.json` & `src/shots.js`**: reuse planned scenes (`stickman_shots_plan` / `stickman_shots_repair`) across restarts.
+5. **`data/checkpoint.json`**: tracks `qaPassed` and `audioMixed` keyed by `sha256(shots.js)`, skipping `capture.mjs check/lint` and `mix_audio.py` when already verified against `data/mixed.wav`.
+6. **`../video.mp4.stickman-manifest.json`**: stamped upon completion alongside `../video.mp4`.

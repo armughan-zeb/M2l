@@ -19,7 +19,7 @@ const { writeJsonAtomic } = require('../lib/config');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { resolveVideoStyle, ENGINES, defaultVoiceForStyle } = require('../lib/videoStyle');
 const { stampStickmanManifest } = require('../lib/masterManifestGuard');
-const { cleanGeneratedCode, parseJsonAnswer, runProcess, inferWithMuse, createFrameProgressReporter } = require('../lib/museBridgeInfer');
+const { cleanGeneratedCode, parseJsonAnswer, runProcess, inferWithMuse, createFrameProgressReporter, readStageCheckpoint, writeStageCheckpoint } = require('../lib/museBridgeInfer');
 
 const SCRIPT_JSON_SCHEMA = {
   type: 'json_schema',
@@ -271,17 +271,19 @@ async function render(job, scriptText, workDir, options = {}) {
   })).digest('hex');
 
   const markerPath = path.join(projectDir, 'data', 'stickman-input.json');
+  const checkpointPath = path.join(projectDir, 'data', 'checkpoint.json');
   let prevMarker = null;
   try { prevMarker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); } catch { /* ignore */ }
 
   if (!fs.existsSync(path.join(projectDir, 'index.html'))) {
     copyStickmanTemplate(runtime.root, projectDir);
   } else if (prevMarker && prevMarker.digest !== inputDigest) {
-    for (const stale of ['script.json', path.join('data', 'mix.wav'), path.join('data', 'mixed.wav'), path.join('data', 'lines.json'), path.join('data', 'words.json'), path.join('data', 'cues.json'), path.join('renders', 'video.mp4')]) {
+    for (const stale of ['script.json', path.join('data', 'checkpoint.json'), path.join('data', 'shots-plan.json'), path.join('data', 'mix.wav'), path.join('data', 'mixed.wav'), path.join('data', 'lines.json'), path.join('data', 'words.json'), path.join('data', 'cues.json'), path.join('renders', 'video.mp4')]) {
       try { fs.rmSync(path.join(projectDir, stale), { force: true }); } catch { /* ignore */ }
     }
   }
   writeJsonAtomic(markerPath, { digest: inputDigest, voice, profile, format, jobId: job.jobId, updatedAt: new Date().toISOString() });
+  let checkpoint = readStageCheckpoint(checkpointPath, inputDigest);
 
   const inferRequests = [];
   const scriptJsonPath = path.join(projectDir, 'script.json');
@@ -307,16 +309,27 @@ async function render(job, scriptText, workDir, options = {}) {
     scriptJson = { ...reply.data, output: 'video', voice, profile, format, captions };
     writeJsonAtomic(scriptJsonPath, scriptJson);
     log.info(`[2d-stickman] Job ${job.jobId}: script.json ready (${scriptJson.lines.length} lines)`);
+  } else {
+    log.info(`[2d-stickman] Job ${job.jobId}: reusing script.json checkpoint (${scriptJson.lines.length} lines)`);
   }
+  checkpoint = writeStageCheckpoint(checkpointPath, inputDigest, { scriptJson: { lines: scriptJson.lines.length } });
 
   const mixWavPath = path.join(projectDir, 'data', 'mix.wav');
   const linesJsonPath = path.join(projectDir, 'data', 'lines.json');
+  const wordsJsonPath = path.join(projectDir, 'data', 'words.json');
   if (!fs.existsSync(mixWavPath) || !fs.existsSync(linesJsonPath)) {
     log.info(`[2d-stickman] Job ${job.jobId}: synthesizing Edge TTS narration (${voice})`);
     onProgress(16, `[2d-stickman] Synthesizing Edge TTS narration (${voice})`, true);
     await runProcess(pythonBin, [path.join('tools', 'voice_edge.py'), '--force'], { cwd: projectDir, signal, label: '2D Stickman TTS' });
+    checkpoint = writeStageCheckpoint(checkpointPath, inputDigest, { tts: true, captions: false });
+  } else {
+    log.info(`[2d-stickman] Job ${job.jobId}: reusing Edge TTS checkpoint`);
+    checkpoint = writeStageCheckpoint(checkpointPath, inputDigest, { tts: true });
   }
-  await runProcess(nodeExecutable(), [path.join('tools', 'plan_captions.mjs')], { cwd: projectDir, signal, label: '2D Stickman captions plan' });
+  if (!checkpoint?.stages?.captions || !fs.existsSync(wordsJsonPath)) {
+    await runProcess(nodeExecutable(), [path.join('tools', 'plan_captions.mjs')], { cwd: projectDir, signal, label: '2D Stickman captions plan' });
+    checkpoint = writeStageCheckpoint(checkpointPath, inputDigest, { captions: true });
+  }
 
   const linesData = JSON.parse(fs.readFileSync(linesJsonPath, 'utf8'));
   const durationSeconds = Number(linesData.duration) || 0;
@@ -334,7 +347,10 @@ async function render(job, scriptText, workDir, options = {}) {
   if (fs.existsSync(shotsPlanFile) && prevMarker?.digest === inputDigest) {
     try {
       const savedPlan = JSON.parse(fs.readFileSync(shotsPlanFile, 'utf8'));
-      if (savedPlan?.shotsJs) shotsJs = cleanGeneratedCode(savedPlan.shotsJs);
+      if (savedPlan?.shotsJs) {
+        shotsJs = cleanGeneratedCode(savedPlan.shotsJs);
+        if (Array.isArray(savedPlan.inferRequests)) inferRequests.push(...savedPlan.inferRequests);
+      }
     } catch { /* ignore */ }
   }
   if (!shotsJs) {
@@ -355,38 +371,54 @@ async function render(job, scriptText, workDir, options = {}) {
     shotsJs = cleanGeneratedCode(reply.data?.shotsJs);
     if (!shotsJs) throw new Error('Muse stickman_shots_plan returned empty shotsJs');
     writeJsonAtomic(shotsPlanFile, { shotsJs, summary: reply.data?.summary || '', inferRequests });
+  } else {
+    log.info(`[2d-stickman] Job ${job.jobId}: reusing shots-plan.json checkpoint`);
   }
   fs.writeFileSync(shotsPath, shotsJs, 'utf8');
 
-  log.info(`[2d-stickman] Job ${job.jobId}: running Canvas scene check and QA lint gate`);
-  onProgress(36, '[2d-stickman] Running Canvas scene check and QA lint gate', true);
-  try {
-    await runQaChecks(projectDir, signal);
-  } catch (qaErr) {
-    log.warn(`2D Stickman QA check/lint failed; requesting bounded Muse repair: ${qaErr.message}`);
-    onProgress(40, '[2d-stickman] Repairing src/shots.js via Muse after QA failure', true);
-    const repair = await inferWithMuse({
-      operation: 'stickman_shots_repair',
-      kind: 'text',
-      messages: buildShotsRepairMessages({ shotsJs, errorText: qaErr.message, duration: durationSeconds }),
-      responseFormat: SHOTS_REPAIR_SCHEMA,
-      jobId: job.jobId,
-      timeoutMs: 10 * 60 * 1000,
-      signal,
-      workDir,
-      inferFn: options.inferFn,
-    });
-    inferRequests.push({ id: repair.id, operation: 'stickman_shots_repair' });
-    shotsJs = cleanGeneratedCode(repair.data?.shotsJs);
-    if (!shotsJs) throw new Error('Muse stickman_shots_repair returned empty shotsJs');
-    fs.writeFileSync(shotsPath, shotsJs, 'utf8');
-    writeJsonAtomic(shotsPlanFile, { shotsJs, repaired: true, inferRequests });
-    await runQaChecks(projectDir, signal);
+  let shotsDigest = crypto.createHash('sha256').update(shotsJs).digest('hex');
+  if (checkpoint?.stages?.qaPassed !== shotsDigest) {
+    log.info(`[2d-stickman] Job ${job.jobId}: running Canvas scene check and QA lint gate`);
+    onProgress(36, '[2d-stickman] Running Canvas scene check and QA lint gate', true);
+    try {
+      await runQaChecks(projectDir, signal);
+    } catch (qaErr) {
+      log.warn(`2D Stickman QA check/lint failed; requesting bounded Muse repair: ${qaErr.message}`);
+      onProgress(40, '[2d-stickman] Repairing src/shots.js via Muse after QA failure', true);
+      const repair = await inferWithMuse({
+        operation: 'stickman_shots_repair',
+        kind: 'text',
+        messages: buildShotsRepairMessages({ shotsJs, errorText: qaErr.message, duration: durationSeconds }),
+        responseFormat: SHOTS_REPAIR_SCHEMA,
+        jobId: job.jobId,
+        timeoutMs: 10 * 60 * 1000,
+        signal,
+        workDir,
+        inferFn: options.inferFn,
+      });
+      inferRequests.push({ id: repair.id, operation: 'stickman_shots_repair' });
+      shotsJs = cleanGeneratedCode(repair.data?.shotsJs);
+      if (!shotsJs) throw new Error('Muse stickman_shots_repair returned empty shotsJs');
+      fs.writeFileSync(shotsPath, shotsJs, 'utf8');
+      writeJsonAtomic(shotsPlanFile, { shotsJs, repaired: true, inferRequests });
+      shotsDigest = crypto.createHash('sha256').update(shotsJs).digest('hex');
+      await runQaChecks(projectDir, signal);
+    }
+    checkpoint = writeStageCheckpoint(checkpointPath, inputDigest, { qaPassed: shotsDigest });
+  } else {
+    log.info(`[2d-stickman] Job ${job.jobId}: reusing QA pass checkpoint`);
   }
 
-  onProgress(45, '[2d-stickman] Generating SFX cues and mixing audio bed', true);
-  await runProcess(nodeExecutable(), ['tools/capture.mjs', 'cues'], { cwd: projectDir, signal, label: '2D Stickman cues export' });
-  await runProcess(pythonBin, [path.join('tools', 'mix_audio.py')], { cwd: projectDir, signal, label: '2D Stickman audio mix' });
+  const mixedWavPath = path.join(projectDir, 'data', 'mixed.wav');
+  if (checkpoint?.stages?.audioMixed !== shotsDigest || !fs.existsSync(mixedWavPath)) {
+    log.info(`[2d-stickman] Job ${job.jobId}: generating SFX cues and mixing audio bed`);
+    onProgress(45, '[2d-stickman] Generating SFX cues and mixing audio bed', true);
+    await runProcess(nodeExecutable(), ['tools/capture.mjs', 'cues'], { cwd: projectDir, signal, label: '2D Stickman cues export' });
+    await runProcess(pythonBin, [path.join('tools', 'mix_audio.py')], { cwd: projectDir, signal, label: '2D Stickman audio mix' });
+    writeStageCheckpoint(checkpointPath, inputDigest, { audioMixed: shotsDigest });
+  } else {
+    log.info(`[2d-stickman] Job ${job.jobId}: reusing mixed.wav audio checkpoint`);
+  }
 
   log.info(`[2d-stickman] Job ${job.jobId}: rendering 1080p Canvas frames through Chrome CDP`);
   onProgress(52, '[2d-stickman] Rendering 1080p Canvas frames through Chrome CDP', true);

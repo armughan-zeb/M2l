@@ -19,7 +19,7 @@ const ffmpeg = require('../lib/ffmpeg');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { resolveVideoStyle, ENGINES, defaultVoiceForStyle } = require('../lib/videoStyle');
 const { stampDocumentaryManifest } = require('../lib/masterManifestGuard');
-const { cleanGeneratedCode, runProcess, inferWithMuse, createFrameProgressReporter } = require('../lib/museBridgeInfer');
+const { cleanGeneratedCode, runProcess, inferWithMuse, createFrameProgressReporter, readStageCheckpoint, writeStageCheckpoint } = require('../lib/museBridgeInfer');
 
 const FPS = 30;
 const WIDTH = 1920;
@@ -617,11 +617,17 @@ async function render(job, scriptText, workDir, options = {}) {
   })).digest('hex');
 
   const markerPath = path.join(projectDir, 'documentary-input.json');
+  const checkpointPath = path.join(projectDir, 'checkpoint.json');
+  const mediaCheckpointPath = path.join(projectDir, 'media-checkpoint.json');
   let prevMarker = null;
   try { prevMarker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); } catch { /* ignore */ }
 
   if (!fs.existsSync(path.join(projectDir, 'package.json'))) {
     copyTemplateProject(runtime.templateDir, projectDir);
+  } else if (prevMarker && prevMarker.digest !== inputDigest) {
+    for (const stale of ['shots-plan.json', 'checkpoint.json', 'media-checkpoint.json', path.join('public', 'audio', 'voiceover.mp3')]) {
+      try { fs.rmSync(path.join(projectDir, stale), { force: true }); } catch { /* ignore */ }
+    }
   }
   writeJsonAtomic(markerPath, { digest: inputDigest, voice, jobId: job.jobId, updatedAt: new Date().toISOString() });
 
@@ -635,7 +641,10 @@ async function render(job, scriptText, workDir, options = {}) {
     onProgress(10, `[documentary] Synthesizing voiceover (${voice})`, true);
     voiceDurationSec = await synthesizeVoiceover(narration, voicePath, { voice, signal, pythonBin });
     log.info(`[documentary] Job ${job.jobId}: voiceover ready (${voiceDurationSec.toFixed(2)}s)`);
+  } else {
+    log.info(`[documentary] Job ${job.jobId}: reusing voiceover checkpoint (${voiceDurationSec.toFixed(2)}s)`);
   }
+  writeStageCheckpoint(checkpointPath, inputDigest, { tts: { durationSec: voiceDurationSec, voice } });
 
   const totalFrames = Math.max(300, Math.ceil(voiceDurationSec * FPS));
   const inferRequests = [];
@@ -668,9 +677,22 @@ async function render(job, scriptText, workDir, options = {}) {
     plan = reply.data;
     writeJsonAtomic(planFile, { ...plan, inferRequests });
     log.info(`[documentary] Job ${job.jobId}: planned ${Array.isArray(plan?.shots) ? plan.shots.length : 0} shots (tag=${plan?.topicTag || 'DOCUMENTARY'})`);
+  } else {
+    if (Array.isArray(plan.inferRequests)) inferRequests.push(...plan.inferRequests);
+    log.info(`[documentary] Job ${job.jobId}: reusing shots-plan.json checkpoint (${plan.shots.length} shots)`);
   }
+  writeStageCheckpoint(checkpointPath, inputDigest, { shotsPlan: { count: plan.shots.length, topicTag: plan.topicTag || '' } });
 
   const normalizedShots = normalizeShots(plan.shots, totalFrames);
+  let savedMediaCheckpoint = null;
+  try {
+    const parsedMedia = JSON.parse(fs.readFileSync(mediaCheckpointPath, 'utf8'));
+    if (parsedMedia?.digest === inputDigest && parsedMedia?.shots && typeof parsedMedia.shots === 'object') {
+      savedMediaCheckpoint = parsedMedia;
+    }
+  } catch { /* ignore */ }
+  const mediaCheckpoints = savedMediaCheckpoint?.shots ? { ...savedMediaCheckpoint.shots } : {};
+
   const mediaSources = [];
   const verifiedFallbacks = [];
   const resolvedShots = [];
@@ -680,45 +702,65 @@ async function render(job, scriptText, workDir, options = {}) {
   for (let i = 0; i < normalizedShots.length; i += 1) {
     const shot = normalizedShots[i];
     const pct = 28 + Math.round(((i + 1) / normalizedShots.length) * 32);
-    log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length} (${shot.beat}, ${shot.kind}): "${shot.query}"`);
-    onProgress(pct, `[documentary] Fetching media for shot ${i + 1}/${normalizedShots.length}: ${shot.query.slice(0, 60)}`, true);
 
     let asset = null;
-    if (shot.kind === 'video') {
-      const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
-      const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight });
-      if (fetched) {
-        asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source };
-        videoShotCount += 1;
-        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready (${(shot.dur / FPS).toFixed(1)}s)`);
-      }
+    const cachedShot = mediaCheckpoints[String(i)];
+    if (cachedShot && cachedShot.query === shot.query && cachedShot.beat === shot.beat && cachedShot.assetPath) {
+      const diskPath = path.join(projectDir, 'public', cachedShot.assetPath);
+      try {
+        if (fs.statSync(diskPath).size >= 1024) {
+          asset = { assetType: cachedShot.assetType, assetPath: cachedShot.assetPath, source: cachedShot.source || 'checkpoint' };
+          if (asset.assetType === 'video') videoShotCount += 1;
+          else imageShotCount += 1;
+          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length} reused from checkpoint (${asset.assetPath})`);
+        }
+      } catch { /* fall through to fetch */ }
     }
+
     if (!asset) {
-      const imgStem = path.join(projectDir, 'public', 'images', `shot-${i + 1}`);
-      const fetchedImg = await fetchImageAsset(shot.query, shot.sourceUrl, imgStem, { signal });
-      if (fetchedImg) {
-        asset = { assetType: 'image', assetPath: `images/${path.basename(fetchedImg.path)}`, source: fetchedImg.source };
-        imageShotCount += 1;
-        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: verified image ready`);
+      log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length} (${shot.beat}, ${shot.kind}): "${shot.query}"`);
+      onProgress(pct, `[documentary] Fetching media for shot ${i + 1}/${normalizedShots.length}: ${shot.query.slice(0, 60)}`, true);
+
+      if (shot.kind === 'video') {
+        const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
+        const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight });
+        if (fetched) {
+          asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source };
+          videoShotCount += 1;
+          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready (${(shot.dur / FPS).toFixed(1)}s)`);
+        }
       }
+      if (!asset) {
+        const imgStem = path.join(projectDir, 'public', 'images', `shot-${i + 1}`);
+        const fetchedImg = await fetchImageAsset(shot.query, shot.sourceUrl, imgStem, { signal });
+        if (fetchedImg) {
+          asset = { assetType: 'image', assetPath: `images/${path.basename(fetchedImg.path)}`, source: fetchedImg.source };
+          imageShotCount += 1;
+          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: verified image ready`);
+        }
+      }
+      if (!asset && verifiedFallbacks.length) {
+        const reused = verifiedFallbacks[i % verifiedFallbacks.length];
+        asset = { ...reused };
+        if (reused.assetType === 'video') videoShotCount += 1;
+        else imageShotCount += 1;
+        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: reused verified asset ${reused.assetPath}`);
+      }
+      if (!asset) {
+        throw new Error(`Documentary shot ${i + 1} ("${shot.query}") could not retrieve any verified video clip or real image.`);
+      }
+      mediaCheckpoints[String(i)] = { query: shot.query, beat: shot.beat, ...asset };
+      writeJsonAtomic(mediaCheckpointPath, { digest: inputDigest, updatedAt: new Date().toISOString(), shots: mediaCheckpoints });
     }
-    if (!asset && verifiedFallbacks.length) {
-      const reused = verifiedFallbacks[i % verifiedFallbacks.length];
-      asset = { ...reused };
-      if (reused.assetType === 'video') videoShotCount += 1;
-      else imageShotCount += 1;
-      log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: reused verified asset ${reused.assetPath}`);
-    }
-    if (!asset) {
-      throw new Error(`Documentary shot ${i + 1} ("${shot.query}") could not retrieve any verified video clip or real image.`);
-    }
+
     verifiedFallbacks.push(asset);
     mediaSources.push(asset.source);
     resolvedShots.push({ ...shot, ...asset });
   }
+  writeStageCheckpoint(checkpointPath, inputDigest, { mediaReady: { totalShots: resolvedShots.length, videoShotCount, imageShotCount } });
 
   log.info(`[documentary] Job ${job.jobId}: building Remotion project (${videoShotCount} video, ${imageShotCount} image shots)`);
-  onProgress(64, '[documentary] Writing Remotion composition from one_minute_documentary template', true);
+  onProgress(64, '[documentary] Writing Remotion composition from documentary template', true);
   fs.writeFileSync(
     path.join(projectDir, 'src', 'Composition.tsx'),
     generateCompositionTsx({
@@ -730,6 +772,7 @@ async function render(job, scriptText, workDir, options = {}) {
     'utf8'
   );
   fs.writeFileSync(path.join(projectDir, 'src', 'RemotionRoot.tsx'), generateRemotionRootTsx(totalFrames, { width: renderWidth, height: renderHeight }), 'utf8');
+  writeStageCheckpoint(checkpointPath, inputDigest, { compositionWritten: { width: renderWidth, height: renderHeight, totalFrames } });
 
   await ensureNodeModules(runtime.templateDir, projectDir, signal);
 

@@ -316,10 +316,10 @@ async function doctorCommand() {
   try {
     const documentary = require('./adapters/documentary');
     const docStatus = documentary.documentaryRuntimeStatus();
-    add('One-Minute Documentary adapter', docStatus.available ? 'pass' : 'fail',
+    add('Documentary (Remotion) adapter', docStatus.available ? 'pass' : 'fail',
       docStatus.available ? `Ready (${docStatus.root})` : `Missing files under ${docStatus.root}: ${docStatus.missing.join(', ')}`);
   } catch (error) {
-    add('One-Minute Documentary adapter', 'fail', error.message);
+    add('Documentary (Remotion) adapter', 'fail', error.message);
   }
 
   try {
@@ -540,6 +540,7 @@ async function startCommand(args) {
   if (blockers.length) {
     throw new Error('Automated Muse worker was not started, so it cannot claim and fail production jobs. ' + blockers.join(' '));
   }
+  process.env.MUSE_INBOX_DIR = inboxRoot;
   process.env.VIDNETS_AGENT_BRIDGE_DIR = inboxRoot;
   process.env.SCRIPTIT_AGENT_BRIDGE_DIR = inboxRoot;
   const transport = museInference.inferenceTransport();

@@ -9,7 +9,7 @@ const path = require('node:path');
 const documentary = require('../adapters/documentary');
 const stickman = require('../adapters/stickman');
 const scriptAdapter = require('../adapters/script');
-const { createFrameProgressReporter } = require('../lib/museBridgeInfer');
+const { createFrameProgressReporter, readStageCheckpoint, writeStageCheckpoint } = require('../lib/museBridgeInfer');
 
 test('one_minute_documentary skill assets and Remotion template are bundled', () => {
   const status = documentary.documentaryRuntimeStatus();
@@ -196,5 +196,23 @@ test('documentary scales cleanly to 20-minute CMS duration, voice, 9:16 aspect, 
   assert.match(compNoCap, /loop/);
   assert.doesNotMatch(compNoCap, /<Caption /);
 });
+
+test('readStageCheckpoint and writeStageCheckpoint persist atomic digest-scoped checkpoints', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-ckpt-'));
+  const file = path.join(dir, 'checkpoint.json');
+  try {
+    assert.equal(readStageCheckpoint(file, 'digest_a'), null);
+    writeStageCheckpoint(file, 'digest_a', { tts: { durationSec: 1200 } });
+    writeStageCheckpoint(file, 'digest_a', { shotsPlan: { count: 171 } });
+    const loaded = readStageCheckpoint(file, 'digest_a');
+    assert.equal(loaded.stages.tts.durationSec, 1200);
+    assert.equal(loaded.stages.shotsPlan.count, 171);
+    // Digest change invalidates prior checkpoint cleanly
+    assert.equal(readStageCheckpoint(file, 'digest_b'), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 
 

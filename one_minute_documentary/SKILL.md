@@ -122,6 +122,20 @@
 
 - Use Pexels for free stock video and stills when a direct download works.
 
+## CMS Integration, Scaling & Durable Checkpoints
+
+- **Follow CMS runtime & settings** when invoked via `muse-agent.js` (the skill defaults to 60s when used standalone, and scales dynamically for 1m, 8m, 20m+ CMS jobs):
+  - Read `targetDurationMinutes`, `targetWordCount` (`~150 words/min`), `voice`, `aspect` (`16:9` -> `1920x1080`, `9:16` -> `1080x1920`), `captionsEnabled`, and channel `scriptSettings` from the CMS payload.
+  - Scale shot count proportionally (`~1 shot per 6-9s`, e.g. ~170 shots for a 20-minute video) so shots never stretch or freeze over multi-minute audio.
+  - Use the channel's configured neural `voice` via `edge-tts` whenever provided (falling back to `/opt/hatch/bin/tts` only when no explicit voice is set).
+- **Never lose completed work — save and resume checkpoints inside `work/<jobId>/documentary-project/`**:
+  1. `script.txt` + `script-meta.json`: reuse existing narration on resume when valid for the digest.
+  2. `documentary-input.json` & `checkpoint.json`: digest-keyed stage markers (`tts`, `shotsPlan`, `mediaReady`, `compositionWritten`); wipe stale outputs only if the CMS job digest changes.
+  3. `public/audio/voiceover.mp3`: probe duration (`ffprobe`) on resume and skip TTS if intact.
+  4. `shots-plan.json`: reuse planned shot list and queries instead of re-calling Muse inference.
+  5. `media-checkpoint.json`: write atomically **after every resolved shot** (`shots[i] = { query, beat, assetType, assetPath, source }`); on restart (e.g. interruption at shot 140 of 170), verify cached files on disk (`>= 1024 bytes`) and resume cleanly at shot 141.
+  6. `video.mp4.documentary-manifest.json`: stamp alongside the finished Remotion master before delivery.
+
 ## Alternatives for better results
 
 - Ask the user for a favourite person, place or moment when the topic alone feels too broad.
