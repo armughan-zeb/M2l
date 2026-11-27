@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 const { startResidentInbox, probeInbox } = require('../lib/museInbox');
-const { runInferenceCommand } = require('../adapters/vidnets');
+const { runInferenceCommand } = require('../lib/museInference');
 const { sleep } = require('../lib/sleep');
 
 const SPOOL_SCRIPT = path.resolve(__dirname, '..', 'scripts', 'muse-inference-spool.cjs');

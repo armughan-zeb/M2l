@@ -44,14 +44,16 @@ test('resolveVideoStyle strictly distinguishes Documentary vs 2D Stickman and re
     { engine: ENGINES.STICKMAN, style: STYLES.STICKMAN, label: '2D Stickman', explicit: true }
   );
 
-  assert.deepEqual(
-    resolveVideoStyle({ productionEngine: 'vidzeo', videoStyle: 'documentary' }),
-    { engine: ENGINES.VIDZEO, style: STYLES.DOCUMENTARY, label: 'Documentary (Vidnets)', explicit: true }
-  );
+  for (const alias of ['vidzeo', 'documentary', 'one_minute_documentary', 'one-minute-documentary']) {
+    assert.deepEqual(
+      resolveVideoStyle({ productionEngine: alias }),
+      { engine: ENGINES.DOCUMENTARY, style: STYLES.DOCUMENTARY, label: 'One-Minute Documentary (Remotion)', explicit: true }
+    );
+  }
 
   assert.deepEqual(
     resolveVideoStyle({ title: 'Legacy payload without style fields' }),
-    { engine: ENGINES.VIDZEO, style: STYLES.DOCUMENTARY, label: 'Documentary (Vidnets)', explicit: false }
+    { engine: ENGINES.DOCUMENTARY, style: STYLES.DOCUMENTARY, label: 'One-Minute Documentary (Remotion)', explicit: false }
   );
 
   // Removed Doodle Verse & local-only Pikgen must fail closed in Muse
@@ -99,16 +101,16 @@ test('validateMasterManifest enforces strict separation between 2D Stickman and 
     assert.match(wrongJob.reason, /belongs to job r_stick_1/i);
 
     // Documentary validation must REFUSE a video carrying a 2D Stickman manifest
-    const wrongEngine = validateMasterManifest(videoFile, { jobId: 'r_stick_1', engine: 'vidzeo' });
+    const wrongEngine = validateMasterManifest(videoFile, { jobId: 'r_stick_1', engine: 'documentary' });
     assert.equal(wrongEngine.ok, false);
     assert.match(wrongEngine.reason, /refusing mixed-engine master/i);
 
-    // Stickman validation must REFUSE if a Vidnets manifest sits beside it
-    const vidnetsManifest = path.join(dir, 'video.manifest.json');
-    fs.writeFileSync(vidnetsManifest, JSON.stringify({ job_id: 'v1', media_paths: ['a.jpg'], asset_count: 1 }), 'utf8');
-    const vidnetsConflict = validateMasterManifest(videoFile, { jobId: 'r_stick_1', engine: 'stickman' });
-    assert.equal(vidnetsConflict.ok, false);
-    assert.match(vidnetsConflict.reason, /Vidnets manifest.*refusing mixed-engine/i);
+    // Stickman validation must REFUSE if a Documentary manifest sits beside it
+    const docManifest = path.join(dir, 'video.documentary-manifest.json');
+    fs.writeFileSync(docManifest, JSON.stringify({ engine: 'documentary', style: 'documentary', job_id: 'd1', shot_count: 4, duration_seconds: 60 }), 'utf8');
+    const docConflict = validateMasterManifest(videoFile, { jobId: 'r_stick_1', engine: 'stickman' });
+    assert.equal(docConflict.ok, false);
+    assert.match(docConflict.reason, /Documentary manifest.*refusing mixed-engine/i);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -233,9 +235,11 @@ test('stickmanRuntimeStatus confirms bundled kit/fonts/sounds and inferWithMuse 
   }
 });
 
-test('muse-agent capabilities advertises 2d-stickman and excludes removed doodle-verse', () => {
+test('muse-agent capabilities advertises both one-minute-documentary and 2d-stickman and excludes removed doodle-verse', () => {
   const { capabilities } = require('../muse-agent');
   const caps = capabilities();
+  assert.ok(caps.includes('one-minute-documentary'));
+  assert.ok(caps.includes('remotion-documentary'));
   assert.ok(caps.includes('2d-stickman'));
   assert.ok(caps.includes('style:2d_stickman'));
   assert.ok(caps.includes('style:documentary'));

@@ -73,7 +73,7 @@ test('jobSummary correctly parses and preserves duration, word counts, reference
   assert.ok(summary.outputLocations.thumbnailPath.endsWith('thumbnail.jpg'));
 });
 
-test('synthesizeNarration dynamically uses title, premise, and niche rather than hardcoded railway switch text', () => {
+test('buildScriptMessages dynamically includes title, premise, and niche without hardcoded template fallback', () => {
   const aviationJob = {
     title: 'The Secret Concorde Flight',
     premise: 'In 1977, a classified flight tested new navigational telemetry.',
@@ -84,12 +84,14 @@ test('synthesizeNarration dynamically uses title, premise, and niche rather than
     }
   };
 
-  const narration = scriptAdapter.synthesizeNarration(aviationJob);
-  assert.match(narration, /The Secret Concorde Flight/i);
-  assert.match(narration, /aviation history/i);
-  assert.match(narration, /Aviation Unveiled/);
-  assert.doesNotMatch(narration, /switch mechanism|turnout or points|railway locomotive/i);
+  const messages = scriptAdapter.buildScriptMessages(aviationJob);
+  const combined = messages.map(m => m.content).join('\n');
+  assert.match(combined, /The Secret Concorde Flight/i);
+  assert.match(combined, /aviation history/i);
+  assert.match(combined, /Aviation Unveiled/);
+  assert.doesNotMatch(combined, /switch mechanism|turnout or points|railway locomotive/i);
+  assert.equal(typeof scriptAdapter.synthesizeNarration, 'undefined');
 
-  const wordCount = narration.split(/\s+/).filter(Boolean).length;
-  assert.ok(wordCount >= scriptAdapter.minimumScriptWords(aviationJob), `Word count ${wordCount} must cover 5 minutes`);
+  assert.ok(scriptAdapter.minimumWords(aviationJob) >= 600, '5-minute job enforces proportional word target');
+  assert.ok(scriptAdapter.minimumWords(aviationJob) > scriptAdapter.minimumWords({ targetDurationMinutes: 1 }));
 });

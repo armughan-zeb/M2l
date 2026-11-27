@@ -1,0 +1,5 @@
+name: "one_minute_documentary"
+title: "One-Minute Documentary"
+description: "Make a finished 60-second documentary video about any topic, with yt-dlp footage, web images, Remotion editing and a voiceover."
+category: "Work and knowledge"
+include_in_prompt: true

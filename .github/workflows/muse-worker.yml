@@ -2,7 +2,7 @@ name: Muse worker
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/media-round14]
   pull_request:
   workflow_dispatch:
 
@@ -21,7 +21,7 @@ jobs:
           cache: npm
           cache-dependency-path: |
             package-lock.json
-            scriptit/package-lock.json
+            one_minute_documentary/templates/remotion-project/package.json
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -29,14 +29,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
-          python -m pip install requests
           npm ci --no-audit --no-fund
-          npm ci --prefix scriptit --omit=dev --no-audit --no-fund
-      - name: Verify worker, host hook and ScriptIT
+          npm --prefix one_minute_documentary/templates/remotion-project install --no-audit --no-fund
+      - name: Verify worker, skills, and shell scripts
         run: |
-          for script in setup.sh setup-linux.sh scripts/install-inbox-hook.sh scripts/install-health-monitor.sh scripts/vidnets-health-monitor.sh docker/entrypoint.sh; do
+          for script in setup.sh setup-linux.sh start.sh start-daemon.sh scripts/install-inbox-hook.sh docker/entrypoint.sh; do
             bash -n "$script"
           done
           bash tests/hook-stale-request.test.sh
           npm test
-          npm --prefix scriptit test

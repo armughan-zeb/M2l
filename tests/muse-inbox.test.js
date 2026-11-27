@@ -10,7 +10,7 @@ const { spawn, execFile } = require('node:child_process');
 const { test } = require('node:test');
 const { writeJsonAtomic } = require('../lib/config');
 const { startResidentInbox, probeInbox, pendingRequests, completeLocally, createInboxReadiness, resetResidentLivenessForTests, PROBE_WALL_MS, REQUEST_WALL_MS } = require('../lib/museInbox');
-const { runInferenceHttp } = require('../adapters/vidnets');
+const { runInferenceHttp } = require('../lib/museInference');
 const { sleep } = require('../lib/sleep');
 
 const logger = { info() {}, warn() {} };

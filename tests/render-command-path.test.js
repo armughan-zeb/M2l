@@ -13,8 +13,8 @@ test('bundled relative renderer runs from a different job folder', async () => {
   try {
     const job = path.join(root, 'job');
     fs.mkdirSync(job);
-    fs.writeFileSync(path.join(root, 'render-vidnets-linux.js'), "console.log(JSON.stringify({ok:true}))");
-    const result = await runCommand(resolveRenderCommand('node ./render-vidnets-linux.js', root), { cwd: job, timeoutMs: 5000 });
+    fs.writeFileSync(path.join(root, 'custom-local-render.js'), "console.log(JSON.stringify({ok:true}))");
+    const result = await runCommand(resolveRenderCommand('node ./custom-local-render.js', root), { cwd: job, timeoutMs: 5000 });
     assert.equal(JSON.parse(result.stdout).ok, true);
     assert.equal(resolveRenderCommand('node custom-render.js --flag', root), 'node custom-render.js --flag');
   } finally {

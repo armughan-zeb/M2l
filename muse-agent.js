@@ -29,8 +29,9 @@ const { sleep } = require('./lib/sleep');
 const { retryDelayMs, cmsRetryOptions } = require('./lib/cmsRetry');
 const ffmpeg = require('./lib/ffmpeg');
 const python = require('./lib/python');
-const vidnets = require('./adapters/vidnets');
+const museInference = require('./lib/museInference');
 const { startResidentInbox, probeInbox, createInboxReadiness } = require('./lib/museInbox');
+const { resolveVideoStyle, ENGINES } = require('./lib/videoStyle');
 
 const VERSION = require('./package.json').version;
 const MIN_NODE = [18, 17];
@@ -53,11 +54,17 @@ function platform() {
 }
 
 function capabilities() {
-  const list = ['script', 'render', 'thumbnail', 'heartbeat', 'remotion-documentary', 'pc-youtube-relay', 'style-routing', 'style:documentary'];
+  const list = ['script', 'render', 'thumbnail', 'heartbeat', 'style-routing'];
   list.push(String(process.env.MUSE_SCRIPT_COMMAND || '').trim() ? 'script-command' : 'autonomous-narration-synthesizer');
   list.push(String(process.env.MUSE_RENDER_COMMAND || '').trim() ? 'render-command' : 'remotion-native');
   list.push(String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() ? 'thumbnail-command' : 'video-frame-thumbnail');
   if (String(process.env.MUSE_INFERENCE_COMMAND || process.env.MUSE_INFERENCE_URL || '').trim()) list.push('agent-inference');
+  try {
+    const documentary = require('./adapters/documentary');
+    if (documentary.documentaryRuntimeStatus().available) {
+      list.push('one-minute-documentary', 'remotion-documentary', 'style:documentary');
+    }
+  } catch { /* ignore if runtime incomplete */ }
   try {
     const stickman = require('./adapters/stickman');
     if (stickman.stickmanRuntimeStatus().available) {
@@ -304,22 +311,15 @@ async function doctorCommand() {
     py.ok ? `${py.binary}${py.version ? ' (v' + py.version + ')' : ''}` : 'Not found. Install python3 (e.g. sudo apt install python3) or set VIDNETS_PYTHON.');
 
   const scriptCommand = String(process.env.MUSE_SCRIPT_COMMAND || '').trim();
-  if (scriptCommand) {
-    add('Script adapter', 'pass', 'Custom script command configured');
-  } else {
-    const scriptCheck = require('./lib/scriptReadiness').checkScriptReadiness();
-    add('Script adapter', scriptCheck.ok ? 'pass' : 'fail', scriptCheck.ok
-      ? 'ScriptIT CLI and runtime dependencies available'
-      : `Missing ${scriptCheck.missing.join(', ')}. Run npm ci --omit=dev in the scriptit directory or rebuild the Docker image.`);
-  }
+  add('Script adapter', 'pass', scriptCommand ? 'Custom script command configured' : 'Muse inference script adapter (5-beat Documentary & 2D Stickman)');
 
-  const renderCommand = String(process.env.MUSE_RENDER_COMMAND || '').trim();
-  if (renderCommand) {
-    add('Render adapter', 'pass', renderCommand);
-  } else {
-    add('Render adapter', 'fail',
-      'No MUSE_RENDER_COMMAND is set. Production renders must use render-vidnets-linux.js ' +
-      '(Vidnets + Muse agent-bridge inbox). The native Remotion engine is not a render path.');
+  try {
+    const documentary = require('./adapters/documentary');
+    const docStatus = documentary.documentaryRuntimeStatus();
+    add('One-Minute Documentary adapter', docStatus.available ? 'pass' : 'fail',
+      docStatus.available ? `Ready (${docStatus.root})` : `Missing files under ${docStatus.root}: ${docStatus.missing.join(', ')}`);
+  } catch (error) {
+    add('One-Minute Documentary adapter', 'fail', error.message);
   }
 
   try {
@@ -334,14 +334,8 @@ async function doctorCommand() {
     add('2D Stickman adapter', 'warn', error.message);
   }
 
-  // Muse inference is COMPULSORY and is verified for real: Vidnets server
-  // healthy, agent-bridge inbox writable, vidnets-inbox-watch hook enabled,
-  // and no OpenRouter key in the environment. A render command alone proves
-  // nothing — an earlier doctor marked inference PASS with "Handled by the
-  // render command" without checking any of this.
   {
-    const { verifyMuseInferenceBridge } = require('./lib/museInference');
-    const inference = await verifyMuseInferenceBridge(process.env);
+    const inference = await museInference.verifyMuseInferenceBridge(process.env);
     let probe;
     if (inference.ok) {
       try { probe = await probeInbox(); }
@@ -351,50 +345,8 @@ async function doctorCommand() {
       probe ? `Muse answered the inbox probe in ${probe.elapsedMs}ms` : inference.failures.join('; '));
   }
 
-  if (!renderCommand) {
-    let remotionReady = false;
-    try {
-      require('@remotion/bundler');
-      require('@remotion/renderer');
-      remotionReady = true;
-    } catch (_) {
-      try {
-        require(path.join(config.ROOT, 'vidnets', 'node_modules', '@remotion', 'bundler'));
-        require(path.join(config.ROOT, 'vidnets', 'node_modules', '@remotion', 'renderer'));
-        remotionReady = true;
-      } catch (_) {}
-    }
-
-    // The native Remotion engine is NOT a render path: it fetches no media
-    // and uses no Muse inference. It is listed here only for diagnosis.
-    add('Remotion Engine', 'fail',
-      remotionReady
-        ? 'Native Remotion engine is installed, but it is not a render path — it renders graphics with no media and no Muse inference. Set MUSE_RENDER_COMMAND to render-vidnets-linux.js.'
-        : 'Remotion packages not installed. Set MUSE_RENDER_COMMAND to render-vidnets-linux.js.');
-
-    // Built-in Vidnets launcher (only relevant when Vidnets is configured)
-    if (process.env.MUSE_VIDNETS_COMMAND || process.env.MUSE_VIDNETS_ROOT) {
-      try {
-        const command = vidnets.agentCommand();
-        add('Vidnets launcher', 'pass', command);
-        try {
-          const ready = await vidnets.ensureReady();
-          add('Vidnets service', 'pass', ready.url || 'ready');
-        } catch (error) {
-          add('Vidnets service', 'warn', error.message);
-        }
-      } catch (error) {
-        add('Vidnets launcher', 'warn', error.message);
-      }
-    }
-  }
-
   add('Thumbnail adapter', String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() ? 'pass' : (media.ffmpeg ? 'pass' : 'fail'),
     String(process.env.MUSE_THUMBNAIL_COMMAND || '').trim() || 'FFmpeg frame extraction from the finished master');
-
-  const missing = ['PEXELS_API_KEY', 'PIXABAY_API_KEY'].filter(key => !String(process.env[key] || '').trim());
-  add('Stock provider keys', missing.length === 0 ? 'pass' : 'warn',
-    missing.length === 0 ? 'Pexels and Pixabay configured' : `Missing ${missing.join(', ')}; real stock rescue will be limited`);
 
   console.log(checks.map(check => `${check.level === 'pass' ? 'PASS' : check.level === 'warn' ? 'WARN' : 'FAIL'}  ${check.name}: ${log.redact(check.detail)}`).join('\n'));
   const failures = checks.filter(check => check.level === 'fail').length;
@@ -442,7 +394,7 @@ async function claimCommand(args) {
   // work gets the script/render/deliver steps.
   let instructions;
   if (decision.decision === 'deliver' && existing) {
-    const master = existing.masterPath || existing.vidnetsMasterPath || (existing.vidnetsMp4s && existing.vidnetsMp4s[0]) || videoPath;
+    const master = existing.masterPath || videoPath;
     const deliverParts = [`node muse-agent.js deliver --job ${job.jobId}`, `--script ${path.join(existing.directory, 'script.txt')}`, `--video ${master}`];
     // Thumbnails are skipped by this worker (VIDZEO_SKIP_THUMBNAILS=1):
     // never ask for one, and pass --skip-thumbnail so deliver does not
@@ -459,19 +411,21 @@ async function claimCommand(args) {
       `RESUME: run "node muse-agent.js start" — the daemon re-attaches to the saved work and continues it.`
     ];
   } else {
+    const style = resolveVideoStyle(job);
+    const skillGuide = style.engine === ENGINES.STICKMAN
+      ? 'Follow 2d-stickman/SKILL.md (write script.json -> voice_edge.py -> plan_captions.mjs -> src/shots.js -> capture.mjs check/lint -> mix_audio.py -> capture.mjs video).'
+      : 'Follow one_minute_documentary/SKILL.md (source yt-dlp footage + images -> write 5-beat script.txt -> synthesize voiceover -> build Remotion Documentary edit from one_minute_documentary/templates/remotion-project/ -> render 1080p mp4).';
     const steps = [
-      `1. SCRIPT: Write complete source-grounded narration matching channel style to scriptPath (${scriptPath}). Target: ~${summary.targetWordCount} words (at least ${summary.minimumWords} words required for ${summary.targetDurationMinutes}min duration).`,
-      `2. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`
+      `1. STYLE (${style.label}): ${skillGuide}`,
+      `2. SCRIPT: Write complete narration to scriptPath (${scriptPath}). Target: ~${summary.targetWordCount} words (minimum ${summary.minimumWords} words for ${summary.targetDurationMinutes}min).`,
+      `3. VIDEO: Render a 1080p master (1920x1080) with audio to videoPath (${videoPath}).`
     ];
-    // Thumbnails are skipped by this worker — no thumbnail step, and the
-    // deliver step carries --skip-thumbnail (Nov 10, 2026). Thumbnails are
-    // generated locally by Pikgen; do not generate or upload one.
     if (jobRunner.thumbnailsSkipped()) {
-      steps.push('3. DELIVER: Once the script and master exist in workDir, run: node muse-agent.js deliver --job ' + job.jobId + ' --skip-thumbnail');
+      steps.push('4. DELIVER: Once script and video exist, run: node muse-agent.js deliver --job ' + job.jobId + ' --skip-thumbnail');
     } else {
       steps.push(
-        `3. THUMBNAIL: Create a high-CTR 16:9 thumbnail styled after the reference (${summary.thumbnailStyle.referenceImageUrl || summary.thumbnailStyle.referenceUrl || 'see concept'}) executing concept "${summary.thumbnailStyle.concept}" to thumbnailPath (${thumbnailPath}).`,
-        `4. DELIVER: Once all files exist in workDir, run: node muse-agent.js deliver --job ${job.jobId}`
+        `4. THUMBNAIL: Create a 16:9 thumbnail to thumbnailPath (${thumbnailPath}).`,
+        `5. DELIVER: Once all files exist in workDir, run: node muse-agent.js deliver --job ${job.jobId}`
       );
     }
     instructions = steps;
@@ -588,7 +542,7 @@ async function startCommand(args) {
   }
   process.env.VIDNETS_AGENT_BRIDGE_DIR = inboxRoot;
   process.env.SCRIPTIT_AGENT_BRIDGE_DIR = inboxRoot;
-  const transport = vidnets.inferenceTransport();
+  const transport = museInference.inferenceTransport();
   const releaseLock = acquireLock();
   const abort = new AbortController();
   const refreshInboxHealth = createInboxReadiness({
@@ -605,15 +559,15 @@ async function startCommand(args) {
       releaseInboxLock = acquireLock(path.join(inboxRoot, 'resident.lock'));
       const stop = startResidentInbox({
         root: inboxRoot,
-        concurrency: vidnets.inferenceConcurrency(),
+        concurrency: museInference.inferenceConcurrency(),
         logger: log,
         onExpiryLimit: () => {
           refreshInboxHealth.invalidate();
           log.warn('Muse claims paused after three consecutive inbox expiries. Waiting for a fresh probe.');
         },
         answer: (request, options) => transport.kind === 'command'
-          ? vidnets.runInferenceCommand(transport.command, request, config.WORK_ROOT, options)
-          : vidnets.runInferenceHttp(transport.url, request, options)
+          ? museInference.runInferenceCommand(transport.command, request, config.WORK_ROOT, options)
+          : museInference.runInferenceHttp(transport.url, request, options)
       });
       process.env.MUSE_RESIDENT_INBOX = '1';
       stopInbox = () => {
@@ -626,7 +580,6 @@ async function startCommand(args) {
       throw error;
     }
   }
-  let lastScriptBlocker = '';
   let current = null;
   let stopping = false;
   let fatal = null;
@@ -773,21 +726,6 @@ async function startCommand(args) {
       }
       // retry === null: the marker was cleared (409 / no checkpoint) —
       // fall through to normal queue polling below.
-    }
-
-    if (!String(process.env.MUSE_SCRIPT_COMMAND || '').trim()) {
-      const readiness = require('./lib/scriptReadiness').checkScriptReadiness();
-      if (!readiness.ok) {
-        const missing = readiness.missing.join(', ');
-        if (lastScriptBlocker !== missing) {
-          log.warn(`Muse claims paused: ScriptIT is missing ${missing}. Run npm ci --omit=dev in scriptit or rebuild the worker image.`);
-          lastScriptBlocker = missing;
-        }
-        if (once) break;
-        await sleep(pollMs, abort.signal);
-        continue;
-      }
-      lastScriptBlocker = '';
     }
 
     if (!await refreshInboxHealth()) {

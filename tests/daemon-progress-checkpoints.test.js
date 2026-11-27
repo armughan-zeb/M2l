@@ -43,7 +43,6 @@ const config = require('../lib/config');
 const { createClient } = require('../lib/cms');
 const { parseRenderProgressLine, render: renderVideo } = require('../adapters/video');
 const jobRunner = require('../lib/jobRunner');
-const { writeVidnetsProgressFile } = require('../render-vidnets-linux');
 
 const RUN_E2E = process.env.MUSE_RUN_E2E_PROGRESS_TEST !== '0';
 
@@ -281,70 +280,6 @@ test('resumeActiveJob probes the CMS with the saved stage/% instead of script 5%
   assert.equal(config.readActiveJob(), null, 'marker cleared when the saved job has no checkpoint');
 });
 
-test('wrapper progress file is written atomically and parses', () => {
-  const dir = tmpDir('daemon-progress-wrapper-');
-  writeVidnetsProgressFile(dir, {
-    vidnetsJobId: 'f04c6b9f', cmsJobId: 'r_test_wrapper',
-    status: 'processing', progress: 45, detail: 'Finding media'
-  });
-  const saved = JSON.parse(fs.readFileSync(path.join(dir, 'vidnets-progress.json'), 'utf8'));
-  assert.equal(saved.vidnetsJobId, 'f04c6b9f');
-  assert.equal(saved.cmsJobId, 'r_test_wrapper');
-  assert.equal(saved.status, 'processing');
-  assert.equal(saved.progress, 45);
-  assert.equal(saved.detail, 'Finding media');
-  assert.ok(saved.updatedAt);
-  assert.ok(noTempFilesLeft(dir));
-});
-
-test('vidnets state.json is written atomically (exact server code, extracted)', async t => {
-  // The Vidnets server is too heavy to import in a unit test, so this
-  // extracts _write_generation_checkpoint + its _checkpoint_safe helper
-  // from server/app.py verbatim and runs them against a scratch package.
-  const python = await pythonAvailability();
-  if (!python.ok) {
-    t.skip('Python 3 is not available');
-    return;
-  }
-  const appSource = fs.readFileSync(path.join(__dirname, '..', 'vidnets', 'server', 'app.py'), 'utf8');
-  const start = appSource.indexOf('def _write_generation_checkpoint(');
-  const end = appSource.indexOf('\n\ndef ', start);
-  assert.ok(start !== -1 && end !== -1, 'could not locate _write_generation_checkpoint in server/app.py');
-  const fnSource = appSource.slice(start, end);
-  assert.ok(fnSource.includes('os.fsync'), 'checkpoint write must fsync');
-  assert.ok(fnSource.includes('os.replace(state_temp, state_target)'), 'state.json must be atomically replaced');
-  const safeStart = appSource.indexOf('def _checkpoint_safe(');
-  const safeEnd = appSource.indexOf('\n\ndef ', safeStart);
-  const safeSource = appSource.slice(safeStart, safeEnd);
-  const dir = tmpDir('daemon-progress-py-');
-  const driver = path.join(dir, 'check_state.py');
-  fs.writeFileSync(driver, [
-    'import json, os, secrets, sys, time',
-    'from pathlib import Path',
-    'sys.path.insert(0, ' + JSON.stringify(path.join(__dirname, '..', 'vidnets', 'server')) + ')',
-    safeSource,
-    fnSource,
-    'package = ' + JSON.stringify(path.join(dir, 'pkg')) + ';',
-    "os.makedirs(os.path.join(package, 'checkpoints'), exist_ok=True)",
-    "config = {'_output_package_dir': package}",
-    "_write_generation_checkpoint(config, 'source_query_plan.json', {'queries': ['a']}, stage='source_queries_planned', status='saved')",
-    "state = json.load(open(os.path.join(package, 'checkpoints', 'state.json')))",
-    "assert state['stage'] == 'source_queries_planned', state",
-    "assert state['status'] == 'saved', state",
-    "left = [n for n in os.listdir(os.path.join(package, 'checkpoints')) if n.endswith('.part')]",
-    'assert not left, left',
-    "print('STATE_JSON_ATOMIC_OK')",
-    ''
-  ].join('\n'));
-  const output = await new Promise((resolve, reject) => {
-    execFile(python.binary, [driver], { timeout: 60000 }, (error, stdout, stderr) => {
-      if (error) reject(new Error(`state.json atomic check failed: ${stderr || error.message}`));
-      else resolve(stdout);
-    });
-  });
-  assert.match(output, /STATE_JSON_ATOMIC_OK/);
-});
-
 // ------------------------------------------------- end-to-end (gated)
 
 function scriptFixture(words = 150) {
@@ -424,7 +359,7 @@ function writeStubRender(dir, { fixture, jobId, slowMs = 0, reattachId = '' }) {
     '[render-vidnets] Vidnets 45% — Finding media',
     '[render-vidnets] Vidnets 78% — Rendering scenes'
   ];
-  if (reattachId) lines.unshift(`[render-vidnets] Re-attaching to existing Vidnets job ${reattachId} for ${jobId}`);
+  if (reattachId) lines.unshift(`[render-documentary] Re-attaching to existing Documentary job ${reattachId} for ${jobId}`);
   fs.writeFileSync(stub, [
     "const fs = require('fs');",
     "const path = require('path');",
@@ -434,8 +369,8 @@ function writeStubRender(dir, { fixture, jobId, slowMs = 0, reattachId = '' }) {
     "process.stdin.on('end', () => {",
     `  const request = JSON.parse(input || '{}');`,
     `  if (${slowMs} > 0) {`,
-    "    fs.writeFileSync(path.join(request.workDir, 'vidnets-job.json'), JSON.stringify({ id: 'stub-vidnets-1', jobId: request.job.jobId }) + '\\n');",
-    "    process.stderr.write('[render-vidnets] Vidnets job stub-vidnets-1 submitted for test\\n');",
+    "    fs.writeFileSync(path.join(request.workDir, 'stub-render-state.json'), JSON.stringify({ id: 'stub-render-1', jobId: request.job.jobId }) + '\\n');",
+    "    process.stderr.write('[render-documentary] Documentary job stub-render-1 submitted for test\\n');",
     '  }',
     `  const lines = ${JSON.stringify(lines)};`,
     '  let i = 0;',
@@ -570,7 +505,7 @@ test('e2e: daemon killed mid-render resumes mid-job instead of restarting', { sk
   // The checkpoints must have survived the kill.
   const saved = config.readActiveJob();
   assert.ok(saved && saved.jobId === jobId, 'active-job.json survived the kill');
-  assert.ok(fs.existsSync(path.join(jobDir, 'vidnets-job.json')), 'vidnets-job.json survived the kill');
+  assert.ok(fs.existsSync(path.join(jobDir, 'stub-render-state.json')), 'stub-render-state.json survived the kill');
   const progress = jobRunner.readProgressCheckpoint(jobDir);
   // The kill lands just after 45% is observed, so 78% may or may not
   // have been reported first — either way the checkpoint is mid-render.
@@ -578,8 +513,8 @@ test('e2e: daemon killed mid-render resumes mid-job instead of restarting', { sk
     `progress checkpoint is mid-render after the kill (got ${JSON.stringify(progress)})`);
 
   // Restart: resumeActiveJob with a fast stub that re-attaches to the
-  // saved Vidnets job id instead of submitting fresh.
-  const fastStub = writeStubRender(dir, { fixture, jobId, reattachId: 'stub-vidnets-1' });
+  // saved render job id instead of submitting fresh.
+  const fastStub = writeStubRender(dir, { fixture, jobId, reattachId: 'stub-render-1' });
   const previous = process.env.MUSE_RENDER_COMMAND;
   process.env.MUSE_RENDER_COMMAND = commandLine(process.execPath, [fastStub]);
   try {
@@ -593,8 +528,8 @@ test('e2e: daemon killed mid-render resumes mid-job instead of restarting', { sk
     assert.match(probe.detail, /Finding media|Rendering scenes/);
     assert.ok(!client.calls.progress.some(call => call.detail === 'Generating narration'),
       'resume reused the saved script instead of regenerating it');
-    assert.ok(client.calls.progress.some(call => call.detail.includes('Re-attaching to existing Vidnets job stub-vidnets-1')),
-      'resume run re-attached to the saved Vidnets job and reported it to the CMS');
+    assert.ok(client.calls.progress.some(call => call.detail.includes('Re-attaching to existing Documentary job stub-render-1')),
+      'resume run re-attached to the saved render state and reported it to the CMS');
     assert.equal(client.calls.completes.length, 1, 'resumed job completed');
     assert.equal(client.calls.fails.length, 0);
     assert.equal(config.readActiveJob(), null, 'active marker cleared after the resumed delivery');

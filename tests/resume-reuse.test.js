@@ -77,7 +77,7 @@ function writeFile(file, content) {
 // Build a work dir (live or archived) with the given artifacts. The video
 // is a dummy >= 1 MB buffer — ffmpeg validation is patched in the tests
 // that need it, so its bytes are never decoded.
-function writeWorkState(directory, { job, scriptWords, master, progress, vidnetsJobId, thumbnail } = {}) {
+function writeWorkState(directory, { job, scriptWords, master, progress, thumbnail } = {}) {
   if (job) {
     writeFile(path.join(directory, 'job.json'), JSON.stringify({
       digest: jobRunner.payloadDigest(job),
@@ -99,7 +99,6 @@ function writeWorkState(directory, { job, scriptWords, master, progress, vidnets
     }));
   }
   if (progress) writeFile(path.join(directory, 'progress.json'), JSON.stringify({ jobId: job?.jobId || '', ...progress, updatedAt: new Date().toISOString() }));
-  if (vidnetsJobId) writeFile(path.join(directory, 'vidnets-job.json'), JSON.stringify({ id: vidnetsJobId, jobId: job?.jobId || '' }));
   if (thumbnail) writeFile(path.join(directory, 'thumbnail.jpg'), Buffer.alloc(2048));
   return directory;
 }
@@ -203,23 +202,17 @@ test('prepareWorkDir does not archive on a createdAt-only re-dispatch, but does 
   assert.equal(fs.existsSync(path.join(dir, 'script.txt')), false, 'the archived dir is replaced by a fresh one');
 });
 
-test('decideClaim: finished master delivers, Vidnets master delivers, mid-run resumes, nothing is fresh, different spec is fresh', () => {
+test('decideClaim: finished master delivers, mid-run resumes, nothing is fresh, different spec is fresh', () => {
   const job = makeJob();
   const finished = {
     source: 'archive', directory: '/tmp/x', payload: job, scriptText: words(200),
-    hasMaster: true, masterPath: '/tmp/x/video.mp4', vidnetsJobId: '', vidnetsMp4s: []
+    hasMaster: true, masterPath: '/tmp/x/video.mp4'
   };
   assert.equal(jobRunner.decideClaim(finished, job).decision, 'deliver');
-  const vidnetsDone = {
-    source: 'archive', directory: '/tmp/x', payload: job, scriptText: words(200),
-    hasMaster: false, masterPath: '', vidnetsJobId: 'f04c6b9f', vidnetsMp4s: [],
-    vidnetsMasterPath: '/tmp/x/vidnets/film.mp4'
-  };
-  assert.equal(jobRunner.decideClaim(vidnetsDone, job).decision, 'deliver');
   const midRun = {
     source: 'work', directory: '/tmp/x', payload: job, scriptText: words(200),
-    hasMaster: false, masterPath: '', vidnetsJobId: 'f04c6b9f', vidnetsMp4s: [],
-    progress: { stage: 'video', progress: 45, detail: 'Finding media' }
+    hasMaster: false, masterPath: '',
+    progress: { stage: 'video', progress: 45, detail: 'Planning documentary shots' }
   };
   assert.equal(jobRunner.decideClaim(midRun, job).decision, 'resume');
   assert.equal(jobRunner.decideClaim(null, job).decision, 'fresh');
@@ -387,36 +380,6 @@ test('second claim while one job is active is refused, never started', async () 
     assert.equal(config.readActiveJob()?.jobId, activeJob.jobId, 'the active marker is untouched');
   } finally {
     config.clearActiveJob();
-  }
-});
-
-test('findVidnetsMaster reads the queue API, then falls back to the queue file, then gives up', async () => {
-  const masterFile = path.join(workRoot, 'vidnets-master.mp4');
-  writeFile(masterFile, Buffer.alloc(2048));
-  await withVidnetsStub({
-    'vid-done-1': { id: 'vid-done-1', status: 'completed', progress: 100, result: { video: masterFile } },
-    'vid-busy-1': { id: 'vid-busy-1', status: 'processing', progress: 45, result: {} }
-  }, async () => {
-    const done = await jobRunner.findVidnetsMaster('vid-done-1');
-    assert.equal(done.status, 'completed');
-    assert.equal(done.videoPath, masterFile);
-    const busy = await jobRunner.findVidnetsMaster('vid-busy-1');
-    assert.equal(busy.status, 'processing');
-    assert.equal(busy.videoPath, '');
-    assert.equal(await jobRunner.findVidnetsMaster('vid-missing-1'), null, 'an unknown id is not an error, just no master');
-  });
-  // No server at all and no queue file: fail-soft, no throw.
-  const previousUrl = process.env.MUSE_VIDNETS_URL;
-  const previousRoot = process.env.VIDZEO_RUNTIME_ROOT;
-  process.env.MUSE_VIDNETS_URL = 'http://127.0.0.1:1';
-  process.env.VIDZEO_RUNTIME_ROOT = path.join(workRoot, 'no-such-runtime');
-  try {
-    assert.equal(await jobRunner.findVidnetsMaster('vid-done-1'), null);
-  } finally {
-    if (previousUrl === undefined) delete process.env.MUSE_VIDNETS_URL;
-    else process.env.MUSE_VIDNETS_URL = previousUrl;
-    if (previousRoot === undefined) delete process.env.VIDZEO_RUNTIME_ROOT;
-    else process.env.VIDZEO_RUNTIME_ROOT = previousRoot;
   }
 });
 

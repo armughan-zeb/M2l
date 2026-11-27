@@ -1,17 +1,13 @@
 'use strict';
 
-// Muse inference is compulsory: every test here proves a fail-closed
-// behaviour — no bridge, no OpenRouter key, no unverified media.
-
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 const {
   openRouterKeysPresent,
-  vidnetsStatusUrl,
+  assertNoOpenRouterKey,
   checkMuseInferenceBridge,
   verifyMuseInferenceBridge
 } = require('../lib/museInference');
@@ -30,26 +26,16 @@ function bridgeFixture({ hookEnabled = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-inference-'));
   const bridgeRoot = path.join(dir, 'agent-bridge');
   fs.mkdirSync(bridgeRoot, { recursive: true });
-  const vidnetsRoot = path.join(dir, 'vidnets');
-  fs.mkdirSync(vidnetsRoot, { recursive: true });
-  fs.writeFileSync(path.join(vidnetsRoot, 'VIDNETS_AGENT.sh'), '#!/bin/sh\n');
-  fs.writeFileSync(path.join(dir, 'render-vidnets-linux.js'), '');
   const hookPath = path.join(dir, 'hook.json');
   fs.writeFileSync(hookPath, JSON.stringify({
     enabled: hookEnabled, id: 'vidnets-inbox-watch',
     delivery: { surface: 'side_chat', to: 'fixture-chat' }, script_path: '/fixture/vidnets-inbox-watch.sh'
   }));
-  const hookStatePath = path.join(dir, 'hook-state');
-  fs.mkdirSync(hookStatePath, { recursive: true });
-  fs.writeFileSync(path.join(hookStatePath, 'last-run'), `${Math.floor(Date.now() / 1000)}\n`);
   return {
     dir,
     env: {
-      MUSE_RENDER_COMMAND: `node "${path.join(dir, 'render-vidnets-linux.js')}"`,
       MUSE_REPO_ROOT: dir,
-      MUSE_VIDNETS_ROOT: vidnetsRoot,
       MUSE_INBOX_HOOK_DEFINITION: hookPath,
-      MUSE_INBOX_HOOK_STATE_DIR: hookStatePath,
       VIDZEO_BRIDGE_ROOT: bridgeRoot
     }
   };
@@ -60,18 +46,13 @@ test('OpenRouter keys are detected, external-agent handles are not', () => {
   assert.deepEqual(openRouterKeysPresent({ VIDZEO_OPENROUTER_API_KEY: 'sk-or-x', SCRIPTIT_API_KEY: '' }), ['VIDZEO_OPENROUTER_API_KEY']);
   assert.deepEqual(openRouterKeysPresent({ OPENROUTER_API_KEY: 'external-agent:local-user' }), []);
   assert.deepEqual(openRouterKeysPresent({}), []);
+  assert.throws(() => assertNoOpenRouterKey({ OPENROUTER_API_KEY: 'sk-or-x' }), /Muse inference is compulsory/i);
 });
 
-test('bridge check passes for the production wiring and fails without it', () => {
+test('bridge check passes for valid wiring and fails without inbox or transport', async () => {
   const { env } = bridgeFixture();
   assert.equal(checkMuseInferenceBridge(env).ok, true);
-
-  const noRender = checkMuseInferenceBridge({
-    MUSE_VIDNETS_ROOT: env.MUSE_VIDNETS_ROOT,
-    MUSE_INBOX_HOOK_DEFINITION: env.MUSE_INBOX_HOOK_DEFINITION,
-    VIDZEO_BRIDGE_ROOT: env.VIDZEO_BRIDGE_ROOT
-  });
-  assert.equal(noRender.ok, false);
+  assert.equal((await verifyMuseInferenceBridge(env)).ok, true);
 
   const noInbox = checkMuseInferenceBridge({
     ...env,
@@ -85,21 +66,7 @@ test('bridge check passes for the production wiring and fails without it', () =>
   assert.ok(keySet.failures.some(failure => /OpenRouter/i.test(failure)));
 });
 
-test('doctor rejects a relative Vidnets renderer because jobs execute from their work directory', () => {
-  const { env } = bridgeFixture();
-  const result = checkMuseInferenceBridge({ ...env, MUSE_RENDER_COMMAND: 'node render-vidnets-linux.js' });
-  assert.equal(result.ok, false);
-  assert.ok(result.failures.some(failure => /absolute path/i.test(failure)));
-});
-
-test('stale hook execution proof defers to the live inbox probe', () => {
-  const { env } = bridgeFixture();
-  fs.writeFileSync(path.join(env.MUSE_INBOX_HOOK_STATE_DIR, 'last-run'), `${Math.floor(Date.now() / 1000) - 180}\n`);
-  const result = checkMuseInferenceBridge(env);
-  assert.equal(result.ok, true, JSON.stringify(result.failures));
-});
-
-test('hook placeholders are rejected even when enabled and recently observed', () => {
+test('hook placeholders are rejected even when enabled', () => {
   const { env } = bridgeFixture();
   fs.writeFileSync(env.MUSE_INBOX_HOOK_DEFINITION, JSON.stringify({
     id: 'vidnets-inbox-watch', enabled: true,
@@ -112,191 +79,22 @@ test('hook placeholders are rejected even when enabled and recently observed', (
   assert.ok(result.failures.some(failure => /script_path/i.test(failure)));
 });
 
-test('bridge verification probes the live Vidnets server', async () => {
-  const { env } = bridgeFixture();
-  const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, ffmpeg: true }));
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const port = server.address().port;
-  try {
-    const up = await verifyMuseInferenceBridge({ ...env, MUSE_VIDNETS_URL: `http://127.0.0.1:${port}` });
-    assert.equal(up.ok, true, JSON.stringify(up.failures));
-  } finally {
-    await new Promise(resolve => server.close(resolve));
-  }
-  const down = await verifyMuseInferenceBridge({ ...env, MUSE_VIDNETS_URL: 'http://127.0.0.1:1' });
-  assert.equal(down.ok, false);
-  assert.ok(down.failures.some(failure => /unreachable/i.test(failure)));
-});
-
-test('doctor uses the Vidnets launcher port unless an explicit URL is configured', () => {
-  const { dir } = bridgeFixture();
-  const secure = path.join(dir, 'secure');
-  fs.mkdirSync(secure);
-  fs.writeFileSync(path.join(secure, 'agent-service.json'), '{"port":5017}');
-  assert.equal(vidnetsStatusUrl({ VIDZEO_RUNTIME_ROOT: dir }), 'http://127.0.0.1:5017');
-  assert.equal(vidnetsStatusUrl({ VIDZEO_RUNTIME_ROOT: dir, MUSE_VIDNETS_URL: 'http://localhost:5019/' }), 'http://localhost:5019');
-});
-
-test('Vidnets buildRequest enforces external_agent and refuses an OpenRouter key', () => {
-  const { buildRequest } = require('../adapters/vidnets');
-  const job = { jobId: 'test-job', title: 'Test Title', channel: { name: 'Test', niche: 'Test' }, targetDurationMinutes: 1 };
-  const previous = process.env.OPENROUTER_API_KEY;
-  try {
-    process.env.OPENROUTER_API_KEY = 'sk-or-test-key';
-    assert.throws(() => buildRequest(job, 'Some narration.', '/tmp'), /Muse inference is compulsory/i);
-  } finally {
-    if (previous === undefined) delete process.env.OPENROUTER_API_KEY;
-    else process.env.OPENROUTER_API_KEY = previous;
-  }
-  const previousCoverage = process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
-  let request;
-  try {
-    // Merged invariant (Nov 14, 2026): the YouTube coverage target is 0.30
-    // (docker-compose.yml) — NOT the remote branch's 0.8. Pin the deployed
-    // value explicitly rather than the adapter's unset default.
-    process.env.MUSE_YOUTUBE_COVERAGE_TARGET = '0.30';
-    request = buildRequest(job, 'Some narration.', '/tmp');
-  } finally {
-    if (previousCoverage === undefined) delete process.env.MUSE_YOUTUBE_COVERAGE_TARGET;
-    else process.env.MUSE_YOUTUBE_COVERAGE_TARGET = previousCoverage;
-  }
-  assert.equal(request.llm_provider, 'external_agent');
-  assert.equal(request.openrouter_api_key, '');
-  assert.equal(request.youtube_accepted_coverage_target, 0.3);
-  assert.equal(request.yt_stop_when_coverage_target_met, undefined);
-  assert.equal(request.preparation_stall_seconds, undefined);
-  // Filter-best (Nov 9, 2026): vision is advisory by default — the two
-  // strict flags are OFF, so an uncertain verdict never blocks delivery.
-  // Named-entity scenes still require a live verdict inside the server
-  // (strict_identity), and the delivery rule lives in the wrapper.
-  assert.equal(request.visual_required, false);
-  assert.equal(request.strict_retrieval_accuracy, false);
-  assert.equal(request.visual_understanding, true);
-  assert.equal(request.stock_video_only, false);
-  assert.equal(request.allow_relevant_stock, false);
-  assert.equal(request.allow_stock_last_resort, false);
-  assert.deepEqual(request.media_source_priority, ['youtube', 'web']);
-  assert.equal(request.allow_emergency_media, false);
-  assert.equal(request.allow_grounded_graphic_fallback, true);
-  assert.equal(request.media_fallback_policy, 'grounded_graphic');
-  // MUSE_MEDIA_STRICT=1 restores the old hard-required flags.
-  const savedStrict = process.env.MUSE_MEDIA_STRICT;
-  try {
-    process.env.MUSE_MEDIA_STRICT = '1';
-    const strict = buildRequest(job, 'Some narration.', '/tmp');
-    assert.equal(strict.visual_required, true);
-    assert.equal(strict.strict_retrieval_accuracy, true);
-  } finally {
-    if (savedStrict === undefined) delete process.env.MUSE_MEDIA_STRICT;
-    else process.env.MUSE_MEDIA_STRICT = savedStrict;
-  }
-});
-
-test('video render with no render path throws instead of falling back to Remotion native', async () => {
-  const video = require('../adapters/video');
-  const saved = {};
-  for (const name of ['MUSE_RENDER_COMMAND', 'MUSE_VIDNETS_COMMAND', 'MUSE_VIDNETS_ROOT', 'MUSE_INFERENCE_COMMAND', 'MUSE_INFERENCE_URL']) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
+test('documentary and stickman adapters both refuse OpenRouter keys', async () => {
+  const documentary = require('../adapters/documentary');
+  const stickman = require('../adapters/stickman');
+  const prev = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = 'sk-or-forbidden';
   try {
     await assert.rejects(
-      () => video.render({ jobId: 'test-job', title: 'Test' }, 'Some narration.', '/tmp'),
-      /No Muse-inference render path/i
+      () => documentary.render({ jobId: 'j_doc', productionEngine: 'documentary' }, 'Narration.', os.tmpdir()),
+      /Muse inference is compulsory/i
+    );
+    await assert.rejects(
+      () => stickman.render({ jobId: 'j_stick', productionEngine: 'stickman' }, 'Narration.', os.tmpdir()),
+      /Muse inference is compulsory/i
     );
   } finally {
-    for (const [name, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
+    if (prev === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = prev;
   }
-});
-
-test('real scenes count adapter-accepted media; Muse rejection always wins', () => {
-  const { countRealScenes } = require('../render-vidnets-linux');
-  // Exercise the same one-real, fourteen-graphic case without depending
-  // on a private video package on one particular Muse machine.
-  const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-verified-plan-'));
-  try {
-    const scenes = [{ media: { type: 'video', src: '/tmp/clip.mp4', visual_decision: { visual_checked: true, accepted: true } } }];
-    for (let index = 0; index < 14; index++) scenes.push({ media: { type: 'graphic', src: `/tmp/graphic_fallback_${index}.png` } });
-    fs.writeFileSync(path.join(planDir, 'fixture_remotion_edit_plan.json'), JSON.stringify({ scenes }));
-    const counted = countRealScenes(planDir);
-    assert.ok(counted, 'edit plan should be found');
-    assert.equal(counted.total, 15);
-    assert.equal(counted.real, 1);
-    assert.equal(counted.verified, 1);
-  } finally {
-    fs.rmSync(planDir, { recursive: true, force: true });
-  }
-
-  // Filter-best: a real-looking image with no Muse verdict and no
-  // adapter acceptance still does not count.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-plan-'));
-  fs.writeFileSync(path.join(dir, 'x_remotion_edit_plan.json'), JSON.stringify({
-    scenes: [
-      { media: { type: 'image', src: '/tmp/real.jpg', visual_decision: { visual_checked: false, accepted: true } } },
-      { media: { type: 'graphic', src: '/tmp/graphic_fallback_1.png' } }
-    ]
-  }));
-  const unverified = countRealScenes(dir);
-  assert.equal(unverified.real, 0);
-  assert.equal(unverified.verified, 0);
-  assert.equal(unverified.graphic, 2);
-
-  // A clip the adapter accepted (verified flag, no Muse verdict — the
-  // fail-open path) counts as real, but is not Muse-verified.
-  // An explicitly Muse-rejected clip never counts, even if the flag says
-  // verified.
-  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-plan-'));
-  fs.writeFileSync(path.join(dir2, 'x_remotion_edit_plan.json'), JSON.stringify({
-    scenes: [
-      { media: { type: 'video', src: '/tmp/clip.mp4', verified: true, visual_decision: {} } },
-      { media: { type: 'video', src: '/tmp/clip2.mp4', verified: true, visual_decision: { accepted: false } } },
-      { media: { type: 'graphic', src: '/tmp/graphic_fallback_1.png' } }
-    ]
-  }));
-  const mixed = countRealScenes(dir2);
-  assert.equal(mixed.real, 1);
-  assert.equal(mixed.verified, 0);
-  assert.equal(mixed.graphic, 2);
-
-  assert.equal(countRealScenes(path.join(dir, 'missing')), null);
-  const { completedMediaCoverage } = require('../render-vidnets-linux');
-  assert.throws(() => completedMediaCoverage({ result: {} }, path.join(dir2, 'unrelated.mp4')), /readable edit plan/);
-  assert.deepEqual(completedMediaCoverage({ result: {} }, path.join(dir2, 'x.mp4')), {
-    realScenes: mixed.real, graphicScenes: mixed.graphic, totalScenes: mixed.total, museVerifiedScenes: mixed.verified,
-  });
-});
-
-test('ScriptIT CLI refuses OpenRouter when Muse inference is compulsory', async () => {
-  const cli = path.join(__dirname, '..', 'scriptit', 'cli', 'generate.js');
-  const result = await new Promise(resolve => {
-    // spawn (not execFile): the CLI reads stdin when it is not a TTY, and
-    // an empty execFile `input` does not close stdin on this Node version.
-    const { spawn } = require('node:child_process');
-    const child = spawn(process.execPath, [cli, '--topic', 'Test title'], {
-      env: {
-        ...process.env,
-        MUSE_INFERENCE_COMPULSORY: '1',
-        SCRIPTIT_API_KEY: ' ',
-        SCRIPTIT_OPENROUTER_API_KEY: ' ',
-        OPENROUTER_API_KEY: ' ',
-        VIDZEO_OPENROUTER_API_KEY: 'sk-or-test-key'
-      }
-    });
-    let stdout = '';
-    child.stdout.on('data', chunk => { stdout += chunk.toString(); });
-    child.stdin.end(); // no stdin payload: the CLI must not block on it
-    const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
-    child.on('close', code => {
-      clearTimeout(timer);
-      resolve({ code, stdout });
-    });
-  });
-  assert.notEqual(result.code, 0);
-  assert.match(result.stdout, /Muse inference is compulsory/i);
 });

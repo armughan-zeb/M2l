@@ -1,50 +1,26 @@
 'use strict';
 
 /**
- * Video rendering for a Muse job.
+ * Video rendering router for a Muse job.
  *
- * Muse inference is COMPULSORY. Precedence:
- *   1. MUSE_RENDER_COMMAND - the Muse environment's own renderer
- *      (production: render-vidnets-linux.js — Vidnets + Muse agent-bridge
- *      inbox; the start gate in lib/runtimePolicy.js enforces this).
- *   2. Built-in Vidnets documentary renderer (llm_provider=external_agent).
+ * Strictly isolates the two Muse styles:
+ *   - documentary (one_minute_documentary) -> adapters/documentary.js
+ *   - 2d_stickman (2d-stickman)            -> adapters/stickman.js
  *
- * There is deliberately NO fallback to the native Remotion engine: it
- * fetches no media, asks no Muse inference, and is what made live jobs
- * graphics-only. If no Muse-inference render path is configured, render()
- * throws and the job fails closed instead of silently degrading.
+ * Also supports an explicit MUSE_RENDER_COMMAND override when configured.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { runCommand, parseJsonOutput, quoteArg } = require('../lib/command');
-const config = require('../lib/config');
+const { runCommand, parseJsonOutput } = require('../lib/command');
 const log = require('../lib/log');
 const { registerStageProcess } = require('../lib/stageCleanup');
-const { renderBudgetMs } = require('../lib/vidnetsSubmission');
-const vidnets = require('./vidnets');
+const stickman = require('./stickman');
+const documentary = require('./documentary');
+const { resolveVideoStyle, ENGINES } = require('../lib/videoStyle');
 
-const BUNDLED_RENDER_COMMAND_RE = /^(\s*(?:node|node\.exe)\s+)(?:["'](?:\.\/)?render-vidnets-linux\.js["']|(?:\.\/)?render-vidnets-linux\.js)(?=\s|$)/i;
-
-function resolveRenderCommand(command, root = config.ROOT) {
-  // Job processes run in their own work directory. Resolve only our known
-  // bundled renderer, leaving custom commands and their arguments untouched.
-  return String(command).replace(BUNDLED_RENDER_COMMAND_RE,
-    (_match, prefix) => prefix + quoteArg(path.join(root, 'render-vidnets-linux.js')));
-}
-/**
- * Parse one stderr line from render-vidnets-linux.js into live progress.
- *
- * The wrapper polls Vidnets every few seconds and logs
- *   [render-vidnets] Vidnets 45% — Finding media
- * plus operational lines (inbox pending, re-plan submitted, re-attach).
- * Returns { progress, detail } for a poll line, { progress: null, detail }
- * for other wrapper lines (the caller keeps the last known %), or null
- * for lines from any other renderer — those are ignored, so a different
- * MUSE_RENDER_COMMAND keeps working unchanged.
- */
-const WRAPPER_PROGRESS_RE = /^\[render-vidnets\]\s+Vidnets\s+(\d+)%\s*[—-]\s*(.*)$/;
-const WRAPPER_LINE_RE = /^\[render-vidnets\]\s+(.*)$/;
+const WRAPPER_PROGRESS_RE = /^\[render-[a-z0-9_-]+\]\s+(?:\w+)\s+(\d+)%\s*[—-]\s*(.*)$/i;
+const WRAPPER_LINE_RE = /^\[render-[a-z0-9_-]+\]\s+(.*)$/i;
 
 function parseRenderProgressLine(line) {
   const text = String(line || '').trim();
@@ -85,21 +61,13 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
     outputPath: path.join(workDir, 'video.mp4'),
     requirements: job.requirements || {}
   });
-  // Live progress: the wrapper's per-poll Vidnets stage/% lines arrive on
-  // stderr while the render runs. Stream them into onProgress so the
-  // daemon reports them to the CMS on every poll instead of only
-  // re-sending the stale "Starting the render" line from the keepalive.
-  // The lines are also written to the daemon log, which is where the CMS
-  // progress call's recent-log-lines come from (lib/log.js ring).
   let lastRenderProgress = 0;
-  const bundled = BUNDLED_RENDER_COMMAND_RE.test(command) ||
-    /^\s*(?:node|node\.exe)\s/i.test(command) && command.includes(path.join(config.ROOT, 'render-vidnets-linux.js'));
-  const result = await runCommand(resolveRenderCommand(command), {
+  const timeoutMs = Math.max(60000, Number(process.env.MUSE_RENDER_TIMEOUT_MS) || 60 * 60 * 1000);
+  const result = await runCommand(command, {
     input,
     cwd: workDir,
     signal,
-    // The bundled wrapper follows Vidnets, which supervises the render itself.
-    timeoutMs: bundled ? null : renderBudgetMs(job),
+    timeoutMs,
     label: 'Muse render command',
     onStderrLine: line => {
       const parsed = parseRenderProgressLine(line);
@@ -142,8 +110,14 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
   };
 }
 
-const stickman = require('./stickman');
-const { resolveVideoStyle, ENGINES } = require('../lib/videoStyle');
+function resolveRenderCommand(command, repoRoot = path.resolve(__dirname, '..')) {
+  const raw = String(command || '').trim();
+  if (!raw) return '';
+  return raw.replace(/(^|\s)(\.[\\/][^\s'"]+)/g, (match, prefix, rel) => {
+    const abs = path.resolve(repoRoot, rel);
+    return prefix + (/\s/.test(abs) ? `"${abs}"` : abs);
+  });
+}
 
 async function render(job, scriptText, workDir, options = {}) {
   const style = resolveVideoStyle(job);
@@ -153,29 +127,14 @@ async function render(job, scriptText, workDir, options = {}) {
     return stickman.render(job, scriptText, workDir, options);
   }
 
-  if (style.engine !== ENGINES.VIDZEO) {
+  if (style.engine !== ENGINES.DOCUMENTARY) {
     throw new Error(`Unsupported video engine "${style.engine}" for Muse worker; refusing fallback render.`);
   }
 
-  const command = String(process.env.MUSE_RENDER_COMMAND || '').trim();
+  const command = resolveRenderCommand(process.env.MUSE_RENDER_COMMAND);
   if (command) return runRenderCommand(command, job, scriptText, workDir, options);
 
-  // If external Vidnets launcher is explicitly configured, use it. A
-  // Vidnets failure is terminal: falling back to the native Remotion
-  // engine would render graphics with no media and no Muse inference.
-  if (process.env.MUSE_VIDNETS_COMMAND || process.env.MUSE_VIDNETS_ROOT) {
-    const result = await vidnets.render(job, scriptText, workDir, options);
-    const videoPath = copyIntoWorkDir(result.videoPath, workDir, 'video.mp4');
-    log.info(`Master copied into worker job folder (${Math.round(fs.statSync(videoPath).size / (1024 * 1024))} MB)`);
-    return { ...result, videoPath };
-  }
-
-  throw new Error(
-    'No Muse-inference render path is configured for this job. Set MUSE_RENDER_COMMAND ' +
-    'to render-vidnets-linux.js (Vidnets + Muse agent-bridge inbox) or configure ' +
-    'MUSE_VIDNETS_ROOT with a Muse inference bridge. Refusing to render with the ' +
-    'native Remotion engine: it fetches no media and uses no Muse inference.'
-  );
+  return documentary.render(job, scriptText, workDir, options);
 }
 
 module.exports = { render, copyIntoWorkDir, parseRenderProgressLine, resolveRenderCommand };
