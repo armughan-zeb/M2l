@@ -222,14 +222,12 @@ def test_slow_connect_lands_through_live_path(monkeypatch, tmp_path):
     assert 20.0 <= wall <= 40.0, f"unexpected wall {wall:.1f}s"
 
 
-def test_blackholed_direct_plus_slow_proxy_lands_via_fallback(monkeypatch, tmp_path):
-    """Direct blackholed + proxy slow-connect (25s) lands via fallback.
+def test_blackholed_direct_has_no_proxy_fallback(monkeypatch, tmp_path):
+    """Nov 25 direct-only: a blackholed direct route fails, it does not land.
 
-    The full test-36 shape: the direct route never connects, the proxy
-    route connects slowly. Fails on clean b91060e: direct dies at the
-    10s connect cap, proxy dies at the 10s connect cap -- 0 landed in
-    ~21s. With the fix the direct attempt dies at the 60s cap and the
-    proxy connects at 25s and lands at ~86s, inside the 180s wall.
+    The direct route never connects and there is no proxy leg to fall
+    back to, so nothing lands — but the failure is bounded by the two
+    60 s connect caps inside the batch wall, never an infinite hang.
     """
     monkeypatch.setenv("VIDZEO_NET_RETRIES", "1")
     monkeypatch.setenv("VIDZEO_WEB_DOWNLOAD_DIRECT_RETRY", "1")
@@ -238,8 +236,8 @@ def test_blackholed_direct_plus_slow_proxy_lands_via_fallback(monkeypatch, tmp_p
     _SlowConnectSession.proxy_delay = 25.0
     _install_fake_aiohttp(monkeypatch, _SlowConnectSession)
     landed, wall, res = _run_one(monkeypatch, tmp_path)
-    assert landed == 1, f"blackholed direct + slow proxy did not land (wall {wall:.1f}s, res={res})"
-    assert 70.0 <= wall <= 120.0, f"unexpected wall {wall:.1f}s"
+    assert landed == 0, f"blackholed direct should not land: {res}"
+    assert wall < 150.0, f"blackholed direct did not fail within the caps (wall {wall:.1f}s)"
 
 
 def test_per_request_timeout_carries_connect_sixty(monkeypatch, tmp_path):

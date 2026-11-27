@@ -135,7 +135,8 @@ def test_next_batch_uses_adapted_deadline_after_all_timeout(monkeypatch):
 
     Batch 1 ends empty on both old and new code (engines need longer than
     even the adapted retries — and stay asleep past the batch end, so the
-    late spool cannot rescue it either). The fix records the streak, so
+    late spool cannot rescue it either; the waterfall wall is ~7.5s, so
+    the 12s sleeps stay safely past it). The fix records the streak, so
     batch 2's wave 1 runs at 1.0 * 1.5 = 1.5s and its engines (1.0s)
     complete in wave 1 — and see the adapted 45s fetch timeout. On the
     pre-fix code batch 2's wave 1 is still 1.0s and the factor stays 1.0x.
@@ -143,7 +144,7 @@ def test_next_batch_uses_adapted_deadline_after_all_timeout(monkeypatch):
     _slow_env(monkeypatch)
     seen = []
     engines = {
-        name: _SlowEngine(name, seen, proxy_sleep=7.0, direct_sleep=6.0)
+        name: _SlowEngine(name, seen, proxy_sleep=12.0, direct_sleep=12.0)
         for name in ("yandex", "bing", "flickr")
     }
     manager = _manager(1.0, engines)
@@ -325,13 +326,15 @@ def test_slow_network_factor_caps_at_configured_max(monkeypatch):
 
     The default cap is 1.5x (muse-search design §2.4 — the old 2.0x cap
     grew timeouts to 120–180 s in test 30); this test pins the cap at
-    2x via env to prove the cap itself is honoured.
+    2x via env to prove the cap itself is honoured. The 10s sleeps stay
+    asleep past the waterfall batch wall (~6s at most), so the late spool
+    cannot rescue a batch that must end empty.
     """
     _slow_env(monkeypatch)
     monkeypatch.setenv("VIDZEO_UNIVERSAL_SLOW_NETWORK_MAX_FACTOR", "2")
     seen = []
     engines = {
-        name: _SlowEngine(name, seen, proxy_sleep=5.0, direct_sleep=5.0)
+        name: _SlowEngine(name, seen, proxy_sleep=10.0, direct_sleep=10.0)
         for name in ("yandex", "bing", "flickr")
     }
     # Base 0.5s via timeout_seconds: the constructor floors at 1.0s.

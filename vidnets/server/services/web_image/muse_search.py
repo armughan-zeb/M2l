@@ -31,10 +31,13 @@ rows instead of dying at the first adapter timeout.
 Rules (design ``work/muse-search-web-design.md`` §2, as amended round 4,
 test 31 fix, and round 5, test 32 fix):
 - Wikimedia is the workhorse (500 req/hr unidentified, no daily cap)
-  and the proven primary: proxy first, 55 s adapter timeout (env
-  ``VIDZEO_WIKIMEDIA_TIMEOUT_SECONDS``), every query. The direct
-  route is dead on this egress (Nov 23 live probe: TCP never
-  completes), so no direct retry is attempted by default.
+  and the proven primary: 55 s adapter timeout (env
+  ``VIDZEO_WIKIMEDIA_TIMEOUT_SECONDS``), every query. Nov 25
+  direct-only: its API host (commons.wikimedia.org) is proxy-only —
+  direct TCP never completes — so the adapter fails fast direct and
+  its circuit opens; Openverse (direct) and the universal lane carry
+  the wave. Wikimedia images still download direct from
+  thumb/upload.wikimedia.org when other engines discover them.
 - Round 5: when the first wave ends with 0 rows AND a provider
   recorded a transport failure, the wave retries ONCE under an
   extended deadline (wall + ``VIDZEO_MUSE_SEARCH_RETRY_WALL_SECONDS``,
@@ -45,8 +48,8 @@ test 31 fix, and round 5, test 32 fix):
   just be slow, not absent. A genuine empty answer is never retried.
   Only providers that failed empty are re-run.
 - Openverse is the SECONDARY source (it 504s through the egress
-  proxy, Nov 23 probe): proxy first (env
-  ``VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE``, default ``proxy``), 45 s
+  proxy, Nov 23 probe): direct first (env
+  ``VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE``, default ``direct``), 45 s
   adapter timeout, first query per scene only (``q_idx == 0``), and
   job-budget-gated (anonymous 200/day cap): env
   ``VIDZEO_MUSE_SEARCH_OPENVERSE_JOB_BUDGET``, default 150. Once
@@ -58,12 +61,11 @@ test 31 fix, and round 5, test 32 fix):
   wall the wave resolves with whatever rows arrived; a provider
   still in flight is logged as ``abandoned at wall``, never as a
   0-row instant result.
-- Per-source attempts: 1 on the first route by default. The old
-  alternate-route (direct) retry is gated by env
-  ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY`` (default 0 — direct is dead;
-  re-enable only if the egress recovers) and fires only when the
-  source recorded a failure (a genuine empty answer is never
-  retried).
+- Per-source attempts: 1 on the first route by default. The second
+  direct attempt is gated by env
+  ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY`` (default 0) and fires only when
+  the source recorded a failure (a genuine empty answer is never
+  retried). Nov 25 direct-only: there is no proxy leg to switch to.
 - One wave per distinct query per job: non-empty results are cached
   on the manager (cleared by ``reset_muse_search_job_budget`` at
   job start). Empty results are NEVER cached — a transient empty
@@ -85,12 +87,13 @@ Env knobs (defaults in parentheses):
   old source order without a code change.
 - ``VIDZEO_MUSE_SEARCH_WAVE_SECONDS`` (60): wave wall.
 - ``VIDZEO_MUSE_SEARCH_OPENVERSE_JOB_BUDGET`` (150).
-- ``VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE`` (proxy): first route for
-  Openverse; ``direct`` flips it back.
+- ``VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE`` (direct): first route for
+  Openverse; ``proxy`` would flip it back (proxy is never used for
+  media since Nov 25 direct-only).
 - ``VIDZEO_MUSE_SEARCH_OPENVERSE_GRACE_SECONDS`` (5): extra wait for
   Openverse once Wikimedia already delivered rows, inside the wall.
-- ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY`` (0): 1 re-enables the
-  alternate-route (direct) retry after a recorded failure.
+- ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY`` (0): 1 re-enables the second
+  direct attempt after a recorded failure.
 - ``VIDZEO_WIKIMEDIA_TIMEOUT_SECONDS`` (55): Wikimedia adapter timeout.
 - ``VIDZEO_OPENVERSE_TIMEOUT_SECONDS`` (45): Openverse adapter timeout.
 - ``VIDZEO_MUSE_SEARCH_RETRY_WALL_SECONDS`` (60): extra wall for one
@@ -150,19 +153,21 @@ def muse_search_openverse_job_budget() -> int:
 
 
 def muse_search_openverse_direct_first() -> bool:
-    # Round 4: proxy-first is the default — live probes (Nov 23) show
-    # direct TCP never completes on this egress, so direct-first burns
-    # the whole adapter timeout on a dead route before proxy is tried.
-    route = os.environ.get("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", "").strip().lower()
-    return route != "proxy" if route else web_direct_first()
+    # Nov 25 direct-only (user order): media retrieval never uses the
+    # egress proxy. Openverse answers direct (live Nov 25: 302 in 1.7s),
+    # so direct is the default route now; the env override still exists
+    # for a deployment that must go back through a proxy.
+    return str(
+        os.environ.get("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", "direct") or "direct"
+    ).strip().lower() != "proxy"
 
 
 def muse_search_direct_retry_enabled() -> bool:
-    """Alternate-route (direct) retry after a recorded failure.
+    """Second direct attempt after a recorded failure.
 
-    Round 4: default OFF. Direct egress is dead (Nov 23 live probe),
-    so retrying on it is pure waste. Re-enable with
-    ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY=1`` only if direct recovers.
+    Nov 25 direct-only: the retry re-attempts direct (there is no proxy
+    leg). Default OFF: one direct attempt per provider per wave; the
+    resolver retries the lane separately after a failure.
     """
     configured = os.environ.get("VIDZEO_MUSE_SEARCH_DIRECT_RETRY", "").strip().lower()
     return configured in {"1", "true", "yes", "on"} if configured else web_direct_first()
@@ -452,12 +457,11 @@ class MuseSearchManager:
         empty result came from a recorded provider failure (timeout /
         transport error) rather than a genuine empty answer — the wave's
         transport retry (round 5) fires only on that flag. A genuine
-        empty answer is never retried. The alternate-route (direct)
-        retry fires only when the source recorded a failure AND direct
-        retry is enabled (env ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY``,
-        default off — direct egress is dead, Nov 23 probe — so a
-        second attempt on it would burn a whole adapter timeout for
-        nothing).
+        empty answer is never retried. Nov 25 direct-only: every attempt
+        runs direct; there is no proxy leg. The second attempt re-tries
+        direct and is gated by the direct-retry flag (env
+        ``VIDZEO_MUSE_SEARCH_DIRECT_RETRY``, default off).
+        ``direct_first`` is kept for signature compatibility.
         """
         source = (
             self.wikimedia_source if provider == "wikimedia"
@@ -471,7 +475,8 @@ class MuseSearchManager:
         started = time.monotonic()
         route = "direct" if direct_first else "proxy"
         for attempt in range(2):
-            direct = direct_first if attempt == 0 else not direct_first
+            # Nov 25 direct-only: no proxy leg; the retry re-attempts direct.
+            direct = True
             route = "direct" if direct else "proxy"
             failures_before = int(getattr(source, "_failure_count", 0) or 0)
             try:
@@ -497,8 +502,8 @@ class MuseSearchManager:
             if attempt == 0 and direct_retry:
                 time.sleep(0.5)
                 continue
-            # Failure recorded but the alternate-route retry is off
-            # (direct is dead): one attempt is all this wave spends.
+            # Failure recorded but the retry is off: one attempt is all
+            # this wave spends.
             return provider, [], time.monotonic() - started, route, attempt + 1, True
         return provider, [], time.monotonic() - started, route, 2, True
 
@@ -619,7 +624,7 @@ class MuseSearchManager:
                 if "wikimedia" in providers:
                     wikimedia_future = phase_pool.submit(
                         self._search_one, "wikimedia", clean, limit_per_source,
-                        direct_first=wikimedia_direct_first, timeout=timeout,
+                        direct_first=True, timeout=timeout,
                     )
                     futures[wikimedia_future] = "wikimedia"
                     submitted.add("wikimedia")

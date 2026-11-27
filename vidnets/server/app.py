@@ -10985,6 +10985,31 @@ def _mixed_media_pool_first_enabled(config, scene_count, env_value=None):
     return bool(value)
 
 
+def _yt_stage_allocation_log(config, yt_wall_seconds, cooldown_wall=None):
+    """Format the YouTube stage-allocation log line.
+
+    Must never raise: a log line must not kill the lane it describes.
+    The Nov 26 no-timeout change removed ``yt_hard_timeout_seconds``
+    from the published stage budget, but the old inline print indexed
+    it directly — ``KeyError: 'yt_hard_timeout_seconds'`` killed the
+    whole YouTube lane in job 70d7f583 before a single clip was
+    attempted (web 7 / YT 0 / graphics 1). Values are read with .get()
+    and the first-wave fragment is shown only when a wall is set.
+    """
+    try:
+        search = float((config or {}).get('yt_search_timeout_seconds') or 0.0)
+        first_wave = (config or {}).get('yt_hard_timeout_seconds')
+        first_wave = float(first_wave) if first_wave else None
+        cooldown = float(cooldown_wall) if cooldown_wall else None
+        outer = float(yt_wall_seconds)
+    except (TypeError, ValueError):
+        return "   [yt] stage allocation: (unavailable)"
+    first_wave_log = f", first wave<={first_wave:.0f}s" if first_wave else ""
+    cooldown_log = f", with cooldown<={cooldown:.0f}s" if cooldown else ""
+    return (f"   [yt] stage allocation: search<={search:.0f}s, "
+            f"outer={outer:.0f}s{first_wave_log}{cooldown_log}")
+
+
 def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, script, progress_callback=None, cancellation=None, prep_manifest_title=None):
     if config.get('muse_media_mode') == 'web-only':
         return [None] * len(scene_texts)
@@ -11198,13 +11223,18 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
     # high-quality clips are not cancelled while they are still merging.
     _quality_ratio = max(0.0, (float(_yt_quality_height) - 1080.0) / 1080.0)
     _quality_socket_timeout = max(30, min(60, int(round(45.0 + (10.0 * _quality_ratio)))))
-    _quality_retries = max(3, min(6, int(round(4.0 + _quality_ratio))))
-    _quality_fragment_retries = max(3, min(6, int(round(4.0 + _quality_ratio))))
+    # Nov 26 (user order): yt-dlp retries raised 4 -> 10 so a throttled-
+    # but-alive transfer retries instead of dying on transient read
+    # timeouts. The per-clip value below is planning-only now (it feeds
+    # the download-slot reserve); it no longer kills a download.
+    _quality_retries = max(8, min(12, int(round(10.0 + _quality_ratio))))
+    _quality_fragment_retries = max(8, min(12, int(round(10.0 + _quality_ratio))))
     # Mixed Media only asks YouTube for a small quota of short ranged clips.
-    # A six-minute per-clip ceiling made one stalled candidate hold the entire
-    # web/image branch hostage. Keep YouTube-only quality jobs on their
-    # existing generous budget, while giving the mixed lane a bounded,
-    # still-generous transfer window.
+    # The value below used to be the per-clip kill wall; since Nov 26 it is
+    # only the planning reserve for the download slot (see
+    # _yt_download_slot_seconds). Keep YouTube-only quality jobs on their
+    # existing generous reserve, while giving the mixed lane a bounded,
+    # still-generous planning window.
     if _mixed_media_job and not long_youtube_job:
         _quality_clip_timeout = max(120, min(240, int(round(150.0 + (60.0 * _quality_ratio)))))
     else:
@@ -12022,12 +12052,7 @@ def _run_youtube_clips_branch(scene_texts, scene_durations, config, title, scrip
         if config.get('yt_per_clip_timeout_seconds'):
             yt_environment['VIDZEO_YT_PER_CLIP_TIMEOUT'] = str(config['yt_per_clip_timeout_seconds'])
         cooldown_wall = stage_budget.get('yt_cooldown_hard_timeout_seconds')
-        cooldown_log = f", with cooldown<={cooldown_wall:.0f}s" if cooldown_wall else ""
-        clip_wall = stage_budget.get('yt_per_clip_timeout_seconds')
-        clip_log = f", clip transport<={clip_wall:.0f}s" if clip_wall else ""
-        print(f"   [yt] stage allocation: search<={config['yt_search_timeout_seconds']:.0f}s, "
-              f"first wave<={config['yt_hard_timeout_seconds']:.0f}s{cooldown_log}{clip_log}, "
-              f"planned download workers={planned_download_workers}, outer={yt_wall_seconds:.0f}s")
+        print(_yt_stage_allocation_log(config, yt_wall_seconds, cooldown_wall))
         # A ThreadPoolExecutor timeout only releases the caller; Python cannot
         # kill a worker thread that is blocked in a provider library. Production
         # runs therefore isolate YouTube in a child process and taskkill its

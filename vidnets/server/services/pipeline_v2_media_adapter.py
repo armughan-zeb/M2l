@@ -5386,6 +5386,11 @@ def resolve_existing_provider_branches_v2(
     # candidates alive until FFmpeg/overlay/visual gates inspect them. Hard
     # package, caption, and subject-mismatch blockers still reject upstream.
     config["yt_stop_on_soft_timeout"] = False
+    # Same for the coverage stop: the primary lane must run to completion
+    # (every quota scene resolved or its candidates exhausted) so the
+    # recovery lane can retry a rejected primary with exclusions. Stopping
+    # early on coverage strands the recovery wave before it starts.
+    config["yt_stop_when_coverage_target_met"] = False
     # Preserve the Mixed Media policy.  The app disables same-source reuse so
     # a real YouTube pool is distributed as distinct cuts; forcing this back
     # to True here made the coordinator collapse the pool into one clip plus
@@ -5540,6 +5545,16 @@ def resolve_existing_provider_branches_v2(
         youtube_discovery_budget_seconds, tail_seconds=youtube_media_tail_seconds,
     )
     if primary_youtube_scene_indices:
+        # The YT lane's own hard wall (when the job config carries one)
+        # bounds clip production: verification must stay open through that
+        # wall plus the vision reserve, or clips landing at the wall are
+        # discarded unverified. The merged stage budget publishes no hard
+        # wall (no-timeout order), so this is a no-op for configs that do
+        # not carry one.
+        try:
+            _yt_hard_wall_seconds = float(config.get("yt_hard_timeout_seconds") or 0.0)
+        except (TypeError, ValueError):
+            _yt_hard_wall_seconds = 0.0
         if config.get("muse_clip_job_id"):
             from .pc_youtube_clips import relay_branch_seconds
             transport_window = relay_branch_seconds(len(primary_youtube_scene_indices))
@@ -5549,6 +5564,7 @@ def resolve_existing_provider_branches_v2(
             transport_window = max(
                 _effective_mixed_youtube_branch_wall_seconds(deadline_config),
                 mixed_agent_cooldown_wall(config),
+                _yt_hard_wall_seconds,
             )
         else:
             from .delivery_budget import get_delivery_budget
@@ -5564,6 +5580,7 @@ def resolve_existing_provider_branches_v2(
                         delivery_budget.render_reserve_seconds + deadline_config["vision_reserve_seconds"]
                     ),
                 )
+            transport_window = max(transport_window, _yt_hard_wall_seconds)
         deadline_config["_youtube_transport_window_seconds"] = transport_window
         youtube_verification_deadline_seconds = max(
             youtube_verification_deadline_seconds,
@@ -5629,10 +5646,10 @@ def resolve_existing_provider_branches_v2(
         if not pool_queries:
             return
         pool_run_config = dict(pool_lane_config)
-        pool_run_config["yt_soft_timeout_seconds"] = youtube_discovery_budget_seconds
-        pool_run_config["yt_stop_on_soft_timeout"] = True
-        pool_run_config["yt_min_resolved_ratio_before_soft_stop"] = 0.0
-        pool_run_config["yt_hard_timeout_seconds"] = youtube_discovery_hard_seconds
+        # Nov 26 (user order): no wall-clock stop on the YouTube lane — no
+        # soft/hard timeout is passed any more. The pool builds until its
+        # queries are done or its candidates are exhausted, not until a
+        # clock fires.
         pool_run_config["yt_max_download_scenes"] = len(pool_queries)
         pool_output_dir = str(
             Path(str(config.get("_run_temp_dir") or config.get("output_dir") or "output"))
@@ -5716,6 +5733,12 @@ def resolve_existing_provider_branches_v2(
             f"{len(youtube_scene_indices)}/{len(scenes)} quota scenes",
         )
         lane_config = dict(config)
+        # Two-track discovery: the YouTube branch runs beside web discovery
+        # until its work is done. Nov 26 (user order): no soft/hard timeout
+        # is passed any more — the lane ends when every quota scene is
+        # resolved or its candidates are exhausted, not when a clock fires.
+        # Start Track B (general pool) now so it builds in parallel with
+        # Track A.
         _start_general_pool_build(lane_config)
         if broad_anchor and provider_topic_title != valid_topic_anchor:
             # The provider reads this field ahead of its title argument.
@@ -7224,7 +7247,28 @@ def resolve_existing_provider_branches_v2(
         # coordinator can try a fresh, already screened still when the
         # primary candidate's final visual gate rejects it.
         candidate_rows = [primary_row]
-        alternate_rows = row.get("alternates") or []
+        # The resolver keeps its downloaded shortlist on the winner row as
+        # ``_vision_shortlist``; the streaming path never attaches the
+        # manifest ``alternates`` list, so without this the coordinator saw
+        # exactly one candidate per scene and any vision reject forced a
+        # full new search round (job 6ea1b5e9: pool=1, alternates=[] on all
+        # 8 scenes). Merge both sources, deduped by path, so the existing
+        # expansion path can retry an already-downloaded still first.
+        alternate_rows = list(row.get("alternates") or [])
+        for _short in (row.get("_vision_shortlist") or []):
+            if isinstance(_short, Mapping):
+                alternate_rows.append(_short)
+        _seen_alt_paths = {str(path)}
+        _deduped_alternates = []
+        for _alt in alternate_rows:
+            if not isinstance(_alt, Mapping):
+                continue
+            _alt_path = str(_alt.get("path") or "").strip()
+            if not _alt_path or _alt_path in _seen_alt_paths:
+                continue
+            _seen_alt_paths.add(_alt_path)
+            _deduped_alternates.append(_alt)
+        alternate_rows = _deduped_alternates
         if isinstance(alternate_rows, (list, tuple)):
             for alt_index, alternate in enumerate(alternate_rows[:8], start=1):
                 if not isinstance(alternate, Mapping):
@@ -8427,10 +8471,14 @@ def resolve_existing_provider_branches_v2(
         "media_deadline_seconds": round(float(media_deadline_seconds), 3),
         "web_recovery_grace_seconds": round(float(web_recovery_grace_seconds), 3),
         # Two-track YouTube discovery: the discovery budget (5 min per
-        # minute of video, downloads exempt) and the Track B general pool
+        # minute of video, planning value only since Nov 26 — no wall-clock
+        # stop is passed to the lane any more) and the Track B general pool
         # as it stood when the media plan was built. Pool entries are
         # summarized without absolute paths or signed URLs.
         "youtube_discovery_budget_seconds": round(float(youtube_discovery_budget_seconds), 3),
+        # Bounded total media time (test-18 long-tail guard): discovery
+        # budget + post-discovery tail; no post-discovery vision starts
+        # past this total from resolve start.
         "youtube_discovery_hard_seconds": round(float(youtube_discovery_hard_seconds), 3),
         # Review windows include the time needed for provider publication.
         "youtube_media_tail_seconds": round(float(youtube_media_tail_seconds), 3),

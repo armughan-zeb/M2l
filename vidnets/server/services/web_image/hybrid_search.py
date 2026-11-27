@@ -159,19 +159,16 @@ def _download_direct_first_hosts() -> set:
 
 
 def _download_route_order(host: str, direct_allowed: bool = True) -> List[str]:
-    """Attempt order for one image download: [first, second].
+    """Attempt order for one image download: direct only (Nov 25 direct-only).
 
-    Direct-capable hosts try direct first with the proxy as fallback;
-    every other host tries the proxy first with direct as fallback. When
-    direct is disabled the download retries via the proxy with a fresh
-    budget (round 6: the proxy is the only route then).
+    Owner order Nov 25: media retrieval never uses the egress proxy.
+    Every host downloads direct; there is no proxy leg. ``direct_allowed``
+    and the direct-first host set are kept for signature compatibility
+    and are now ignored: a host whose direct route is dead fails the
+    download, and the scene falls to its next candidate (a single bad
+    image never blocks a render).
     """
-    host = str(host or "").strip().lower()
-    if not direct_allowed:
-        return ["proxy", "proxy"]
-    if web_direct_first() or host in _download_direct_first_hosts():
-        return ["direct", "proxy"]
-    return ["proxy", "direct"]
+    return ["direct"]
 
 
 class DownloadLimiter:
@@ -1161,14 +1158,10 @@ async def _download_bulk_async(
                 path = output_dir / f"img_{uh}_{ts}{ext}"
                 last_error = ""
                 host = urlparse(url).netloc.lower()
-                # Round 6: per-host route order (see _download_route_order).
-                # Direct-capable hosts try direct first with the proxy as
-                # fallback; all other hosts try the proxy first with direct
-                # as fallback. A transport failure (timeout / connection
-                # error) moves to the next route with a fresh budget; a
-                # refusal (403/429) on one route also tries the other route
-                # once — a 429 may be egress-IP-specific, and the other
-                # route has repeatedly answered 200 for the same URL.
+                # Nov 25 direct-only (see _download_route_order): every
+                # attempt downloads direct; there is no proxy leg. A
+                # transport failure (timeout / connection error) retries
+                # direct with a fresh budget; a 429 retries direct too.
                 routes = _download_route_order(host, direct_retry_enabled)
                 retry_statuses = {408, 425, 429, 500, 502, 503, 504}
                 if batch_deadline <= time.monotonic():
@@ -1238,12 +1231,10 @@ async def _download_bulk_async(
                                     last_error = f"HTTP {resp.status}"
                                     if resp.status == 429:
                                         if attempt < max_attempts - 1:
-                                            # Round 6: a 429 on one route may be
-                                            # egress-IP-specific — the other
-                                            # route has answered 200 for the
-                                            # same URL. Fall through to it; the
-                                            # defer below applies only once
-                                            # both routes have refused.
+                                            # Nov 25 direct-only: a 429 is
+                                            # retried direct; there is no other
+                                            # route. The defer below applies
+                                            # only once attempts are exhausted.
                                             pass
                                         else:
                                             try:

@@ -94,7 +94,11 @@ class _FakeEngine:
         ]
 
 
-def test_manager_fans_out_and_interleaves_results():
+def test_manager_waterfall_runs_engines_in_priority_order_and_interleaves():
+    """Yandex-first waterfall (Nov 26 user order): engines run one at a
+    time in priority order, not all at once, and the batch stops as soon
+    as the merged rows reach limit_per_engine.  With limit 6 and 2 rows
+    per engine, all three run and their rows interleave round-robin."""
     manager = UniversalScraperManager(max_workers=3, engine_timeout_seconds=2)
     manager._engines = {
         "one": _FakeEngine("one", delay=0.12, rows=2),
@@ -102,11 +106,27 @@ def test_manager_fans_out_and_interleaves_results():
         "three": _FakeEngine("three", delay=0.12, rows=2),
     }
     started = time.perf_counter()
-    response = manager.search("Apollo 11", engine_ids=["one", "two", "three"], limit_per_engine=2)
+    response = manager.search("Apollo 11", engine_ids=["one", "two", "three"], limit_per_engine=6)
     elapsed = time.perf_counter() - started
-    assert elapsed < 0.30
+    assert elapsed < 0.60
     assert response.total == 6
     assert [row.source_engine for row in response.results[:3]] == ["one", "two", "three"]
+    assert all(stat.success for stat in response.stats)
+
+
+def test_manager_waterfall_stops_when_first_engine_satisfies_limit():
+    """The later engines are fallbacks, not co-runners: when the first
+    engine already returns limit rows, the rest never run."""
+    manager = UniversalScraperManager(max_workers=3, engine_timeout_seconds=2)
+    manager._engines = {
+        "one": _FakeEngine("one", rows=2),
+        "two": _FakeEngine("two", rows=2),
+        "three": _FakeEngine("three", rows=2),
+    }
+    response = manager.search("Apollo 11", engine_ids=["one", "two", "three"], limit_per_engine=2)
+    assert response.total == 2
+    assert all(row.source_engine == "one" for row in response.results)
+    assert [stat.engine for stat in response.stats] == ["one"]
     assert all(stat.success for stat in response.stats)
 
 
@@ -116,11 +136,13 @@ def test_manager_keeps_partial_success_when_one_engine_fails():
         "good": _FakeEngine("good", rows=2),
         "bad": _FakeEngine("bad", fail=True),
     }
-    response = manager.search("royal family", engine_ids=["good", "bad"], limit_per_engine=2)
+    # Waterfall (Nov 26): the failing engine runs first and fails fast;
+    # the good engine is the fallback that still delivers.
+    response = manager.search("royal family", engine_ids=["bad", "good"], limit_per_engine=2)
     assert response.total == 2
-    assert response.stats[0].success is True
-    assert response.stats[1].success is False
-    assert "unavailable" in response.stats[1].error
+    assert response.stats[0].success is False
+    assert "unavailable" in response.stats[0].error
+    assert response.stats[1].success is True
 
 
 def test_no_duckduckgo_in_live_web_engine_set():
@@ -195,10 +217,11 @@ def test_is_bot_gate_error_matches_known_challenge_messages():
 
 
 def test_bot_gated_engine_is_skipped_until_its_reprobe_window():
-    # DuckDuckGo bot-gates once (its 202 anomaly interstitial). The manager
-    # must not pay its retry/timeout budget again on the next scene — but
-    # the skip is now 300s with a halfway re-probe, not a whole-run ban
-    # (GTA fix, Nov 16). An immediate second search still skips it.
+    # Waterfall (Nov 26): Yandex must come up short for the gated engine
+    # to be attempted at all. Yandex returns nothing here, so DuckDuckGo
+    # is tried once (and gates itself); the skip is now 300s with a
+    # halfway re-probe, not a whole-run ban (GTA fix, Nov 16). An
+    # immediate second search still skips it.
     calls = {"duckduckgo": 0, "yandex": 0}
 
     class BotGatedEngine(_FakeEngine):
@@ -216,16 +239,16 @@ def test_bot_gated_engine_is_skipped_until_its_reprobe_window():
 
     manager = UniversalScraperManager(max_workers=2, engine_timeout_seconds=2)
     manager._engines = {
-        "yandex": CountingEngine("yandex", rows=1),
+        "yandex": CountingEngine("yandex", rows=0),
         "duckduckgo": BotGatedEngine("duckduckgo"),
     }
     first = manager.search("train wheel", engine_ids=["yandex", "duckduckgo"], limit_per_engine=1)
-    assert first.total == 1
+    assert first.total == 0
     assert calls == {"duckduckgo": 1, "yandex": 1}
     second = manager.search(
         "train wheel flange", engine_ids=["yandex", "duckduckgo"], limit_per_engine=1
     )
-    assert second.total == 1
+    assert second.total == 0
     # DuckDuckGo was not called again; Yandex still runs.
     assert calls == {"duckduckgo": 1, "yandex": 2}
     assert all(stat.engine != "duckduckgo" for stat in second.stats)
@@ -255,30 +278,31 @@ def test_http_403_refusal_is_cooled_down_without_disabling_provider_for_15_minut
 def test_ordinary_engine_failure_is_not_sticky():
     # A transport failure (not a bot challenge) must not disable the engine
     # for the rest of the run; it may recover on the next scene.
+    # Waterfall (Nov 26): the failing engine runs first so its failure is
+    # exercised; the good engine is the fallback that still delivers.
     manager = UniversalScraperManager(max_workers=2, engine_timeout_seconds=2)
     manager._engines = {
         "good": _FakeEngine("good", rows=1),
         "bad": _FakeEngine("bad", fail=True),
     }
-    manager.search("royal family", engine_ids=["good", "bad"], limit_per_engine=1)
-    second = manager.search("royal family", engine_ids=["good", "bad"], limit_per_engine=1)
+    manager.search("royal family", engine_ids=["bad", "good"], limit_per_engine=1)
+    second = manager.search("royal family", engine_ids=["bad", "good"], limit_per_engine=1)
     assert any(stat.engine == "bad" and not stat.success for stat in second.stats)
 
 
-def test_manager_converts_future_timeout_into_partial_response(monkeypatch):
-    # Staggered deadlines (Area 6, Nov 16): the second engine's deadline
-    # is the base timeout plus one stagger step, so a 1.4s engine still
-    # times out against a 1.0s base + 0.2s stagger = 1.2s deadline — but
-    # an engine that merely needed longer than the FIRST engine's wall
-    # no longer dies with it.
-    monkeypatch.setenv("VIDZEO_UNIVERSAL_ENGINE_STAGGER_SECONDS", "0.2")
+def test_manager_converts_future_timeout_into_partial_response():
+    # Waterfall (Nov 26): the slow engine runs first and times out against
+    # the base timeout; the good engine is the fallback that still
+    # delivers, so the batch is a partial response, not a failure. The
+    # stagger no longer applies to the main wave — each engine gets the
+    # base timeout alone.
     manager = UniversalScraperManager(max_workers=2, engine_timeout_seconds=1)
     manager._engines = {
         "good": _FakeEngine("good", rows=1),
         "slow": _FakeEngine("slow", delay=1.4, rows=1),
     }
     response = manager.search(
-        "royal family", engine_ids=["good", "slow"], limit_per_engine=1, timeout_seconds=1
+        "royal family", engine_ids=["slow", "good"], limit_per_engine=1, timeout_seconds=1
     )
     assert response.total == 1
     assert any(stat.engine == "slow" and not stat.success and "timeout" in stat.error for stat in response.stats)

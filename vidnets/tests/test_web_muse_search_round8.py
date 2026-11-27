@@ -244,6 +244,7 @@ class _RouteSession:
     proxy session (trust_env=True) always lands fast."""
 
     direct_mode = "fail"
+    direct_calls = 0
 
     def __init__(self, **kwargs):
         self.trust_env = kwargs.get("trust_env")
@@ -259,6 +260,13 @@ class _RouteSession:
         if self.trust_env is False:
             if self.direct_mode == "hang":
                 return _HangResponse(timeout)
+            if self.direct_mode == "fail_once":
+                # Nov 25 direct-only: direct fails at once on attempt 1,
+                # then lands on the direct retry (no proxy leg any more).
+                type(self).direct_calls += 1
+                if type(self).direct_calls == 1:
+                    return _FailingResponse(timeout)
+                return _FastResponse()
             return _FailingResponse(timeout)
         return _FastResponse()
 
@@ -283,19 +291,19 @@ def _fresh_limiter(monkeypatch):
     )
 
 
-def test_route_fallback_runs_despite_net_retries_1(monkeypatch, tmp_path):
-    """With NET_RETRIES=1 the proxy fallback still runs.
+def test_retry_runs_despite_net_retries_1(monkeypatch, tmp_path):
+    """Nov 25 direct-only: with NET_RETRIES=1 the retry still runs.
 
-    Direct fails at once; the proxy lands. Fails on 93a5f96:
-    max_attempts = min(2, 1) = 1, so the URL dies on the direct
-    failure and the proxy is never tried — test 35's connect-error
-    URLs, where the direct-first CDN host never fell back.
+    Direct fails at once on attempt 1; the retry (direct again — no
+    proxy leg) lands. Fails on 93a5f96: max_attempts = min(2, 1) = 1,
+    so the URL dies on the direct failure and is never retried.
     """
     from services.web_image import hybrid_search, resolver
 
     monkeypatch.setenv("VIDZEO_NET_RETRIES", "1")
     monkeypatch.setenv("VIDZEO_WEB_DOWNLOAD_DIRECT_RETRY", "1")
-    _RouteSession.direct_mode = "fail"
+    _RouteSession.direct_mode = "fail_once"
+    _RouteSession.direct_calls = 0
     _install_fake_aiohttp(monkeypatch, _RouteSession)
     _fresh_limiter(monkeypatch)
     res = resolver._download_candidate_batch(
@@ -304,7 +312,7 @@ def test_route_fallback_runs_despite_net_retries_1(monkeypatch, tmp_path):
         download_cache={}, download_cache_lock=threading.Lock(),
     )
     landed = sum(1 for _u, p, _e in res if p and Path(p).is_file())
-    assert landed == 1, f"proxy fallback did not run under NET_RETRIES=1: {res}"
+    assert landed == 1, f"direct retry did not run under NET_RETRIES=1: {res}"
 
 
 def test_per_request_timeout_includes_connect_timeout(monkeypatch, tmp_path):
@@ -336,16 +344,13 @@ def test_per_request_timeout_includes_connect_timeout(monkeypatch, tmp_path):
         )
 
 
-def test_hung_connect_fails_fast_then_proxy_lands(monkeypatch, tmp_path):
-    """A SYN-blackholed direct connect fails at ~60 s, proxy lands.
+def test_hung_connect_fails_fast_with_no_proxy_fallback(monkeypatch, tmp_path):
+    """Nov 25 direct-only: a SYN-blackholed direct connect fails bounded.
 
-    Direct hangs; the proxy lands fast. Round 9 (test 36): the 10s
-    connect cap that used to fail this fast killed every slow-but-alive
-    connect in the job, so the default is now 60s (half the 120s total)
-    -- a hung connect costs up to 60s, then the proxy lands inside the
-    180s batch wall. This test pins the NEW behavior (it passes on the
-    old 10s cap too, faster -- the round-9 tests carry the
-    fail-on-clean proof that 10s kills slow connects).
+    Direct hangs on both attempts; each dies at the 60 s connect cap
+    and there is no proxy leg to land on, so nothing lands — but the
+    failure is bounded by the caps (two ~60 s hangs inside the batch
+    wall), never an infinite hang.
     """
     from services.web_image import hybrid_search, resolver
 
@@ -363,8 +368,8 @@ def test_hung_connect_fails_fast_then_proxy_lands(monkeypatch, tmp_path):
     )
     wall = time.monotonic() - t0
     landed = sum(1 for _u, p, _e in res if p and Path(p).is_file())
-    assert landed == 1, f"hung direct + proxy fallback did not land: {res}"
-    assert wall < 90.0, f"hung connect did not fail within the 60s cap (wall {wall:.1f}s)"
+    assert landed == 0, f"hung direct should not land with no proxy leg: {res}"
+    assert wall < 150.0, f"hung connect did not fail within the caps (wall {wall:.1f}s)"
 
 
 def test_connect_timeout_default_is_sixty(monkeypatch):

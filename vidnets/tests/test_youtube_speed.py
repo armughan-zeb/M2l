@@ -38,8 +38,12 @@ def _clear_info_cache():
 
 def test_player_clients_anonymous_uses_android(monkeypatch):
     monkeypatch.delenv("VIDZEO_YT_PLAYER_CLIENTS", raising=False)
-    assert ytv2._youtube_player_clients(None) == ["android"]
-    assert ytv2._youtube_player_clients() == ["android"]
+    assert ytv2._youtube_player_clients(None) == [
+        "android", "web_embedded", "web_creator", "mweb",
+    ]
+    assert ytv2._youtube_player_clients() == [
+        "android", "web_embedded", "web_creator", "mweb",
+    ]
 
 
 def test_player_clients_authenticated_uses_authed_defaults(monkeypatch):
@@ -48,11 +52,13 @@ def test_player_clients_authenticated_uses_authed_defaults(monkeypatch):
     with mock.patch.object(
         ytv2, "_adapt_youtube_cookie_jar", return_value=object()
     ):
-        # web_embedded was dropped (run 4): its embed-page ytcfg path
-        # raises raw KeyError('INNERTUBE_CONTEXT') in yt-dlp 2026.10.26
-        # and aborts the whole extraction instead of falling through.
+        # Nov 26 (Test 21 recipe, c5133b4): android-first multi-client
+        # list. web_embedded stays in the list — android leads, so it
+        # is rarely reached, and _youtube_failure_is_rotatable treats
+        # its KeyError('INNERTUBE_CONTEXT') as rotatable (the run-4
+        # abort was a single-list extraction with no rotation loop).
         assert ytv2._youtube_player_clients(jar) == [
-            "web", "tv_samsung",
+            "android", "web", "web_embedded", "web_creator", "mweb",
         ]
 
 

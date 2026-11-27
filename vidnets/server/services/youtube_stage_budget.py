@@ -3,6 +3,17 @@ import math
 import os
 
 
+def youtube_clip_grace_seconds(transfer_seconds):
+    """Use the same merge and verification allowance in the planner and worker."""
+    try:
+        configured = float(os.environ.get("VIDZEO_YT_CLIP_GRACE_SECONDS") or 0)
+    except (TypeError, ValueError):
+        configured = 0.0
+    if math.isfinite(configured) and configured > 0:
+        return max(15.0, min(120.0, configured))
+    return max(20.0, min(90.0, transfer_seconds * 0.25))
+
+
 def mixed_agent_cooldown_wall(config, environment=None):
     env = os.environ if environment is None else environment
     if (
@@ -16,17 +27,6 @@ def mixed_agent_cooldown_wall(config, environment=None):
         return max(0.0, min(1800.0, float(env.get('VIDZEO_MIXED_YT_AGENT_WALL_CAP_SECONDS', '1200') or 1200)))
     except (TypeError, ValueError):
         return 1200.0
-
-
-def youtube_clip_grace_seconds(transfer_seconds):
-    """Use the same merge and verification allowance in the planner and worker."""
-    try:
-        configured = float(os.environ.get("VIDZEO_YT_CLIP_GRACE_SECONDS") or 0)
-    except (TypeError, ValueError):
-        configured = 0.0
-    if math.isfinite(configured) and configured > 0:
-        return max(15.0, min(120.0, configured))
-    return max(20.0, min(90.0, transfer_seconds * 0.25))
 
 
 def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_workers=1, vision_reserve_seconds=None):
@@ -60,11 +60,19 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
     # 20% made the 150s mixed-media cap unusable for the three transfer waves
     # required by a 60% clip target on short films.
     internal = max(1.0, wall - min(18.0, wall * 0.10))
-    # Deduct global review headroom once from the outer window, then apply
-    # the already-computed first-wave cap. Subtracting it from that cap too
-    # turned a 480s first wave into 180s inside a 1200s job.
-    transport_wall = max(min(60.0, internal), internal - vision_reserve)
-    hard = min(transport_wall, positive(settings.get('yt_hard_timeout_seconds'), transport_wall))
+    # Nov 26 (user order: remove every timeout that stops a download): the
+    # stage budget no longer publishes a hard wall or a per-clip ceiling.
+    # ``internal`` below is planning input only (search ceiling, wave
+    # sizing) — it never stops a download. The lane ends when its work is
+    # done (every quota scene resolved or its candidates exhausted), not
+    # when a clock fires. The cooldown recovery wall is still published:
+    # it is a recovery allowance, not a kill.
+    hard = min(internal, positive(settings.get('yt_hard_timeout_seconds'), internal))
+    if vision_reserve:
+        # Shrink the hard wall by the vision reserve (floored so a search
+        # plus one minimum transfer still fits); the reserve is verification
+        # time, not discovery time.
+        hard = max(60.0, hard - vision_reserve)
     search_ceiling = min(120.0, hard * 0.28)
     search = min(search_ceiling, positive(settings.get('yt_search_timeout_seconds'), search_ceiling))
     if 0 < scene_count <= 12 and str(settings.get('llm_provider') or '') != 'external_agent':
@@ -74,7 +82,7 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
         # even though a single yt-dlp search answers in ~3s. Agent jobs
         # keep the ceiling instead; the branch wall still bounds the stage.
         search = min(search, 35.0)
-    plan = {'yt_search_timeout_seconds': search, 'yt_hard_timeout_seconds': hard}
+    plan = {'yt_search_timeout_seconds': search}
     if settings.get('muse_clip_job_id'):
         from .pc_youtube_clips import CLIP_WAIT_SECONDS
         # The remote runner has an independent download deadline followed by
@@ -89,45 +97,27 @@ def youtube_stage_budget(wall_seconds, config=None, *, scene_count=0, download_w
     if settings.get('_yt_cooldown_headroom'):
         # The adapter supplies a first-wave cap. Keep it and give the cooldown
         # a separate deadline inside the job-clamped outer wall.
-        if transport_wall > hard:
-            plan['yt_cooldown_hard_timeout_seconds'] = transport_wall
+        recovery_wall = max(60.0, internal - vision_reserve) if vision_reserve else internal
+        if recovery_wall > hard:
+            plan['yt_cooldown_hard_timeout_seconds'] = recovery_wall
     if scene_count > 0 and not settings.get('yt_pool_first'):
-        preselected = bool(settings.get('_youtube_quota_preselected'))
-        try:
-            coverage = 1.0 if preselected else float(settings.get('youtube_accepted_coverage_target',
-                                                                    settings.get('youtube_coverage_target', 0.60)))
-            if not math.isfinite(coverage):
-                coverage = 1.0 if preselected else 0.60
-        except (TypeError, ValueError):
-            coverage = 1.0 if preselected else 0.60
-        coverage = max(0.0, min(1.0, coverage))
-        target_scenes = max(1, math.ceil(scene_count * coverage))
-        waves = math.ceil(target_scenes / max(1, int(download_workers)))
         # Reserve enough time for a useful transfer attempt before expanding
         # discovery. The previous preselected-quota path spread a short wall
         # across every requested scene, reducing each clip attempt to 10–24s;
         # the live run then timed out healthy candidates and rendered graphics.
-        # The working app budgets 60s for transport plus 20s for merge/probe.
-        # The shared deadline bounds actual work; wave estimates must not
-        # remove later scenes before fast transfers/cache hits can reach them.
+        # Nov 26 (user order): no per-clip ceiling is published any more —
+        # the wave math below only sizes the search budget now; transfers
+        # are no longer wall-clock bounded.
         handoff = 10.0
-        minimum_transfer = 60.0
-        minimum_wave = minimum_transfer + youtube_clip_grace_seconds(minimum_transfer)
+        grace = 20.0
+        minimum_transfer = 45.0
+        minimum_wave = minimum_transfer + grace
         minimum_search = min(30.0, search)
-        reserved_waves = min(waves, int(max(0.0, hard - minimum_search - handoff) // minimum_wave))
-        if reserved_waves > 0:
-            search_for_waves = max(0.0, hard - handoff - reserved_waves * minimum_wave)
+        max_complete_waves = int(max(0.0, hard - minimum_search - handoff) // minimum_wave)
+        if max_complete_waves > 0:
+            search_for_waves = max(0.0, hard - handoff - max_complete_waves * minimum_wave)
             search = min(search, search_for_waves)
             plan['yt_search_timeout_seconds'] = search
-        available = max(0.0, hard - search - handoff)
-        schedulable_waves = int(available // minimum_wave)
-        effective_waves = max(1, min(waves, schedulable_waves or 1))
-        timeout_floor = minimum_transfer if schedulable_waves > 0 else 10.0
-        slot_seconds = available / effective_waves
-        upper_clip = min(150.0, max(timeout_floor, slot_seconds - youtube_clip_grace_seconds(0)))
-        plan['yt_per_clip_timeout_seconds'] = max(
-            timeout_floor, min(upper_clip, slot_seconds - youtube_clip_grace_seconds(upper_clip)),
-        )
         explicit_cap = positive(settings.get('yt_max_download_scenes'), 0)
         if explicit_cap > 0:
             plan['yt_max_download_scenes'] = min(scene_count, max(1, int(explicit_cap)))

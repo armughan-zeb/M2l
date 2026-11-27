@@ -5838,8 +5838,7 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 and hasattr(source_health, "failure_count")
                 else None
             )
-            direct_first = web_direct_first()
-            rows = _call_discover(direct=direct_first)
+            rows = _call_discover(direct=True)
             if (
                 rows
                 or source_type not in ("api", "hybrid", "flickr_api")
@@ -5855,10 +5854,10 @@ def _resolve_scene(idx: int, scene_text: str, queries: List[str],
                 time.sleep(delay)
             _web_log(
                 f"{source_name} '{q_str[:30]}': empty after provider error; "
-                f"retrying once via {'proxy' if direct_first else 'direct'}"
+                "retrying once direct"
             )
             if not _deadline_reached():
-                rows = _call_discover(direct=not direct_first)
+                rows = _call_discover(direct=True)
             _note_fetch_outcome(source_name, rows, health_before)
             return rows
 
@@ -9539,6 +9538,104 @@ def _verify_web_scenes_cross_scene(
             return _web_visual_strict_failure("hard_fail", "all_candidates_clearly_irrelevant" if clearly_irrelevant else "visual_fail_closed")
         return _web_visual_metadata_fallback(safe_rows, "borderline_visual_rejection", "uncertain")
 
+    def _result_fingerprint(result: Optional[Dict]) -> str:
+        """Identity of an emitted winner: asset fingerprint, else its path.
+
+        ``_build_web_visual_result`` stamps ``asset_fingerprint`` (sha256
+        of the file, falling back to a hash of the path) whenever the
+        winner has a path, so the stamped value is the identity. Two
+        scenes emitting the same fingerprint would ship the same image
+        twice — the 6ea1b5e9 repeat (5 of 8 scenes on one box-art file).
+        """
+        if not isinstance(result, dict):
+            return ""
+        fp = str(result.get("asset_fingerprint") or "").strip()
+        if fp:
+            return fp
+        path = str(result.get("path") or "").strip()
+        return ("path:" + path) if path else ""
+
+    def _candidate_fingerprint(candidate: Dict) -> str:
+        """Fingerprint of one shortlist candidate, for the straggler filter."""
+        path = str((candidate or {}).get("path") or "").strip()
+        if not path:
+            return ""
+        try:
+            from services.visual_intelligence.decision import asset_fingerprint as _fp
+            return str(_fp(path) or "")
+        except Exception:
+            return "path:" + path
+
+    # Winners already emitted by this driver call, by fingerprint. A
+    # scene whose accepted winner duplicates one is routed to its next
+    # candidate (wave 2 / stragglers) instead of shipping the same
+    # image twice. Driver-call-local: one pack-set is normally all 8
+    # scenes, so this covers the common case; cross-call repeats stay
+    # with the selection-level used_files machinery.
+    emitted_fingerprints: set = set()
+
+    def _fresh_accepted(ranked):
+        """Accepted ranked entries whose candidate is not already emitted.
+
+        Filtering BEFORE ``_build_web_visual_result`` picks the max
+        matters: a duplicate candidate can outscore the fresh one, so a
+        post-build check would still let it win again in wave 2.
+        """
+        fresh = []
+        for _row in ranked or []:
+            if not _row[0]:
+                continue
+            if _candidate_fingerprint(_row[3]) in emitted_fingerprints:
+                continue
+            fresh.append(_row)
+        return fresh
+
+    def _refile_missing(wave_scenes: Dict[int, Dict], rows: Dict, pick: str) -> Dict:
+        """Re-file a wave's scenes whose verdict never arrived, once.
+
+        A lost verdict is an availability failure, not a rejection: the
+        batch call expired unanswered (or returned no row) while the
+        candidate is still downloaded and waiting. Re-filing the SAME
+        candidates through the same scheduler lets the bridge twin/cache
+        layer reuse a late answer instead of dropping the scene to a
+        full re-search round (new queries, new downloads). One re-file
+        per wave, same candidates, same packs; the lane budget still
+        gates it via _file_wave. A scene still without a row after the
+        re-file falls through to the straggler fallback as today.
+        """
+        if not isinstance(rows, dict) or not wave_scenes:
+            return rows
+        if lane_budget is not None:
+            try:
+                if lane_budget.expired():
+                    return rows
+            except Exception:
+                pass
+        pick_index = 0 if pick == "wave1" else 1
+        missing: Dict[int, Dict] = {}
+        for idx, entry in wave_scenes.items():
+            if idx in decided:
+                continue
+            live = entry.get("live") or []
+            if len(live) <= pick_index:
+                continue
+            cand = live[pick_index]
+            cid = str(cand.get("candidate_id") or cand.get("id") or cand.get("path") or "")
+            if not isinstance(rows.get(cid), dict):
+                missing[idx] = entry
+        if not missing:
+            return rows
+        _web_log(
+            f"web cross-scene {pick} refile: {len(missing)} scene(s) with no verdict; "
+            "re-filing the same candidates once"
+        )
+        refilled = _file_wave(missing, pick + "-refile") if missing else {}
+        if isinstance(refilled, dict) and refilled:
+            merged = dict(rows)
+            merged.update(refilled)
+            return merged
+        return rows
+
     # Per-scene prep: screen, cap, prep-hit winners, wave-1 candidate.
     prepared: Dict[int, Dict] = {}
     for task in tasks or []:
@@ -9567,12 +9664,25 @@ def _verify_web_scenes_cross_scene(
             )
             ranked.append(judged)
             if judged[0]:
+                fresh = _fresh_accepted(ranked)
+                if not fresh:
+                    # Accepted, but the winner duplicates an image
+                    # another scene already won: keep looking at the
+                    # next prep-hit candidate instead of emitting it.
+                    _web_log(
+                        f"scene {idx + 1} prep winner duplicates an earlier scene image; "
+                        "trying the next prep candidate"
+                    )
+                    continue
                 winner_result = _build_web_visual_result(
-                    [j for j in ranked if j[0]],
+                    fresh,
                     scene_text=task.get("scene_text") or "",
                     subject=task.get("subject") or "",
                     global_topic=task.get("global_topic") or "",
                 )
+                _prep_fp = _result_fingerprint(winner_result)
+                if _prep_fp:
+                    emitted_fingerprints.add(_prep_fp)
                 break
         if winner_result is not None:
             _emit(idx, winner_result)
@@ -9598,7 +9708,9 @@ def _verify_web_scenes_cross_scene(
         by_cid: Dict[str, tuple] = {}
         for idx in scene_ids:
             entry = wave_scenes[idx]
-            cand = entry["live"][0] if pick == "wave1" else entry["live"][1]
+            # Refile picks ("wave1-refile", "wave2-refile") judge the
+            # same candidate index as their wave.
+            cand = entry["live"][0] if pick.startswith("wave1") else entry["live"][1]
             cid = str(cand.get("candidate_id") or cand.get("id") or cand.get("path") or "")
             task = entry["task"]
             block = _web_cross_scene_block(
@@ -9609,9 +9721,9 @@ def _verify_web_scenes_cross_scene(
         pack_cids = []
         for pack in packs:
             pack_cids.append([
-                str(wave_scenes[idx]["live"][0 if pick == "wave1" else 1].get("candidate_id")
-                    or wave_scenes[idx]["live"][0 if pick == "wave1" else 1].get("id")
-                    or wave_scenes[idx]["live"][0 if pick == "wave1" else 1].get("path") or "")
+                str(wave_scenes[idx]["live"][0 if pick.startswith("wave1") else 1].get("candidate_id")
+                    or wave_scenes[idx]["live"][0 if pick.startswith("wave1") else 1].get("id")
+                    or wave_scenes[idx]["live"][0 if pick.startswith("wave1") else 1].get("path") or "")
                 for idx in pack
             ])
 
@@ -9655,6 +9767,7 @@ def _verify_web_scenes_cross_scene(
     # Wave 1: top-1 per scene.
     wave1 = {idx: e for idx, e in prepared.items() if e["wave"] == 1 and len(e["live"]) >= 1}
     rows1 = _file_wave(wave1, "wave1") if wave1 else {}
+    rows1 = _refile_missing(wave1, rows1, "wave1")
     wave2: Dict[int, Dict] = {}
     for idx, entry in wave1.items():
         if idx in decided:
@@ -9673,19 +9786,35 @@ def _verify_web_scenes_cross_scene(
             visual_context=visual_context, client=client,
         )
         entry["ranked"].append(judged)
-        if judged[0]:
-            _emit(idx, _build_web_visual_result(
-                [j for j in entry["ranked"] if j[0]],
+        fresh = _fresh_accepted(entry["ranked"])
+        if fresh:
+            _winner = _build_web_visual_result(
+                fresh,
                 scene_text=task.get("scene_text") or "",
                 subject=task.get("subject") or "",
                 global_topic=task.get("global_topic") or "",
-            ))
+            )
+            _winner_fp = _result_fingerprint(_winner)
+            if _winner_fp:
+                emitted_fingerprints.add(_winner_fp)
+            _emit(idx, _winner)
+        elif judged[0]:
+            # Accepted, but the winner duplicates an image another scene
+            # already won in this driver call: do not ship it twice.
+            # Route to the next candidate (wave 2) or the stragglers.
+            _web_log(
+                f"scene {idx + 1} winner duplicates an earlier scene image; "
+                "falling through to the next candidate"
+            )
+            if len(entry["live"]) >= 2:
+                wave2[idx] = entry
         elif len(entry["live"]) >= 2:
             wave2[idx] = entry
         else:
             _emit(idx, _no_accept_result(idx, task, entry["ranked"], entry["safe_rows"]))
     # Wave 2: top-2 for scenes whose top-1 was rejected.
     rows2 = _file_wave(wave2, "wave2") if wave2 else {}
+    rows2 = _refile_missing(wave2, rows2, "wave2")
     for idx, entry in wave2.items():
         if idx in decided:
             continue
@@ -9703,13 +9832,26 @@ def _verify_web_scenes_cross_scene(
             visual_context=visual_context, client=client,
         )
         entry["ranked"].append(judged)
-        if judged[0]:
-            _emit(idx, _build_web_visual_result(
-                [j for j in entry["ranked"] if j[0]],
+        fresh = _fresh_accepted(entry["ranked"])
+        if fresh:
+            _winner = _build_web_visual_result(
+                fresh,
                 scene_text=task.get("scene_text") or "",
                 subject=task.get("subject") or "",
                 global_topic=task.get("global_topic") or "",
-            ))
+            )
+            _winner_fp = _result_fingerprint(_winner)
+            if _winner_fp:
+                emitted_fingerprints.add(_winner_fp)
+            _emit(idx, _winner)
+        elif judged[0]:
+            # Accepted but a duplicate of an earlier scene's image:
+            # leave undecided for the stragglers (which filter taken
+            # images out) instead of hard-failing the scene.
+            _web_log(
+                f"scene {idx + 1} winner duplicates an earlier scene image; "
+                "falling through to the straggler fallback"
+            )
         else:
             _emit(idx, _no_accept_result(idx, task, entry["ranked"], entry["safe_rows"]))
     # Stragglers: scenes with no verdict at all in either wave (batch
@@ -9729,6 +9871,13 @@ def _verify_web_scenes_cross_scene(
             _emit(idx, None)
             continue
         task = entry["task"]
+        # Never hand the straggler gate an image another scene already
+        # won: it judges the shortlist in order and would re-accept the
+        # same duplicate the wave guard just routed away from.
+        _straggler_cands = [
+            cand for cand in (task.get("candidates") or [])
+            if _candidate_fingerprint(cand) not in emitted_fingerprints
+        ]
         try:
             result = _rank_deferred_scene_shortlist(
                 scene_index=idx,
@@ -9736,7 +9885,7 @@ def _verify_web_scenes_cross_scene(
                 subject=task.get("subject") or "",
                 global_topic=task.get("global_topic") or "",
                 query=task.get("query") or "",
-                candidates=task.get("candidates") or [],
+                candidates=_straggler_cands,
                 visual_context=visual_context,
             )
         except Exception as exc:

@@ -211,12 +211,13 @@ def test_openverse_request_exception_records_failure():
     assert source.is_available() is True
 
 
-def test_openverse_failure_fires_alternate_route_retry_when_enabled():
-    """With direct retry enabled, a recorded failure retries once.
+def test_openverse_failure_retries_direct_when_enabled():
+    """With direct retry enabled, a recorded failure retries once direct.
 
-    Fails on HEAD: the failure is never recorded, so the manager
-    never retries (1 attempt, 2 session calls). With the fix the
-    manager retries on the alternate route (2 attempts, 4 calls).
+    Nov 25 direct-only: the retry re-attempts direct — there is no
+    proxy leg to switch to. (Previously: first attempt direct, retry
+    on proxy.) The manager still retries on a recorded failure
+    (2 attempts, 4 calls).
     """
 
     class DeadSession:
@@ -250,21 +251,19 @@ def test_openverse_failure_fires_alternate_route_retry_when_enabled():
         f"got {len(DeadSession.calls)}"
     )
     assert source._failure_count == 2
-    # First attempt direct, retry on proxy.
-    assert DeadSession.calls[0] == {"http": None, "https": None}
-    assert DeadSession.calls[2] is None
+    # Both attempts direct: no proxy leg exists any more.
+    assert all(
+        call == {"http": None, "https": None} for call in DeadSession.calls
+    ), f"expected every call direct, got {DeadSession.calls}"
 
 
-def test_openverse_failure_does_not_retry_direct_by_default():
-    """With direct retry off (default), no attempt is wasted on direct.
+def test_wikimedia_first_call_is_direct_and_lands():
+    """Nov 25 direct-only: the first call goes direct and lands.
 
-    Fails on HEAD: the manager always retries on the alternate route.
-    Direct egress is dead (Nov 23 probe), so the default must not
-    burn a whole adapter timeout there.
-
-    Round 5: the wave now retries a transport failure ONCE on the
-    SAME route under an extended wall — so this fake sees 2 proxy
-    calls (first attempt + transport retry), still zero direct calls.
+    The fake fails on proxy and returns rows on direct; under
+    direct-only the manager's first attempt is direct, so the row
+    lands at once with no retry — the old proxy-first shape (empty
+    rows, proxy calls only) no longer exists.
     """
     source = _FailingThenDirectSource([_wikimedia_candidate()])
     manager = muse_mod.MuseSearchManager(
@@ -273,18 +272,19 @@ def test_openverse_failure_does_not_retry_direct_by_default():
         wave_seconds=10,
     )
     rows = manager.search("panama canal", q_idx=0)
-    assert rows == [], "proxy failure must not be rescued by dead direct"
-    assert all(not direct for _q, direct in source.calls), (
-        f"direct route was attempted with retry off: {source.calls}"
-    )
-    assert len(source.calls) == 2, (
-        f"expected first attempt + one same-route transport retry, "
-        f"got {source.calls}"
+    assert len(rows) == 1, "direct first call must land the row"
+    assert [direct for _q, direct in source.calls] == [True], (
+        f"expected a single direct call, got {source.calls}"
     )
 
 
-def test_direct_retry_enabled_rescues_via_alternate_route():
-    """Positive control: direct_retry=True restores the old retry."""
+def test_direct_first_lands_without_retry():
+    """Nov 25 direct-only: direct lands on the first attempt.
+
+    The fake returns rows on direct; the manager's first call is
+    direct, so the row lands at once and no retry fires — there is
+    no alternate route left to rescue via.
+    """
     source = _FailingThenDirectSource([_wikimedia_candidate()])
     manager = muse_mod.MuseSearchManager(
         wikimedia_source=source,
@@ -294,11 +294,11 @@ def test_direct_retry_enabled_rescues_via_alternate_route():
     )
     rows = manager.search("panama canal", q_idx=0)
     assert len(rows) == 1
-    assert [direct for _q, direct in source.calls] == [False, True]
+    assert [direct for _q, direct in source.calls] == [True]
 
 
 # ---------------------------------------------------------------------------
-# R3 — Openverse is proxy-first and secondary (fix #2)
+# R3 — Openverse is direct-only (Nov 25 direct-only order)
 # ---------------------------------------------------------------------------
 
 def test_direct_web_mode_respects_explicit_source_overrides(monkeypatch):
@@ -313,24 +313,24 @@ def test_direct_web_mode_respects_explicit_source_overrides(monkeypatch):
     assert not muse_mod.muse_search_direct_retry_enabled()
 
 
-def test_openverse_proxy_first_by_default(monkeypatch):
-    """Default route is proxy; direct-first needs an explicit opt-in.
+def test_openverse_direct_first_by_default(monkeypatch):
+    """Nov 25 direct-only: the default route is direct.
 
-    Fails on HEAD: VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE defaults to
-    direct, and direct TCP never completes on this egress.
+    The env knob still overrides it: "direct" stays direct,
+    "proxy" opts back into the proxy route.
     """
     monkeypatch.delenv("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", raising=False)
-    assert muse_mod.muse_search_openverse_direct_first() is False
+    assert muse_mod.muse_search_openverse_direct_first() is True
     monkeypatch.setenv("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", "direct")
     assert muse_mod.muse_search_openverse_direct_first() is True
     monkeypatch.setenv("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", "proxy")
     assert muse_mod.muse_search_openverse_direct_first() is False
 
 
-def test_openverse_first_call_uses_proxy_by_default(monkeypatch):
-    """The first live Openverse call goes through the proxy by default.
+def test_openverse_first_call_uses_direct_by_default(monkeypatch):
+    """Nov 25 direct-only: the first live Openverse call goes direct.
 
-    Fails on HEAD: the first call carries the direct bypass proxies.
+    The first call carries the direct bypass proxies.
     """
     monkeypatch.delenv("VIDZEO_MUSE_SEARCH_OPENVERSE_ROUTE", raising=False)
     calls = []
@@ -369,8 +369,9 @@ def test_openverse_first_call_uses_proxy_by_default(monkeypatch):
     )
     rows = manager.search("moon crater", q_idx=0)
     assert len(rows) == 1
-    assert calls and calls[0] is None, (
-        f"first Openverse call must use the proxy (proxies=None), got {calls[0]!r}"
+    assert calls and calls[0] == {"http": None, "https": None}, (
+        f"first Openverse call must use direct (proxies={{'http': None, "
+        f"'https': None}}), got {calls[0]!r}"
     )
 
 

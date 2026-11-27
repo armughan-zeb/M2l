@@ -99,7 +99,7 @@ def _web_task(idx, tmp_path, n_candidates=1):
     for j in range(n_candidates):
         candidates.append({
             "candidate_id": f"web:{idx}:c{j}",
-            "path": _image(tmp_path, f"web_{idx}_{j}.jpg", (10 + idx, 40 + j, 80)),
+            "path": _image(tmp_path, f"web_{idx}_{j}.jpg", (10 + idx * 16, 40 + j * 60, 80)),
             "title": "Grand Theft Auto VI street scene",
             "description": "a street scene",
             "domain": "example.com",
@@ -318,8 +318,8 @@ def test_yt_batch_4_candidates_2_frames(tmp_path, monkeypatch):
     candidates.
     """
     frames = [
-        [_image(tmp_path, f"c{i}f1.jpg", (10 + i, 20, 30)),
-         _image(tmp_path, f"c{i}f2.jpg", (200, 30 + i, 30))]
+        [_image(tmp_path, f"c{i}f1.jpg", (10 + i * 16, 20, 30)),
+         _image(tmp_path, f"c{i}f2.jpg", (200, 30 + i * 16, 30))]
         for i in range(4)
     ]
     payload = {"candidates": [_batch_row(f"clip{i}", score=82.0) for i in range(4)]}
@@ -615,3 +615,136 @@ def test_web_loader_publishes_row_per_scene(tmp_path):
     )
     assert sorted(seen) == [0, 1, 2]
     assert all(outcomes[idx] is not None for idx in range(3))
+
+
+# ---------------------------------------------------------------------------
+# T12 — a lost verdict is re-filed, not dropped to a re-search round
+# ---------------------------------------------------------------------------
+
+class _LosingThenAnsweringClient:
+    """Drops the verdict rows for `lost_ids` on the first 3 batch calls.
+
+    The scheduler retries missing candidates twice internally (3 attempts
+    total), so a verdict lost on all 3 is gone as far as the wave is
+    concerned. From the 4th call on the rows arrive — the driver-level
+    re-file. Without the re-file the lost scenes fall to the straggler
+    metadata fallback instead of a vision pass.
+    """
+
+    def __init__(self, lost_ids):
+        self.calls = []
+        self.lost_ids = set(lost_ids)
+        self.model = "qwen/test"
+
+    def analyze_images_batch(self, paths, prompt, system, ids, scene_tags=None):
+        self.calls.append({"paths": list(paths), "ids": list(ids)})
+        out = {}
+        for cid in ids:
+            if cid in self.lost_ids and len(self.calls) <= 3:
+                continue
+            out[cid] = _passing_model_row(cid)
+        return out
+
+
+def test_lost_verdict_is_refiled_not_dropped(tmp_path):
+    """T12: a wave-1 verdict lost 3x is re-filed once, same candidates.
+
+    4 scenes, 1 candidate each; the verdicts for scenes 2 and 3 never
+    arrive in the wave's own attempts. The driver must re-file exactly
+    those two candidates (same ids, no new query) and every scene must
+    end with a vision pass — not a metadata fallback, and never a
+    re-search. HEAD: the lost scenes go to the straggler fallback.
+    """
+    tasks = [_web_task(idx, tmp_path) for idx in range(4)]
+    lost = {"web:2:c0", "web:3:c0"}
+    client = _LosingThenAnsweringClient(lost)
+    clock = FakeClock(1000.0)
+    budgets = create_lane_budgets(4, clock=clock)["budgets"]
+    scheduler = LaneScheduler()
+    outcomes = _verify_web_scenes_cross_scene(
+        tasks,
+        visual_context=_fake_visual_context(),
+        client=client,
+        lane_budget=budgets["web"],
+        scheduler=scheduler,
+    )
+    assert len(outcomes) == 4
+    for idx, result in outcomes.items():
+        assert result is not None and result.get("path"), f"scene {idx} must have a winner"
+        assert result.get("visual_outcome") == "pass", (
+            f"scene {idx} must end with a vision pass, got {result.get('visual_outcome')!r}"
+        )
+    refiles = [call for call in client.calls if set(call["ids"]) <= lost]
+    assert refiles, (
+        f"the lost candidates must be re-filed as their own batch, got calls: {client.calls}"
+    )
+    assert set(refiles[-1]["ids"]) == lost, (
+        f"re-file must carry exactly the lost candidates, got {refiles[-1]['ids']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T13 — the same image cannot win two scenes in one driver call
+# ---------------------------------------------------------------------------
+
+def test_same_image_cannot_win_two_scenes(tmp_path):
+    """T13: two scenes whose top-1 is the same file get distinct winners.
+
+    Scene 0 and scene 1 both rank the same downloaded file first (the
+    6ea1b5e9 repeat: 5 of 8 scenes on one box-art file). The second
+    scene must fall through to its own second candidate instead of
+    shipping the same image twice. HEAD: both scenes emit the same file.
+    """
+    shared = _image(tmp_path, "shared_boxart.jpg", (200, 30, 30))
+    tasks = []
+    for idx in range(2):
+        second = _image(tmp_path, f"web_{idx}_1.jpg", (10 + idx * 16, 40, 80))
+        tasks.append({
+            "scene_index": idx,
+            "scene_text": f"Grand Theft Auto VI street scene {idx}",
+            "subject": "Grand Theft Auto VI",
+            "global_topic": "Grand Theft Auto VI",
+            "query": "GTA VI street",
+            "candidates": [
+                {
+                    "candidate_id": f"web:{idx}:c0",
+                    "path": shared,
+                    "title": "Grand Theft Auto VI box art",
+                    "description": "box art",
+                    "domain": "example.com",
+                    "provider": "web",
+                    "source": "web",
+                    "url": "https://example.com/boxart.jpg",
+                    "query_used": "GTA VI box art",
+                },
+                {
+                    "candidate_id": f"web:{idx}:c1",
+                    "path": second,
+                    "title": "Grand Theft Auto VI street scene",
+                    "description": "a street scene",
+                    "domain": "example.com",
+                    "provider": "web",
+                    "source": "web",
+                    "url": "https://example.com/img.jpg",
+                    "query_used": "GTA VI street",
+                },
+            ],
+        })
+    client = FakeWebClient()
+    clock = FakeClock(1000.0)
+    budgets = create_lane_budgets(2, clock=clock)["budgets"]
+    scheduler = LaneScheduler()
+    outcomes = _verify_web_scenes_cross_scene(
+        tasks,
+        visual_context=_fake_visual_context(),
+        client=client,
+        lane_budget=budgets["web"],
+        scheduler=scheduler,
+    )
+    assert len(outcomes) == 2
+    paths = [outcomes[idx]["path"] for idx in range(2)]
+    assert len(set(paths)) == 2, f"the two scenes must win distinct images, got {paths}"
+    assert outcomes[0]["path"] == shared
+    assert outcomes[1]["path"].endswith("web_1_1.jpg"), (
+        f"scene 1 must fall through to its own second candidate, got {paths[1]}"
+    )

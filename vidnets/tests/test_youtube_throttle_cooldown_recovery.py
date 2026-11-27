@@ -166,7 +166,10 @@ def test_download_with_session_falls_back_to_public_android(tmp_path, monkeypatc
         tmp_path,
         "raw_",
     )
-    assert clients_seen == [["web", "tv_samsung"], ["android"]]
+    assert clients_seen == [
+        ["android", "web", "web_embedded", "web_creator", "mweb"],
+        ["android", "web_embedded", "web_creator", "mweb"],
+    ]
     if isinstance(failure, ytv2.YouTubeExtractionTimeout):
         assert throttle_marks == []
     else:

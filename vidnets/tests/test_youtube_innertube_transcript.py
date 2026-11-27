@@ -8,8 +8,14 @@ Run 4 (job 3006fd62) surfaced two YouTube blockers:
     which does a bare ``ytcfg['INNERTUBE_CONTEXT']``. When YouTube serves
     an embed page without a ytcfg, that raises a raw KeyError — not an
     ExtractorError — so yt-dlp's per-client loop aborts instead of
-    falling through to the next client. The fix is to keep every
+    falling through to the next client. The Nov 18 fix kept every
     ``*_embedded`` client out of the authenticated download list.
+
+    Nov 26 (user order: restore the Test 21 recipe, c5133b4): the
+    authenticated list is android-first multi-client again, embedded
+    clients included but never first — android leads, so the embed
+    path is rarely reached, and _youtube_failure_is_rotatable treats
+    the KeyError as rotatable now that the rotation loop exists.
 
 (b) Transcript deadline: the live mixed-media worker ran with an 18 s
     transcript deadline (app.py overrode the pipeline's 120 s default
@@ -81,19 +87,26 @@ def test_embedded_ytcfg_gap_raises_keyerror():
         _fix_embedded_ytcfg({})
 
 
-def test_authenticated_download_clients_exclude_embedded_variant(monkeypatch):
-    """Authenticated downloads must never list an embedded client first
-    (or at all): one degenerate embed page aborts the whole extraction
-    instead of falling through to the next client (run 4: 6/6 dead)."""
+def test_authenticated_download_clients_lead_with_android(monkeypatch):
+    """Nov 26 (Test 21 recipe, c5133b4): authenticated downloads use
+    the android-first multi-client list. Embedded clients are never
+    FIRST — android leads, so the embed-page ytcfg path that raises
+    raw KeyError('INNERTUBE_CONTEXT') (run 4) is only reached after
+    android and web fail, and _youtube_failure_is_rotatable treats
+    that KeyError as rotatable (the run-4 abort was a single-list
+    extraction with no rotation loop)."""
     monkeypatch.delenv("VIDZEO_YT_PLAYER_CLIENTS", raising=False)
     clients = _youtube_player_clients(_cookie_jar())
-    assert clients == ["web", "tv_samsung"]
-    assert not any(_embedded_variant(client) for client in clients)
+    assert clients == ["android", "web", "web_embedded", "web_creator", "mweb"]
+    assert clients[0] == "android"
+    assert not _embedded_variant(clients[0])
 
 
 def test_anonymous_download_uses_the_android_player_client(monkeypatch):
     monkeypatch.delenv("VIDZEO_YT_PLAYER_CLIENTS", raising=False)
-    assert _youtube_player_clients(None) == ["android"]
+    assert _youtube_player_clients(None) == [
+        "android", "web_embedded", "web_creator", "mweb",
+    ]
 
 
 def test_player_client_env_override_still_wins(monkeypatch):

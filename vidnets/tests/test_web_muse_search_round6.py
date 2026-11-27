@@ -166,11 +166,12 @@ def test_download_retries_via_direct_for_unknown_host(monkeypatch, tmp_path):
     )
 
 
-def test_download_retries_via_proxy_when_direct_disabled(monkeypatch, tmp_path):
-    """direct_retry=False: the retry re-attempts via the proxy and lands.
+def test_download_stays_direct_when_direct_disabled(monkeypatch, tmp_path):
+    """Nov 25 direct-only: direct_retry=False no longer selects the proxy.
 
-    The proxy session fails once, then lands — proving the proxy retry
-    still works when direct is switched off.
+    The flag is ignored for routing now; the download goes direct and
+    lands. The proxy session fails once in the fake, but it is never
+    used, so the download lands on the first direct attempt.
     """
     _install_fake_aiohttp(monkeypatch, _ProxyFailsOnceSession)
     stats = []
@@ -183,8 +184,8 @@ def test_download_retries_via_proxy_when_direct_disabled(monkeypatch, tmp_path):
     assert error == "", f"download failed: {error}"
     assert path is not None and Path(path).is_file()
     assert len(stats) == 1
-    assert stats[0]["route"] == "proxy", (
-        f"retry should stay on the proxy when direct is off, got route={stats[0]['route']}"
+    assert stats[0]["route"] == "direct", (
+        f"download must stay direct when direct is off, got route={stats[0]['route']}"
     )
 
 
@@ -260,12 +261,12 @@ class _Direct429Session:
         return _FakeResponse(status=200, data=b"x" * 20000)
 
 
-def test_download_429_on_direct_falls_back_to_proxy(monkeypatch, tmp_path):
-    """A 429 on direct falls through to the proxy and lands.
+def test_download_429_on_direct_has_no_proxy_fallback(monkeypatch, tmp_path):
+    """Nov 25 direct-only: a 429 on direct retries direct; there is no
+    proxy leg to fall through to.
 
-    Fails on HEAD: the proxy is tried first and lands at once (direct
-    never attempted), and a 429 returns immediately instead of trying
-    the other route.
+    The fake 429s every direct call, so the download fails with a 429
+    instead of landing via the proxy — and no proxy call is recorded.
     """
     _Direct429Session.calls = []
     _install_fake_aiohttp(monkeypatch, _Direct429Session)
@@ -274,10 +275,11 @@ def test_download_429_on_direct_falls_back_to_proxy(monkeypatch, tmp_path):
         ["https://thumb.wikimedia.org/x/moon.jpg"], tmp_path,
         max_concurrent=1, timeout_seconds=30, stats=stats,
     )
-    assert results[0][1] is not None and Path(results[0][1]).is_file()
-    assert stats[0]["route"] == "proxy"
+    assert results[0][1] is None
+    assert "429" in (results[0][2] or "")
+    assert stats[0]["route"] == "direct"
     assert [route for route, _url in _Direct429Session.calls] == [
-        "direct", "proxy",
+        "direct", "direct",
     ]
 
 
@@ -299,46 +301,39 @@ def test_download_direct_retry_default_is_on(monkeypatch):
     assert hybrid_search._download_direct_retry_enabled() is True
 
 
-def test_direct_web_mode_prefers_direct_even_for_unlisted_image_hosts(monkeypatch):
-    monkeypatch.setenv("VIDZEO_WEB_DIRECT_FIRST", "1")
-    assert hybrid_search._download_route_order("images.example") == ["direct", "proxy"]
-    assert hybrid_search._download_route_order("images.example", direct_allowed=False) == ["proxy", "proxy"]
-
-
-def test_download_route_order_is_per_host(monkeypatch):
-    """Direct-capable hosts try direct first; unknown hosts proxy-first.
-
-    Fails on HEAD: no such helper exists (one global order for all hosts).
+def test_download_route_order_is_direct_only(monkeypatch):
+    """Nov 25 direct-only: every host downloads direct; there is no
+    proxy leg, per-host or otherwise.
     """
     monkeypatch.delenv("VIDZEO_WEB_DOWNLOAD_DIRECT_FIRST_HOSTS", raising=False)
     assert hybrid_search._download_route_order("thumb.wikimedia.org") == [
-        "direct", "proxy",
+        "direct",
     ]
     assert hybrid_search._download_route_order("upload.wikimedia.org") == [
-        "direct", "proxy",
+        "direct",
     ]
     assert hybrid_search._download_route_order("live.staticflickr.com") == [
-        "direct", "proxy",
+        "direct",
     ]
     assert hybrid_search._download_route_order("images.example") == [
-        "proxy", "direct",
+        "direct",
     ]
     assert hybrid_search._download_route_order("commons.wikimedia.org") == [
-        "proxy", "direct",
+        "direct",
     ]
-    # Direct disabled: proxy twice (fresh budget on the retry).
+    # The direct flag and the env override no longer change the route.
     assert hybrid_search._download_route_order(
         "thumb.wikimedia.org", direct_allowed=False
-    ) == ["proxy", "proxy"]
-    # Env override replaces the set.
+    ) == ["direct"]
+    # Env override replaces the set — still direct-only.
     monkeypatch.setenv(
         "VIDZEO_WEB_DOWNLOAD_DIRECT_FIRST_HOSTS", "images.example"
     )
     assert hybrid_search._download_route_order("images.example") == [
-        "direct", "proxy",
+        "direct",
     ]
     assert hybrid_search._download_route_order("thumb.wikimedia.org") == [
-        "proxy", "direct",
+        "direct",
     ]
 
 

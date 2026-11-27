@@ -1,4 +1,11 @@
-"""Killable yt-dlp range attempt, with a deadline before transfer starts."""
+"""Killable yt-dlp range attempt, with an extraction wall before transfer starts.
+
+Nov 26 (user order: remove every timeout that stops a download): there is
+no clip deadline any more (``deadline=None`` in production). The extraction
+wall still bounds each attempt, but it is a *rotation* trigger now — when it
+fires, the caller retries the candidate with the next player-client list
+instead of failing it.
+"""
 from __future__ import annotations
 
 import http.cookiejar
@@ -14,6 +21,31 @@ import time
 
 _RESULT_PREFIX = b"VIDZEO_YOUTUBE_RANGE_RESULT "
 _SERVER = Path(__file__).resolve().parents[1]
+
+# Proxy env vars the Hatch egress proxy injects into every shell. The
+# range-attempt subprocess inherits the server env, so without this the
+# child could reach the proxy through any library that reads them.
+_PROXY_ENV_KEYS = frozenset({
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+})
+
+
+def _child_env():
+    """Child env for the range-attempt subprocess.
+
+    Nov 26 (user order: restore the Test 21 recipe fully): the child
+    inherits the egress proxy vars by default, as on Nov 15 (c5133b4)
+    when 6 of 7 clips landed. VIDZEO_YT_DIRECT=1 restores the Nov 25
+    direct-only behaviour (proxy vars stripped; yt-dlp also forced
+    direct via options["proxy"] = "" in _execute) for when the proxy
+    itself dies.
+    """
+    if str(os.environ.get("VIDZEO_YT_DIRECT", "") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return {
+            key: value for key, value in os.environ.items()
+            if key.lower() not in _PROXY_ENV_KEYS
+        }
+    return dict(os.environ)
 
 
 class YouTubeExtractionTimeout(TimeoutError):
@@ -68,7 +100,7 @@ def _stop_attempt(process):
         process.wait(timeout=5)
 
 
-def _monitor_attempt(command, request, transfer_marker, *, extraction_seconds, deadline,
+def _monitor_attempt(command, request, transfer_marker, *, extraction_seconds, deadline=None,
                      cancellation=None, check_transfer=None, on_process=None):
     if cancellation is not None:
         cancellation.raise_if_cancelled()
@@ -76,7 +108,8 @@ def _monitor_attempt(command, request, transfer_marker, *, extraction_seconds, d
     transferring = False
     with subprocess.Popen(
         command, cwd=str(_SERVER), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        stderr=subprocess.DEVNULL, env=_child_env(),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     ) as process:
         # Keep the deadline independent of pipe I/O. Windows communicate()
         # can block writing a large request while the child is still starting.
@@ -117,14 +150,21 @@ def _monitor_attempt(command, request, transfer_marker, *, extraction_seconds, d
                     raise YouTubeExtractionTimeout(
                         f"youtube_extraction_timeout_after_{extraction_seconds:g}s"
                     )
-                if now >= deadline:
+                # Nov 26 (user order): no clip deadline — deadline is None
+                # in production. The extraction wall above is a rotation
+                # trigger (the caller tries the next client list), not a
+                # failure.
+                if deadline is not None and now >= deadline:
                     raise TimeoutError("youtube_clip_timeout_in_range_attempt")
                 if transferring and check_transfer is not None:
                     check_transfer()
-                remaining = deadline - now
+                if deadline is None:
+                    remaining = None
+                else:
+                    remaining = deadline - now
                 if not transferring:
-                    remaining = min(remaining, extraction_deadline - now)
-                finished.wait(min(0.2, remaining))
+                    remaining = extraction_deadline - now if remaining is None else min(remaining, extraction_deadline - now)
+                finished.wait(0.2 if remaining is None else min(0.2, remaining))
         finally:
             try:
                 if process.poll() is None:
@@ -135,8 +175,26 @@ def _monitor_attempt(command, request, transfer_marker, *, extraction_seconds, d
                     on_process(None)
 
 
+def _jsonable(value):
+    """Make a yt-dlp options payload JSON-safe for the subprocess boundary.
+
+    In-process yt-dlp accepts set-valued options (e.g. compat_opts is a
+    ``{"no-certifi"}`` set), but json.dumps does not: every range attempt
+    died in ~0.1s with "Object of type set is not JSON serializable"
+    before yt-dlp even started. Sets become sorted lists; yt-dlp only
+    does membership tests on them, so a list behaves identically.
+    """
+    if isinstance(value, set):
+        return sorted((_jsonable(item) for item in value), key=str)
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 def download_range_attempt(options, url, clients, jar, ranges, *, work_dir,
-                           extraction_seconds, deadline, cancellation, check_transfer, on_process):
+                           extraction_seconds, deadline=None, cancellation, check_transfer, on_process):
     from .youtube_pipeline_v2 import _youtube_cached_info, _youtube_evict_info, _youtube_store_info
 
     with tempfile.TemporaryDirectory(prefix=".yt-attempt-", dir=work_dir) as temp:
@@ -165,7 +223,7 @@ def download_range_attempt(options, url, clients, jar, ranges, *, work_dir,
         try:
             stdout = _monitor_attempt(
                 [sys.executable, "-m", "services.youtube_range_attempt"],
-                json.dumps(payload).encode("utf-8"),
+                json.dumps(_jsonable(payload)).encode("utf-8"),
                 marker,
                 extraction_seconds=extraction_seconds, deadline=deadline,
                 cancellation=cancellation, check_transfer=check_transfer, on_process=on_process,
@@ -209,6 +267,11 @@ def _execute(request, logger):
         request["options"], logger=logger,
         download_ranges=download_range_func(None, request["ranges"]),
     )
+    # Nov 26 (user order: restore the Test 21 recipe fully): the
+    # subprocess uses the egress proxy via the inherited env vars, as
+    # on Nov 15. Only VIDZEO_YT_DIRECT=1 forces direct mode here.
+    if str(os.environ.get("VIDZEO_YT_DIRECT", "") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        options["proxy"] = ""
     if "compat_opts" in options:
         options["compat_opts"] = set(options["compat_opts"])
     marker = Path(request["transfer_marker"])

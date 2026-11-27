@@ -70,14 +70,50 @@ def test_range_attempt_runs_yt_dlp_and_delivers_local_media(tmp_path):
     assert list(tmp_path.glob(".yt-attempt-*")) == []
 
 
+def test_range_attempt_serializes_set_valued_options(tmp_path):
+    # Regression: production passes compat_opts as a {"no-certifi"} set.
+    # The in-process path tolerates sets, but the subprocess payload is
+    # JSON, so every attempt died in ~0.1s with "Object of type set is
+    # not JSON serializable" before yt-dlp started (live job 08f0e2c1).
+    ffmpeg = pipeline._ffmpeg_bin("ffmpeg")
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+         "testsrc2=size=160x90:rate=20:duration=3", "-c:v", "libx264", str(source)],
+        timeout=15, check=True,
+    )
+    from services.yt_dlp_runtime import YouTubeRuntimeLog
+    output = tmp_path / "range.raw.mp4"
+    options = {
+        "enable_file_urls": True,
+        "quiet": True,
+        "noprogress": True,
+        "logger": YouTubeRuntimeLog(),
+        "outtmpl": str(output),
+        "ffmpeg_location": ffmpeg,
+        "compat_opts": {"no-certifi"},
+    }
+    ranged.download_range_attempt(
+        options, source.as_uri(), [], None, [], work_dir=tmp_path,
+        extraction_seconds=30, deadline=time.monotonic() + 60,
+        cancellation=None, check_transfer=None, on_process=None,
+    )
+    assert output.stat().st_size > 1024
+    assert pipeline._source_has_video_stream(output)
+    assert list(tmp_path.glob(".yt-attempt-*")) == []
+
+
 @pytest.mark.parametrize(("session_status", "require_session", "expected_routes"), [
     ("verified", "0", ["signed_in", "public"]),
-    ("unverified", "0", ["public"]),
+    ("signed_out", "0", ["public", "signed_in"]),
     ("verified", "1", ["signed_in"]),
 ])
-def test_pre_transfer_timeout_uses_one_bounded_public_attempt(
+def test_pre_transfer_timeout_rotates_clients_before_abandoning_candidate(
     tmp_path, monkeypatch, session_status, require_session, expected_routes,
 ):
+    """Nov 26: a pre-transfer extraction timeout rotates through every
+    client list before the candidate fails — it no longer dies on the
+    first attempt, and no clip deadline is imposed at all."""
     class RealPackage:
         __path__ = ["yt_dlp"]
 
@@ -92,10 +128,10 @@ def test_pre_transfer_timeout_uses_one_bounded_public_attempt(
     monkeypatch.setattr(pipeline, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
     calls = []
 
-    def stall(options, _url, _clients, jar, _ranges, **kwargs):
+    def stall(options, _url, clients, jar, _ranges, **kwargs):
         calls.append((
             options["format"], "public" if jar is None else "signed_in",
-            kwargs["extraction_seconds"], kwargs["deadline"],
+            kwargs["extraction_seconds"], kwargs["deadline"], tuple(clients),
         ))
         raise ranged.YouTubeExtractionTimeout("youtube_extraction_timeout_after_40s")
 
@@ -103,21 +139,111 @@ def test_pre_transfer_timeout_uses_one_bounded_public_attempt(
     jar = ranged._cookie_jar([])
     jar._vidzeo_session_status = session_status
     candidate = {"id": "fixture", "url": "https://www.youtube.com/watch?v=fixture"}
-    first_wave_deadline = time.monotonic() + 64
-    assert not pipeline._download_clip(
-        candidate, tmp_path / "clip.mp4", 5, 3, session_jar=jar, deadline_at=first_wave_deadline,
-    )
-    assert [call[1] for call in calls] == expected_routes
-    assert {call[3] for call in calls} == {first_wave_deadline}
-    assert len({call[0] for call in calls}) == 1
+    assert not pipeline._download_clip(candidate, tmp_path / "clip.mp4", 5, 3, session_jar=jar)
+    rotations = pipeline._youtube_player_client_rotations()
+    # One full session/anon pass per client rotation.
+    assert [call[1] for call in calls] == expected_routes * len(rotations)
+    assert len({(call[0], call[3]) for call in calls}) == 1
+    # No clip deadline is imposed even though the env sets one.
+    assert all(call[3] is None for call in calls)
+    # The client list follows the rotation order on every pass.
+    expected_clients = []
+    for auth, anon in rotations:
+        for route in expected_routes:
+            expected_clients.append(tuple(anon if route == "public" else auth))
+    assert [call[4] for call in calls] == expected_clients
     if expected_routes == ["signed_in", "public"]:
-        assert [call[2] for call in calls] == [10.0, 55.0]
+        assert [call[2] for call in calls] == [40.0, 240.0] * len(rotations)
+    if expected_routes == ["public", "signed_in"]:
+        # Anonymous-first extraction timed out: the session is tried next
+        # with the full configured wall, since the public attempt already
+        # ran first and no reserve needs holding back for it.
+        assert [call[2] for call in calls] == [240.0, 40.0] * len(rotations)
+    if expected_routes == ["signed_in"]:
+        assert [call[2] for call in calls] == [40.0] * len(rotations)
     assert candidate["_transport_failure"] == "youtube_extraction_timeout"
     assert pipeline._ANON_DOWNLOAD_THROTTLE_UNTIL == 0.0
 
 
+def test_player_client_rotations_restore_android_first(monkeypatch):
+    """Nov 26: rotation 1 is the Nov 15 android-first list that landed 6
+    clips in test 21; rotation 2 is the Nov 18 measured list; rotation 3
+    is yt-dlp's own defaults. An env override still wins with one list."""
+    monkeypatch.delenv("VIDZEO_YT_PLAYER_CLIENTS", raising=False)
+    rotations = pipeline._youtube_player_client_rotations()
+    assert rotations[0] == (
+        ["android", "web", "web_embedded", "web_creator", "mweb"],
+        ["android", "web_embedded", "web_creator", "mweb"],
+    )
+    assert rotations[1] == (["web", "tv_samsung"], ["tv_embedded"])
+    assert rotations[2] == ([], [])
+    monkeypatch.setenv("VIDZEO_YT_PLAYER_CLIENTS", "android,web")
+    assert pipeline._youtube_player_client_rotations() == [(["android", "web"], ["android", "web"])]
+
+
+def test_download_clip_rotates_client_lists_on_transport_timeout(tmp_path, monkeypatch):
+    """Nov 26: a transport timeout rotates through every client list
+    before the candidate fails — and no clip deadline is imposed."""
+    class RealPackage:
+        __path__ = ["yt_dlp"]
+
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+    monkeypatch.setattr(pipeline, "_current_youtube_network_diagnostic", lambda: {})
+    monkeypatch.setattr("services.yt_dlp_runtime.load_yt_dlp", RealPackage)
+    monkeypatch.setenv("VIDZEO_YT_REQUIRE_SESSION", "0")
+    monkeypatch.setenv("VIDZEO_YT_DOWNLOAD_ANON_FALLBACK", "1")
+    monkeypatch.setenv("VIDZEO_YT_RANGE_EXTRACTION_TIMEOUT_SECONDS", "40")
+    monkeypatch.setattr(pipeline, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
+    calls = []
+
+    def stall(_options, _url, clients, jar, _ranges, **kwargs):
+        calls.append((tuple(clients), "public" if jar is None else "signed_in", kwargs["deadline"]))
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(pipeline, "download_range_attempt", stall)
+    jar = ranged._cookie_jar([])
+    jar._vidzeo_session_status = "verified"
+    candidate = {"id": "fixture", "url": "https://www.youtube.com/watch?v=fixture"}
+    assert not pipeline._download_clip(candidate, tmp_path / "clip.mp4", 5, 3, session_jar=jar)
+    rotations = pipeline._youtube_player_client_rotations()
+    expected = []
+    for auth, anon in rotations:
+        expected.extend([(tuple(auth), "signed_in"), (tuple(anon), "public")])
+    assert [(call[0], call[1]) for call in calls] == expected
+    assert all(call[2] is None for call in calls)
+    assert candidate["_transport_failure"] == "transport_timeout"
+
+
+def test_download_clip_does_not_rotate_on_429(tmp_path, monkeypatch):
+    """Nov 26: a 429 never rotates — it is a shared-window failure, and
+    the cooldown wave retry (not another client list) handles it."""
+    class RealPackage:
+        __path__ = ["yt_dlp"]
+
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+    monkeypatch.setattr(pipeline, "_current_youtube_network_diagnostic", lambda: {})
+    monkeypatch.setattr("services.yt_dlp_runtime.load_yt_dlp", RealPackage)
+    monkeypatch.setenv("VIDZEO_YT_REQUIRE_SESSION", "0")
+    monkeypatch.setenv("VIDZEO_YT_DOWNLOAD_ANON_FALLBACK", "1")
+    monkeypatch.setenv("VIDZEO_YT_RANGE_EXTRACTION_TIMEOUT_SECONDS", "40")
+    monkeypatch.setattr(pipeline, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
+    calls = []
+
+    def throttled(_options, _url, clients, jar, _ranges, **kwargs):
+        calls.append(tuple(clients))
+        raise Exception("HTTP Error 429: Too Many Requests")
+
+    monkeypatch.setattr(pipeline, "download_range_attempt", throttled)
+    jar = ranged._cookie_jar([])
+    jar._vidzeo_session_status = "verified"
+    candidate = {"id": "fixture", "url": "https://www.youtube.com/watch?v=fixture"}
+    assert not pipeline._download_clip(candidate, tmp_path / "clip.mp4", 5, 3, session_jar=jar)
+    auth, anon = pipeline._youtube_player_client_rotations()[0]
+    assert calls == [tuple(auth), tuple(anon), tuple(auth)]
+
+
 @pytest.mark.parametrize("public_error", [None, "login required", "Sign in to confirm you're not a bot"])
-def test_unverified_session_uses_signed_in_attempt_only_if_public_requires_login(
+def test_signed_out_session_uses_signed_in_attempt_only_if_public_requires_login(
     tmp_path, monkeypatch, public_error,
 ):
     monkeypatch.setenv("VIDZEO_YT_REQUIRE_SESSION", "0")
@@ -126,7 +252,7 @@ def test_unverified_session_uses_signed_in_attempt_only_if_public_requires_login
     persisted = []
     monkeypatch.setattr(pipeline, "_persist_youtube_session_cookies", lambda used, _: persisted.append(used))
     jar = ranged._cookie_jar([])
-    jar._vidzeo_session_status = "unverified"
+    jar._vidzeo_session_status = "signed_out"
     attempts = []
 
     def download(_opts, session):
@@ -150,11 +276,76 @@ def test_unverified_session_uses_signed_in_attempt_only_if_public_requires_login
     assert persisted == ([jar] if public_error == "login required" else [])
 
 
+def test_unverified_session_falls_back_to_public_on_signed_in_extraction_timeout(
+    tmp_path, monkeypatch,
+):
+    """Nov 26 (Test 21 recipe: signed-in first): the anonymous attempt
+    is the fallback after an authenticated failure, not the first
+    attempt. A pre-transfer extraction timeout on the signed-in attempt
+    must fall through to public playback instead of abandoning the
+    candidate."""
+    monkeypatch.setenv("VIDZEO_YT_REQUIRE_SESSION", "0")
+    monkeypatch.setenv("VIDZEO_YT_DOWNLOAD_ANON_FALLBACK", "1")
+    monkeypatch.setattr(pipeline, "_ANON_DOWNLOAD_THROTTLE_UNTIL", 0.0)
+    persisted = []
+    monkeypatch.setattr(pipeline, "_persist_youtube_session_cookies", lambda used, _: persisted.append(used))
+    jar = ranged._cookie_jar([])
+    jar._vidzeo_session_status = "unverified"
+    attempts = []
+
+    def download(_opts, session):
+        attempts.append(session)
+        if session is not None:
+            raise ranged.YouTubeExtractionTimeout("youtube_extraction_timeout_after_55s")
+        return session
+
+    pipeline._download_with_youtube_session(
+        None, {}, "https://www.youtube.com/watch?v=fixture", jar, None, tmp_path,
+        "clip.raw.", attempt_runner=download,
+    )
+    assert attempts == [jar, None]
+    assert persisted == []
+
+
+def test_range_attempt_subprocess_env_keeps_proxy_vars_by_default(monkeypatch):
+    """Nov 26 (Test 21 recipe): the range-attempt child env inherits
+    the egress proxy vars by default, as on Nov 15. VIDZEO_YT_DIRECT=1
+    restores the Nov 25 direct-only strip for when the proxy dies."""
+    monkeypatch.delenv("VIDZEO_YT_DIRECT", raising=False)
+    monkeypatch.setenv("https_proxy", "http://hatch-egress-proxy:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://hatch-egress-proxy:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://hatch-egress-proxy:3128")
+    monkeypatch.setenv("no_proxy", "localhost")
+    env = ranged._child_env()
+    assert env["https_proxy"] == "http://hatch-egress-proxy:3128"
+    assert env["HTTP_PROXY"] == "http://hatch-egress-proxy:3128"
+    assert env["ALL_PROXY"] == "http://hatch-egress-proxy:3128"
+    assert env["no_proxy"] == "localhost"
+    assert "PATH" in env
+    monkeypatch.setenv("VIDZEO_YT_DIRECT", "1")
+    env = ranged._child_env()
+    for key in (
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    ):
+        assert key not in env
+    assert "PATH" in env
+
+
+def test_youtube_runtime_options_use_proxy_by_default(monkeypatch):
+    """Nov 26 (Test 21 recipe): YT options carry no proxy override, so
+    yt-dlp reads the egress proxy env vars — as on Nov 15 (c5133b4),
+    when 6 of 7 clips landed. VIDZEO_YT_DIRECT=1 restores the Nov 25
+    direct-only override (proxy="") for when the proxy itself dies."""
+    monkeypatch.delenv("VIDZEO_YT_DIRECT", raising=False)
+    assert "proxy" not in pipeline._youtube_js_runtime_options()
+    monkeypatch.setenv("VIDZEO_YT_DIRECT", "1")
+    assert pipeline._youtube_js_runtime_options()["proxy"] == ""
 @pytest.mark.parametrize("failure, override, expected_clients", [
-    ("Requested format is not available", None, [["android"], ["tv"]]),
+    ("Requested format is not available", None, [["android", "web_embedded", "web_creator", "mweb"], ["tv"]]),
     ("Requested format is not available", "web", [["web"]]),
-    ("Sign in to confirm you're not a bot", None, [["android"]]),
-    ("HTTP Error 429: Too Many Requests", None, [["android"]]),
+    ("Sign in to confirm you're not a bot", None, [["android", "web_embedded", "web_creator", "mweb"]]),
+    ("HTTP Error 429: Too Many Requests", None, [["android", "web_embedded", "web_creator", "mweb"]]),
 ])
 def test_public_range_uses_tv_only_when_android_lacks_formats(
     tmp_path, monkeypatch, failure, override, expected_clients,
@@ -189,6 +380,7 @@ def test_public_range_uses_tv_only_when_android_lacks_formats(
 def test_worker_passes_requested_range_and_cookie_in_memory(tmp_path, monkeypatch):
     from services.yt_dlp_runtime import YouTubeRuntimeLog
 
+    monkeypatch.delenv("VIDZEO_YT_DIRECT", raising=False)
     marker = tmp_path / "transfer"
     segment_ranges = [(12.25, 16.5)]
     cookie = http.cookiejar.Cookie(
@@ -200,6 +392,10 @@ def test_worker_passes_requested_range_and_cookie_in_memory(tmp_path, monkeypatc
 
     class FakeYDL:
         def __init__(self, options):
+            # Nov 26 (Test 21 recipe): _execute leaves the proxy unset
+            # by default, so yt-dlp reads the egress proxy env vars;
+            # VIDZEO_YT_DIRECT=1 forces proxy="" instead.
+            assert "proxy" not in options
             assert list(options["download_ranges"]({}, self)) == [
                 {"start_time": 12.25, "end_time": 16.5}
             ]

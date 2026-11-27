@@ -11,15 +11,22 @@ from services.youtube_clip_provenance import write_clip_provenance, load_clip_pr
 @pytest.mark.parametrize('wall', [30, 120, 240, 480, 900])
 def test_search_reserves_majority_of_worker_wall_for_downloads(wall):
     plan = youtube_stage_budget(wall)
-    assert 0 < plan['yt_search_timeout_seconds'] <= plan['yt_hard_timeout_seconds'] * .28
-    assert plan['yt_hard_timeout_seconds'] < wall
+    assert 0 < plan['yt_search_timeout_seconds'] <= 120
+    # Nov 26 (user order): the stage budget publishes no wall that can
+    # stop a download — no hard wall, no per-clip ceiling.
+    assert 'yt_hard_timeout_seconds' not in plan
+    assert 'yt_per_clip_timeout_seconds' not in plan
 
 
 def test_explicit_shorter_stage_limits_remain_authoritative():
     plan = youtube_stage_budget(240, {'yt_search_timeout_seconds': 15, 'yt_hard_timeout_seconds': 100})
-    assert plan == {'yt_search_timeout_seconds': 15, 'yt_hard_timeout_seconds': 100}
+    # The explicit search limit stays; the explicit hard limit is planning
+    # input only now (it sizes the search ceiling) and is not published
+    # as a stop.
+    assert plan == {'yt_search_timeout_seconds': 15}
     excessive = youtube_stage_budget(240, {'yt_search_timeout_seconds': 600, 'yt_hard_timeout_seconds': 1000})
-    assert excessive['yt_hard_timeout_seconds'] == 222
+    assert 'yt_hard_timeout_seconds' not in excessive
+    assert 'yt_per_clip_timeout_seconds' not in excessive
     assert excessive['yt_search_timeout_seconds'] == pytest.approx(62.16)
 
 
@@ -33,51 +40,30 @@ def test_cut_provenance_is_bound_to_exact_pixels_and_scene(tmp_path):
     assert not load_clip_provenance(clip, 2)
 
 
-def test_per_transfer_budget_scales_with_actual_download_waves(monkeypatch):
-    monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
-    settings = {'_youtube_quota_preselected': True}
-    serial = youtube_stage_budget(480, settings, scene_count=5, download_workers=1)
-    parallel = youtube_stage_budget(480, settings, scene_count=5, download_workers=2)
-    assert 60 <= serial['yt_per_clip_timeout_seconds'] < parallel['yt_per_clip_timeout_seconds']
+def test_no_per_clip_wall_is_published_for_any_wave_count():
+    # Nov 26 (user order): downloads are no longer wall-clock bounded, so
+    # the stage budget publishes no per-clip ceiling for any wave count.
+    for workers in (1, 2):
+        plan = youtube_stage_budget(240, scene_count=5, download_workers=workers)
+        assert 'yt_per_clip_timeout_seconds' not in plan
+    assert 'yt_per_clip_timeout_seconds' not in youtube_stage_budget(480, scene_count=5, download_workers=1)
+    assert 'yt_per_clip_timeout_seconds' not in youtube_stage_budget(480, scene_count=5, download_workers=2)
     assert 'yt_per_clip_timeout_seconds' not in youtube_stage_budget(240, {'yt_pool_first': True}, scene_count=5)
 
 
-@pytest.mark.parametrize("configured_grace", [None, "40"])
-def test_wave_budget_leaves_time_for_the_workers_actual_merge_grace(monkeypatch, configured_grace):
-    if configured_grace is None:
-        monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
-    else:
-        monkeypatch.setenv("VIDZEO_YT_CLIP_GRACE_SECONDS", configured_grace)
-    plan = youtube_stage_budget(300, {'_youtube_quota_preselected': True}, scene_count=4, download_workers=2)
-    transfer = plan['yt_per_clip_timeout_seconds']
-    assert transfer >= 60
-    assert 2 * (transfer + youtube_clip_grace_seconds(transfer)) + plan['yt_search_timeout_seconds'] + 10 <= plan['yt_hard_timeout_seconds']
-
-
-def test_first_wave_preserves_agent_search_when_download_waves_fit(monkeypatch):
-    monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
-    plan = youtube_stage_budget(480, {
-        "llm_provider": "external_agent",
-        "_youtube_quota_preselected": True,
-        "yt_search_timeout_seconds": 120,
-    }, scene_count=7, download_workers=4)
-    assert plan["yt_search_timeout_seconds"] == 120
-    assert plan["yt_per_clip_timeout_seconds"] >= 60
-
-
-def test_preselected_quota_keeps_useful_transfer_windows_without_truncating_scenes(monkeypatch):
-    monkeypatch.delenv("VIDZEO_YT_CLIP_GRACE_SECONDS", raising=False)
+def test_preselected_quota_keeps_useful_search_windows_without_truncating_scenes():
     plan = youtube_stage_budget(
         420,
         {'_youtube_quota_preselected': True},
         scene_count=35,
         download_workers=4,
     )
-    transfer = plan['yt_per_clip_timeout_seconds']
-    assert transfer >= 60
+    # Nov 26 (user order): no per-clip ceiling and no hard wall are
+    # published any more; the search window is still bounded.
+    assert 'yt_per_clip_timeout_seconds' not in plan
+    assert 'yt_hard_timeout_seconds' not in plan
     assert 'yt_max_download_scenes' not in plan
-    assert 4 * (transfer + youtube_clip_grace_seconds(transfer)) + plan['yt_search_timeout_seconds'] + 10 <= plan['yt_hard_timeout_seconds']
-    assert plan['yt_hard_timeout_seconds'] < 420
+    assert plan['yt_search_timeout_seconds'] <= 67
 
 
 def test_explicit_user_scene_cap_remains_authoritative():
@@ -291,22 +277,31 @@ def test_unavailable_hd_source_does_not_repeat_every_format(monkeypatch, tmp_pat
     monkeypatch.setattr(yt_dlp_runtime, 'load_yt_dlp', lambda: types.SimpleNamespace(YoutubeDL=FakeYoutubeDL))
     assert not yt._download_clip({'id': 'missing', 'webpage_url': 'https://youtube.com/watch?v=missing'},
                                  tmp_path / 'cut.mp4', 20, 4)
-    assert len(calls) == 3
-    assert calls[0] != calls[1] == calls[2]
-    assert 'height<=2160' in calls[1]
-    assert calls[1].endswith('bestvideo[height>=720][height<=2160]')
+    # Merged Nov 26: each format is tried with Android, then the TV client
+    # on "no playable formats" (one bounded alternate per format), so two
+    # formats produce four calls — the loop still stops instead of
+    # repeating every format on a video with none available.
+    assert len(calls) == 4
+    assert calls[0] == calls[1]
+    assert calls[2] == calls[3]
+    assert calls[0] != calls[2]
+    assert 'height<=2160' in calls[2]
+    assert calls[2].endswith('bestvideo[height>=720][height<=2160]')
 
 
-def test_vision_reserve_shrinks_youtube_hard_wall():
-    """Vision reserve: the YT hard wall shrinks by the reserve instead of
-    reserving only transfer time; with no reserve the plan is unchanged."""
+def test_vision_reserve_shrinks_youtube_search_planning():
+    """Vision reserve: the internal planning wall shrinks by the reserve
+    instead of reserving only transfer time; with no reserve the plan is
+    unchanged. Nov 26 (user order): no hard wall is published any more."""
     plan = youtube_stage_budget(900, {}, scene_count=8, download_workers=3,
                                 vision_reserve_seconds=300)
     assert plan["vision_reserve_seconds"] == 300
-    assert plan["yt_hard_timeout_seconds"] == pytest.approx(582.0)
+    assert "yt_hard_timeout_seconds" not in plan
+    assert plan["yt_search_timeout_seconds"] <= 35
     plain = youtube_stage_budget(900, {}, scene_count=8, download_workers=3)
     assert "vision_reserve_seconds" not in plain
-    assert plain["yt_hard_timeout_seconds"] == pytest.approx(882.0)
+    assert "yt_hard_timeout_seconds" not in plain
+    assert plain["yt_search_timeout_seconds"] <= 35
 
 
 def test_muse_cooldown_keeps_first_wave_and_review_reserve_separate():
@@ -317,7 +312,29 @@ def test_muse_cooldown_keeps_first_wave_and_review_reserve_separate():
     assert mixed_agent_cooldown_wall(config, {"VIDZEO_YT_COOLDOWN_RETRY": "0"}) == 0
     assert mixed_agent_cooldown_wall({**config, "yt_branch_wall_timeout_seconds": 480}, {}) == 0
     plan = youtube_stage_budget(1200, {**config, "_yt_cooldown_headroom": True}, vision_reserve_seconds=300)
-    assert plan["yt_hard_timeout_seconds"] == 480
+    assert "yt_hard_timeout_seconds" not in plan
     assert plan["yt_cooldown_hard_timeout_seconds"] == 882
-    shorter = youtube_stage_budget(1200, {"yt_hard_timeout_seconds": 35}, vision_reserve_seconds=300)
-    assert shorter["yt_hard_timeout_seconds"] == 35
+
+
+def test_stage_allocation_log_never_indexes_removed_hard_wall():
+    # Regression (job 70d7f583): the Nov 26 no-timeout change removed
+    # yt_hard_timeout_seconds from the published stage budget, but the
+    # YouTube branch's allocation print indexed it directly — KeyError
+    # killed the whole lane before any clip was attempted (web 7 / YT 0
+    # / graphics 1). The log line must format fine with a current plan.
+    import app as server_app
+
+    plan = youtube_stage_budget(480, scene_count=8, download_workers=2)
+    assert 'yt_hard_timeout_seconds' not in plan
+    assert 'yt_per_clip_timeout_seconds' not in plan
+    config = dict(plan)
+    line = server_app._yt_stage_allocation_log(
+        config, 480, plan.get('yt_cooldown_hard_timeout_seconds'))
+    assert 'search<=' in line
+    assert 'outer=480s' in line
+    assert 'first wave' not in line
+    # A legacy config that still carries a hard wall keeps the fragment.
+    legacy = dict(config, yt_hard_timeout_seconds=412)
+    assert 'first wave<=412s' in server_app._yt_stage_allocation_log(legacy, 480)
+    # Garbage values must not raise either.
+    assert server_app._yt_stage_allocation_log({}, 'nonsense') == '   [yt] stage allocation: (unavailable)'

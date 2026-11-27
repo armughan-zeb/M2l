@@ -572,8 +572,17 @@ def _engine_prefers_direct(engine_name: str) -> bool:
 
 
 def _route_order(engine: str, prefer_direct: bool) -> List[str]:
-    """Routes to try for one engine fetch, best first, dead routes skipped."""
-    order = ["direct", "proxy"] if prefer_direct else ["proxy", "direct"]
+    """Routes to try for one engine fetch: direct only (Nov 25 direct-only).
+
+    Owner order Nov 25: media retrieval never uses the egress proxy —
+    the proxy's dead CONNECT path killed every lane in the Nov 25 outage
+    while direct answered for every engine host. ``prefer_direct`` is
+    kept for signature compatibility and is now ignored: there is no
+    proxy leg to fall back to, so a direct transport failure fails the
+    engine. Route health still tracks direct failures; the dead-route
+    skip below re-probes direct rather than switching routes.
+    """
+    order = ["direct"]
     now = time.monotonic()
     live: List[str] = []
     for route in order:
@@ -2047,7 +2056,15 @@ class UniversalScraperManager:
         wait_until_complete: bool = False,
         direct: bool = False,
     ) -> UniversalSearchResponse:
-        """Search all selected engines in parallel.
+        """Search the selected engines as a Yandex-first waterfall.
+
+        Engines run one at a time in WEB_ENGINE_PRIORITY order
+        (Yandex, then Bing, then Flickr) and the batch stops as soon as
+        the merged rows reach ``limit_per_engine``.  Yandex alone returns
+        12-20 rows in ~13s when healthy; firing all three at once triples
+        the load on the shared egress and the 2-slot throttle queue (Nov 23
+        probe: 13 concurrent calls stair-stepped 19-59s), which is what
+        made download chunks take 95-120s in job 45795d65.
 
         ``direct=True`` runs this batch's engines direct (proxy bypass);
         the route is passed explicitly to the pool worker threads (the
@@ -2125,19 +2142,19 @@ class UniversalScraperManager:
         #
         # Wright (Nov 16): the four engines shared ONE wall, so all of them
         # died in ~20s and the candidates that arrived a minute later were
-        # discarded ("late result ignored").  Deadlines are now staggered
-        # per engine in priority order — the first engine gets the base
-        # timeout, each later engine one more stagger step — and a late
-        # engine's rows are salvaged to the spool instead of dropped.
+        # discarded ("late result ignored").  A late engine's rows are
+        # salvaged to the spool instead of dropped.
+        #
+        # Yandex-first waterfall (Nov 26 user order): engines run one at a
+        # time in priority order, each with the base engine timeout — no
+        # stagger, because there is no shared wall any more.  The stagger
+        # survives only for the retry waves below, where several stalled
+        # engines are retried together.
         stagger = _universal_engine_stagger_seconds()
-        deadlines = {
-            engine: engine_timeout + index * stagger
-            for index, engine in enumerate(selected)
-        }
-        max_deadline = max(deadlines.values())
+        max_deadline = engine_timeout
         with self._lock:
             self._last_batch_max_deadline_seconds = max_deadline
-        timeout_label = f"{engine_timeout:.1f}s+{stagger:.1f}s/engine"
+        timeout_label = f"{engine_timeout:.1f}s/engine"
         slow_label = (
             f" slow_network={slow_factor:.2f}x"
             if slow_factor > 1.0
@@ -2145,7 +2162,7 @@ class UniversalScraperManager:
         )
         self._log(
             f"[universal] batch start query='{clean[:72]}' engines={','.join(selected)} "
-            f"parallel={len(selected)} timeout={timeout_label} max={max_deadline:.1f}s "
+            f"waterfall timeout={timeout_label} max={max_deadline:.1f}s "
             f"route={'direct' if direct else 'proxy'}{slow_label}"
         )
         # Re-check the spool first: a previous batch's late engines may
@@ -2156,19 +2173,36 @@ class UniversalScraperManager:
         buckets: Dict[str, List[UniversalImageResult]] = {}
         stats_by_engine: Dict[str, UniversalEngineStat] = {}
         timed_out: List[str] = []
+        tried: List[str] = []
         try:
-            futures = {
-                self._executor.submit(
+            # Yandex-first waterfall: one engine at a time, in priority
+            # order.  Stop as soon as the merged rows reach `limit` — the
+            # later engines are fallbacks, not co-runners.  An engine that
+            # times out leaves its rows to the late spool via _collect_batch,
+            # exactly as the old parallel wave did.
+            for engine in selected:
+                tried.append(engine)
+                _future = self._executor.submit(
                     self._run_engine, engine, clean, limit,
                     max(1, int(page)), bool(safe_search), batch_finished,
                     direct, fetch_timeout,
-                ): engine
-                for engine in selected
-            }
-            buckets, stats_by_engine, timed_out = self._collect_batch(
-                futures, deadlines, clean
-            )
-            # Slow-network signal (Nov 22): zero rows AND every selected
+                )
+                _buckets, _stats, _timed_out = self._collect_batch(
+                    {_future: engine}, {engine: engine_timeout}, clean
+                )
+                buckets.update(_buckets)
+                stats_by_engine.update(_stats)
+                timed_out.extend(_timed_out)
+                _have = sum(len(rows) for rows in buckets.values())
+                if _have >= limit:
+                    _skipped = ",".join(selected[len(tried):]) or "none"
+                    self._log(
+                        f"[universal] waterfall satisfied by {engine}: "
+                        f"{_have} row(s) >= limit {limit}; "
+                        f"skipping {_skipped}"
+                    )
+                    break
+            # Slow-network signal (Nov 22): zero rows AND every tried
             # (non-gated) engine stalled on transport — the shared egress
             # is slow, not one engine. Record it now so the retry wave
             # below — and the next batch — get the longer deadline. A
@@ -2189,7 +2223,7 @@ class UniversalScraperManager:
             # (success, 0 rows) or a refusal never arms this.
             stalled_engines = [
                 engine
-                for engine in selected
+                for engine in tried
                 if engine in timed_out
                 or _is_transport_stall_error_text(
                     (
@@ -2200,8 +2234,8 @@ class UniversalScraperManager:
             ]
             if (
                 not any(buckets.values())
-                and selected
-                and len(stalled_engines) == len(selected)
+                and tried
+                and len(stalled_engines) == len(tried)
             ):
                 # Fail-faster (§2.1): count this consecutive all-empty
                 # stalled batch FOR THIS QUERY. The cap gates RETRIES
@@ -2220,7 +2254,7 @@ class UniversalScraperManager:
                     slow_factor = self._slow_network_factor_locked()
                 fetch_timeout = min(120.0, base_fetch_timeout * slow_factor)
                 self._log(
-                    f"[universal] slow network: all {len(selected)} engine(s) "
+                    f"[universal] slow network: all {len(tried)} engine(s) "
                     f"stalled (transport); timeout factor now {slow_factor:.2f}x "
                     f"(streak {self._slow_network_streak})"
                 )
@@ -2353,7 +2387,7 @@ class UniversalScraperManager:
             merged.append(row)
         max_len = max((len(rows) for rows in buckets.values()), default=0)
         for index in range(max_len):
-            for engine in selected:
+            for engine in tried:
                 rows = buckets.get(engine) or []
                 if index >= len(rows):
                     continue
@@ -2380,7 +2414,7 @@ class UniversalScraperManager:
                 # empty-streak entry — the network is delivering again.
                 # Other queries keep their own streaks (test 29).
                 self._consecutive_empty_stalled_by_query.pop(_streak_key, None)
-        stats = [stats_by_engine.get(e, UniversalEngineStat(e, 0, 0, False, "engine timeout")) for e in selected]
+        stats = [stats_by_engine.get(e, UniversalEngineStat(e, 0, 0, False, "engine timeout")) for e in tried]
         # Host learning (no reordering: engine round-robin order and relevance
         # are untouched). Tag each row with whether its image host is already
         # in the persistent seen-host store, so the resolver can prefer
@@ -2422,7 +2456,7 @@ class UniversalScraperManager:
         _dom_share = response.source_diversity.get("dominant_share") or 0.0
         self._log(
             f"[universal] batch complete results={response.total} "
-            f"engines={successes}/{len(selected)} "
+            f"engines={successes}/{len(tried)} "
             f"dominant_source={_dom}:{float(_dom_share):.0%}"
         )
         return response

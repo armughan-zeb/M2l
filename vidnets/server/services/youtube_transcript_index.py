@@ -796,6 +796,8 @@ class YouTubeTranscriptIndex:
                         # Prefer the system SSL context over certifi so a host
                         # behind a TLS-intercepting proxy still works.
                         "compat_opts": {"no-certifi"},
+                        # Nov 25 direct-only: no egress proxy for media.
+                        "proxy": "",
                         "extractor_args": {"youtube": {"player_client": [client]}},
                     }
                     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1015,6 +1017,8 @@ class YouTubeTranscriptIndex:
                             # Prefer the system SSL context over certifi so a
                             # host behind a TLS-intercepting proxy still works.
                             "compat_opts": {"no-certifi"},
+                            # Nov 25 direct-only: no egress proxy for media.
+                            "proxy": "",
                             "extractor_args": {"youtube": {"player_client": [client]}},
                         }) as ydl:
                             # Anonymous spot (fixed Nov 17): this fallback

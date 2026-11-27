@@ -289,7 +289,14 @@ class _ProbeEngine(_Engine):
         return self._client
 
 
-def test_engine_fetch_falls_back_to_direct_on_proxy_timeout(monkeypatch):
+def test_engine_fetch_is_direct_only_no_proxy_leg(monkeypatch):
+    """Nov 25 direct-only: the engine never touches the proxy.
+
+    The fetch goes direct on the first and only attempt; there is no
+    proxy leg to fall back from. The probe client times out the proxy
+    route and lands direct — under direct-only the proxy route is
+    never attempted, so the fetch lands at once.
+    """
     monkeypatch.setattr(
         "services.web_image.universal_scraper._universal_retry_count", lambda: 0
     )
@@ -301,17 +308,27 @@ def test_engine_fetch_falls_back_to_direct_on_proxy_timeout(monkeypatch):
     )
     assert response.status_code == 200
     assert route == "direct"
-    assert client.routes == ["proxy", "direct"]
+    assert client.routes == ["direct"]
 
 
-def test_dead_route_is_skipped_fast_then_reprobed():
+def test_dead_direct_route_is_reprobed_not_abandoned():
+    """Nov 25 direct-only: the order is always ["direct"].
+
+    There is no proxy leg, so proxy health can no longer change the
+    order. A direct route that failed transport 3x is still re-probed
+    (the order never comes back empty) rather than abandoned.
+    """
     engine = "probe-skip"
+    for _ in range(3):
+        _note_route_result(engine, "direct", False)
+    assert _route_order(engine, prefer_direct=False) == ["direct"]
+    assert _route_order(engine, prefer_direct=True) == ["direct"]
+    # Proxy health is irrelevant now: marking it dead changes nothing.
     for _ in range(3):
         _note_route_result(engine, "proxy", False)
     assert _route_order(engine, prefer_direct=False) == ["direct"]
+    _note_route_result(engine, "direct", True)
     assert _route_order(engine, prefer_direct=True) == ["direct"]
-    _note_route_result(engine, "proxy", True)
-    assert _route_order(engine, prefer_direct=False) == ["proxy", "direct"]
 
 
 def test_manager_search_passes_direct_to_pool_threads():
@@ -380,10 +397,10 @@ def test_new_route_session_direct_never_reads_env_proxy():
     assert _new_route_session(direct=False).trust_env is True
 
 
-def test_fetch_issues_each_route_on_its_own_session(monkeypatch):
-    """_fetch must hand the proxy attempt a trust_env=True session and the
-    direct fallback attempt a trust_env=False session — the wire path must
-    match the route label, not just the proxies kwarg."""
+def test_fetch_issues_direct_attempt_on_its_own_session(monkeypatch):
+    """Nov 25 direct-only: the single direct attempt runs on the
+    trust_env=False session — the wire path must match the route label,
+    not just the proxies kwarg. No proxy attempt is ever issued."""
     from services.web_image import universal_scraper as scraper
 
     seen = []
@@ -406,4 +423,4 @@ def test_fetch_issues_each_route_on_its_own_session(monkeypatch):
     )
     assert response.status_code == 200
     assert route == "direct"
-    assert seen == [(True, False), (False, True)]
+    assert seen == [(False, True)]

@@ -178,6 +178,20 @@ def _youtube_js_runtime_options() -> Dict[str, Any]:
     # SSL context instead, which honours SSL_CERT_FILE and the OS trust
     # store. Safe on Windows/macOS too (their system stores are used).
     options["compat_opts"] = {"no-certifi"}
+    # Nov 26 (user order: restore the Test 21 recipe fully): media
+    # retrieval runs through the egress proxy again, as on Nov 15
+    # (c5133b4) when 6 of 7 clips landed. The Nov 25 direct-only
+    # override (proxy="") was ordered after the proxy outage, but every
+    # job since has been YouTube 0 while the proxy itself answers
+    # again. yt-dlp reads the proxy env vars (urllib getproxies) when
+    # no proxy option is set, so leaving the key out restores proxy
+    # downloads. Every YT options dict flows through here (search,
+    # download, probe, range-attempt payload), so this covers the
+    # whole lane. VIDZEO_YT_DIRECT=1 restores direct mode without a
+    # code change (an empty proxy string means __noproxy__ inside
+    # yt-dlp: no env proxy is ever consulted).
+    if str(os.environ.get("VIDZEO_YT_DIRECT", "") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        options["proxy"] = ""
     root = Path(__file__).resolve().parents[2]
     runtime_candidates = [
         os.environ.get("VIDZEO_NODE_PATH"),
@@ -2889,7 +2903,15 @@ def _youtube_formats_unavailable(detail: str) -> bool:
 
 
 def _youtube_range_prefers_public(jar: Any) -> bool:
-    return getattr(jar, "_vidzeo_session_status", "") in {"unverified", "signed_out"}
+    # Nov 26 (user order: restore the Test 21 recipe fully): the
+    # signed-in session goes first. "unverified" only means the probe
+    # timed out or has not run yet — the cookies are usually fine (the
+    # probe itself flakes; account 1 verified on retry today), and
+    # trying public first burns a whole attempt and heats the throttle
+    # window before the session is ever tried. Only a confirmed
+    # "signed_out" session goes public first; the anonymous attempt
+    # remains as the fallback after an authenticated failure.
+    return getattr(jar, "_vidzeo_session_status", "") in {"signed_out"}
 
 
 def _download_with_youtube_session(
@@ -2903,17 +2925,30 @@ def _download_with_youtube_session(
     *,
     on_retry_reset=None,
     attempt_runner=None,
+    clients=None,
     allow_public_client_fallback=True,
 ):
-    """Select a session and recover with bounded alternate attempts."""
-    def download(jar, clients=None):
+    """Select a session and recover with bounded alternate attempts.
+
+    ``clients`` is one (authenticated, anonymous) rotation from
+    ``_youtube_player_client_rotations``; without it the single-list
+    ``_youtube_player_clients`` resolver is used (direct callers, tests).
+    """
+    def download(jar, override_clients=None):
         if cancellation is not None:
             cancellation.raise_if_cancelled()
+        if override_clients is not None:
+            # Explicit client list (e.g. the TV fallback): use it as-is.
+            client_list = list(override_clients)
+        elif clients is not None:
+            client_list = clients[1] if jar is None else clients[0]
+        else:
+            client_list = _youtube_player_clients(jar)
         attempt_opts = dict(opts, extractor_args={
             **(opts.get("extractor_args") or {}),
             "youtube": {
                 **((opts.get("extractor_args") or {}).get("youtube") or {}),
-                "player_client": clients if clients is not None else _youtube_player_clients(jar),
+                "player_client": client_list,
             },
         })
         if attempt_runner is not None:
@@ -2955,7 +2990,7 @@ def _download_with_youtube_session(
                 cancellation.raise_if_cancelled()
             _reset_and_clean()
             print("   [yt-session] Android returned no playable formats; trying the TV client", flush=True)
-            return download(None, clients=["tv"])
+            return download(None, override_clients=["tv"])
 
     tried_public = (
         attempt_runner is not None
@@ -2970,9 +3005,19 @@ def _download_with_youtube_session(
         except Exception as exc:
             detail = str(exc).casefold()
             _note_public_download_failure(detail)
-            if not _youtube_login_required(detail):
+            if _youtube_login_required(detail) or isinstance(exc, YouTubeExtractionTimeout):
+                # Public playback failed before transfer (extraction timed
+                # out) or needs sign-in: the authenticated session is the
+                # next attempt, not a reason to abandon the candidate.
+                # c53092c2 proved the point: anonymous-first extraction
+                # stalled past its 55s wall on every candidate and the
+                # session was never tried, so each candidate died with
+                # an attempt unspent.
+                print("   [yt-session] public playback failed; trying authenticated session", flush=True)
+                _reset_and_clean()
+            else:
                 raise
-            _reset_and_clean()
+
 
     try:
         used_jar = download_public() if session_jar is None else download(session_jar)
@@ -3005,13 +3050,17 @@ def _download_with_youtube_session(
         if cancellation is not None:
             cancellation.raise_if_cancelled()
 
-        # 1. Rotate to another verified account on sign-in OR session throttle.
-        if pool is not None and (sign_in or throttled) and "not a bot" not in detail:
+        # 1. Rotate to another verified account on sign-in only. A throttle
+        # (429 / zero-byte stall) is a shared-window failure, not an
+        # account-access failure: rotating burns the backup account's
+        # window too, and the next account hits the same wall.
+        # Pinned by test_verified_cookie_files_fail_over_only_for_account_access:
+        # 429 must raise, never rotate.
+        if pool is not None and sign_in and "not a bot" not in detail:
             index, backup = pool.next_verified(_pool_index)
             if backup is not None:
                 _reset_and_clean()
-                label = "sign-in-required footage" if sign_in else "throttled download"
-                print(f"   [yt-session] retrying {label} with verified account {index + 1}", flush=True)
+                print(f"   [yt-session] retrying sign-in-required footage with verified account {index + 1}", flush=True)
                 used_backup = download(backup)
                 _persist_youtube_session_cookies(used_backup, pool=pool, index=index)
                 return
@@ -3028,7 +3077,7 @@ def _download_with_youtube_session(
         ):
             _reset_and_clean()
             phase = "extraction timed out" if extraction_timeout else "transfer stalled or was throttled"
-            print(f"   [yt-session] authenticated {phase}; trying public playback", flush=True)
+            print(f"   [yt-session] authenticated {phase}; trying public playback once", flush=True)
             try:
                 download_public(allow_alternate=True)
                 return
@@ -3049,14 +3098,96 @@ def _download_with_youtube_session(
 
 
 def _youtube_player_clients(session_jar: Any = None) -> List[str]:
-    """Use the working app's Android client for public clips and cookie-capable clients for signed-in clips."""
+    """Android-first multi-client lists, as on Nov 15 (c5133b4) when 6 of
+    7 clips landed in test 21.
+
+    Nov 26 (user order: restore the Test 21 recipe fully). The Nov 18
+    switch to bare tv_embedded / web+tv_samsung never proved itself on
+    a GTA job. Android leads, so yt-dlp usually never reaches the
+    embedded clients; if it does and one aborts with
+    KeyError('INNERTUBE_CONTEXT'), _youtube_failure_is_rotatable
+    treats that as rotatable (the run-4 single-list abort predates the
+    rotation loop). yt-dlp drops Android from the list when signed in,
+    so the authenticated list still works with cookies.
+    """
     configured = str(os.environ.get("VIDZEO_YT_PLAYER_CLIENTS") or "").strip()
     clients = [client.strip() for client in configured.split(",") if client.strip()]
     if clients:
         return clients
     adapted = _adapt_youtube_cookie_jar(session_jar) if session_jar is not None else None
-    # yt-dlp removes Android from the requested clients when signed in.
-    return ["web", "tv_samsung"] if adapted is not None else ["android"]
+    if adapted is not None:
+        return ["android", "web", "web_embedded", "web_creator", "mweb"]
+    return ["android", "web_embedded", "web_creator", "mweb"]
+
+
+def _youtube_player_client_rotations() -> List[Tuple[List[str], List[str]]]:
+    """Ordered (authenticated, anonymous) player-client lists per candidate.
+
+    Nov 26 (user order: restore what worked, then safeguard it). The Nov 15
+    code that landed 6 clips in test 21 tried android-first multi-client
+    lists; the Nov 18 switch to bare tv_embedded / web+tv_samsung never
+    proved itself on a GTA job (every job since: YouTube 0). Rotation 1 is
+    the old working list; rotation 2 is the Nov 18 measured list; rotation
+    3 is yt-dlp's own defaults (empty list). A stalled/throttled transfer
+    rotates to the next list instead of failing the candidate — only the
+    last rotation can fail it, and a 429 / "not a bot" never rotates (back
+    off; the cooldown wave retry handles those).
+    ``VIDZEO_YT_PLAYER_CLIENTS`` still overrides with a single list.
+    """
+    configured = str(os.environ.get("VIDZEO_YT_PLAYER_CLIENTS") or "").strip()
+    if configured:
+        clients = [c.strip() for c in configured.split(",") if c.strip()]
+        if clients:
+            return [(clients, clients)]
+    return [
+        (
+            ["android", "web", "web_embedded", "web_creator", "mweb"],
+            ["android", "web_embedded", "web_creator", "mweb"],
+        ),
+        (["web", "tv_samsung"], ["tv_embedded"]),
+        ([], []),
+    ]
+
+
+def _youtube_failure_is_rotatable(exc: BaseException) -> bool:
+    """True when a failed attempt should rotate to the next client list.
+
+    Rotatable: extraction timeouts, zero-byte/ffmpeg stalls, and transport
+    timeouts — the throttle symptoms a different player client can dodge.
+    Never rotatable: 429 / "too many requests" / "not a bot" (a shared
+    window failure — rotating only burns the window further; the cooldown
+    wave retry handles those), sign-in / availability failures (a different
+    client cannot unlock a private or age-gated video), and DNS / network
+    outages (the network is down, not the client).
+    """
+    detail = str(exc or "").casefold()
+    if any(marker in detail for marker in (
+        "429", "too many requests", "not a bot", "confirm you're not a bot",
+    )):
+        return False
+    if _youtube_login_required(detail):
+        return False
+    if any(marker in detail for marker in (
+        "please sign in", "sign in to confirm", "use --cookies",
+        "video unavailable", "private video", "age-restricted",
+        "this video is not available",
+    )):
+        return False
+    if _youtube_host_dns_failure(detail):
+        return False
+    if any(marker in detail for marker in (
+        "network is unreachable", "unreachable network",
+        "no route to host", "connection refused",
+        "wsaenetunreach", "winerror 10051", "errno 101",
+    )):
+        return False
+    if isinstance(exc, YouTubeExtractionTimeout):
+        return True
+    return any(marker in detail for marker in (
+        "youtube_zero_byte_stall", "youtube_ffmpeg_stall",
+        "timeout", "timed out", "temporarily unavailable",
+        "connection reset", "connection aborted", "innertube_context",
+    ))
 
 
 def _search_cache_path(query: str) -> Path:
@@ -5064,18 +5195,26 @@ def _youtube_transport_timeout_defaults() -> Tuple[int, int, int, int]:
     higher-quality stream enough time for transfer, merge, and verification.
     The returned values are ``socket_seconds, retries, fragment_retries,
     per_clip_seconds``.
+
+    Nov 26 (user order: remove every timeout that stops a download):
+    ``per_clip_seconds`` is 0, meaning no wall-clock kill on a clip — a
+    download ends only on success, a real yt-dlp error, or exhaustion of
+    the client/session safeguard chain (see
+    ``_youtube_player_client_rotations``). Retries are raised to 10 so a
+    throttled-but-alive transfer retries instead of dying on transient
+    read timeouts.
     """
     max_height, _output_fps = _youtube_quality_limits()
     quality_ratio = max(0.0, (float(max_height) - 1080.0) / 1080.0)
     socket_seconds = int(round(45.0 + (10.0 * quality_ratio)))
-    retries = int(round(4.0 + quality_ratio))
-    fragment_retries = int(round(4.0 + quality_ratio))
-    per_clip_seconds = int(round(360.0 + (120.0 * quality_ratio)))
+    retries = int(round(10.0 + quality_ratio))
+    fragment_retries = int(round(10.0 + quality_ratio))
+    per_clip_seconds = 0
     return (
         max(30, min(60, socket_seconds)),
-        max(3, min(6, retries)),
-        max(3, min(6, fragment_retries)),
-        max(300, min(600, per_clip_seconds)),
+        max(8, min(12, retries)),
+        max(8, min(12, fragment_retries)),
+        per_clip_seconds,
     )
 
 
@@ -5317,39 +5456,34 @@ def _download_clip(
     zero_byte_grace_seconds: Optional[float] = None,
     deadline_at: Optional[float] = None,
 ) -> bool:
-    # Bound the complete per-candidate operation, including yt-dlp retrieval,
-    # format fallback, FFmpeg conversion, and integrity probing.  The outer
-    # batch deadline alone is insufficient because a worker stuck inside
-    # yt-dlp can keep the executor alive after the batch has moved on.
+    # Nov 26 (user order: remove every timeout that stops a download). There
+    # is no per-candidate wall-clock deadline any more: a download ends only
+    # on success, a real yt-dlp error, or exhaustion of the client/session
+    # safeguard chain (see _youtube_player_client_rotations). The old 360s
+    # per-clip wall — and the stage budget's 150s ceiling feeding it — killed
+    # healthy-but-throttled transfers at their bound, never at a real
+    # failure: 2fc9521f's 10 downloads all died that way. The extraction
+    # wall below is now a *rotation* interval, not a failure: when it fires,
+    # the attempt rotates to the next client list. The outer coordinator
+    # still provides the final deadlock guard for the job as a whole.
     _default_socket_timeout, _default_retries, _default_fragment_retries, _default_clip_timeout = _youtube_transport_timeout_defaults()
     try:
-        per_clip_timeout = max(
-            10.0,
-            # The transfer often reaches 100% just before yt-dlp's merge and
-            # the local integrity probe. 45s cut those healthy candidates off
-            # on the production machine; keep the deadline bounded, but leave
-            # enough time for the post-download merge.
-            float(os.environ.get("VIDZEO_YT_PER_CLIP_TIMEOUT", str(_default_clip_timeout)) or _default_clip_timeout),
-        )
-    except (TypeError, ValueError):
-        per_clip_timeout = float(_default_clip_timeout)
-    clip_grace = youtube_clip_grace_seconds(per_clip_timeout)
-    clip_deadline = time.monotonic() + per_clip_timeout + clip_grace
-    if deadline_at is not None:
-        clip_deadline = min(clip_deadline, deadline_at)
-    try:
-        extraction_seconds = max(5.0, min(90.0, float(
-            os.environ.get("VIDZEO_YT_RANGE_EXTRACTION_TIMEOUT_SECONDS", "40") or 40
+        extraction_seconds = max(5.0, min(300.0, float(
+            os.environ.get("VIDZEO_YT_RANGE_EXTRACTION_TIMEOUT_SECONDS", "240") or 240
         )))
     except (TypeError, ValueError):
-        extraction_seconds = 40.0
-    public_attempt_reserve = 55.0
+        extraction_seconds = 240.0
+    # c53092c2 (Nov 25): anonymous-first extraction stalled past the old
+    # 55s wall on every candidate and the 40s session wall was no better;
+    # both died at their bound, never at a real failure. Give extraction
+    # room for the JS-challenge solver: 240s per attempt. The public
+    # (anonymous) attempt gets the full reserve on top of it.
+    public_attempt_reserve = 240.0
 
     def _remaining_clip_timeout() -> float:
-        remaining = clip_deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"youtube_clip_timeout_after_{per_clip_timeout:.0f}s")
-        return remaining
+        # No clip deadline: always room. Kept so progress hooks and the
+        # range-attempt plumbing still have a remaining-budget call.
+        return math.inf
 
     url = _candidate_url(candidate)
     if not url:
@@ -5401,9 +5535,11 @@ def _download_clip(
                          f"[height<={max(_youtube_quality_limits()[0], 2160)}]")
             format_candidates.append('/'.join(raw_formats[1:] + [silent_hd] + _archival_quality_formats(candidate)))
         # A finite clip ends normally at EOF. Treating EOF as a reconnect
-        # event can keep FFmpeg reopening an already finished range. Bound
-        # real network stalls while leaving time for another ranked source.
-        range_read_seconds = max(8.0, min(20.0, per_clip_timeout))
+        # event can keep FFmpeg reopening an already finished range. The
+        # read timeout below only triggers a reconnect (raised to 10
+        # retries / 60s total, Nov 26: a throttled transfer must reconnect,
+        # not die); it never kills the clip.
+        range_read_seconds = 20.0
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -5422,8 +5558,8 @@ def _download_clip(
                 "ffmpeg_i": [
                     "-rw_timeout", str(int(range_read_seconds * 1_000_000)),
                     "-reconnect", "1", "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "3", "-reconnect_max_retries", "2",
-                    "-reconnect_delay_total_max", "6",
+                    "-reconnect_delay_max", "3", "-reconnect_max_retries", "10",
+                    "-reconnect_delay_total_max", "60",
                 ]
             },
             "socket_timeout": int(os.environ.get("VIDZEO_YT_DOWNLOAD_SOCKET_TIMEOUT", str(_default_socket_timeout)) or _default_socket_timeout),
@@ -5458,26 +5594,24 @@ def _download_clip(
         stall_watchdog.start()
 
         def run_ranged_attempt(attempt_opts, jar):
-            remaining = _remaining_clip_timeout()
             clients = attempt_opts["extractor_args"]["youtube"]["player_client"]
             candidate['_player_client_attempts'].append({
                 "clients": list(clients), "authenticated": jar is not None,
             })
+            # No clip deadline any more, so there is no reserve to hold back:
+            # the session attempt gets the full extraction wall and the
+            # public attempt gets the wall plus the reserve.
             extraction_wall = extraction_seconds
             if jar is None:
-                # Direct-mode observations put successful public clips near
-                # 50s end to end. The total clip deadline still caps this.
+                # Public extraction gets the full reserve: c53092c2 showed
+                # anonymous extraction stalling past 55s on a warm window,
+                # so the old 55s wall killed it before the solver could
+                # finish.
                 extraction_wall = max(extraction_wall, public_attempt_reserve)
-            elif not _youtube_range_prefers_public(session_jar) and _anon_download_fallback_ready():
-                # Give a public retry time to extract and transfer inside
-                # this clip's original wall, even in a tight wave.
-                extraction_wall = min(
-                    extraction_wall, max(10.0, remaining - public_attempt_reserve),
-                )
             return download_range_attempt(
                 attempt_opts, url, clients,
                 jar, [(range_start, range_end)], work_dir=output_path.parent,
-                extraction_seconds=extraction_wall, deadline=clip_deadline,
+                extraction_seconds=extraction_wall, deadline=None,
                 cancellation=cancellation, check_transfer=lambda: _download_progress(None),
                 on_process=stall_watchdog.bind_attempt,
             )
@@ -5485,136 +5619,144 @@ def _download_clip(
         # Real packages run in a killable subprocess. Lightweight injected
         # YoutubeDL doubles still exercise the session/format flow in-process.
         run_attempt = run_ranged_attempt if isolated_attempt else None
+        # Nov 26 (user order): a stalled/throttled attempt rotates through
+        # the player-client lists instead of failing the candidate. The
+        # rotation loop is the outer loop; the format loop runs inside it.
+        # Only the last rotation can fail the candidate, and only a
+        # non-rotatable failure (429, sign-in, private/age-gated, DNS down)
+        # fails it at once. A 429 never rotates.
+        rotations = _youtube_player_client_rotations()
         try:
-            for format_index, format_spec in enumerate(format_candidates):
-                if cancellation is not None:
-                    cancellation.raise_if_cancelled()
-                _remaining_clip_timeout()
-                if format_index:
+            for rotation_index, rotation_clients in enumerate(rotations):
+                last_rotation = rotation_index + 1 == len(rotations)
+                rotate_requested = False
+                for format_index, format_spec in enumerate(format_candidates):
+                    if cancellation is not None:
+                        cancellation.raise_if_cancelled()
+                    _remaining_clip_timeout()
+                    if format_index:
+                        for stale in output_path.parent.glob(raw_prefix + "*"):
+                            try:
+                                stale.unlink()
+                            except OSError:
+                                pass
+                        opts["format"] = format_spec
+                        stall_watchdog.reset()
+                    try:
+                        _download_with_youtube_session(
+                            yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
+                            on_retry_reset=stall_watchdog.reset, attempt_runner=run_attempt,
+                            clients=rotation_clients,
+                        )
+                        download_error = None
+                        break
+                    except Exception as exc:
+                        download_error = exc
+                        # A branch-wall cancellation is terminal. Retrying every
+                        # format after the coordinator has moved on only creates late
+                        # partial files and delays executor quiescence/salvage.
+                        if cancellation is not None and cancellation.cancelled():
+                            raise
+                        if _youtube_failure_is_rotatable(exc):
+                            # Stalled/throttled transfer: rotate to the next
+                            # client list instead of failing the candidate.
+                            # Stamp the kind so the caller can tell a throttled
+                            # transfer (park this video; try the next ranked
+                            # candidate) from a content reject (another
+                            # timestamp from the same video may still be clean).
+                            if stall_watchdog.zero_byte_stalled:
+                                candidate['_transport_failure'] = 'zero_byte_throttle'
+                            elif isinstance(exc, YouTubeExtractionTimeout):
+                                candidate['_transport_failure'] = 'youtube_extraction_timeout'
+                            else:
+                                candidate.setdefault('_transport_failure', 'transport_timeout')
+                            if last_rotation:
+                                print(f"   [yt-v2] {exc}; all client rotations exhausted", flush=True)
+                                raise
+                            print(f"   [yt-v2] {exc}; rotating to the next client list", flush=True)
+                            rotate_requested = True
+                            break
+                        # Authentication and availability failures are independent of
+                        # the requested selector. Retrying the same protected video
+                        # with four more format strings only burns the branch wall and
+                        # makes a healthy web/stock rescue look stuck. Let the caller
+                        # move to the next ranked candidate immediately; the error is
+                        # still retained in the branch audit.
+                        error_text = str(exc or "").lower()
+                        if _youtube_host_dns_failure(error_text):
+                            diagnostic = _record_youtube_network_failure('download', exc)
+                            candidate['_transport_failure'] = diagnostic['code']
+                            print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+                            raise
+                        if any(marker in error_text for marker in (
+                            'network is unreachable', 'unreachable network',
+                            'no route to host', 'connection refused',
+                            'wsaenetunreach', 'winerror 10051', 'errno 101',
+                        )):
+                            diagnostic = _record_youtube_network_failure('download', exc)
+                            candidate['_transport_failure'] = diagnostic['code']
+                            print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
+                            raise
+                        non_selector_failure = any(
+                            marker in error_text
+                            for marker in (
+                                "please sign in",
+                                "sign in to confirm",
+                                "use --cookies",
+                                "confirm you're not a bot",
+                                "video unavailable",
+                                "private video",
+                                "age-restricted",
+                                "this video is not available",
+                            )
+                        )
+                        if non_selector_failure:
+                            candidate['_transport_failure'] = (
+                                'youtube_access_required' if any(marker in error_text for marker in (
+                                    'sign in', 'use --cookies', 'age-restricted', "confirm you're not a bot",
+                                )) else 'youtube_source_unavailable'
+                            )
+                            print(
+                                "   [yt-v2] non-selector download failure; "
+                                "skipping format retries for this candidate",
+                                flush=True,
+                            )
+                            raise
+                        if _youtube_format_retry_is_futile(str(exc or ""), runtime_log.categories):
+                            # The extraction already logged a sign-in/age-gate
+                            # warning: no format rung can succeed on this video.
+                            # Skip the remaining rungs and let the caller try the
+                            # next ranked candidate.
+                            candidate['_transport_failure'] = 'youtube_access_required'
+                            print(
+                                "   [yt-v2] format unavailable with an authentication warning; "
+                                "skipping format retries for this candidate",
+                                flush=True,
+                            )
+                            raise
+                        if format_index + 1 < len(format_candidates):
+                            print(
+                                f"   [yt-v2] format '{format_spec}' failed ({str(exc)[:60]}); "
+                                f"retrying fallback format '{format_candidates[format_index + 1]}'",
+                                flush=True,
+                            )
+                            continue
+                        # Both extractions already tried the complete bounded format
+                        # set. Switch source instead of repeating an unbounded rescue.
+                        if 'requested format is not available' in error_text:
+                            candidate['_transport_failure'] = 'youtube_format_unavailable'
+                        raise
+                if rotate_requested:
                     for stale in output_path.parent.glob(raw_prefix + "*"):
                         try:
                             stale.unlink()
                         except OSError:
                             pass
-                    opts["format"] = format_spec
                     stall_watchdog.reset()
-                try:
-                    _download_with_youtube_session(
-                        yt_dlp, opts, url, session_jar, cancellation, output_path.parent, raw_prefix,
-                        on_retry_reset=stall_watchdog.reset, attempt_runner=run_attempt,
-                        allow_public_client_fallback=format_index == len(format_candidates) - 1,
-                    )
-                    download_error = None
-                    break
-                except Exception as exc:
-                    download_error = exc
-                    # A branch-wall cancellation is terminal. Retrying every
-                    # format after the coordinator has moved on only creates late
-                    # partial files and delays executor quiescence/salvage.
-                    if cancellation is not None and cancellation.cancelled():
-                        raise
-                    if isinstance(exc, YouTubeExtractionTimeout):
-                        candidate['_transport_failure'] = 'youtube_extraction_timeout'
-                        print(f"   [yt-v2] {exc}; pre-transfer attempt stopped", flush=True)
-                        raise
-                    if stall_watchdog.zero_byte_stalled:
-                        candidate['_transport_failure'] = 'zero_byte_throttle'
-                        print(
-                            "   [yt-v2] 0-byte throttle stall detected; aborting format retries",
-                            flush=True,
-                        )
-                        raise
-                    # Authentication and availability failures are independent of
-                    # the requested selector. Retrying the same protected video
-                    # with four more format strings only burns the branch wall and
-                    # makes a healthy web/stock rescue look stuck. Let the caller
-                    # move to the next ranked candidate immediately; the error is
-                    # still retained in the branch audit.
-                    error_text = str(exc or "").lower()
-                    # A transport timeout says the current transfer is unhealthy;
-                    # changing format cannot make that network request faster and
-                    # used to spend the remaining scene wall on a duplicate retry.
-                    # Stamp the kind so the caller can tell a throttled transfer
-                    # (park this video; try the next ranked candidate) from a
-                    # content reject (another timestamp from the same video may
-                    # still be clean). Without the stamp every failure looked
-                    # the same and the scene re-queued the same throttled video
-                    # at another timestamp for up to 6 passes.
-                    if _youtube_host_dns_failure(error_text):
-                        diagnostic = _record_youtube_network_failure('download', exc)
-                        candidate['_transport_failure'] = diagnostic['code']
-                        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
-                        raise
-                    if any(marker in error_text for marker in (
-                        'network is unreachable', 'unreachable network',
-                        'no route to host', 'connection refused',
-                        'wsaenetunreach', 'winerror 10051', 'errno 101',
-                    )):
-                        diagnostic = _record_youtube_network_failure('download', exc)
-                        candidate['_transport_failure'] = diagnostic['code']
-                        print(f"   [yt-v2] {diagnostic['code']}: {diagnostic['message']}", flush=True)
-                        raise
-                    if any(marker in error_text for marker in (
-                        "timeout", "timed out", "temporarily unavailable",
-                        "connection reset", "connection aborted", "youtube_ffmpeg_stall",
-                    )):
-                        candidate.setdefault('_transport_failure', 'transport_timeout')
-                        print(
-                            "   [yt-v2] transport timeout/failure; moving to the next ranked candidate",
-                            flush=True,
-                        )
-                        raise
-                    non_selector_failure = any(
-                        marker in error_text
-                        for marker in (
-                            "please sign in",
-                            "sign in to confirm",
-                            "use --cookies",
-                            "confirm you're not a bot",
-                            "video unavailable",
-                            "private video",
-                            "age-restricted",
-                            "this video is not available",
-                        )
-                    )
-                    if non_selector_failure:
-                        candidate['_transport_failure'] = (
-                            'youtube_access_required' if any(marker in error_text for marker in (
-                                'sign in', 'use --cookies', 'age-restricted', "confirm you're not a bot",
-                            )) else 'youtube_source_unavailable'
-                        )
-                        print(
-                            "   [yt-v2] non-selector download failure; "
-                            "skipping format retries for this candidate",
-                            flush=True,
-                        )
-                        raise
-                    if _youtube_format_retry_is_futile(str(exc or ""), runtime_log.categories):
-                        # The extraction already logged a sign-in/age-gate
-                        # warning: no format rung can succeed on this video.
-                        # Skip the remaining rungs and let the caller try the
-                        # next ranked candidate.
-                        candidate['_transport_failure'] = 'youtube_access_required'
-                        print(
-                            "   [yt-v2] format unavailable with an authentication warning; "
-                            "skipping format retries for this candidate",
-                            flush=True,
-                        )
-                        raise
-                    if format_index + 1 < len(format_candidates):
-                        print(
-                            f"   [yt-v2] format '{format_spec}' failed ({str(exc)[:60]}); "
-                            f"retrying fallback format '{format_candidates[format_index + 1]}'",
-                            flush=True,
-                        )
-                        continue
-                    # Both extractions already tried the complete bounded format
-                    # set. Switch source instead of repeating an unbounded rescue.
-                    if _youtube_formats_unavailable(error_text):
-                        candidate['_transport_failure'] = 'youtube_format_unavailable'
-                    raise
-            if download_error is not None:
-                raise download_error
+                    continue
+                if download_error is not None:
+                    raise download_error
+                break
         finally:
             stall_watchdog.stop()
             if stall_watchdog.fired:
@@ -5622,11 +5764,12 @@ def _download_clip(
                 if stall_watchdog.zero_byte_stalled:
                     candidate.setdefault('_transport_failure', 'zero_byte_throttle')
     except Exception as exc:
-        # The per-clip wall raises TimeoutError from _remaining_clip_timeout
-        # (progress hooks and the format loop); yt-dlp timeouts surface as
-        # "timeout"/"timed out" in the message. Stamp both as transport
-        # timeouts so the caller parks the video instead of re-queueing it
-        # at another timestamp. Cancellations still raise above.
+        # yt-dlp timeouts surface as "timeout"/"timed out" in the message.
+        # Stamp them as transport timeouts so the caller parks the video
+        # instead of re-queueing it at another timestamp. (Nov 26: there is
+        # no per-clip wall any more, so "youtube_clip_timeout_after_" can no
+        # longer fire; the check stays as a guard.) Cancellations still
+        # raise above.
         if isinstance(exc, TimeoutError) or "youtube_clip_timeout_after_" in str(exc):
             candidate.setdefault('_transport_failure', 'transport_timeout')
         if cancellation is not None and cancellation.cancelled():

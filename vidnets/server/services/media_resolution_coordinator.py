@@ -4203,10 +4203,16 @@ def _scene_finalist_limit() -> int:
 
 
 def _finalists_for_storyboard(rows, configured):
-    """Avoid checking several candidates per scene for a short video.
+    """Keep up to three vision finalists per scene even for a short video.
 
-    Unusable or missing duration data keeps the configured limit. Rejected
-    candidates still use the existing bounded expansion/recovery path.
+    The old cap of 1 meant any single vision reject forced a full new
+    search round (job 6ea1b5e9: every scene's pool was 1 with no
+    alternates, so 3 rejects + 1 lost verdict cost 4 fallback rounds).
+    The batch verifier judges up to 4 finalists in one
+    ``analyze_images_batch`` call with first-accept-wins, so 3 finalists
+    cost ~one batch call, not three sequential ones. Unusable or missing
+    duration data keeps the configured limit. Rejected candidates still
+    use the existing bounded expansion/recovery path.
     """
     try:
         durations = []
@@ -4216,7 +4222,7 @@ def _finalists_for_storyboard(rows, configured):
                 value = float(row["end_seconds"]) - float(row["start_seconds"])
             durations.append(float(value or 0))
         if durations and all(0 < value < 600 for value in durations) and sum(durations) <= 120:
-            return min(configured, 1)
+            return min(configured, 3)
     except (TypeError, ValueError, AttributeError):
         pass
     return configured
