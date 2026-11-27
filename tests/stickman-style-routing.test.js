@@ -47,13 +47,13 @@ test('resolveVideoStyle strictly distinguishes Documentary vs 2D Stickman and re
   for (const alias of ['vidzeo', 'documentary', 'one_minute_documentary', 'one-minute-documentary']) {
     assert.deepEqual(
       resolveVideoStyle({ productionEngine: alias }),
-      { engine: ENGINES.DOCUMENTARY, style: STYLES.DOCUMENTARY, label: 'One-Minute Documentary (Remotion)', explicit: true }
+      { engine: ENGINES.DOCUMENTARY, style: STYLES.DOCUMENTARY, label: 'Documentary (Remotion)', explicit: true }
     );
   }
 
   assert.deepEqual(
     resolveVideoStyle({ title: 'Legacy payload without style fields' }),
-    { engine: ENGINES.DOCUMENTARY, style: STYLES.DOCUMENTARY, label: 'One-Minute Documentary (Remotion)', explicit: false }
+    { engine: ENGINES.DOCUMENTARY, style: STYLES.DOCUMENTARY, label: 'Documentary (Remotion)', explicit: false }
   );
 
   // Removed Doodle Verse & local-only Pikgen must fail closed in Muse

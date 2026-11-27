@@ -19,7 +19,7 @@ const { writeJsonAtomic } = require('../lib/config');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { resolveVideoStyle, ENGINES, defaultVoiceForStyle } = require('../lib/videoStyle');
 const { stampStickmanManifest } = require('../lib/masterManifestGuard');
-const { cleanGeneratedCode, parseJsonAnswer, runProcess, inferWithMuse } = require('../lib/museBridgeInfer');
+const { cleanGeneratedCode, parseJsonAnswer, runProcess, inferWithMuse, createFrameProgressReporter } = require('../lib/museBridgeInfer');
 
 const SCRIPT_JSON_SCHEMA = {
   type: 'json_schema',
@@ -290,6 +290,7 @@ async function render(job, scriptText, workDir, options = {}) {
     try { scriptJson = JSON.parse(fs.readFileSync(scriptJsonPath, 'utf8')); } catch { scriptJson = null; }
   }
   if (!scriptJson || !Array.isArray(scriptJson.lines) || !scriptJson.lines.length) {
+    log.info(`[2d-stickman] Job ${job.jobId}: structuring narration into script.json via Muse`);
     onProgress(8, '[2d-stickman] Structuring narration into script.json via Muse', true);
     const reply = await inferWithMuse({
       operation: 'stickman_script_json',
@@ -305,11 +306,13 @@ async function render(job, scriptText, workDir, options = {}) {
     inferRequests.push({ id: reply.id, operation: 'stickman_script_json' });
     scriptJson = { ...reply.data, output: 'video', voice, profile, format, captions };
     writeJsonAtomic(scriptJsonPath, scriptJson);
+    log.info(`[2d-stickman] Job ${job.jobId}: script.json ready (${scriptJson.lines.length} lines)`);
   }
 
   const mixWavPath = path.join(projectDir, 'data', 'mix.wav');
   const linesJsonPath = path.join(projectDir, 'data', 'lines.json');
   if (!fs.existsSync(mixWavPath) || !fs.existsSync(linesJsonPath)) {
+    log.info(`[2d-stickman] Job ${job.jobId}: synthesizing Edge TTS narration (${voice})`);
     onProgress(16, `[2d-stickman] Synthesizing Edge TTS narration (${voice})`, true);
     await runProcess(pythonBin, [path.join('tools', 'voice_edge.py'), '--force'], { cwd: projectDir, signal, label: '2D Stickman TTS' });
   }
@@ -317,6 +320,7 @@ async function render(job, scriptText, workDir, options = {}) {
 
   const linesData = JSON.parse(fs.readFileSync(linesJsonPath, 'utf8'));
   const durationSeconds = Number(linesData.duration) || 0;
+  log.info(`[2d-stickman] Job ${job.jobId}: audio + captions ready (${durationSeconds.toFixed(1)}s, ${linesData.lines.length} lines)`);
   const profileCfg = {
     name: profile,
     format,
@@ -334,6 +338,7 @@ async function render(job, scriptText, workDir, options = {}) {
     } catch { /* ignore */ }
   }
   if (!shotsJs) {
+    log.info(`[2d-stickman] Job ${job.jobId}: choreographing scenes via Muse (${linesData.lines.length} lines, ${durationSeconds.toFixed(1)}s)`);
     onProgress(26, `[2d-stickman] Choreographing scenes via Muse (${linesData.lines.length} lines, ${durationSeconds.toFixed(1)}s)`, true);
     const reply = await inferWithMuse({
       operation: 'stickman_shots_plan',
@@ -353,6 +358,7 @@ async function render(job, scriptText, workDir, options = {}) {
   }
   fs.writeFileSync(shotsPath, shotsJs, 'utf8');
 
+  log.info(`[2d-stickman] Job ${job.jobId}: running Canvas scene check and QA lint gate`);
   onProgress(36, '[2d-stickman] Running Canvas scene check and QA lint gate', true);
   try {
     await runQaChecks(projectDir, signal);
@@ -382,8 +388,15 @@ async function render(job, scriptText, workDir, options = {}) {
   await runProcess(nodeExecutable(), ['tools/capture.mjs', 'cues'], { cwd: projectDir, signal, label: '2D Stickman cues export' });
   await runProcess(pythonBin, [path.join('tools', 'mix_audio.py')], { cwd: projectDir, signal, label: '2D Stickman audio mix' });
 
+  log.info(`[2d-stickman] Job ${job.jobId}: rendering 1080p Canvas frames through Chrome CDP`);
   onProgress(52, '[2d-stickman] Rendering 1080p Canvas frames through Chrome CDP', true);
   const rawVideo = path.join(projectDir, 'renders', 'video.mp4');
+  const reportFrame = createFrameProgressReporter(onProgress, {
+    prefix: '[2d-stickman]',
+    basePct: 52,
+    spanPct: 42,
+    logger: log,
+  });
   await runProcess(nodeExecutable(), ['tools/capture.mjs', 'video', path.join('renders', 'video.mp4')], {
     cwd: projectDir,
     timeoutMs: Math.max(30 * 60 * 1000, Math.round(durationSeconds * 8000)),
@@ -391,12 +404,7 @@ async function render(job, scriptText, workDir, options = {}) {
     label: '2D Stickman video render',
     onStdoutLine: (line) => {
       const m = line.match(/^(\d+)\/(\d+)\s+frames/);
-      if (m) {
-        const done = Number(m[1]);
-        const total = Math.max(1, Number(m[2]));
-        const pct = 52 + Math.min(42, Math.round((done / total) * 42));
-        onProgress(pct, `[2d-stickman] Rendered ${done}/${total} frames`, true);
-      }
+      if (m) reportFrame(m[1], m[2]);
     },
   });
 

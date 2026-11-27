@@ -9,6 +9,7 @@ const path = require('node:path');
 const documentary = require('../adapters/documentary');
 const stickman = require('../adapters/stickman');
 const scriptAdapter = require('../adapters/script');
+const { createFrameProgressReporter } = require('../lib/museBridgeInfer');
 
 test('one_minute_documentary skill assets and Remotion template are bundled', () => {
   const status = documentary.documentaryRuntimeStatus();
@@ -134,3 +135,66 @@ test('adapters/script routes documentary and stickman jobs via Muse inference wi
     fs.rmSync(stickWork, { recursive: true, force: true });
   }
 });
+
+test('createFrameProgressReporter throttles noise and formats CMS frame counters cleanly', () => {
+  const events = [];
+  const logs = [];
+  const reportFrame = createFrameProgressReporter(
+    (pct, msg, adv) => events.push({ pct, msg, adv }),
+    { prefix: '[documentary]', basePct: 70, spanPct: 25, intervalMs: 60000, logger: { info: m => logs.push(m) } }
+  );
+  assert.equal(reportFrame(1, 1800), true);   // initial frame reports immediately
+  assert.equal(reportFrame(2, 1800), false);  // same percent within intervalMs is throttled
+  assert.equal(reportFrame(180, 1800), true); // pct jumped -> 73%
+  assert.equal(reportFrame(1800, 1800), true); // final frame always emits
+  assert.equal(events.length, 3);
+  assert.match(events[1].msg, /\bframe 180\/1800\b/);
+  assert.equal(events[2].pct, 95);
+  assert.equal(logs.length, 3);
+});
+
+test('documentary scales cleanly to 20-minute CMS duration, voice, 9:16 aspect, and captions toggle', () => {
+  const { defaultVoiceForStyle } = require('../lib/videoStyle');
+  const longJob = {
+    jobId: 'j_20min',
+    title: 'How the Panama Canal Was Built',
+    productionEngine: 'vidzeo',
+    targetDurationMinutes: 20,
+    targetWordCount: 3000,
+    voice: 'en-GB-RyanNeural',
+    documentaryOptions: { aspect: '9:16', captionsEnabled: false, width: 1080, height: 1920 },
+    channel: { name: 'History Deep Dive', niche: 'Engineering', scriptSettings: { tone: 'Cinematic', rules: 'Dates verified' } },
+  };
+  assert.equal(defaultVoiceForStyle(longJob), 'en-GB-RyanNeural');
+
+  const scriptMsgs = scriptAdapter.buildScriptMessages(longJob).map(m => m.content).join('\n');
+  assert.match(scriptMsgs, /20-minute/);
+  assert.match(scriptMsgs, /3000 words/);
+  assert.match(scriptMsgs, /Dates verified/);
+
+  const shotMsgs = documentary.buildShotsPlanMessages({
+    title: longJob.title,
+    scriptText: 'Test narration',
+    voiceDurationSec: 1200,
+    targetDurationMinutes: 20,
+    channel: longJob.channel,
+  }).map(m => m.content).join('\n');
+  assert.match(shotMsgs, /1200\.00s/);
+  assert.match(shotMsgs, /~171 shots/);
+
+  const rootVertical = documentary.generateRemotionRootTsx(36000, { width: 1080, height: 1920 });
+  assert.match(rootVertical, /durationInFrames=\{36000\}/);
+  assert.match(rootVertical, /width=\{1080\}/);
+  assert.match(rootVertical, /height=\{1920\}/);
+
+  const compNoCap = documentary.generateCompositionTsx({
+    topicTag: 'HISTORY',
+    headerText: 'PANAMA CANAL',
+    shots: [{ from: 0, dur: 240, assetType: 'video', assetPath: 'footage/shot-1.mp4', title: 'THE CUT', sub: '', zoomIn: true, center: false }],
+    captionsEnabled: false,
+  });
+  assert.match(compNoCap, /loop/);
+  assert.doesNotMatch(compNoCap, /<Caption /);
+});
+
+

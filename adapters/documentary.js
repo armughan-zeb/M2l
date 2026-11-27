@@ -19,7 +19,7 @@ const ffmpeg = require('../lib/ffmpeg');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { resolveVideoStyle, ENGINES, defaultVoiceForStyle } = require('../lib/videoStyle');
 const { stampDocumentaryManifest } = require('../lib/masterManifestGuard');
-const { cleanGeneratedCode, runProcess, inferWithMuse } = require('../lib/museBridgeInfer');
+const { cleanGeneratedCode, runProcess, inferWithMuse, createFrameProgressReporter } = require('../lib/museBridgeInfer');
 
 const FPS = 30;
 const WIDTH = 1920;
@@ -87,30 +87,32 @@ function documentaryRuntimeStatus(env = process.env) {
   };
 }
 
-function buildShotsPlanMessages({ title, scriptText, voiceDurationSec, channel }) {
-  const dur = Math.max(20, Number(voiceDurationSec) || 60);
-  const minShots = Math.max(6, Math.min(24, Math.round(dur / 6)));
+function buildShotsPlanMessages({ title, scriptText, voiceDurationSec, targetDurationMinutes, channel }) {
+  const dur = Math.max(20, Number(voiceDurationSec) || Math.round((Number(targetDurationMinutes) || 1) * 60));
+  const targetMinutes = Math.max(1, Number(targetDurationMinutes) || Math.round((dur / 60) * 10) / 10);
+  const targetShots = Math.max(6, Math.min(240, Math.round(dur / 7)));
+  const minShots = Math.max(5, Math.min(180, Math.round(dur / 10)));
+  const structure = String(channel?.scriptSettings?.customStructure || '').trim();
   const sys = [
-    'You are the director for the One-Minute Documentary Remotion template (`one_minute_documentary`).',
-    'Plan a crisp shot list that covers the full measured voiceover duration across the 5 documentary beats:',
-    '  1. hook (0-13% of duration)',
-    '  2. background (13-33%)',
-    '  3. development (33-58%)',
-    '  4. impact (58-80%)',
-    '  5. closing (80-100%, last shot usually center=true)',
+    'You are the director for the Documentary Remotion engine (`one_minute_documentary` template, scaled dynamically to any CMS runtime).',
+    `Plan a continuous shot list covering the ENTIRE ${dur.toFixed(2)}s (~${targetMinutes}-minute) measured voiceover.`,
+    structure
+      ? `Documentary structure: ${structure}`
+      : 'Distribute shots proportionally across the 5 documentary beats: 1) hook (0-13%), 2) background (13-33%), 3) development (33-58%), 4) impact (58-80%), 5) closing (80-100%, last shot usually center=true).',
     '',
     'Rules:',
-    `1. Target total duration = ${dur.toFixed(2)}s across roughly ${minShots} shots (4-10s each).`,
-    '2. Mix `kind: "video"` (4-8 shots for yt-dlp / Wikimedia / Creative Commons / stock) and `kind: "image"` (3-6 archival or photo stills).',
+    `1. CRITICAL DURATION: Sum of shot \`durationSec\` MUST cover the full ${dur.toFixed(2)}s voiceover (~${targetShots} shots, at least ${minShots} shots, typically 4-10s per shot — NEVER cap a multi-minute video at a 1-minute shot count).`,
+    '2. Mix `kind: "video"` (for yt-dlp documentary/real footage) and `kind: "image"` (archival or photo stills).',
     '3. Keep `topicTag` (2-20 chars uppercase) and `headerText` (short uppercase subtitle) specific to the topic.',
     '4. Keep each shot `title` short and punchy (2-6 uppercase words) and `sub` one short descriptive line (<= 10 words).',
-    '5. Each `query` must be concrete, visual, and specific to the real documentary subject (never generic filler).',
+    '5. Each `query` must be concrete, visual, and specific to that segment of narration (never generic filler).',
     '6. Output valid JSON matching the schema ONLY.',
   ].join('\n');
 
   const refs = Array.isArray(channel?.scriptReferences)
     ? channel.scriptReferences.map((r) => r.title || r.url).filter(Boolean).slice(0, 3).join('; ')
     : '';
+  const tone = String(channel?.scriptSettings?.tone || '').trim();
 
   return [
     { role: 'system', content: sys },
@@ -119,7 +121,9 @@ function buildShotsPlanMessages({ title, scriptText, voiceDurationSec, channel }
       content: [
         `TITLE: ${title}`,
         `CHANNEL: ${channel?.name || 'Documentary'} (${channel?.niche || 'General'})`,
+        tone ? `TONE: ${tone}` : '',
         refs ? `REFERENCES: ${refs}` : '',
+        `TARGET_MINUTES: ${targetMinutes}`,
         `MEASURED_VOICEOVER_SECONDS: ${dur.toFixed(2)}`,
         '',
         'NARRATION:',
@@ -164,7 +168,7 @@ function normalizeShots(rawShots, totalFrames) {
   });
 }
 
-function generateCompositionTsx({ topicTag, headerText, shots }) {
+function generateCompositionTsx({ topicTag, headerText, shots, captionsEnabled = true }) {
   const safeTag = JSON.stringify(String(topicTag || 'DOCUMENTARY').toUpperCase().slice(0, 32));
   const safeHeader = JSON.stringify(String(headerText || '').toUpperCase().slice(0, 48));
   const shotLines = shots.map((shot) => {
@@ -311,6 +315,7 @@ const Shot: React.FC<{
             <OffthreadVideo
               src={staticFile(video)}
               muted
+              loop
               style={{ width: "100%", height: "100%", objectFit: "cover" }}
             />
           ) : (
@@ -320,8 +325,7 @@ const Shot: React.FC<{
             />
           )}
         </div>
-        <Gradient />
-        <Caption title={title} sub={sub} align={center ? "center" : "left"} />
+        ${captionsEnabled ? '<Gradient />\n        <Caption title={title} sub={sub} align={center ? "center" : "left"} />' : ''}
       </AbsoluteFill>
     </Sequence>
   );
@@ -368,8 +372,10 @@ ${shotLines}
 `;
 }
 
-function generateRemotionRootTsx(durationInFrames) {
+function generateRemotionRootTsx(durationInFrames, { width = WIDTH, height = HEIGHT } = {}) {
   const frames = Math.max(300, Math.round(Number(durationInFrames) || 1800));
+  const outW = Number(width) || WIDTH;
+  const outH = Number(height) || HEIGHT;
   return `import React from "react";
 import { Composition } from "remotion";
 import { Documentary } from "./Composition";
@@ -381,8 +387,8 @@ export const RemotionRoot: React.FC = () => {
       component={Documentary}
       durationInFrames={${frames}}
       fps={${FPS}}
-      width={${WIDTH}}
-      height={${HEIGHT}}
+      width={${outW}}
+      height={${outH}}
     />
   );
 };
@@ -402,9 +408,10 @@ async function synthesizeVoiceover(scriptText, outputPath, { voice, signal, pyth
   const hatchTts = String(process.env.MUSE_HATCH_TTS_BIN || '/opt/hatch/bin/tts').trim();
   const textFile = `${outputPath}.txt`;
   fs.writeFileSync(textFile, String(scriptText || '').trim(), 'utf8');
+  const explicitVoice = String(voice || '').trim();
+  const py = pythonBin || await resolvePython();
 
-  if (hatchTts && fs.existsSync(hatchTts)) {
-    const py = pythonBin || await resolvePython();
+  if (!explicitVoice && hatchTts && fs.existsSync(hatchTts)) {
     await runProcess(py, ['-c', `
 import subprocess, sys
 text = open(sys.argv[1], encoding="utf-8").read()
@@ -412,8 +419,7 @@ proc = subprocess.run([sys.argv[2], "speak", "--output", sys.argv[3], "--text-st
 sys.exit(proc.returncode)
 `, textFile, hatchTts, outputPath], { signal, label: 'Hatch TTS synthesis' });
   } else {
-    const py = pythonBin || await resolvePython();
-    const edgeVoice = String(voice || '').trim() || 'en-US-ChristopherNeural';
+    const edgeVoice = explicitVoice || 'en-US-ChristopherNeural';
     await runProcess(py, ['-m', 'edge_tts', '--voice', edgeVoice, '--file', textFile, '--write-media', outputPath], {
       signal,
       label: 'Edge TTS voiceover',
@@ -481,7 +487,7 @@ async function fetchImageAsset(query, sourceUrl, destStem, { signal } = {}) {
   return null;
 }
 
-async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal, pythonBin } = {}) {
+async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal, pythonBin, width = WIDTH, height = HEIGHT } = {}) {
   const tempRaw = `${destPath}.raw.mp4`;
   const target = sourceUrl && /^https?:\/\//i.test(sourceUrl) ? sourceUrl : `ytsearch2:${query}`;
   const ytdlpArgs = [
@@ -514,12 +520,14 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
     try { fs.rmSync(tempRaw, { force: true }); } catch { /* ignore */ }
     return null;
   }
-  const clipDur = Math.max(2, Math.min(15, Number(durationSec) || 6));
+  const clipDur = Math.max(2, Math.min(30, Math.ceil(Number(durationSec) || 6)));
+  const outW = Number(width) || WIDTH;
+  const outH = Number(height) || HEIGHT;
   try {
     await runProcess(ffmpegBin, [
       '-y', '-i', tempRaw,
       '-t', clipDur.toFixed(2),
-      '-vf', `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},fps=${FPS}`,
+      '-vf', `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},fps=${FPS}`,
       '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
       destPath,
     ], { timeoutMs: 2 * 60 * 1000, signal, label: 'ffmpeg documentary trim' });
@@ -590,12 +598,21 @@ async function render(job, scriptText, workDir, options = {}) {
   const signal = options.signal;
   const pythonBin = options.pythonBin || await resolvePython();
   const voice = defaultVoiceForStyle(job);
+  const aspect = String(job.documentaryOptions?.aspect || job.videoOptions?.aspect || job.channel?.videoOptions?.aspect || '16:9').trim() || '16:9';
+  const isVertical = aspect === '9:16';
+  const renderWidth = Number(job.documentaryOptions?.width) || (isVertical ? 1080 : WIDTH);
+  const renderHeight = Number(job.documentaryOptions?.height) || (isVertical ? 1920 : HEIGHT);
+  const captionsEnabled = job.documentaryOptions?.captionsEnabled !== false && job.videoOptions?.captionsEnabled !== false && job.channel?.videoOptions?.captionsEnabled !== false;
+  const targetMinutes = Math.max(1, Number(job.targetDurationMinutes) || Number(job.documentaryOptions?.durationMinutes) || 1);
 
   const projectDir = path.join(workDir, 'documentary-project');
   const inputDigest = crypto.createHash('sha256').update(JSON.stringify({
     title: job.title || '',
     narration,
     voice,
+    aspect,
+    captionsEnabled,
+    targetMinutes,
     engine: ENGINES.DOCUMENTARY,
   })).digest('hex');
 
@@ -614,8 +631,10 @@ async function render(job, scriptText, workDir, options = {}) {
     try { voiceDurationSec = (await ffmpeg.probeVideo(voicePath)).duration || 0; } catch { voiceDurationSec = 0; }
   }
   if (!voiceDurationSec) {
+    log.info(`[documentary] Job ${job.jobId}: synthesizing voiceover (${voice})`);
     onProgress(10, `[documentary] Synthesizing voiceover (${voice})`, true);
     voiceDurationSec = await synthesizeVoiceover(narration, voicePath, { voice, signal, pythonBin });
+    log.info(`[documentary] Job ${job.jobId}: voiceover ready (${voiceDurationSec.toFixed(2)}s)`);
   }
 
   const totalFrames = Math.max(300, Math.ceil(voiceDurationSec * FPS));
@@ -626,6 +645,7 @@ async function render(job, scriptText, workDir, options = {}) {
     try { plan = JSON.parse(fs.readFileSync(planFile, 'utf8')); } catch { plan = null; }
   }
   if (!plan || !Array.isArray(plan.shots) || !plan.shots.length) {
+    log.info(`[documentary] Job ${job.jobId}: requesting shot plan via Muse inference (${totalFrames} frames)`);
     onProgress(20, '[documentary] Planning documentary shots and visual queries via Muse', true);
     const reply = await inferWithMuse({
       operation: 'documentary_shots_plan',
@@ -634,6 +654,7 @@ async function render(job, scriptText, workDir, options = {}) {
         title: job.title || 'Documentary',
         scriptText: narration,
         voiceDurationSec,
+        targetDurationMinutes: targetMinutes,
         channel: job.channel || {},
       }),
       responseFormat: SHOTS_PLAN_SCHEMA,
@@ -646,6 +667,7 @@ async function render(job, scriptText, workDir, options = {}) {
     inferRequests.push({ id: reply.id, operation: 'documentary_shots_plan' });
     plan = reply.data;
     writeJsonAtomic(planFile, { ...plan, inferRequests });
+    log.info(`[documentary] Job ${job.jobId}: planned ${Array.isArray(plan?.shots) ? plan.shots.length : 0} shots (tag=${plan?.topicTag || 'DOCUMENTARY'})`);
   }
 
   const normalizedShots = normalizeShots(plan.shots, totalFrames);
@@ -658,15 +680,17 @@ async function render(job, scriptText, workDir, options = {}) {
   for (let i = 0; i < normalizedShots.length; i += 1) {
     const shot = normalizedShots[i];
     const pct = 28 + Math.round(((i + 1) / normalizedShots.length) * 32);
-    onProgress(pct, `[documentary] Fetching media for shot ${i + 1}/${normalizedShots.length}`, true);
+    log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length} (${shot.beat}, ${shot.kind}): "${shot.query}"`);
+    onProgress(pct, `[documentary] Fetching media for shot ${i + 1}/${normalizedShots.length}: ${shot.query.slice(0, 60)}`, true);
 
     let asset = null;
     if (shot.kind === 'video') {
       const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
-      const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin });
+      const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight });
       if (fetched) {
         asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source };
         videoShotCount += 1;
+        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready (${(shot.dur / FPS).toFixed(1)}s)`);
       }
     }
     if (!asset) {
@@ -675,6 +699,7 @@ async function render(job, scriptText, workDir, options = {}) {
       if (fetchedImg) {
         asset = { assetType: 'image', assetPath: `images/${path.basename(fetchedImg.path)}`, source: fetchedImg.source };
         imageShotCount += 1;
+        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: verified image ready`);
       }
     }
     if (!asset && verifiedFallbacks.length) {
@@ -682,6 +707,7 @@ async function render(job, scriptText, workDir, options = {}) {
       asset = { ...reused };
       if (reused.assetType === 'video') videoShotCount += 1;
       else imageShotCount += 1;
+      log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: reused verified asset ${reused.assetPath}`);
     }
     if (!asset) {
       throw new Error(`Documentary shot ${i + 1} ("${shot.query}") could not retrieve any verified video clip or real image.`);
@@ -691,6 +717,7 @@ async function render(job, scriptText, workDir, options = {}) {
     resolvedShots.push({ ...shot, ...asset });
   }
 
+  log.info(`[documentary] Job ${job.jobId}: building Remotion project (${videoShotCount} video, ${imageShotCount} image shots)`);
   onProgress(64, '[documentary] Writing Remotion composition from one_minute_documentary template', true);
   fs.writeFileSync(
     path.join(projectDir, 'src', 'Composition.tsx'),
@@ -698,20 +725,30 @@ async function render(job, scriptText, workDir, options = {}) {
       topicTag: plan.topicTag || job.channel?.name || 'DOCUMENTARY',
       headerText: plan.headerText || job.title || '',
       shots: resolvedShots,
+      captionsEnabled,
     }),
     'utf8'
   );
-  fs.writeFileSync(path.join(projectDir, 'src', 'RemotionRoot.tsx'), generateRemotionRootTsx(totalFrames), 'utf8');
+  fs.writeFileSync(path.join(projectDir, 'src', 'RemotionRoot.tsx'), generateRemotionRootTsx(totalFrames, { width: renderWidth, height: renderHeight }), 'utf8');
 
   await ensureNodeModules(runtime.templateDir, projectDir, signal);
 
-  onProgress(70, '[documentary] Rendering 1080p master with Remotion', true);
+  log.info(`[documentary] Job ${job.jobId}: starting Remotion render (${renderWidth}x${renderHeight}@${FPS}fps, ${totalFrames} frames)`);
+  onProgress(70, `[documentary] Rendering ${renderWidth}x${renderHeight} master with Remotion`, true);
   const rawVideo = path.join(workDir, 'video.mp4');
   const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
   const renderArgs = ['remotion', 'render', 'src/index.ts', 'Documentary', `--output=${rawVideo}`, '--codec=h264', '--overwrite'];
+  const concurrency = Math.max(0, Math.min(8, Math.floor(Number(process.env.MUSE_REMOTION_CONCURRENCY) || 0)));
+  if (concurrency > 0) renderArgs.push(`--concurrency=${concurrency}`);
   const browserExec = browserExecutablePath();
   if (browserExec) renderArgs.push(`--browser-executable=${browserExec}`);
 
+  const reportFrame = createFrameProgressReporter(onProgress, {
+    prefix: '[documentary]',
+    basePct: 70,
+    spanPct: 25,
+    logger: log,
+  });
   await runProcess(npxBin, renderArgs, {
     cwd: projectDir,
     timeoutMs: Math.max(30 * 60 * 1000, Math.round(voiceDurationSec * 25000)),
@@ -719,12 +756,7 @@ async function render(job, scriptText, workDir, options = {}) {
     label: 'Remotion documentary render',
     onStdoutLine: (line) => {
       const m = line.match(/(\d+)\s*\/\s*(\d+)/);
-      if (m) {
-        const done = Number(m[1]);
-        const total = Math.max(1, Number(m[2]));
-        const pct = 70 + Math.min(25, Math.round((done / total) * 25));
-        onProgress(pct, `[documentary] Rendered ${done}/${total} frames`, true);
-      }
+      if (m) reportFrame(m[1], m[2]);
     },
   });
 

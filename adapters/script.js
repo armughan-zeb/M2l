@@ -112,47 +112,58 @@ function buildScriptMessages(job) {
   const title = String(job.title || 'Untitled').trim();
   const premise = String(job.premise || job.description || '').trim();
   const hook = String(job.titlePackage?.hook || '').trim();
+  const angle = String(job.titlePackage?.angle || '').trim();
+  const audience = String(job.titlePackage?.targetAudience || '').trim();
   const channelName = String(job.channel?.name || '').trim();
   const niche = String(job.channel?.niche || '').trim();
+  const subniche = String(job.channel?.subniche || '').trim();
+  const persona = String(job.channel?.persona || job.channel?.notes || job.channel?.description || '').trim();
   const tone = String(job.channel?.scriptSettings?.tone || '').trim();
+  const customStructure = String(job.channel?.scriptSettings?.customStructure || '').trim();
+  const rules = String(job.channel?.scriptSettings?.rules || '').trim();
+  const guidelines = String(job.channel?.scriptSettings?.guidelines || '').trim();
   const refTranscript = String(
     job.titlePackage?.referenceTranscript ||
     job.channel?.scriptSettings?.referenceTranscript ||
     job.scriptReferences?.[0]?.transcript || ''
-  ).trim().slice(0, 1200);
+  ).trim().slice(0, 1800);
 
   const isStickman = style.engine === ENGINES.STICKMAN;
   const sys = isStickman
     ? [
-        'Write spoken narration for a 2D Stickman Cartoon Studio video (`2d-stickman`).',
-        `Target ~${targetWords} words (minimum ${minWords} words) for a ${targetMinutes}-minute video.`,
+        `Write spoken narration for a ${targetMinutes}-minute 2D Stickman Cartoon Studio video (\`2d-stickman\`).`,
+        `IMPORTANT DURATION TARGET: Write ~${targetWords} words (minimum ${minWords} words) to fill the full ${targetMinutes}-minute CMS runtime at ~150 words/minute.`,
         'Rules:',
         '1. Use punchy, visual, action-driven sentences (~8-15 words per sentence) that work naturally with animated stickman scenes.',
         '2. Spell out numbers, years, and acronyms as they should be spoken.',
         '3. Output plain spoken narration paragraphs ONLY — no headings, no markdown, no stage directions.',
         '4. Be factually accurate; do not invent statistics or claims.',
-      ].join('\n')
+        rules ? `5. Channel script rules: ${rules}` : '',
+      ].filter(Boolean).join('\n')
     : [
-        'Write spoken narration for a One-Minute Documentary video (`one_minute_documentary`).',
-        `Target ~${targetWords} words (minimum ${minWords} words) for a ${targetMinutes}-minute documentary.`,
-        'Follow the five documentary beats in clear spoken paragraphs:',
-        '  1. Hook (opening tension or question)',
-        '  2. Background / Origins',
-        '  3. Development / Turning point',
-        '  4. Impact',
-        '  5. Closing reflection',
+        `Write full-length spoken narration for a ${targetMinutes}-minute Remotion documentary video (\`one_minute_documentary\` template).`,
+        `IMPORTANT DURATION TARGET: Write ~${targetWords} words (minimum ${minWords} words) so spoken narration covers the entire ${targetMinutes}-minute CMS runtime (~150 words/minute). Never write a short 1-minute summary when ${targetMinutes} > 1.`,
+        customStructure
+          ? `Follow this structure: ${customStructure}`
+          : 'Follow the five documentary beats scaled proportionally to the full runtime: 1) Hook, 2) Background / Origins, 3) Development / Turning points, 4) Impact, 5) Closing reflection.',
         'Rules:',
         '1. Spell numbers and dates as they should sound when spoken aloud.',
         '2. Output plain spoken narration paragraphs ONLY — no markdown, no headings, no bullet lists, no stage directions.',
-        '3. Ground every claim in documented reality; never invent facts.',
-      ].join('\n');
+        '3. Ground every claim in documented reality; never invent facts or filler repetition.',
+        rules ? `4. Channel script rules: ${rules}` : '',
+      ].filter(Boolean).join('\n');
 
   const userParts = [
     `TITLE: ${title}`,
-    channelName ? `CHANNEL: ${channelName}${niche ? ` (${niche})` : ''}` : '',
+    `TARGET_DURATION_MINUTES: ${targetMinutes} (~${targetWords} words target, >= ${minWords} words)`,
+    channelName ? `CHANNEL: ${channelName}${niche ? ` (${niche}${subniche ? ` / ${subniche}` : ''})` : ''}` : '',
+    persona ? `CHANNEL_PERSONA: ${persona}` : '',
     premise ? `PREMISE: ${premise}` : '',
     hook ? `HOOK: ${hook}` : '',
+    angle ? `ANGLE: ${angle}` : '',
+    audience ? `TARGET_AUDIENCE: ${audience}` : '',
     tone ? `TONE: ${tone}` : '',
+    guidelines ? `GUIDELINES: ${guidelines}` : '',
     refTranscript ? `REFERENCE STYLE EXCERPT:\n${refTranscript}` : '',
   ].filter(Boolean);
 
