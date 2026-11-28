@@ -37,13 +37,12 @@ Only one Active Worker can claim — that is a CMS limit, not a bug.
 
 ```bash
 docker compose ps
-docker compose exec worker node muse-agent.js doctor   # bridge + Vidnets health — must pass before any job runs
+docker compose exec worker node muse-agent.js doctor   # bridge + daemon health — must pass before any job runs
 docker compose exec worker node muse-agent.js status   # connected true, activeWorker true
-docker compose exec worker curl -s http://127.0.0.1:5010/   # Vidnets answers inside the container
+docker compose exec worker curl -s https://cms.vidnets.com/api/muse   # CMS reachable (warn-only: the daemon runs jobs locally when the CMS is down)
 ```
 
-No ports are published to the host by default. To inspect Vidnets from the
-host, uncomment the `ports:` block in `docker-compose.yml` and re-up.
+No ports are published to the host by default — the daemon has no HTTP port (the retired :5010 Vidnets server is gone); it talks to the CMS over HTTPS.
 
 ## Fast inference first: the resident worker pool (primary), the host hook (fallback)
 

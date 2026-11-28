@@ -2,12 +2,17 @@
 
 // CMS-outage resilience (Nov 9, 2026): the daemon used to die on every
 // restart while the CMS returned 502/530, because resumeActiveJob()
-// re-threw a transient error from its one-shot progress probe. These
-// tests pin the fix: transient errors are retried with backoff and then
-// deferred (marker kept, no throw); only 409 clears the marker and only
-// 401 / non-transient errors still throw. The health monitor is covered
-// by a fixture dry-run at the bottom — it must detect a dead daemon and
-// a stale inbox request without touching anything live.
+// re-threw a transient error from its one-shot progress probe. The probe
+// then retried with backoff and deferred — the daemon survived, but the
+// job sat idle for the whole outage even though its work is local.
+// Pipeline-never-dies (Nov 28, 2026): after 2 transient probe failures
+// the resume proceeds locally from the saved checkpoint instead of
+// deferring; the first successful progress report during execution is the
+// real liveness check. These tests pin that: transient failures run the
+// job locally, only 409 clears the marker, only 401 / non-transient
+// errors still throw, and only an aborted resume still defers. The health
+// monitor is covered by a fixture dry-run at the bottom — it must detect
+// a dead daemon and a stale inbox request without touching anything live.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -44,9 +49,18 @@ function transientClient(failures) {
   };
 }
 
+// Stub for resumeActiveJob's executeJob seam: records invocations and
+// returns a marker result instead of rendering for real.
+function stubExecuteJob(result = { ok: true, stubbed: true }) {
+  const calls = [];
+  const fn = async (args) => { calls.push(args); return result; };
+  fn.calls = calls;
+  return fn;
+}
+
 let jobCounter = 0;
 
-function writeActiveJob({ withCheckpoint = true } = {}) {
+function writeActiveJob({ withCheckpoint = true, executorPid } = {}) {
   // A fresh job id per test: resume tests share one work root, and a
   // leftover job.json / active marker from another test would let a
   // probe succeed into executeJob (which renders for real).
@@ -68,9 +82,23 @@ function writeActiveJob({ withCheckpoint = true } = {}) {
     payload: { jobId, title: 'Test title' },
     attempt: 1,
     digest: 'x',
-    startedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    ...(executorPid !== undefined ? { executorPid } : {})
   });
   return jobId;
+}
+
+function spawnSleeper() {
+  // A real live process to stand in for a rival executor.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+  return child;
+}
+
+async function deadPid() {
+  // A pid that belonged to a real process which has already exited.
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await new Promise(resolve => child.once('exit', resolve));
+  return child.pid;
 }
 
 test('transient CMS errors are the gateway/overload set, terminal ones are not', () => {
@@ -103,25 +131,103 @@ test('retry tunables come from the environment with safe defaults', () => {
   assert.equal(cmsRetryOptions({ MUSE_CMS_RESUME_ATTEMPTS: '0' }).maxAttempts, 1);
 });
 
-test('resume defers (no throw, marker kept) after bounded transient failures', async () => {
+test('resume proceeds locally after 2 transient probe failures instead of deferring', async () => {
   const jobId = writeActiveJob();
   const client = transientClient([cmsError(530), cmsError(502), cmsError(530)]);
-  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 3 });
-  assert.deepEqual(
-    { deferred: result.deferred, jobId: result.jobId },
-    { deferred: true, jobId }
-  );
-  assert.equal(client.calls, 3, 'all bounded attempts are used');
-  assert.equal(config.readActiveJob()?.jobId, jobId, 'the resume marker must survive a CMS outage');
+  const executeJob = stubExecuteJob();
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 3, executeJob });
+  assert.equal(result.stubbed, true, 'the job must execute locally after 2 failed probes');
+  assert.equal(client.calls, 2, 'only 2 probes run before the local proceed');
+  assert.equal(executeJob.calls.length, 1, 'executeJob runs once');
+  assert.equal(executeJob.calls[0].job.jobId, jobId);
+  assert.equal(executeJob.calls[0].attempt, 1);
 });
 
-test('resume retries through transient failures, then a 409 clears the marker', async () => {
+test('a 409 on the second probe clears the marker and the job never executes', async () => {
   writeActiveJob();
-  const client = transientClient([cmsError(530), cmsError(530), cmsError(409)]);
-  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 5 });
+  const client = transientClient([cmsError(530), cmsError(409)]);
+  const executeJob = stubExecuteJob();
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 5, executeJob });
   assert.equal(result, null);
-  assert.equal(client.calls, 3);
+  assert.equal(client.calls, 2);
+  assert.equal(executeJob.calls.length, 0, 'a settled job must never execute');
   assert.equal(config.readActiveJob(), null, 'a settled job clears the resume marker');
+});
+
+// Double-render guard (Nov 28, 2026): an external executeJob runner and
+// the daemon's resume both rendered t_rebuild_20261128 at once. The
+// marker's executorPid names the owning process; a resume that finds a
+// live rival pid must skip without probing or executing.
+
+test('resume skips a job whose executor pid is still alive — no probe, no second render', async () => {
+  const rival = spawnSleeper();
+  try {
+    const jobId = writeActiveJob({ executorPid: rival.pid });
+    const client = transientClient([]);
+    const executeJob = stubExecuteJob();
+    const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 3, executeJob });
+    assert.equal(result.skipped, true, 'a live rival executor must skip the resume');
+    assert.equal(result.executorPid, rival.pid);
+    assert.equal(result.reason, 'already-running');
+    assert.equal(client.calls, 0, 'the guard fires before any CMS probe');
+    assert.equal(executeJob.calls.length, 0, 'a live rival executor must never start a second render');
+    assert.equal(config.readActiveJob()?.jobId, jobId, 'the marker stays so the poll loop retries after the owner settles it');
+    assert.equal(config.readActiveJob()?.executorPid, rival.pid, 'the skip must not re-stamp the marker');
+  } finally {
+    rival.kill();
+  }
+});
+
+test('resume proceeds when the recorded executor pid is dead', async () => {
+  const pid = await deadPid();
+  writeActiveJob({ executorPid: pid });
+  const client = transientClient([]);
+  const executeJob = stubExecuteJob();
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 3, executeJob });
+  assert.equal(result.stubbed, true, 'a dead executor pid must not block the resume');
+  assert.equal(executeJob.calls.length, 1);
+});
+
+test('resume proceeds when the recorded executor pid is this process (deferred retry)', async () => {
+  writeActiveJob({ executorPid: process.pid });
+  const client = transientClient([]);
+  const executeJob = stubExecuteJob();
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 3, executeJob });
+  assert.equal(result.stubbed, true, 'our own pid is not a rival — the poll loop must be able to retry a deferred resume');
+  assert.equal(executeJob.calls.length, 1);
+});
+
+test('liveExecutorPid only reports a live rival pid', () => {
+  for (const bad of [undefined, null, 0, 1, -5, Number.NaN, 'abc', 1.5]) {
+    assert.equal(jobRunner.liveExecutorPid({ executorPid: bad }), 0, `${String(bad)} is not a live rival`);
+  }
+  assert.equal(jobRunner.liveExecutorPid({}), 0, 'a marker with no pid has no rival');
+  assert.equal(jobRunner.liveExecutorPid(null), 0, 'no marker has no rival');
+  assert.equal(jobRunner.liveExecutorPid({ executorPid: process.pid }), 0, 'our own pid is not a rival');
+});
+
+test('a 409 on the first probe clears the marker without executing', async () => {
+  writeActiveJob();
+  const client = transientClient([cmsError(409)]);
+  const executeJob = stubExecuteJob();
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 5, executeJob });
+  assert.equal(result, null);
+  assert.equal(client.calls, 1);
+  assert.equal(executeJob.calls.length, 0);
+  assert.equal(config.readActiveJob(), null);
+});
+
+test('an aborted resume still defers with the marker kept and the job unexecuted', async () => {
+  const jobId = writeActiveJob();
+  const client = transientClient([cmsError(530), cmsError(502)]);
+  const executeJob = stubExecuteJob();
+  const controller = new AbortController();
+  controller.abort();
+  const result = await jobRunner.resumeActiveJob({ client, maxAttempts: 5, signal: controller.signal, executeJob });
+  assert.equal(result.deferred, true);
+  assert.equal(result.error, 'resume aborted');
+  assert.equal(executeJob.calls.length, 0, 'an aborted resume must not execute');
+  assert.equal(config.readActiveJob()?.jobId, jobId, 'the marker survives an aborted resume');
 });
 
 test('resume still throws immediately on a revoked credential (401)', async () => {
@@ -161,15 +267,18 @@ test('an interrupted delivery keeps the checkpoint and a completed CMS receipt c
   }, jobId, 1, cmsError(502));
   assert.equal(delivery.deferred, true);
   assert.equal(config.readActiveJob().jobId, jobId);
+  const executeJob = stubExecuteJob();
   const resumed = await jobRunner.resumeActiveJob({
     client: { async progress(id, stage, progress, detail, advancing, extra) {
       assert.equal(id, jobId);
       assert.equal(extra.attempt, 1);
       return { ok: true, completed: true };
     } },
-    maxAttempts: 1
+    maxAttempts: 1,
+    executeJob
   });
   assert.deepEqual(resumed, { ok: true, alreadyDelivered: true });
+  assert.equal(executeJob.calls.length, 0, 'an already-delivered job must never execute');
   assert.equal(config.readActiveJob(), null);
 });
 

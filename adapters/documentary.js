@@ -16,7 +16,7 @@ const log = require('../lib/log');
 const { resolvePython } = require('../lib/python');
 const { writeJsonAtomic } = require('../lib/config');
 const ffmpeg = require('../lib/ffmpeg');
-const { assertNoOpenRouterKey } = require('../lib/museInference');
+const { assertNoOpenRouterKey, bridgeRoot } = require('../lib/museInference');
 const { resolveVideoStyle, ENGINES, defaultVoiceForStyle } = require('../lib/videoStyle');
 const { stampDocumentaryManifest } = require('../lib/masterManifestGuard');
 const { cleanGeneratedCode, runProcess, inferWithMuse, createFrameProgressReporter, readStageCheckpoint, writeStageCheckpoint } = require('../lib/museBridgeInfer');
@@ -24,6 +24,64 @@ const { cleanGeneratedCode, runProcess, inferWithMuse, createFrameProgressReport
 const FPS = 30;
 const WIDTH = 1920;
 const HEIGHT = 1080;
+
+// --- Media budgets (Franklin job r_mwztjy7reed4a4: 19 min for 7 shots) ---
+// YouTube is BOUNDED per scene; the web image lane is not (per user order
+// the image lane itself has no per-request timeout — a slow-but-working
+// fetch is never killed on a budget). What bounds a shot is the watchdog:
+// agent lane + YouTube phase, then the whole shot. A genuine stall falls
+// through to the next lane and finally to a graphic title card, so media
+// always finishes for every shot and never stalls silently.
+// All values are env-overridable in milliseconds unless noted.
+function envInt(name, fallback, env = process.env) {
+  const raw = Number(env[name]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+// Fresh budgets on every call (env is re-read, so tests and the daemon
+// can tune a run without reloading the module). MEDIA_BUDGETS is the
+// load-time snapshot, kept for inspection/back-compat.
+function mediaBudgets(env = process.env) {
+  return {
+    // Full agent-lane budget once a worker has CLAIMED the request (a
+    // claimed request means a worker is composing; cutting it short would
+    // discard real work). Unclaimed requests die far earlier — see the
+    // claim grace below.
+    agentTimeoutMs: envInt('MUSE_DOCUMENTARY_MEDIA_AGENT_TIMEOUT_MS', 120000, env),
+    // Unanswered lane request: if no worker claims any fresh
+    // documentary_media request within this grace, the lane is a miss and
+    // the shot falls through to the direct engines. Franklin's 7/7 misses
+    // each cost the full 120s; a miss now costs ~this.
+    agentClaimGraceMs: envInt('MUSE_DOCUMENTARY_MEDIA_CLAIM_GRACE_MS', 20000, env),
+    // yt-dlp search (ytsearch8 metadata only).
+    ytSearchTimeoutMs: envInt('MUSE_DOCUMENTARY_YT_SEARCH_TIMEOUT_MS', 60000, env),
+    // yt-dlp download of one clip. Franklin's shot 6 burned ~10 min in
+    // yt-dlp's default 10-retry curl-error-56 loop; fragment/HTTP retries
+    // are now capped (see fetchVideoClip) and the whole download dies here.
+    ytDownloadTimeoutMs: envInt('MUSE_DOCUMENTARY_YT_DOWNLOAD_TIMEOUT_MS', 120000, env),
+    ytFragmentRetries: envInt('MUSE_DOCUMENTARY_YT_FRAGMENT_RETRIES', 2, env),
+    ytSocketTimeoutSec: envInt('MUSE_DOCUMENTARY_YT_SOCKET_TIMEOUT_S', 15, env),
+    // ffmpeg trim of a downloaded clip.
+    ytTrimTimeoutMs: envInt('MUSE_DOCUMENTARY_YT_TRIM_TIMEOUT_MS', 120000, env),
+    // Direct YouTube phase (search/download/trim). Firing skips the
+    // rest of the clip attempt and moves the shot to the image lane —
+    // it never jumps straight to graphic while an image lane is still
+    // untried.
+    ytPhaseBudgetMs: envInt('MUSE_DOCUMENTARY_YT_PHASE_BUDGET_MS', 300000, env),
+    // Whole shot: direct clip + image + agent lanes. Firing aborts
+    // whatever is still in flight (via the shot AbortSignal) and the
+    // shot falls back to the agent lane, then a generated graphic
+    // title card. 8 min covers the legitimate worst case (direct YT
+    // search 60s + download 120s + trim 120s + image lane + agent
+    // lane 120s) with headroom; a shot past this is a stall, not a
+    // slow success.
+    shotBudgetMs: envInt('MUSE_DOCUMENTARY_SHOT_BUDGET_MS', 480000, env),
+  };
+}
+const MEDIA_BUDGETS = mediaBudgets();
+
+// Pool heartbeats older than this mean the pool is not live — same
+// threshold the spool transport uses to report MUSE_TRANSPORT_UNAVAILABLE.
+const POOL_HEARTBEAT_MAX_AGE_MS = 90000;
 
 const SHOTS_PLAN_SCHEMA = {
   type: 'json_schema',
@@ -67,18 +125,67 @@ function documentaryRoot(env = process.env) {
   return path.join(__dirname, '..', 'one_minute_documentary');
 }
 
-function documentaryRuntimeStatus(env = process.env) {
-  const root = documentaryRoot(env);
-  const templateDir = path.join(root, 'templates', 'remotion-project');
+function defaultTemplateDir(env = process.env) {
+  return path.join(documentaryRoot(env), 'templates', 'remotion-project');
+}
+
+// Template contract (built by another agent): lib/documentaryTemplates.js
+// exports resolveDocumentaryTemplate(job) -> { id, dir, label }. Until
+// that file exists, this falls back to the default template dir — the
+// adapter never fails a job for a missing template helper, and a template
+// whose dir is missing on disk also falls back (with a warning) instead
+// of rendering into a half-copied project.
+function resolveDocumentaryTemplate(job) {
+  const fallback = { id: 'default', dir: defaultTemplateDir(), label: 'default' };
+  let helper;
+  try {
+    helper = require('../lib/documentaryTemplates');
+  } catch (error) {
+    if (error && error.code !== 'MODULE_NOT_FOUND') {
+      log.warn(`[documentary] documentaryTemplates helper failed to load (${error.message}); using default template`);
+    }
+    return fallback;
+  }
+  if (!helper || typeof helper.resolveDocumentaryTemplate !== 'function') return fallback;
+  let picked = null;
+  try {
+    picked = helper.resolveDocumentaryTemplate(job || {});
+  } catch (error) {
+    log.warn(`[documentary] resolveDocumentaryTemplate threw (${error.message}); using default template`);
+    return fallback;
+  }
+  if (!picked || typeof picked.dir !== 'string' || !picked.dir.trim()) return fallback;
+  if (!fs.existsSync(picked.dir)) {
+    log.warn(`[documentary] Template "${picked.id || '?'}" dir missing (${picked.dir}); using default template`);
+    return fallback;
+  }
+  return {
+    id: String(picked.id || 'default'),
+    dir: picked.dir,
+    label: String(picked.label || picked.id || 'default'),
+  };
+}
+
+function checkTemplateDir(templateDir) {
   const required = [
-    path.join(root, 'SKILL.md'),
-    path.join(root, 'skill.yaml'),
     path.join(templateDir, 'package.json'),
     path.join(templateDir, 'src', 'Composition.tsx'),
     path.join(templateDir, 'src', 'RemotionRoot.tsx'),
     path.join(templateDir, 'src', 'index.ts'),
   ];
   const missing = required.filter((file) => !fs.existsSync(file));
+  return { available: missing.length === 0, templateDir, missing };
+}
+
+function documentaryRuntimeStatus(env = process.env) {
+  const root = documentaryRoot(env);
+  const templateDir = defaultTemplateDir(env);
+  const template = checkTemplateDir(templateDir);
+  const missing = [
+    path.join(root, 'SKILL.md'),
+    path.join(root, 'skill.yaml'),
+    ...template.missing,
+  ].filter((file) => !fs.existsSync(file));
   return {
     available: missing.length === 0,
     root,
@@ -469,7 +576,9 @@ async function searchWikimediaImages(query, { signal } = {}) {
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'VidzeoMuseDocumentary/1.0' },
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+      // No timeout: media-first order — a web search never dies on a
+      // budget, only on the job's own stop signal.
+      signal,
     });
     if (!res.ok) return [];
     const data = await res.json();
@@ -491,7 +600,7 @@ async function downloadImageUrl(url, destStem, { signal } = {}) {
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'VidzeoMuseDocumentary/1.0' },
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(20000),
+      signal,
     });
     if (!res.ok) return null;
     const buf = Buffer.from(await res.arrayBuffer());
@@ -544,7 +653,7 @@ async function searchOpenverseImages(query, { signal } = {}) {
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'VidzeoMuseDocumentary/1.0', Accept: 'application/json' },
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+      signal,
     });
     if (!res.ok) return [];
     const data = await res.json();
@@ -602,7 +711,7 @@ async function searchYandexImages(query, { signal } = {}) {
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9', Referer: 'https://yandex.com/images/' },
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
+      signal,
     });
     if (!res.ok) return [];
     const html = await res.text();
@@ -622,7 +731,7 @@ async function searchBingImages(query, { signal } = {}) {
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' },
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
+      signal,
     });
     if (!res.ok) return [];
     return extractImageUrls(await res.text()).slice(0, 8);
@@ -664,6 +773,287 @@ async function fetchImageAsset(query, sourceUrl, destStem, { signal } = {}) {
   return null;
 }
 
+const MEDIA_AGENT_SCHEMA = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'documentary_media',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['candidates'],
+      properties: {
+        candidates: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['type'],
+            properties: {
+              type: { type: 'string', enum: ['video', 'image'] },
+              videoId: { type: 'string' },
+              url: { type: 'string' },
+              title: { type: 'string' },
+              source: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+function buildMediaAgentMessages({ title, topicTag, shot }) {
+  const system = 'You find real media for a documentary shot. Use web search and video search to find real, existing images and YouTube videos that match the shot. Never invent a URL or a video ID: every candidate must come from a real search result you observed. Prefer the exact subject of the shot (people, places, events) over generic stock. Return only candidates you actually found.';
+  const user = [
+    `Video: ${title}`,
+    `Topic tag: ${topicTag}`,
+    `Shot beat: ${shot.beat}`,
+    `Shot kind: ${shot.kind} (prefer this kind, but a strong candidate of the other kind is useful too)`,
+    `Shot query: ${shot.query}`,
+    `Shot length: ${Math.max(2, Math.round((shot.dur || 180) / FPS))}s`,
+    'Return up to 4 candidates, best first. For a video candidate give the 11-character YouTube videoId. For an image candidate give the direct image URL (a link that serves the image file itself, not a search page).',
+  ].join('\n');
+  return [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+}
+
+function normalizeAgentMediaCandidates(data) {
+  const list = Array.isArray(data?.candidates) ? data.candidates : [];
+  const out = [];
+  const seen = new Set();
+  for (const c of list) {
+    if (out.length >= 4) break;
+    if (!c || (c.type !== 'video' && c.type !== 'image')) continue;
+    if (c.type === 'video') {
+      const id = normalizeYoutubeVideoId(c.videoId || c.url || '');
+      if (!id || seen.has(`v:${id}`)) continue;
+      seen.add(`v:${id}`);
+      out.push({ type: 'video', videoId: id, title: String(c.title || '').trim(), source: String(c.source || '').trim() });
+    } else {
+      const url = String(c.url || '').trim();
+      if (!/^https?:\/\//i.test(url) || seen.has(`i:${url}`)) continue;
+      seen.add(`i:${url}`);
+      out.push({ type: 'image', url, title: String(c.title || '').trim(), source: String(c.source || '').trim() });
+    }
+  }
+  return out;
+}
+
+// --- Agent-lane liveness: make an unanswered lane cheap -----------------
+// The lane posts through the bridge inbox, and the resident pool claims
+// spool requests by atomically renaming `<id>.request.json` to
+// `<id>.request.json.claimed-<worker>` (scripts/muse-inference-spool.cjs).
+// Two guards keep a dead/ignorant pool from costing a shot its full
+// 120s budget (Franklin: 7/7 misses x 120s):
+//  1. mediaPoolLiveness() — before posting, check the pool is actually
+//     alive (fresh worker heartbeat, same 90s rule as the spool
+//     transport). A dead pool skips the lane in ~0s.
+//  2. waitForMediaPoolClaim() — after posting, watch the spool (and the
+//     bridge inbox) for a claim/answer on any fresh documentary_media
+//     request. A request that sits unclaimed past the claim grace is a
+//     miss: the lane is aborted and the shot falls through to the direct
+//     engines. A claim means a worker IS composing, so the lane then runs
+//     to its full budget. The watch is pool-level, not per-request: with
+//     3 shots in parallel, one claim proves the pool knows the op.
+function spoolDirForMedia(env = process.env) {
+  const explicit = String(env.MUSE_INFERENCE_SPOOL_DIR || '').trim();
+  if (explicit) return explicit;
+  try {
+    return path.join(bridgeRoot(env), '..', 'inference-spool');
+  } catch {
+    return '';
+  }
+}
+
+function mediaPoolLiveness(env = process.env) {
+  const dir = spoolDirForMedia(env);
+  if (!dir) return { live: false, reason: 'no spool dir configured' };
+  let heartbeats = 0;
+  let youngestAgeMs = Infinity;
+  try {
+    for (const entry of fs.readdirSync(dir)) {
+      if (!entry.startsWith('worker-alive-') || !entry.endsWith('.json')) continue;
+      heartbeats += 1;
+      try {
+        youngestAgeMs = Math.min(youngestAgeMs, Date.now() - fs.statSync(path.join(dir, entry)).mtimeMs);
+      } catch { /* ignore */ }
+    }
+  } catch {
+    return { live: false, reason: `spool dir unreadable (${dir})` };
+  }
+  if (heartbeats > 0 && youngestAgeMs <= POOL_HEARTBEAT_MAX_AGE_MS) {
+    return { live: true, reason: `${heartbeats} heartbeat file(s), youngest ${Math.round(youngestAgeMs / 1000)}s ago` };
+  }
+  // Fallback: the supervisor's pool-status.json (workers>0, fresh).
+  try {
+    const status = JSON.parse(fs.readFileSync(path.join(dir, 'pool-status.json'), 'utf8'));
+    const ageMs = Date.now() - Number(status.updatedAt || 0);
+    if (Number(status.workers) > 0 && status.ownerResponsive !== false && ageMs <= 5 * 60 * 1000) {
+      return { live: true, reason: `pool-status reports ${status.workers} worker(s)` };
+    }
+  } catch { /* ignore */ }
+  return {
+    live: false,
+    reason: heartbeats > 0
+      ? `youngest worker heartbeat ${Math.round(youngestAgeMs / 1000)}s ago (stale)`
+      : 'no worker heartbeat in spool dir',
+  };
+}
+
+// Scan the spool dir + bridge inbox for fresh documentary_media requests.
+// Returns { unclaimed, claimed, answered } counts for requests created
+// at/after sinceMs (5s of slack for file timing). A claim file carries
+// the renamed request, so its operation is checkable; an answer file is
+// transient (deleted on delivery) and carries no operation, so any fresh
+// answer/error counts as pool-responsive — a pool answering other work
+// while our request waits is busy, not ignorant, and must not be aborted.
+function scanMediaPoolClaims({ spoolDir, bridgeDir, sinceMs }) {
+  let unclaimed = 0;
+  let claimed = 0;
+  let answered = 0;
+  const fresh = (mtimeMs) => Number.isFinite(mtimeMs) && mtimeMs >= sinceMs - 5000;
+  if (spoolDir) {
+    let entries = [];
+    try { entries = fs.readdirSync(spoolDir); } catch { entries = []; }
+    for (const entry of entries) {
+      const claimMatch = entry.match(/^([a-f0-9]{32})\.request\.json(\.claimed-.*)?$/);
+      if (claimMatch) {
+        const full = path.join(spoolDir, entry);
+        let stat = null;
+        try { stat = fs.statSync(full); } catch { continue; }
+        if (!fresh(stat.mtimeMs)) continue;
+        let operation = '';
+        try { operation = JSON.parse(fs.readFileSync(full, 'utf8'))?.request?.operation || ''; } catch { /* ignore */ }
+        if (operation !== 'documentary_media') continue;
+        if (claimMatch[2]) claimed += 1;
+        else unclaimed += 1;
+        continue;
+      }
+      if (/^[a-f0-9]{32}\.(answer|error)\.json$/.test(entry)) {
+        try {
+          if (fresh(fs.statSync(path.join(spoolDir, entry)).mtimeMs)) answered += 1;
+        } catch { /* ignore */ }
+      }
+    }
+  }
+  if (bridgeDir) {
+    let entries = [];
+    try { entries = fs.readdirSync(bridgeDir); } catch { entries = []; }
+    for (const entry of entries) {
+      if (!/^[a-f0-9]{32}$/.test(entry)) continue;
+      const dir = path.join(bridgeDir, entry);
+      let responseStat = null;
+      try { responseStat = fs.statSync(path.join(dir, 'response.json')); } catch { continue; }
+      if (!fresh(responseStat.mtimeMs)) continue;
+      let operation = '';
+      try { operation = JSON.parse(fs.readFileSync(path.join(dir, 'request.json'), 'utf8'))?.operation || ''; } catch { /* ignore */ }
+      if (operation === 'documentary_media') answered += 1;
+    }
+  }
+  return { unclaimed, claimed, answered };
+}
+
+// Resolves true as soon as any fresh documentary_media request is claimed
+// or answered; false when the grace expires with >=1 fresh request still
+// unclaimed and nothing claimed/answered. Resolves false on abort too
+// (caller treats abort as "stop watching"). When NO fresh request is
+// visible yet (bridge forwarding lag, or a transport that writes no
+// files), it keeps watching until aborted — absence alone never aborts
+// a lane that may just be slow to post.
+async function waitForMediaPoolClaim({ sinceMs, graceMs, signal, pollMs = 1000, env = process.env } = {}) {
+  const spoolDir = spoolDirForMedia(env);
+  let bridgeDir = '';
+  try { bridgeDir = bridgeRoot(env); } catch { bridgeDir = ''; }
+  const deadline = Date.now() + Math.max(1000, Number(graceMs) || mediaBudgets().agentClaimGraceMs);
+  while (true) {
+    if (signal?.aborted) return false;
+    const seen = scanMediaPoolClaims({ spoolDir, bridgeDir, sinceMs });
+    if (seen.claimed > 0 || seen.answered > 0) return true;
+    if (Date.now() >= deadline && seen.unclaimed > 0) return false;
+    // Past the deadline with nothing fresh posted yet: keep watching at
+    // the normal poll interval (absence alone never aborts the lane).
+    const waitMs = Date.now() >= deadline ? pollMs : Math.min(pollMs, Math.max(50, deadline - Date.now()));
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, waitMs);
+      if (typeof timer.unref === 'function') timer.unref();
+      if (signal) signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+    });
+    // Loop re-checks: a claim that lands just after the deadline is
+    // still a claim — the next scan returns true before the abort fires.
+    if (signal?.aborted) return false;
+    const late = scanMediaPoolClaims({ spoolDir, bridgeDir, sinceMs });
+    if (late.claimed > 0 || late.answered > 0) return true;
+    if (Date.now() >= deadline && late.unclaimed > 0) return false;
+  }
+}
+
+// Agent-first media lane: ask Muse (the resident inference pool) to find
+// real clips/images for a shot, the same way a direct chat with Muse does.
+// Best-effort with a bounded budget: a dead pool is skipped before
+// posting, an unclaimed request is aborted at the claim grace, and any
+// other failure falls through to the direct engines below, so a slow or
+// empty pool can never stall the shot.
+async function fetchAgentMediaCandidates({ shot, title, topicTag, jobId, workDir, signal, timeoutMs, inferFn }) {
+  const budgets = mediaBudgets();
+  const budget = Math.max(10000, Math.min(300000, Number(timeoutMs) || budgets.agentTimeoutMs));
+  // The spool/claim guards only apply to the bridge path: an HTTP
+  // transport answers directly (no spool files), and an injected inferFn
+  // (tests) bypasses the pool entirely.
+  const usePoolGuards = !process.env.MUSE_INFERENCE_URL && typeof inferFn !== 'function';
+  if (usePoolGuards) {
+    const liveness = mediaPoolLiveness();
+    if (!liveness.live) {
+      log.info(`[documentary] Agent media lane skipped for "${shot.query}": pool not live (${liveness.reason})`);
+      return [];
+    }
+  }
+  const laneController = new AbortController();
+  if (signal) {
+    if (signal.aborted) laneController.abort();
+    else signal.addEventListener('abort', () => laneController.abort(), { once: true });
+  }
+  const laneSignal = signal ? AbortSignal.any([signal, laneController.signal]) : laneController.signal;
+  const laneDone = new AbortController();
+  const startedAt = Date.now();
+  if (usePoolGuards) {
+    waitForMediaPoolClaim({
+      sinceMs: startedAt,
+      graceMs: budgets.agentClaimGraceMs,
+      signal: AbortSignal.any([laneSignal, laneDone.signal]),
+    }).then((claimed) => {
+      if (!claimed && !laneDone.signal.aborted) {
+        log.info(`[documentary] Agent media lane missed for "${shot.query}": no worker claimed the request within ${Math.round(budgets.agentClaimGraceMs / 1000)}s; falling through to the graphic fallback`);
+        laneController.abort();
+      }
+    }).catch(() => { /* watcher is best-effort */ });
+  }
+  try {
+    const reply = await inferWithMuse({
+      operation: 'documentary_media',
+      kind: 'text',
+      messages: buildMediaAgentMessages({ title, topicTag, shot }),
+      responseFormat: MEDIA_AGENT_SCHEMA,
+      jobId,
+      timeoutMs: budget,
+      signal: laneSignal,
+      workDir,
+      inferFn,
+    });
+    const candidates = normalizeAgentMediaCandidates(reply.data);
+    if (candidates.length) {
+      log.info(`[documentary] Agent media lane found ${candidates.length} candidate(s) for "${shot.query}"`);
+    }
+    return candidates;
+  } catch (error) {
+    log.info(`[documentary] Agent media lane missed for "${shot.query}": ${String(error?.message || error).slice(0, 160)}`);
+    return [];
+  } finally {
+    laneDone.abort();
+  }
+}
+
 async function listYoutubeCandidates(query, sourceUrl, { signal, pythonBin } = {}) {
   const py = pythonBin || await resolvePython();
   const directId = normalizeYoutubeVideoId(sourceUrl || '');
@@ -679,7 +1069,7 @@ async function listYoutubeCandidates(query, sourceUrl, { signal, pythonBin } = {
     search,
   ];
   try {
-    const { stdout } = await runProcess(py, args, { timeoutMs: 90 * 1000, signal, label: 'yt-dlp documentary search' });
+    const { stdout } = await runProcess(py, args, { timeoutMs: mediaBudgets().ytSearchTimeoutMs, signal, label: 'yt-dlp documentary search' });
     const data = JSON.parse(String(stdout || '').trim());
     const entries = Array.isArray(data?.entries) ? data.entries : [];
     return entries
@@ -707,11 +1097,33 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
     log.info(`[documentary] No unused YouTube candidate for "${query}" (all ${candidates.length} already used or search empty)`);
     return null;
   }
+  // Reserve the pick immediately: parallel shots share this set, and
+  // without a reservation two shots can pick the same video before
+  // either download finishes. Released on every failure path below.
+  if (excludeVideoIds instanceof Set) excludeVideoIds.add(picked.id);
   const target = `https://www.youtube.com/watch?v=${picked.id}`;
+  // Bounded download: yt-dlp's defaults retry a stalled/curl-56 download
+  // 10 times (Franklin shot 6 burned ~10 min that way) and a wedged
+  // socket can hang with no timeout at all. Retries and the socket
+  // timeout are capped here, and runProcess kills the whole download at
+  // the download budget — a failed clip falls through to the image lane
+  // within minutes instead of stalling the shot.
+  const clipBudgets = mediaBudgets();
+  // Only the first clipDur seconds are ever used (ffmpeg trims to that
+  // below), so fetch only that section: a full-video download is 35–79
+  // MiB at ~1 MiB/s from this VM and times out the 120s budget, while
+  // the section is ~1–3 MiB and lands in seconds. Proven in the Franklin
+  // proof run: all three wave-1 downloads timed out on full videos.
+  const clipDur = Math.max(2, Math.min(30, Math.ceil(Number(durationSec) || 6)));
   const ytdlpArgs = [
     '-m', 'yt_dlp',
     '--no-playlist',
     '--no-warnings',
+    '--retries', String(clipBudgets.ytFragmentRetries),
+    '--fragment-retries', String(clipBudgets.ytFragmentRetries),
+    '--socket-timeout', String(clipBudgets.ytSocketTimeoutSec),
+    '--retry-sleep', '2',
+    '--download-sections', `*0-${clipDur}`,
     '-f', 'bv*[height<=1080][ext=mp4]/bv*[height<=1080]/best[height<=1080]/best',
     '--merge-output-format', 'mp4',
     '-o', tempRaw,
@@ -721,14 +1133,17 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
 
   const py = pythonBin || await resolvePython();
   try {
-    await runProcess(py, ytdlpArgs, { timeoutMs: 3 * 60 * 1000, signal, label: 'yt-dlp documentary clip' });
+    await runProcess(py, ytdlpArgs, { timeoutMs: clipBudgets.ytDownloadTimeoutMs, signal, label: 'yt-dlp documentary clip' });
   } catch (error) {
-    log.info(`[documentary] Clip download failed for "${query}" (id=${picked.id}): ${error.message}`);
+    const ageGated = /sign in to confirm your age/i.test(String(error?.message || ''));
+    log.info(`[documentary] Clip download failed for "${query}" (id=${picked.id}${ageGated ? ', age-gated' : ''}): ${error.message}`);
+    if (excludeVideoIds instanceof Set) excludeVideoIds.delete(picked.id);
     cleanupRaw();
     return null;
   }
   if (!fs.existsSync(tempRaw) || fs.statSync(tempRaw).size < 16384) {
     log.info(`[documentary] Clip download too small/empty for "${query}" (id=${picked.id})`);
+    if (excludeVideoIds instanceof Set) excludeVideoIds.delete(picked.id);
     cleanupRaw();
     return null;
   }
@@ -738,7 +1153,6 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
     cleanupRaw();
     return null;
   }
-  const clipDur = Math.max(2, Math.min(30, Math.ceil(Number(durationSec) || 6)));
   const outW = Number(width) || WIDTH;
   const outH = Number(height) || HEIGHT;
   try {
@@ -748,7 +1162,7 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
       '-vf', `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},fps=${FPS}`,
       '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
       destPath,
-    ], { timeoutMs: 2 * 60 * 1000, signal, label: 'ffmpeg documentary trim' });
+    ], { timeoutMs: clipBudgets.ytTrimTimeoutMs, signal, label: 'ffmpeg documentary trim' });
     const info = await ffmpeg.probeVideo(destPath);
     if (info.hasVideo && info.duration >= 1.5) {
       return { path: destPath, source: target, videoId: picked.id };
@@ -759,6 +1173,44 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
   } finally {
     cleanupRaw();
   }
+  if (excludeVideoIds instanceof Set) excludeVideoIds.delete(picked.id);
+  return null;
+}
+
+// Last-resort graphic: a branded title card for a shot whose every lane
+// failed or whose watchdog fired. Real media always wins over this — it
+// only fires when the alternative is a hole in the video. The Remotion
+// caption overlay already carries the shot title/sub, so the card is a
+// dark background with the title burned in (DejaVu Bold ships on the VM);
+// if drawtext fails, a plain dark card is still a valid frame.
+async function makeGraphicFallback(shot, destPath, { signal, width = WIDTH, height = HEIGHT } = {}) {
+  const ffmpegBin = await ffmpeg.resolveBinary('ffmpeg');
+  if (!ffmpegBin) return null;
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
+  const outW = Number(width) || WIDTH;
+  const outH = Number(height) || HEIGHT;
+  const title = String(shot?.title || 'DOCUMENTARY').toUpperCase().replace(/[^A-Za-z0-9 .,!?'&-]/g, '').trim().slice(0, 48) || 'DOCUMENTARY';
+  const escaped = title.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:');
+  const fontFile = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+  const attempts = [];
+  if (fs.existsSync(fontFile)) {
+    attempts.push(`drawtext=fontfile=${fontFile}:text='${escaped}':fontsize=72:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2`);
+  }
+  attempts.push(null); // plain dark card
+  for (const drawtext of attempts) {
+    const vf = drawtext ? `,${drawtext}` : '';
+    try {
+      await runProcess(ffmpegBin, [
+        '-y', '-f', 'lavfi', '-i', `color=c=0x141414:s=${outW}x${outH}:d=1`,
+        '-vf', `format=yuv420p${vf}`,
+        '-frames:v', '1', destPath,
+      ], { timeoutMs: 30000, signal, label: 'ffmpeg documentary graphic fallback' });
+      if (fs.existsSync(destPath) && fs.statSync(destPath).size >= 1024) return destPath;
+    } catch (error) {
+      log.info(`[documentary] Graphic fallback attempt failed for "${shot?.query || ''}": ${error.message}`);
+    }
+  }
+  try { fs.rmSync(destPath, { force: true }); } catch { /* ignore */ }
   return null;
 }
 
@@ -796,6 +1248,325 @@ async function ensureNodeModules(templateDir, projectDir, signal) {
   await runProcess(npmBin, ['install', '--no-audit', '--no-fund'], { cwd: projectDir, timeoutMs: 10 * 60 * 1000, signal, label: 'Remotion npm install' });
 }
 
+// Media stage: resolve every shot in parallel (default 3 at a time),
+// direct engines first, agent lane only as fallback. Direct search
+// (yt-dlp + web images) is the fastest path — a clip lands in ~40s
+// with no pool round-trip — so a shot that direct resolves never
+// touches the lane. The agent lane (Muse finding clips/images the way
+// a direct chat does) runs only for shots direct could not resolve,
+// as the last hope before the graphic fallback. A shot that cannot be
+// resolved in the parallel pass gets a second, sequential pass over the
+// least-used verified assets — repeats are a last resort, never a
+// first choice, and never across the parallel pass itself.
+//
+// Per-scene watchdog (no mid-job stops): every shot runs under two
+// deadlines. The YouTube phase (direct yt-dlp search/download/trim)
+// is raced against the YT-phase budget; firing aborts the YouTube
+// work and moves the shot to the image lane. The whole shot is raced
+// against the shot budget; firing aborts whatever is still in flight
+// and the shot falls back to the agent lane, then a graphic title
+// card. The image lane's own fetches have no per-request timeout
+// (per user order) — the watchdog only fires when the lane is
+// genuinely stalled, never on a slow success. The stage always
+// returns an asset for every shot (real clip, real image, or graphic)
+// unless even a graphic cannot be produced, in which case it throws
+// — there is nothing left to render with.
+//
+// Lane functions are injectable via `overrides` ({ agentMediaFn,
+// videoClipFn, imageAssetFn, graphicFn }, same signatures as the module
+// functions) so tests can stall a lane without touching the network.
+function raceAgainstDeadline(promise, deadlineMs) {
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) return Promise.resolve({ timedOut: true });
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ timedOut: true }), remaining);
+    if (typeof timer.unref === 'function') timer.unref();
+    promise.then(
+      (value) => { clearTimeout(timer); resolve({ value }); },
+      (error) => { clearTimeout(timer); resolve({ error }); },
+    );
+  });
+}
+
+async function resolveDocumentaryMedia({
+  shots, projectDir, workDir, job, topicTag, signal, pythonBin,
+  renderWidth, renderHeight, onProgress, mediaCheckpoints: savedCheckpoints,
+  mediaCheckpointPath, inputDigest, overrides = {},
+}) {
+  const agentMediaFn = overrides.agentMediaFn || fetchAgentMediaCandidates;
+  const videoClipFn = overrides.videoClipFn || fetchVideoClip;
+  const imageAssetFn = overrides.imageAssetFn || fetchImageAsset;
+  const graphicFn = overrides.graphicFn || makeGraphicFallback;
+  const budgets = mediaBudgets();
+  const mediaCheckpoints = savedCheckpoints ? { ...savedCheckpoints } : {};
+
+  const mediaSources = [];
+  const verifiedFallbacks = [];
+  const fallbackUsage = new Map();
+  const usedVideoIds = new Set();
+  const usedAssetPaths = new Set();
+  const resolvedShots = [];
+  let videoShotCount = 0;
+  let imageShotCount = 0;
+  let graphicShotCount = 0;
+
+  const mediaConcurrency = Math.max(1, Math.min(6, Math.floor(Number(process.env.MUSE_DOCUMENTARY_MEDIA_CONCURRENCY) || 3)));
+  const mediaResults = new Array(shots.length).fill(null);
+  let mediaResolvedCount = 0;
+
+  const writeMediaCheckpoint = () => {
+    writeJsonAtomic(mediaCheckpointPath, { digest: inputDigest, updatedAt: new Date().toISOString(), shots: mediaCheckpoints });
+  };
+  const wireJobAbort = (controller) => {
+    if (!signal) return;
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', () => controller.abort(), { once: true });
+  };
+
+  const resolveShotMedia = async (i) => {
+    const shot = shots[i];
+    const pct = () => 28 + Math.round((mediaResolvedCount / shots.length) * 32);
+    const shotStartedAt = Date.now();
+    const shotDeadline = shotStartedAt + budgets.shotBudgetMs;
+    const ytDeadline = shotStartedAt + Math.min(budgets.ytPhaseBudgetMs, budgets.shotBudgetMs);
+    // Separate controllers per phase: a YouTube-phase timeout must abort
+    // the YouTube work WITHOUT killing the image lane that follows it,
+    // and the agent lane gets its own controller so a shot-budget
+    // timeout there does not cancel the graphic fallback below.
+    const ytController = new AbortController();
+    const shotController = new AbortController();
+    const agentController = new AbortController();
+    wireJobAbort(ytController);
+    wireJobAbort(shotController);
+    wireJobAbort(agentController);
+    let asset = null;
+    const cachedShot = mediaCheckpoints[String(i)];
+    if (cachedShot && cachedShot.query === shot.query && cachedShot.beat === shot.beat && cachedShot.assetPath) {
+      const diskPath = path.join(projectDir, 'public', cachedShot.assetPath);
+      try {
+        // An old checkpoint may itself repeat one asset across shots; a
+        // repeat here is a miss, not a reuse — re-fetch for a distinct clip.
+        // This check-and-add is synchronous, so parallel shots cannot
+        // both claim the same cached asset.
+        if (!usedAssetPaths.has(cachedShot.assetPath) && fs.statSync(diskPath).size >= 1024) {
+          asset = { assetType: cachedShot.assetType, assetPath: cachedShot.assetPath, source: cachedShot.source || 'checkpoint', videoId: cachedShot.videoId || '', isGraphic: Boolean(cachedShot.isGraphic) };
+          if (asset.videoId) usedVideoIds.add(asset.videoId);
+          usedAssetPaths.add(asset.assetPath);
+          log.info(`[documentary] Shot ${i + 1}/${shots.length} reused from checkpoint (${asset.assetPath})`);
+        }
+      } catch { /* fall through to fetch */ }
+    }
+
+    if (!asset) {
+      log.info(`[documentary] Shot ${i + 1}/${shots.length} (${shot.beat}, ${shot.kind}): "${shot.query}"`);
+      onProgress(pct(), `[documentary] Fetching media for shot ${i + 1}/${shots.length}: ${shot.query.slice(0, 60)}`, true);
+
+      // Phase A — direct YouTube clip, bounded by the YT-phase budget.
+      // Direct search is the fastest path (no pool round-trip): a clip
+      // lands in ~40s. Image shots skip this phase — their primary is
+      // the image lane below, and a clip is only their cross-lane
+      // second chance there.
+      if (shot.kind === 'video') {
+        const runYtPhase = async () => {
+          const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
+          const fetched = await videoClipFn(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal: ytController.signal, pythonBin, width: renderWidth, height: renderHeight, excludeVideoIds: usedVideoIds });
+          if (fetched) {
+            return { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source, videoId: fetched.videoId || '' };
+          }
+          return null;
+        };
+        const ytOutcome = await raceAgainstDeadline(runYtPhase(), ytDeadline);
+        if (ytOutcome.error) throw ytOutcome.error;
+        if (ytOutcome.timedOut) {
+          ytController.abort();
+          log.info(`[documentary] Shot ${i + 1}/${shots.length}: YouTube phase exceeded its ${Math.round((ytDeadline - shotStartedAt) / 1000)}s budget; moving to the image lane`);
+        } else {
+          asset = ytOutcome.value || null;
+        }
+      }
+
+      // Phase B — image lane (fetches have no per-request timeout), then
+      // a cross-lane fresh clip for image shots, bounded by the whole
+      // shot budget. Firing here means the shot is genuinely stalled.
+      if (!asset) {
+        const runImagePhase = async () => {
+          const imgStem = path.join(projectDir, 'public', 'images', `shot-${i + 1}`);
+          const fetchedImg = await imageAssetFn(shot.query, shot.sourceUrl, imgStem, { signal: shotController.signal });
+          if (fetchedImg) {
+            return { assetType: 'image', assetPath: `images/${path.basename(fetchedImg.path)}`, source: fetchedImg.source };
+          }
+          if (shot.kind === 'image') {
+            // Cross-lane second chance: an image shot whose stills lanes are
+            // empty gets a fresh related clip before any repeat. A fresh clip
+            // beats a repeated clip; the manifest counts it honestly as video.
+            const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
+            const fetched = await videoClipFn(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal: shotController.signal, pythonBin, width: renderWidth, height: renderHeight, excludeVideoIds: usedVideoIds });
+            if (fetched) {
+              return { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source, videoId: fetched.videoId || '' };
+            }
+          }
+          return null;
+        };
+        const imgOutcome = await raceAgainstDeadline(runImagePhase(), shotDeadline);
+        if (imgOutcome.error) throw imgOutcome.error;
+        if (imgOutcome.timedOut) {
+          shotController.abort();
+          log.info(`[documentary] Shot ${i + 1}/${shots.length}: exceeded its ${Math.round(budgets.shotBudgetMs / 1000)}s shot budget; moving to the agent lane`);
+        } else {
+          asset = imgOutcome.value || null;
+        }
+      }
+
+      // Phase C — agent lane, last hope before the graphic fallback,
+      // bounded by the whole shot budget. Only reached when the direct
+      // engines resolved nothing for this shot: the lane files a
+      // documentary_media request and a pool worker finds real
+      // clips/images for it, the same way a direct chat with Muse
+      // does. A miss or a timeout here means the graphic below. The
+      // deadline guard skips the lane entirely when the shot budget
+      // is already spent — filing a request nobody waits for would
+      // only leave an expired request in the spool.
+      if (!asset && Date.now() < shotDeadline) {
+        const runAgentPhase = async () => {
+          const agentCandidates = await agentMediaFn({
+            shot, title: job.title || 'Documentary', topicTag,
+            jobId: job.jobId, workDir, signal: agentController.signal,
+          });
+          const tryAgentCandidates = async (wantVideoFirst) => {
+            const ordered = [...agentCandidates].sort((a, b) => {
+              const aScore = (a.type === 'video') === wantVideoFirst ? 0 : 1;
+              const bScore = (b.type === 'video') === wantVideoFirst ? 0 : 1;
+              return aScore - bScore;
+            });
+            for (const cand of ordered) {
+              if (cand.type === 'video') {
+                if (usedVideoIds.has(cand.videoId)) continue;
+                const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
+                const fetched = await videoClipFn(shot.query, `https://www.youtube.com/watch?v=${cand.videoId}`, clipFile, shot.dur / FPS, { signal: agentController.signal, pythonBin, width: renderWidth, height: renderHeight, excludeVideoIds: usedVideoIds });
+                if (fetched) return { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source, videoId: fetched.videoId || '' };
+              } else {
+                const imgStem = path.join(projectDir, 'public', 'images', `shot-${i + 1}`);
+                const saved = await downloadImageUrl(cand.url, imgStem, { signal: agentController.signal });
+                if (saved) return { assetType: 'image', assetPath: `images/${path.basename(saved)}`, source: cand.url };
+              }
+            }
+            return null;
+          };
+          return tryAgentCandidates(shot.kind === 'video');
+        };
+        const agentOutcome = await raceAgainstDeadline(runAgentPhase(), shotDeadline);
+        if (agentOutcome.error) throw agentOutcome.error;
+        if (agentOutcome.timedOut) {
+          agentController.abort();
+          log.info(`[documentary] Shot ${i + 1}/${shots.length}: agent lane exceeded the remaining shot budget; falling back to a graphic title card`);
+        } else {
+          asset = agentOutcome.value || null;
+        }
+      }
+
+      // Last resort: a graphic title card keeps the video complete.
+      // NOTE: the graphic runs under the JOB signal, not the shot signal
+      // — the watchdog has just aborted the shot signal to kill the
+      // stalled lanes, and a graphic made under it would be cancelled
+      // before it starts.
+      if (!asset) {
+        const graphicPath = path.join(projectDir, 'public', 'images', `shot-${i + 1}-graphic.png`);
+        const made = await graphicFn(shot, graphicPath, { signal, width: renderWidth, height: renderHeight });
+        if (made) {
+          asset = { assetType: 'image', assetPath: `images/${path.basename(made)}`, source: 'graphic:watchdog', isGraphic: true };
+          log.info(`[documentary] Shot ${i + 1}/${shots.length}: graphic fallback (all lanes empty or watchdog fired)`);
+        }
+      }
+
+      if (asset) {
+        if (asset.videoId) usedVideoIds.add(asset.videoId);
+        usedAssetPaths.add(asset.assetPath);
+        if (asset.assetType === 'video') log.info(`[documentary] Shot ${i + 1}/${shots.length}: video ready (${(shot.dur / FPS).toFixed(1)}s, id=${asset.videoId || 'n/a'})`);
+        else if (asset.isGraphic) log.info(`[documentary] Shot ${i + 1}/${shots.length}: graphic ready`);
+        else log.info(`[documentary] Shot ${i + 1}/${shots.length}: verified image ready`);
+        mediaCheckpoints[String(i)] = { query: shot.query, beat: shot.beat, ...asset };
+        writeMediaCheckpoint();
+      }
+    }
+
+    mediaResults[i] = asset;
+    if (asset) {
+      mediaResolvedCount += 1;
+      onProgress(pct(), `[documentary] Media ready for shot ${i + 1}/${shots.length}`, true);
+    }
+    return asset;
+  };
+
+  // Phase 1: resolve all shots concurrently (bounded).
+  {
+    let next = 0;
+    const workers = Array.from({ length: Math.min(mediaConcurrency, shots.length) }, async () => {
+      while (next < shots.length) {
+        const idx = next;
+        next += 1;
+        await resolveShotMedia(idx);
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  // Phase 2: sequential least-used fallback for anything still unresolved.
+  for (const a of mediaResults.filter(Boolean)) {
+    if (!fallbackUsage.has(a.assetPath)) fallbackUsage.set(a.assetPath, 0);
+  }
+  for (let i = 0; i < shots.length; i += 1) {
+    if (mediaResults[i]) continue;
+    const shot = shots[i];
+    const pool = mediaResults.filter(Boolean).map((a) => ({ assetPath: a.assetPath, assetType: a.assetType, source: a.source, videoId: a.videoId || '', isGraphic: Boolean(a.isGraphic) }));
+    if (pool.length) {
+      const reused = pickLeastUsedFallback(pool, fallbackUsage);
+      if (reused) {
+        const asset = { ...reused };
+        fallbackUsage.set(reused.assetPath, (fallbackUsage.get(reused.assetPath) || 0) + 1);
+        mediaResults[i] = asset;
+        mediaCheckpoints[String(i)] = { query: shot.query, beat: shot.beat, ...asset };
+        writeMediaCheckpoint();
+        log.info(`[documentary] Shot ${i + 1}/${shots.length}: reused verified asset ${reused.assetPath} (least-used fallback)`);
+      }
+    }
+    if (!mediaResults[i]) {
+      const graphicPath = path.join(projectDir, 'public', 'images', `shot-${i + 1}-graphic.png`);
+      const made = await graphicFn(shot, graphicPath, { signal, width: renderWidth, height: renderHeight });
+      if (made) {
+        mediaResults[i] = { assetType: 'image', assetPath: `images/${path.basename(made)}`, source: 'graphic:watchdog', isGraphic: true };
+        mediaCheckpoints[String(i)] = { query: shot.query, beat: shot.beat, ...mediaResults[i] };
+        writeMediaCheckpoint();
+        log.info(`[documentary] Shot ${i + 1}/${shots.length}: graphic fallback (phase 2)`);
+      }
+    }
+    if (!mediaResults[i]) {
+      throw new Error(`Documentary shot ${i + 1} ("${shot.query}") could not retrieve any verified video clip, real image, or graphic fallback.`);
+    }
+  }
+
+  for (let i = 0; i < shots.length; i += 1) {
+    const asset = mediaResults[i];
+    const shot = shots[i];
+    if (asset.isGraphic) graphicShotCount += 1;
+    else if (asset.assetType === 'video') videoShotCount += 1;
+    else imageShotCount += 1;
+    fallbackUsage.set(asset.assetPath, fallbackUsage.get(asset.assetPath) || 0);
+    verifiedFallbacks.push(asset);
+    mediaSources.push(asset.source);
+    resolvedShots.push({ ...shot, ...asset });
+  }
+
+  return {
+    resolvedShots,
+    videoShotCount,
+    imageShotCount,
+    graphicShotCount,
+    mediaSources,
+    mediaCheckpoints,
+    mediaResults,
+  };
+}
+
 async function render(job, scriptText, workDir, options = {}) {
   const resolved = resolveVideoStyle(job);
   if (resolved.engine !== ENGINES.DOCUMENTARY) {
@@ -812,6 +1583,16 @@ async function render(job, scriptText, workDir, options = {}) {
   if (!runtime.available) {
     throw new Error(`One-Minute Documentary runtime is missing required files under ${runtime.root}: ${runtime.missing.join(', ')}`);
   }
+  // Template is picked per job via the documentaryTemplates helper
+  // contract (another agent's module); until it exists, this resolves to
+  // the default template dir. The project copy + node_modules below use
+  // the picked template, never the hardcoded default.
+  const template = resolveDocumentaryTemplate(job);
+  const templateCheck = checkTemplateDir(template.dir);
+  if (!templateCheck.available) {
+    throw new Error(`One-Minute Documentary template "${template.id}" is missing required files under ${template.dir}: ${templateCheck.missing.join(', ')}`);
+  }
+  log.info(`[documentary] Job ${job.jobId}: using Remotion template "${template.id}" (${template.label})`);
 
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
   const signal = options.signal;
@@ -842,7 +1623,7 @@ async function render(job, scriptText, workDir, options = {}) {
   try { prevMarker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); } catch { /* ignore */ }
 
   if (!fs.existsSync(path.join(projectDir, 'package.json'))) {
-    copyTemplateProject(runtime.templateDir, projectDir);
+    copyTemplateProject(template.dir, projectDir);
   } else if (prevMarker && prevMarker.digest !== inputDigest) {
     for (const stale of ['shots-plan.json', 'checkpoint.json', 'media-checkpoint.json', path.join('public', 'audio', 'voiceover.mp3')]) {
       try { fs.rmSync(path.join(projectDir, stale), { force: true }); } catch { /* ignore */ }
@@ -912,102 +1693,32 @@ async function render(job, scriptText, workDir, options = {}) {
   } catch { /* ignore */ }
   const mediaCheckpoints = savedMediaCheckpoint?.shots ? { ...savedMediaCheckpoint.shots } : {};
 
-  const mediaSources = [];
-  const verifiedFallbacks = [];
-  const fallbackUsage = new Map();
-  const usedVideoIds = new Set();
-  const usedAssetPaths = new Set();
-  const resolvedShots = [];
-  let videoShotCount = 0;
-  let imageShotCount = 0;
+  const mediaStartMs = Date.now();
+  const media = await resolveDocumentaryMedia({
+    shots: normalizedShots,
+    projectDir,
+    workDir,
+    job,
+    topicTag: plan.topicTag || 'DOCUMENTARY',
+    signal,
+    pythonBin,
+    renderWidth,
+    renderHeight,
+    onProgress,
+    mediaCheckpoints,
+    mediaCheckpointPath,
+    inputDigest,
+    overrides: options.mediaOverrides || {},
+  });
+  const resolvedShots = media.resolvedShots;
+  const videoShotCount = media.videoShotCount;
+  const imageShotCount = media.imageShotCount;
+  const graphicShotCount = media.graphicShotCount;
+  const mediaSources = media.mediaSources;
+  log.info(`[documentary] Job ${job.jobId}: media stage finished in ${Math.round((Date.now() - mediaStartMs) / 1000)}s (${videoShotCount} video, ${imageShotCount} image, ${graphicShotCount} graphic)`);
+  writeStageCheckpoint(checkpointPath, inputDigest, { mediaReady: { totalShots: resolvedShots.length, videoShotCount, imageShotCount, graphicShotCount } });
 
-  for (let i = 0; i < normalizedShots.length; i += 1) {
-    const shot = normalizedShots[i];
-    const pct = 28 + Math.round(((i + 1) / normalizedShots.length) * 32);
-
-    let asset = null;
-    const cachedShot = mediaCheckpoints[String(i)];
-    if (cachedShot && cachedShot.query === shot.query && cachedShot.beat === shot.beat && cachedShot.assetPath) {
-      const diskPath = path.join(projectDir, 'public', cachedShot.assetPath);
-      try {
-        // An old checkpoint may itself repeat one asset across shots; a
-        // repeat here is a miss, not a reuse — re-fetch for a distinct clip.
-        if (!usedAssetPaths.has(cachedShot.assetPath) && fs.statSync(diskPath).size >= 1024) {
-          asset = { assetType: cachedShot.assetType, assetPath: cachedShot.assetPath, source: cachedShot.source || 'checkpoint', videoId: cachedShot.videoId || '' };
-          if (asset.videoId) usedVideoIds.add(asset.videoId);
-          usedAssetPaths.add(asset.assetPath);
-          if (asset.assetType === 'video') videoShotCount += 1;
-          else imageShotCount += 1;
-          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length} reused from checkpoint (${asset.assetPath})`);
-        }
-      } catch { /* fall through to fetch */ }
-    }
-
-    if (!asset) {
-      log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length} (${shot.beat}, ${shot.kind}): "${shot.query}"`);
-      onProgress(pct, `[documentary] Fetching media for shot ${i + 1}/${normalizedShots.length}: ${shot.query.slice(0, 60)}`, true);
-
-      if (shot.kind === 'video') {
-        const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
-        const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight, excludeVideoIds: usedVideoIds });
-        if (fetched) {
-          asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source, videoId: fetched.videoId || '' };
-          if (asset.videoId) usedVideoIds.add(asset.videoId);
-          usedAssetPaths.add(asset.assetPath);
-          videoShotCount += 1;
-          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready (${(shot.dur / FPS).toFixed(1)}s, id=${asset.videoId || 'n/a'})`);
-        }
-      }
-      if (!asset) {
-        const imgStem = path.join(projectDir, 'public', 'images', `shot-${i + 1}`);
-        const fetchedImg = await fetchImageAsset(shot.query, shot.sourceUrl, imgStem, { signal });
-        if (fetchedImg) {
-          asset = { assetType: 'image', assetPath: `images/${path.basename(fetchedImg.path)}`, source: fetchedImg.source };
-          usedAssetPaths.add(asset.assetPath);
-          imageShotCount += 1;
-          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: verified image ready`);
-        }
-      }
-      if (!asset && shot.kind === 'image') {
-        // Cross-lane second chance: an image shot whose stills lanes are
-        // empty gets a fresh related clip before any repeat. A fresh clip
-        // beats a repeated clip; the manifest counts it honestly as video.
-        const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
-        const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight, excludeVideoIds: usedVideoIds });
-        if (fetched) {
-          asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source, videoId: fetched.videoId || '' };
-          if (asset.videoId) usedVideoIds.add(asset.videoId);
-          usedAssetPaths.add(asset.assetPath);
-          videoShotCount += 1;
-          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready via cross-lane fallback (${(shot.dur / FPS).toFixed(1)}s, id=${asset.videoId || 'n/a'})`);
-        }
-      }
-      if (!asset && verifiedFallbacks.length) {
-        // Last resort only: spread repeats across the least-used verified
-        // asset instead of round-robin by index, which kept re-picking
-        // the same first clip.
-        const reused = pickLeastUsedFallback(verifiedFallbacks, fallbackUsage);
-        asset = { ...reused };
-        fallbackUsage.set(reused.assetPath, (fallbackUsage.get(reused.assetPath) || 0) + 1);
-        if (reused.assetType === 'video') videoShotCount += 1;
-        else imageShotCount += 1;
-        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: reused verified asset ${reused.assetPath} (least-used fallback)`);
-      }
-      if (!asset) {
-        throw new Error(`Documentary shot ${i + 1} ("${shot.query}") could not retrieve any verified video clip or real image.`);
-      }
-      mediaCheckpoints[String(i)] = { query: shot.query, beat: shot.beat, ...asset };
-      writeJsonAtomic(mediaCheckpointPath, { digest: inputDigest, updatedAt: new Date().toISOString(), shots: mediaCheckpoints });
-    }
-
-    verifiedFallbacks.push(asset);
-    fallbackUsage.set(asset.assetPath, fallbackUsage.get(asset.assetPath) || 0);
-    mediaSources.push(asset.source);
-    resolvedShots.push({ ...shot, ...asset });
-  }
-  writeStageCheckpoint(checkpointPath, inputDigest, { mediaReady: { totalShots: resolvedShots.length, videoShotCount, imageShotCount } });
-
-  log.info(`[documentary] Job ${job.jobId}: building Remotion project (${videoShotCount} video, ${imageShotCount} image shots)`);
+  log.info(`[documentary] Job ${job.jobId}: building Remotion project (${videoShotCount} video, ${imageShotCount} image, ${graphicShotCount} graphic shots)`);
   onProgress(64, '[documentary] Writing Remotion composition from documentary template', true);
   fs.writeFileSync(
     path.join(projectDir, 'src', 'Composition.tsx'),
@@ -1022,7 +1733,7 @@ async function render(job, scriptText, workDir, options = {}) {
   fs.writeFileSync(path.join(projectDir, 'src', 'RemotionRoot.tsx'), generateRemotionRootTsx(totalFrames, { width: renderWidth, height: renderHeight }), 'utf8');
   writeStageCheckpoint(checkpointPath, inputDigest, { compositionWritten: { width: renderWidth, height: renderHeight, totalFrames } });
 
-  await ensureNodeModules(runtime.templateDir, projectDir, signal);
+  await ensureNodeModules(template.dir, projectDir, signal);
 
   log.info(`[documentary] Job ${job.jobId}: starting Remotion render (${renderWidth}x${renderHeight}@${FPS}fps, ${totalFrames} frames)`);
   onProgress(70, `[documentary] Rendering ${renderWidth}x${renderHeight} master with Remotion`, true);
@@ -1080,6 +1791,8 @@ async function render(job, scriptText, workDir, options = {}) {
       shotCount: resolvedShots.length,
       videoShotCount,
       imageShotCount,
+      graphicShotCount,
+      templateId: template.id,
       documentaryManifestPath: manifestPath,
       inferRequests,
     },
@@ -1101,6 +1814,23 @@ module.exports = {
   normalizeYoutubeVideoId,
   pickUnusedVideoCandidate,
   pickLeastUsedFallback,
+  MEDIA_AGENT_SCHEMA,
+  MEDIA_BUDGETS,
+  mediaBudgets,
+  buildMediaAgentMessages,
+  normalizeAgentMediaCandidates,
+  fetchAgentMediaCandidates,
+  mediaPoolLiveness,
+  scanMediaPoolClaims,
+  waitForMediaPoolClaim,
+  spoolDirForMedia,
+  resolveDocumentaryTemplate,
+  checkTemplateDir,
+  resolveDocumentaryMedia,
+  makeGraphicFallback,
+  fetchVideoClip,
+  listYoutubeCandidates,
+  downloadImageUrl,
   relaxedImageQueries,
   extractImageUrls,
   fetchImageAsset,

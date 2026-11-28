@@ -381,7 +381,8 @@ async function claimCommand(args) {
   const decision = inspected.decision;
   const existing = inspected.existing;
   const workDir = jobRunner.prepareWorkDir(job, digest);
-  config.writeActiveJob({ jobId: job.jobId, payload: job, attempt: claim.attempt || 1, digest, startedAt: new Date().toISOString() });
+  // Ownership stamp: the daemon claims and is about to execute this job.
+  config.writeActiveJob({ jobId: job.jobId, payload: job, attempt: claim.attempt || 1, digest, startedAt: new Date().toISOString(), executorPid: process.pid });
   log.info(`Claimed Muse job ${job.jobId}: ${job.title} — ${decision.decision} (${decision.reason})`);
   const summary = jobRunner.jobSummary(job);
   const scriptPath = path.join(workDir, 'script.txt');
@@ -603,6 +604,13 @@ async function startCommand(args) {
         : null;
       const response = await client.heartbeat(heartbeatInfo(jobId, progress));
       if (response.syncRequest) await jobRunner.syncSavedProgress(client, response.syncRequest, active);
+      if (jobId && active) {
+        // Reconnect drain: the heartbeat just proved the CMS is up, so
+        // replay any progress queued while it was down, in order.
+        // Fire-and-forget — a flush never throws and never blocks the
+        // poll loop, and the next heartbeat retries what is left.
+        jobRunner.flushProgressOutbox(client, config.workDir(jobId), jobId, { attempt: active.attempt || 1, force: true }).catch(() => {});
+      }
       if (response.active === false) {
         log.warn('This worker is paired but not the Active Worker. Select it in Muse agents to receive jobs.');
       }
@@ -645,12 +653,12 @@ async function startCommand(args) {
   await heartbeat();
   if (fatal) throw fatal;
 
-  // A deferred resume means the CMS was unreachable while probing the
-  // saved job: the marker is kept and the poll loop below re-attempts
-  // the resume (single probe per iteration, backing off) instead of
-  // claiming a new job or exiting. See lib/jobRunner.js resumeActiveJob.
-  // The initial probe is guarded like the loop's: only a 401 is fatal —
-  // any other throw defers instead of killing the daemon on boot.
+  // A saved job no longer waits on the CMS: resumeActiveJob probes twice
+  // and then runs locally from the saved checkpoint if the CMS is
+  // unreachable (see lib/jobRunner.js resumeActiveJob). Deferred now means
+  // only that the resume was aborted — the marker is kept and the poll
+  // loop below re-attempts it. Only a 401 is fatal — any other throw
+  // defers instead of killing the daemon on boot.
   let resumed = null;
   try {
     resumed = await jobRunner.resumeActiveJob({
@@ -664,11 +672,17 @@ async function startCommand(args) {
       throw fatal;
     }
     const savedJob = config.readActiveJob();
-    log.warn(`Saved-job resume probe failed at startup (${error.message}); daemon keeps polling and will resume it when the CMS answers`);
+    log.warn(`Saved-job resume probe failed at startup (${error.message}); daemon keeps polling and will resume it locally`);
     resumed = { deferred: true, jobId: savedJob?.jobId };
   }
-  if (resumed?.deferred) {
-    log.warn(`Resume of saved job ${resumed.jobId} deferred (CMS unavailable); daemon keeps polling and will resume it when the CMS answers`);
+  if (resumed?.skipped) {
+    // Another executor owns the saved job (e.g. an external runner, or a
+    // previous daemon that is still alive). Not settled — the owner will
+    // clear the marker when it finishes, and the poll loop below keeps
+    // re-attempting the resume until then.
+    log.warn(`Resume of saved job ${resumed.jobId} skipped: already running under pid ${resumed.executorPid}; daemon keeps polling and will resume it locally once the owner settles it`);
+  } else if (resumed?.deferred) {
+    log.warn(`Resume of saved job ${resumed.jobId} deferred (${resumed.error || 'aborted'}); daemon keeps polling and will resume it locally`);
   } else if (resumed) {
     log.info(`Saved job ${resumed.ok ? 'delivered' : 'settled without delivery'}`);
     current = null;
@@ -694,10 +708,13 @@ async function startCommand(args) {
     if (config.readActiveJob()) {
       let retry = null;
       try {
+        // Two probes per iteration, then resumeActiveJob runs the saved
+        // job locally if the CMS is still unreachable — a down CMS must
+        // never idle a job whose work is all on disk.
         retry = await jobRunner.resumeActiveJob({
           client,
           signal: abort.signal,
-          maxAttempts: 1,
+          maxAttempts: 2,
           onBusy: (jobId, stage, progress, detail) => { current = { jobId, stage, progress, detail }; }
         });
       } catch (error) {
@@ -712,10 +729,20 @@ async function startCommand(args) {
         await sleep(delay, abort.signal);
         continue;
       }
+      if (retry?.skipped) {
+        // The saved job is owned by a live executor elsewhere; back off
+        // and re-attempt. Never log this as settled — the job is running,
+        // just not here.
+        resumeFailures += 1;
+        const delay = retryDelayMs(resumeFailures - 1, { baseMs: pollMs, maxMs: retryOptions.maxMs });
+        log.warn(`Saved-job resume skipped for job ${retry.jobId} (already running under pid ${retry.executorPid}); re-attempting in ${Math.round(delay / 1000)}s — saved work retained`);
+        await sleep(delay, abort.signal);
+        continue;
+      }
       if (retry?.deferred) {
         resumeFailures += 1;
         const delay = retryDelayMs(resumeFailures - 1, { baseMs: pollMs, maxMs: retryOptions.maxMs });
-        log.warn(`CMS still unavailable for saved job ${retry.jobId}; resume deferred, re-probing in ${Math.round(delay / 1000)}s — saved work retained`);
+        log.warn(`Saved-job resume deferred for job ${retry.jobId} (${retry.error || 'aborted'}); re-attempting in ${Math.round(delay / 1000)}s — saved work retained`);
         await sleep(delay, abort.signal);
         continue;
       }

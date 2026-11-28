@@ -8,8 +8,9 @@
 # longer re-wake matters because composing a full answer takes minutes —
 # re-waking at 120s used to launch a second worker for the same request
 # while the first was still writing, and the loser got a 400.
-# Agent-request TTLs are floored at 600s server-side
-# (VIDZEO_AGENT_MIN_WALL_SECONDS) and 600s on the ScriptIT bridge.
+# Agent-request TTLs are the inbox walls in lib/museInbox.js: 120s for
+# muse.inbox_probe, 15 min for real requests (MUSE_INBOX_REQUEST_WALL_MS
+# overrides).
 #
 # Legacy wake-up path when a resident Muse inference transport is unavailable.
 # INSTALL (host Muse VM, not the container):

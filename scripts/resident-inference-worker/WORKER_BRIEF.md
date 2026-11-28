@@ -190,6 +190,25 @@ query plans expired while still queued behind it).
   ScriptIT drafts. Follow `request.instructions` and the response schema.
   Keep queries specific (viewpoint + entity words from the narration) and
   beats grounded in the script's real dates and names.
+- Media (`operation: 'documentary_media'`, `kind: 'text'`): the daemon
+  asks you to find real clips/images for one documentary shot. The
+  request's messages carry the video title, topic tag, shot beat/kind/
+  query/duration. Find candidates with real tools: web search for the shot
+  subject, image search for stills, and the repo venv yt-dlp
+  (`~/workspace/M2l/vidnets/.venv/bin/python -m yt_dlp --flat-playlist -J
+  --no-warnings 'ytsearch5:<query>'`) for YouTube video IDs. Return the
+  schema exactly: `{"candidates": [{"type": "video"|"image", "videoId"?,
+  "url"?, "title"?, "source"?}]}` — up to 4, best first. Rules: never
+  invent a URL or a video ID — every candidate must come from a search
+  result you actually observed; a videoId must be the 11-character ID
+  from a real YouTube result (verify with yt-dlp --get-title if unsure);
+  an image url must be a direct image link from a search result, not a
+  search page. Prefer the exact subject (person, place, event) over
+  generic stock. If you find nothing real, return `{"candidates": []}` —
+  never a fake. Validate with validate_answer.py before delivering, like
+  any structured answer. Note: the request's own messages already carry
+  these instructions, so answer from them even if this brief section is
+  older than the operation.
 - Diagnostic probes (`operation: 'muse.inbox_probe'`): do NOT answer
   these and do NOT echo the token — token echo is refused by policy,
   and probes are not a liveness signal (the daemon gates on real

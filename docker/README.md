@@ -61,9 +61,9 @@ docker compose down -v                     # DANGER: also deletes ./data? No —
 | Node | 24 via NodeSource `node_24.x` (reference VM: v24.22.1) |
 | Python | 3.12 (Ubuntu 24.04 default) |
 | ffmpeg | apt (see deviation below) |
-| yt-dlp, scrapers, TTS | `vidnets/server/requirements.txt` — `yt-dlp[default]>=2026.10.26`, `edge-tts`, `primp`, `ddgs`, `curl-cffi`, `faster-whisper`, `rembg`, `opencv-headless` |
+| yt-dlp, scrapers, TTS | yt-dlp in the repo venv (`vidnets/.venv`, created by `setup-muse.sh` step 3); scrapers and TTS are the repo's own code — there is no server requirements file anymore (retired with the :5010 server in 92ab202) |
 | Remotion | 4.0.541 (`remotion-linux` lockfile; root/vidnets `^4.0.526` resolves to it) |
-| Chrome Headless Shell | **157.0.8103.38**, pinned download from Chrome-for-Testing (URL verified HTTP 200 on 2026-11-10). Installed at `/opt/chrome-headless-shell-linux64`, linked to the path `remotion-linux/remotion.config.ts` hardcodes (`/home/hatch/chrome-headless-shell-linux64`) and into `vidnets/node_modules/.remotion/...` where `vidnets/server/app.py` resolves the browser. |
+| Chrome Headless Shell | **157.0.8103.38**, pinned download from Chrome-for-Testing (URL verified HTTP 200 on 2026-11-10). Installed at `/opt/chrome-headless-shell-linux64`, linked to the path `remotion-linux/remotion.config.ts` hardcodes (`/home/hatch/chrome-headless-shell-linux64`) and into each Remotion template's `node_modules/.remotion/chrome-headless-shell/`, which the documentary adapter uses (the retired `vidnets/server/app.py` resolver is gone). |
 | Vidnets data root | `/data/runtime` (bind-mounted to `./data/runtime`): output, temp, `secure/agent-service.json`, queue. Vidnets temp lives on disk, not in the container's `/tmp`. |
 | Worker state | `/data/work` (claimed-job state) and `/data/.muse-agent.json` (credential), bind-mounted to `./data`. |
 
@@ -165,9 +165,7 @@ with no Muse-answered verdicts is failed, never delivered as graphics).
 - **`vidnets` npm install uses `--omit=dev`** to skip Electron 45
   (desktop-only). The doctor check needs only the production
   `@remotion/{bundler,renderer}` packages, which are installed.
-- **No ports are published** by default. Vidnets binds `127.0.0.1:5010–5110`
-  inside the container; the daemon talks to it over container loopback.
-  Uncomment the `ports:` block in `docker-compose.yml` to inspect it.
+- **No ports are published** by default. No server binds any port inside the container (the retired Vidnets :5010 server is gone); the daemon talks straight to the CMS over HTTPS.
 
 ## Troubleshooting
 

@@ -317,3 +317,88 @@ test('extractImageUrls drops search-engine chrome hosts', () => {
   const urls = documentary.extractImageUrls(html);
   assert.deepEqual(urls, ['https://i.imgur.com/nEyIaWg.jpg']);
 });
+
+test('documentary_media agent schema and messages carry the shot', () => {
+  const schema = documentary.MEDIA_AGENT_SCHEMA;
+  assert.equal(schema.type, 'json_schema');
+  assert.equal(schema.json_schema.name, 'documentary_media');
+  assert.deepEqual(schema.json_schema.schema.required, ['candidates']);
+  assert.equal(schema.json_schema.schema.properties.candidates.type, 'array');
+
+  const messages = documentary.buildMediaAgentMessages({
+    title: 'Franklin Story',
+    topicTag: 'FRANKLIN',
+    shot: { beat: 'hook', kind: 'video', query: 'GTA V Franklin Clinton gameplay', dur: 210 },
+  });
+  const text = messages.map((m) => m.content).join('\n');
+  assert.match(text, /GTA V Franklin Clinton gameplay/);
+  assert.match(text, /Franklin Story/);
+  assert.match(text, /hook/);
+});
+
+test('normalizeAgentMediaCandidates keeps real candidates, drops invented ones', () => {
+  const out = documentary.normalizeAgentMediaCandidates({
+    candidates: [
+      { type: 'video', videoId: 'dQw4w9WgXcQ', title: 'Real clip' },
+      { type: 'video', url: 'https://www.youtube.com/watch?v=76bdrSeL6uI', title: 'From URL' },
+      { type: 'video', videoId: 'dQw4w9WgXcQ', title: 'Duplicate ID' },
+      { type: 'video', videoId: 'not-an-id', title: 'Invented ID' },
+      { type: 'image', url: 'https://example.com/franklin.jpg', title: 'Real image' },
+      { type: 'image', url: 'https://example.com/franklin.jpg', title: 'Duplicate image' },
+      { type: 'image', url: '/search?q=franklin', title: 'Search page, not an image' },
+      { type: 'audio', url: 'https://example.com/x.mp3' },
+      { type: 'video', videoId: 'abc12345678', title: 'Third video' },
+      { type: 'video', videoId: 'xyz12345678', title: 'Fourth video (over the cap)' },
+    ],
+  });
+  assert.equal(out.length, 4, 'caps at 4, drops dupes and invented entries');
+  assert.deepEqual(out.map((c) => c.type), ['video', 'video', 'image', 'video']);
+  assert.equal(out[0].videoId, 'dQw4w9WgXcQ');
+  assert.equal(out[1].videoId, '76bdrSeL6uI');
+  assert.equal(out[2].url, 'https://example.com/franklin.jpg');
+  assert.deepEqual(documentary.normalizeAgentMediaCandidates({}), []);
+  assert.deepEqual(documentary.normalizeAgentMediaCandidates(null), []);
+});
+
+test('fetchAgentMediaCandidates falls back to [] when the agent transport fails', async () => {
+  const prev = process.env.MUSE_INFERENCE_URL;
+  process.env.MUSE_INFERENCE_URL = 'http://127.0.0.1:1/nope';
+  try {
+    const out = await documentary.fetchAgentMediaCandidates({
+      shot: { beat: 'hook', kind: 'video', query: 'GTA V Franklin Clinton gameplay', dur: 210 },
+      title: 'Franklin Story',
+      topicTag: 'FRANKLIN',
+      jobId: 'test-job',
+      workDir: os.tmpdir(),
+      timeoutMs: 30000,
+    });
+    assert.deepEqual(out, []);
+  } finally {
+    if (prev === undefined) delete process.env.MUSE_INFERENCE_URL;
+    else process.env.MUSE_INFERENCE_URL = prev;
+  }
+});
+
+test('worker validator accepts a valid documentary_media answer and rejects a bad one', () => {
+  const { execFileSync } = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-media-validator-'));
+  const requestFile = path.join(dir, 'request.json');
+  const goodFile = path.join(dir, 'good.json');
+  const badFile = path.join(dir, 'bad.json');
+  const request = {
+    type: 'inference',
+    request: {
+      id: 'a'.repeat(32),
+      operation: 'documentary_media',
+      kind: 'text',
+      response_format: documentary.MEDIA_AGENT_SCHEMA,
+    },
+  };
+  fs.writeFileSync(requestFile, JSON.stringify(request));
+  fs.writeFileSync(goodFile, JSON.stringify({ candidates: [{ type: 'video', videoId: '76bdrSeL6uI', title: 'Heist' }, { type: 'image', url: 'https://example.com/f.jpg', title: 'Still' }] }));
+  fs.writeFileSync(badFile, JSON.stringify({ clips: [] }));
+  const venvPython = path.join(__dirname, '..', 'vidnets', '.venv', 'bin', 'python');
+  const validator = path.join(__dirname, '..', 'scripts', 'resident-inference-worker', 'validate_answer.py');
+  execFileSync(venvPython, [validator, goodFile, requestFile], { stdio: 'pipe' });
+  assert.throws(() => execFileSync(venvPython, [validator, badFile, requestFile], { stdio: 'pipe' }));
+});
