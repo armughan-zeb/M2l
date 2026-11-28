@@ -26,5 +26,7 @@ fi
 
 # Default to autonomous auto-looping without manual intervention
 export MUSE_AUTO_LOOP="${MUSE_AUTO_LOOP:-1}"
+case "${MUSE_RENDER_COMMAND:-}" in *render-vidnets-linux*|*render-linux*) unset MUSE_RENDER_COMMAND ;; esac
+case "${MUSE_SCRIPT_COMMAND:-}" in *scriptit*) unset MUSE_SCRIPT_COMMAND ;; esac
 
 exec node "$ROOT/muse-agent.js" start "$@"

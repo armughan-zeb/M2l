@@ -17,14 +17,14 @@ const { registerStageProcess } = require('../lib/stageCleanup');
 const { assertNoOpenRouterKey } = require('../lib/museInference');
 const { writeJsonAtomic } = require('../lib/config');
 const { resolveVideoStyle, ENGINES } = require('../lib/videoStyle');
-const { inferWithMuse } = require('../lib/museBridgeInfer');
+const { inferWithMuse, resolveOverrideCommand } = require('../lib/museBridgeInfer');
 
 function minimumWords(job) {
   return minimumScriptWords(job.targetDurationMinutes || 1);
 }
 
 function resolveScriptEngine(env = process.env) {
-  if (String(env.MUSE_SCRIPT_COMMAND || '').trim()) return 'command';
+  if (resolveOverrideCommand(env.MUSE_SCRIPT_COMMAND, { envName: 'MUSE_SCRIPT_COMMAND', warnOnStale: false })) return 'command';
   return 'muse-inference';
 }
 
@@ -194,7 +194,7 @@ function readSavedScript(workDir) {
 }
 
 async function generateScript(job, workDir, { signal, onDetail, onProgress, inferFn } = {}) {
-  const command = String(process.env.MUSE_SCRIPT_COMMAND || '').trim();
+  const command = resolveOverrideCommand(process.env.MUSE_SCRIPT_COMMAND, { envName: 'MUSE_SCRIPT_COMMAND' });
 
   const saved = readSavedScript(workDir);
   if (saved) {

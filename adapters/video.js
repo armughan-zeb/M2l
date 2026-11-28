@@ -18,6 +18,7 @@ const { registerStageProcess } = require('../lib/stageCleanup');
 const stickman = require('./stickman');
 const documentary = require('./documentary');
 const { resolveVideoStyle, ENGINES } = require('../lib/videoStyle');
+const { resolveOverrideCommand } = require('../lib/museBridgeInfer');
 
 const WRAPPER_PROGRESS_RE = /^\[render-[a-z0-9_-]+\]\s+(?:\w+)\s+(\d+)%\s*[—-]\s*(.*)$/i;
 const WRAPPER_LINE_RE = /^\[render-[a-z0-9_-]+\]\s+(.*)$/i;
@@ -111,12 +112,7 @@ async function runRenderCommand(command, job, scriptText, workDir, { signal, onP
 }
 
 function resolveRenderCommand(command, repoRoot = path.resolve(__dirname, '..')) {
-  const raw = String(command || '').trim();
-  if (!raw) return '';
-  return raw.replace(/(^|\s)(\.[\\/][^\s'"]+)/g, (match, prefix, rel) => {
-    const abs = path.resolve(repoRoot, rel);
-    return prefix + (/\s/.test(abs) ? `"${abs}"` : abs);
-  });
+  return resolveOverrideCommand(command, { repoRoot, envName: 'MUSE_RENDER_COMMAND' });
 }
 
 async function render(job, scriptText, workDir, options = {}) {

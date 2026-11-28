@@ -17,6 +17,8 @@ test('bundled relative renderer runs from a different job folder', async () => {
     const result = await runCommand(resolveRenderCommand('node ./custom-local-render.js', root), { cwd: job, timeoutMs: 5000 });
     assert.equal(JSON.parse(result.stdout).ok, true);
     assert.equal(resolveRenderCommand('node custom-render.js --flag', root), 'node custom-render.js --flag');
+    assert.equal(resolveRenderCommand('node ./render-vidnets-linux.js', root), '');
+    assert.equal(resolveRenderCommand('node ./missing-old-wrapper.js', root), '');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
