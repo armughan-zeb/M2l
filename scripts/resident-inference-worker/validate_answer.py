@@ -2,12 +2,12 @@
 """Validate a resident inference worker's answer against its request schema.
 
 The worker must run this BEFORE delivering an answer (before renaming the
-tmp answer file into place). It mirrors the server-side check in
-``vidnets/server/services/agent_bridge.py`` exactly: the same size/text
-rules, and the same validator — ``_json_schema_error`` imported from
-``vidnets/server/services/openrouter_llm.py`` — so a worker-side PASS
-means the server will accept the answer, and a worker-side FAIL means
-the server would have rejected it terminally.
+tmp answer file into place). It mirrors the old server-side check in
+``vidnets/server/services/agent_bridge.py``: the same size/text rules,
+and the same validator — ``_json_schema_error`` vendored verbatim from
+``vidnets/server/services/openrouter_llm.py`` (3be5190), which 92ab202
+deleted along with the Vidnets server. A worker-side PASS means the
+answer matches its schema, and a worker-side FAIL means it does not.
 
 Usage (run with the Vidnets venv python):
     validate_answer.py <answer-file> <request-file>
@@ -31,7 +31,9 @@ A request with no schema (plain-text answer) is always valid.
 """
 
 import json
+import math
 import os
+import re
 import sys
 
 MAX_BYTES = 2_000_000
@@ -54,21 +56,78 @@ def _find_response_format(data):
     return {}
 
 
-def _load_json_schema_error():
-    """Import the server's own schema validator (single source of truth).
+def _json_schema_error(value, schema: dict, path: str = "$", max_errors: int = 1) -> str:
+    """Small local validator for the JSON Schema subset used by OpenRouter.
 
-    Imported as ``server.services.openrouter_llm`` (package import, not a
-    bare top-level import): the module has a class-level relative import
-    that fails when it is loaded as a top-level module.
+    Vendored verbatim from vidnets/server/services/openrouter_llm.py
+    (3be5190). 92ab202 deleted that module with the Vidnets server, so
+    the validator now carries its own copy instead of importing it.
+    Keeping this dependency-free makes schema checks work in the bundled
+    Windows runtime as well as the developer environment.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(os.path.dirname(here))
-    vidnets_dir = os.path.join(repo_root, "vidnets")
-    if vidnets_dir not in sys.path:
-        sys.path.insert(0, vidnets_dir)
-    from server.services.openrouter_llm import _json_schema_error  # noqa: E402
-
-    return _json_schema_error
+    if not isinstance(schema, dict):
+        return f"{path}: schema must be an object"
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(value):
+        return f"{path}: JSON numbers must be finite"
+    expected = schema.get("type")
+    expected_types = expected if isinstance(expected, list) else [expected]
+    type_ok = not expected
+    for item in expected_types:
+        if item == "object" and isinstance(value, dict): type_ok = True
+        elif item == "array" and isinstance(value, list): type_ok = True
+        elif item == "string" and isinstance(value, str): type_ok = True
+        elif item == "integer" and isinstance(value, int) and not isinstance(value, bool): type_ok = True
+        elif item == "number" and isinstance(value, (int, float)) and not isinstance(value, bool): type_ok = True
+        elif item == "boolean" and isinstance(value, bool): type_ok = True
+        elif item == "null" and value is None: type_ok = True
+    if not type_ok:
+        return f"{path}: expected {expected}"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path}: value is outside the allowed choices"
+    if isinstance(value, dict):
+        required = schema.get("required") or []
+        missing = [key for key in required if key not in value]
+        if missing:
+            return f"{path}: missing required fields {', '.join(map(str, missing))}"
+        properties = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False:
+            unexpected = set(value) - set(properties)
+            if unexpected:
+                return f"{path}: unexpected fields {', '.join(sorted(map(str, unexpected)))}"
+        for key, child in properties.items():
+            if key in value:
+                error = _json_schema_error(value[key], child, f"{path}.{key}", max_errors)
+                if error:
+                    return error
+    elif isinstance(value, list):
+        if len(value) < int(schema.get("minItems", 0)):
+            return f"{path}: too few items"
+        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+            return f"{path}: too many items"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, child_value in enumerate(value):
+                error = _json_schema_error(child_value, item_schema, f"{path}[{index}]", max_errors)
+                if error:
+                    return error
+    elif isinstance(value, str):
+        if len(value) < int(schema.get("minLength", 0)):
+            return f"{path}: text is too short"
+        if "maxLength" in schema and len(value) > int(schema["maxLength"]):
+            return f"{path}: text is too long"
+        pattern = schema.get("pattern")
+        if pattern:
+            try:
+                if re.search(str(pattern), value) is None:
+                    return f"{path}: text does not match the required pattern"
+            except re.error:
+                return f"{path}: schema contains an invalid pattern"
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < float(schema["minimum"]):
+            return f"{path}: number is below the allowed range"
+        if "maximum" in schema and value > float(schema["maximum"]):
+            return f"{path}: number is above the allowed range"
+    return ""
 
 
 def validate(answer_path, request_path):
@@ -95,11 +154,7 @@ def validate(answer_path, request_path):
             value = json.loads(raw.decode("utf-8"))
         except ValueError:
             return False, "This request requires valid JSON matching its schema."
-        try:
-            json_schema_error = _load_json_schema_error()
-        except Exception as exc:  # fail closed: never deliver unvalidated
-            return False, "validator unavailable: %s" % exc
-        issue = json_schema_error(value, contract.get("schema") or {})
+        issue = _json_schema_error(value, contract.get("schema") or {})
         if issue:
             return False, "Agent response does not match the schema: " + str(issue)[:300]
         return True, ""

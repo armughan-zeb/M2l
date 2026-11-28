@@ -33,6 +33,6 @@ Every character uses `stickman({ ... })` for locked visual consistency across ev
 - **Props**: `safariHat`, `spreadCoat`, `woodStick`, `palmLeaf`, `clanger` (with `soundShockwaves`), and `backwardMask` (`drawBackwardHeadMask`).
 
 ## 4. Pacing, Captions & Sound
-- **Zero-Silence Narration**: Edge TTS lines trimmed cleanly with `gap: 0.02s`.
+- **Zero-Silence Narration**: Muse TTS lines trimmed cleanly with `gap: 0.02s`.
 - **Fast Cuts**: `1.5–4.5 s` per scene (`short`) or `2–5 s` (`wide`). Every shot declares a `motion` and uses continuous secondary movement (breathing bob, swaying leaves, ocean foam, tail sway).
 - **Clean Typography**: Outlined cartoon badges (`cartoonBadge`) and optional bold outlined phrase captions with yellow `*keyword` highlights — never giant cluttered paper boxes.

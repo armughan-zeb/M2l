@@ -1,6 +1,6 @@
 ---
 name: stickman-cartoon-studio
-description: Create 2D cartoon stickman shorts (1080x1920) and landscape explainer videos (1920x1080) using procedural HTML5 Canvas 2D vector characters ('white' gloved pure stickman and 'black' clothed stickman), bright cel-shaded environments, Edge TTS voiceover, SFX mixing, and zero-dep headless Chrome rendering.
+description: Create 2D cartoon stickman shorts (1080x1920) and landscape explainer videos (1920x1080) using procedural HTML5 Canvas 2D vector characters ('white' gloved pure stickman and 'black' clothed stickman), bright cel-shaded environments, Muse TTS voiceover, SFX mixing, and zero-dep headless Chrome rendering.
 ---
 
 # Stickman Cartoon Studio — Agent & Production Workflow
@@ -10,14 +10,14 @@ Use this skill whenever generating a new 2D Stickman Cartoon video (vertical Sho
 ## 1. Choose Format & Profile (`script.json`)
 - **Landscape 16:9 (`1920×1080`)**: `"profile": "wide"`, `"format": "wide"`, `"captions": "phrase"`
 - **Vertical Shorts 9:16 (`1080×1920`)**: `"profile": "short"`, `"format": "vertical"`, `"captions": "off"` (or `"phrase"`)
-- **Voice**: Microsoft Edge TTS public endpoints (`"voice": "en-US-ChristopherNeural"` or `"en-GB-RyanNeural"`).
+- **Voice**: Muse TTS primary (`"voice": "avocado_v2:MAI_03"` via `/opt/hatch/bin/tts`); Edge TTS (`"en-US-ChristopherNeural"` or `"en-GB-RyanNeural"`) only as fallback.
 - **Ambience Bed**: `"sound": { "mode": "auto", "bed": "jungle" | "drone" | "tense" | "wind", "transitions": true }`
 
 ## 2. Step-by-Step Build Pipeline
 1. **Write `script.json`** with punchy short lines (~8–13 words per line; ~2.5s–4s each).
 2. **Synthesize Voiceover**:
    ```sh
-   python tools/voice_edge.py --force
+   python tools/voice_muse.py --force
    ```
    Produces `data/mix.wav` (silence-trimmed), `data/lines.json`, and `data/words.json`.
 3. **Plan Captions** (if `captions` is `"phrase"`):

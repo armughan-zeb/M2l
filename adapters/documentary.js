@@ -107,6 +107,7 @@ function buildShotsPlanMessages({ title, scriptText, voiceDurationSec, targetDur
     '4. Keep each shot `title` short and punchy (2-6 uppercase words) and `sub` one short descriptive line (<= 10 words).',
     '5. Each `query` must be concrete, visual, and specific to that segment of narration (never generic filler).',
     '6. Output valid JSON matching the schema ONLY.',
+    '7. NEVER repeat a `query`: every shot gets a different search query with different subject, angle, or setting words — two shots must never search the same thing, or the video will show the same clip twice.',
   ].join('\n');
 
   const refs = Array.isArray(channel?.scriptReferences)
@@ -146,19 +147,31 @@ function normalizeShots(rawShots, totalFrames) {
   const weights = list.map((s) => Math.max(2, Number(s.durationSec) || 6));
   const weightSum = weights.reduce((acc, w) => acc + w, 0) || 1;
   let cursor = 0;
+  // The planner sometimes repeats one query across shots; identical queries
+  // resolve to the identical clip, so force later duplicates apart by folding
+  // the shot's own title words into the query. Fetch-level ID exclusion below
+  // is the hard guarantee — this keeps the search terms honest too.
+  const seenQueries = new Set();
   return list.map((shot, index) => {
     const isLast = index === list.length - 1;
     const rawFrames = Math.max(60, Math.round((weights[index] / weightSum) * total));
     const dur = isLast ? Math.max(60, total - cursor) : Math.min(rawFrames, Math.max(60, total - cursor - (list.length - 1 - index) * 60));
     const from = cursor;
     cursor += dur;
+    let query = String(shot.query || '').trim() || 'documentary archive';
+    const queryKey = query.toLowerCase().replace(/\s+/g, ' ');
+    if (seenQueries.has(queryKey)) {
+      const discriminator = String(shot.title || '').trim().toLowerCase();
+      if (discriminator) query = `${query} ${discriminator}`;
+    }
+    seenQueries.add(queryKey);
     return {
       index,
       beat: ['hook', 'background', 'development', 'impact', 'closing'].includes(shot.beat) ? shot.beat : 'development',
       kind: shot.kind === 'video' ? 'video' : 'image',
       from,
       dur,
-      query: String(shot.query || '').trim() || 'documentary archive',
+      query,
       sourceUrl: String(shot.sourceUrl || '').trim(),
       title: String(shot.title || 'DOCUMENTARY').trim().slice(0, 80),
       sub: String(shot.sub || '').trim().slice(0, 140),
@@ -168,6 +181,15 @@ function normalizeShots(rawShots, totalFrames) {
   });
 }
 
+// NOTE: the generated Shot template deliberately puts NO `loop` prop on
+// <OffthreadVideo>. In Remotion 4.0.547 the loop prop leaks through
+// OffthreadVideoForRendering into an internal <Img>, which renders a looping
+// <Sequence> with no durationInFrames, so the render dies at frame 0.
+// (Do NOT put this note as a {/* */} comment inside the generated JSX: a
+// comment next to the video element makes two adjacent children and breaks
+// the bundle with `Expected ")" but found "src"` — proven live 2026-11-27.)
+// Clips are trimmed to roughly the shot length, so a clip that ends a few
+// frames early simply holds its last frame.
 function generateCompositionTsx({ topicTag, headerText, shots, captionsEnabled = true }) {
   const safeTag = JSON.stringify(String(topicTag || 'DOCUMENTARY').toUpperCase().slice(0, 32));
   const safeHeader = JSON.stringify(String(headerText || '').toUpperCase().slice(0, 48));
@@ -315,7 +337,6 @@ const Shot: React.FC<{
             <OffthreadVideo
               src={staticFile(video)}
               muted
-              loop
               style={{ width: "100%", height: "100%", objectFit: "cover" }}
             />
           ) : (
@@ -403,6 +424,15 @@ function isValidImageBuffer(buf) {
   return '';
 }
 
+function selectTtsEngine({ explicitVoice, hatchTtsAvailable } = {}) {
+  // Muse TTS (Hatch) is PRIMARY; Edge is only the fallback when the Hatch
+  // binary is missing. An explicit voice name must NOT force Edge — the
+  // default documentary voice is an Edge-style name, and routing on it
+  // silently switched every documentary narration to Edge.
+  void explicitVoice;
+  return hatchTtsAvailable ? 'hatch' : 'edge';
+}
+
 async function synthesizeVoiceover(scriptText, outputPath, { voice, signal, pythonBin } = {}) {
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   const hatchTts = String(process.env.MUSE_HATCH_TTS_BIN || '/opt/hatch/bin/tts').trim();
@@ -411,7 +441,7 @@ async function synthesizeVoiceover(scriptText, outputPath, { voice, signal, pyth
   const explicitVoice = String(voice || '').trim();
   const py = pythonBin || await resolvePython();
 
-  if (!explicitVoice && hatchTts && fs.existsSync(hatchTts)) {
+  if (selectTtsEngine({ explicitVoice, hatchTtsAvailable: Boolean(hatchTts) && fs.existsSync(hatchTts) }) === 'hatch') {
     await runProcess(py, ['-c', `
 import subprocess, sys
 text = open(sys.argv[1], encoding="utf-8").read()
@@ -467,6 +497,10 @@ async function downloadImageUrl(url, destStem, { signal } = {}) {
     const buf = Buffer.from(await res.arrayBuffer());
     const ext = isValidImageBuffer(buf);
     if (!ext) return null;
+    // A real photo for a 1080p frame is never a few KB: tiny files are
+    // UI sprites/icons that pass the magic-byte check (a 2.8 KB Yandex
+    // chrome PNG did exactly that in live testing).
+    if (buf.length < 8192) return null;
     const dest = `${destStem}${ext}`;
     fs.writeFileSync(dest, buf);
     return dest;
@@ -475,21 +509,205 @@ async function downloadImageUrl(url, destStem, { signal } = {}) {
   }
 }
 
-async function fetchImageAsset(query, sourceUrl, destStem, { signal } = {}) {
-  const candidates = [];
-  if (sourceUrl && /^https?:\/\//i.test(sourceUrl)) candidates.push(sourceUrl);
-  const wikiUrls = await searchWikimediaImages(query, { signal });
-  candidates.push(...wikiUrls);
-  for (const url of candidates) {
-    const saved = await downloadImageUrl(url, destStem, { signal });
-    if (saved) return { path: saved, source: url };
+function normalizeYoutubeVideoId(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
+  const m = raw.match(/(?:[?&]v=|\/shorts\/|\/embed\/|\/v\/|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : '';
+}
+
+function pickUnusedVideoCandidate(candidates, usedVideoIds) {
+  const used = usedVideoIds instanceof Set ? usedVideoIds : new Set(usedVideoIds || []);
+  for (const cand of Array.isArray(candidates) ? candidates : []) {
+    const id = normalizeYoutubeVideoId(cand?.id || cand?.url || '');
+    if (id && !used.has(id)) return { id, title: String(cand?.title || '').trim() };
   }
   return null;
 }
 
-async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal, pythonBin, width = WIDTH, height = HEIGHT } = {}) {
+function pickLeastUsedFallback(fallbacks, usageCounts) {
+  let best = null;
+  let bestCount = Infinity;
+  for (const fb of Array.isArray(fallbacks) ? fallbacks : []) {
+    const count = Number(usageCounts?.get?.(fb.assetPath)) || 0;
+    if (count < bestCount) {
+      best = fb;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+async function searchOpenverseImages(query, { signal } = {}) {
+  const url = `https://api.openverse.org/v1/images/?q=${encodeURIComponent(query)}&page_size=5`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'VidzeoMuseDocumentary/1.0', Accept: 'application/json' },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const urls = [];
+    for (const item of Array.isArray(data?.results) ? data.results : []) {
+      if (typeof item?.url === 'string' && /^https?:\/\//i.test(item.url)) urls.push(item.url);
+    }
+    return urls;
+  } catch {
+    return [];
+  }
+}
+
+const BROWSER_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+function unescapeJsonUrl(raw) {
+  return String(raw || '').replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+}
+
+// Pure HTML -> image URL extraction, shared by the Yandex/Bing lanes.
+// Yandex embeds originals as "origUrl":"https://..." in data-state JSON;
+// Bing embeds them as murl&quot;:&quot;https://...&quot;. The direct-URL
+// pattern requires a delimiter right after the extension so it cannot
+// span across JSON blobs and return garbage.
+function extractImageUrls(html) {
+  const out = [];
+  const seen = new Set();
+  const push = (u) => {
+    const url = unescapeJsonUrl(u).split('#')[0];
+    // Never accept a URL that spans JSON markup: a real image URL has no
+    // braces, brackets, or entity residue in it. Also drop search-engine
+    // chrome (Yandex/Bing/Google static hosts serve UI sprites, not photos
+    // — a 2.8 KB yastatic.net PNG passed the magic-byte check in live
+    // testing and would have shipped as a shot).
+    if (!/^https?:\/\//i.test(url) || /[\s{}[\]]/.test(url) || url.includes('&quot;')) return;
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      if (/(^|\.)(yastatic\.net|bing\.com|google\.com|gstatic\.com|yandex\.(com|ru|com\.tr))$/.test(host)) return;
+    } catch { return; }
+    if (!seen.has(url)) { seen.add(url); out.push(url); }
+  };
+  const text = String(html || '').replace(/\\\//g, '/');
+  for (const m of text.matchAll(/"origUrl"\s*:\s*"((?:https?:)?\/\/[^"]+)"/g)) {
+    push(m[1].startsWith('//') ? `https:${m[1]}` : m[1]);
+  }
+  for (const m of text.matchAll(/murl(?:&quot;|")\s*:\s*(?:&quot;|")(https?:[^&"\\]+?)(?:&quot;|")/g)) push(m[1]);
+  // ';' is excluded so the match cannot span an &quot; entity into a
+  // later .jpg; a real image URL almost never carries a ';'.
+  for (const m of text.matchAll(/https?:\/\/[^\s"'<>\\;]+?\.(?:jpg|jpeg|png|webp)(?=[\s"'<>&?]|$)/gi)) push(m[0]);
+  return out;
+}
+
+async function searchYandexImages(query, { signal } = {}) {
+  const url = `https://yandex.com/images/search?text=${encodeURIComponent(query)}&isize=large&nomisspell=1`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9', Referer: 'https://yandex.com/images/' },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    if (/<title[^>]*>\s*Are you not a robot\?/i.test(html)) {
+      log.info('[documentary] Yandex image search hit a robot check');
+      return [];
+    }
+    return extractImageUrls(html).slice(0, 8);
+  } catch (error) {
+    log.info(`[documentary] Yandex image search failed for "${query}": ${error.message}`);
+    return [];
+  }
+}
+
+async function searchBingImages(query, { signal } = {}) {
+  const url = `https://www.bing.com/images/search?q=${encodeURIComponent(query)}`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
+    });
+    if (!res.ok) return [];
+    return extractImageUrls(await res.text()).slice(0, 8);
+  } catch (error) {
+    log.info(`[documentary] Bing image search failed for "${query}": ${error.message}`);
+    return [];
+  }
+}
+
+function relaxedImageQueries(query) {
+  const words = String(query || '').trim().split(/\s+/).filter(Boolean);
+  const out = [];
+  const push = (q) => { if (q && !out.includes(q)) out.push(q); };
+  push(words.join(' '));
+  if (words.length > 4) push(words.slice(0, 4).join(' '));
+  if (words.length > 2) push(words.slice(0, 2).join(' '));
+  return out.slice(0, 3);
+}
+
+async function fetchImageAsset(query, sourceUrl, destStem, { signal } = {}) {
+  if (sourceUrl && /^https?:\/\//i.test(sourceUrl)) {
+    const saved = await downloadImageUrl(sourceUrl, destStem, { signal });
+    if (saved) return { path: saved, source: sourceUrl };
+  }
+  // Web image lane, Yandex first (the old pipeline's waterfall order):
+  // general web search handles game/modern topics that Wikimedia and
+  // Openverse are empty for. Full query first, then relaxed variants.
+  // Google is 429 from this VM, so it is not a lane.
+  const engines = [searchYandexImages, searchBingImages, searchWikimediaImages, searchOpenverseImages];
+  for (const q of relaxedImageQueries(query)) {
+    for (const search of engines) {
+      const urls = await search(q, { signal });
+      for (const url of urls) {
+        const saved = await downloadImageUrl(url, destStem, { signal });
+        if (saved) return { path: saved, source: url };
+      }
+    }
+  }
+  return null;
+}
+
+async function listYoutubeCandidates(query, sourceUrl, { signal, pythonBin } = {}) {
+  const py = pythonBin || await resolvePython();
+  const directId = normalizeYoutubeVideoId(sourceUrl || '');
+  if (directId) return [{ id: directId, title: '' }];
+  const search = `ytsearch8:${query}`;
+  const args = [
+    '-m', 'yt_dlp',
+    '--no-playlist',
+    '--no-warnings',
+    '--flat-playlist',
+    '-J',
+    '--no-check-certificates',
+    search,
+  ];
+  try {
+    const { stdout } = await runProcess(py, args, { timeoutMs: 90 * 1000, signal, label: 'yt-dlp documentary search' });
+    const data = JSON.parse(String(stdout || '').trim());
+    const entries = Array.isArray(data?.entries) ? data.entries : [];
+    return entries
+      .map((e) => ({ id: normalizeYoutubeVideoId(e?.id || e?.url || ''), title: String(e?.title || '').trim() }))
+      .filter((e) => e.id);
+  } catch (error) {
+    log.info(`[documentary] YouTube candidate search failed for "${query}": ${error.message}`);
+    return [];
+  }
+}
+
+async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal, pythonBin, width = WIDTH, height = HEIGHT, excludeVideoIds } = {}) {
   const tempRaw = `${destPath}.raw.mp4`;
-  const target = sourceUrl && /^https?:\/\//i.test(sourceUrl) ? sourceUrl : `ytsearch2:${query}`;
+  const cleanupRaw = () => {
+    for (const p of [tempRaw, `${tempRaw}.part`]) {
+      try { fs.rmSync(p, { force: true }); } catch { /* ignore */ }
+    }
+  };
+  // List candidates first and skip any video already used by an earlier shot.
+  // The old code downloaded ytsearch2's first hit blindly, so one repeated
+  // query (or one popular result) filled half the video with the same clip.
+  const candidates = await listYoutubeCandidates(query, sourceUrl, { signal, pythonBin });
+  const picked = pickUnusedVideoCandidate(candidates, excludeVideoIds);
+  if (!picked) {
+    log.info(`[documentary] No unused YouTube candidate for "${query}" (all ${candidates.length} already used or search empty)`);
+    return null;
+  }
+  const target = `https://www.youtube.com/watch?v=${picked.id}`;
   const ytdlpArgs = [
     '-m', 'yt_dlp',
     '--no-playlist',
@@ -497,27 +715,27 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
     '-f', 'bv*[height<=1080][ext=mp4]/bv*[height<=1080]/best[height<=1080]/best',
     '--merge-output-format', 'mp4',
     '-o', tempRaw,
+    '--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=android', '--no-check-certificates',
+    target,
   ];
-  if (/youtube\.com|youtu\.be|^ytsearch/i.test(target)) {
-    ytdlpArgs.push('--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=android', '--no-check-certificates');
-  }
-  ytdlpArgs.push(target);
 
   const py = pythonBin || await resolvePython();
   try {
     await runProcess(py, ytdlpArgs, { timeoutMs: 3 * 60 * 1000, signal, label: 'yt-dlp documentary clip' });
-  } catch {
-    try { fs.rmSync(tempRaw, { force: true }); } catch { /* ignore */ }
+  } catch (error) {
+    log.info(`[documentary] Clip download failed for "${query}" (id=${picked.id}): ${error.message}`);
+    cleanupRaw();
     return null;
   }
   if (!fs.existsSync(tempRaw) || fs.statSync(tempRaw).size < 16384) {
-    try { fs.rmSync(tempRaw, { force: true }); } catch { /* ignore */ }
+    log.info(`[documentary] Clip download too small/empty for "${query}" (id=${picked.id})`);
+    cleanupRaw();
     return null;
   }
 
   const ffmpegBin = await ffmpeg.resolveBinary('ffmpeg');
   if (!ffmpegBin) {
-    try { fs.rmSync(tempRaw, { force: true }); } catch { /* ignore */ }
+    cleanupRaw();
     return null;
   }
   const clipDur = Math.max(2, Math.min(30, Math.ceil(Number(durationSec) || 6)));
@@ -533,12 +751,13 @@ async function fetchVideoClip(query, sourceUrl, destPath, durationSec, { signal,
     ], { timeoutMs: 2 * 60 * 1000, signal, label: 'ffmpeg documentary trim' });
     const info = await ffmpeg.probeVideo(destPath);
     if (info.hasVideo && info.duration >= 1.5) {
-      return { path: destPath, source: target };
+      return { path: destPath, source: target, videoId: picked.id };
     }
-  } catch {
-    // Fall back to image asset below
+    log.info(`[documentary] Trimmed clip failed probe for "${query}" (id=${picked.id})`);
+  } catch (error) {
+    log.info(`[documentary] Clip trim failed for "${query}" (id=${picked.id}): ${error.message}`);
   } finally {
-    try { fs.rmSync(tempRaw, { force: true }); } catch { /* ignore */ }
+    cleanupRaw();
   }
   return null;
 }
@@ -695,6 +914,9 @@ async function render(job, scriptText, workDir, options = {}) {
 
   const mediaSources = [];
   const verifiedFallbacks = [];
+  const fallbackUsage = new Map();
+  const usedVideoIds = new Set();
+  const usedAssetPaths = new Set();
   const resolvedShots = [];
   let videoShotCount = 0;
   let imageShotCount = 0;
@@ -708,8 +930,12 @@ async function render(job, scriptText, workDir, options = {}) {
     if (cachedShot && cachedShot.query === shot.query && cachedShot.beat === shot.beat && cachedShot.assetPath) {
       const diskPath = path.join(projectDir, 'public', cachedShot.assetPath);
       try {
-        if (fs.statSync(diskPath).size >= 1024) {
-          asset = { assetType: cachedShot.assetType, assetPath: cachedShot.assetPath, source: cachedShot.source || 'checkpoint' };
+        // An old checkpoint may itself repeat one asset across shots; a
+        // repeat here is a miss, not a reuse — re-fetch for a distinct clip.
+        if (!usedAssetPaths.has(cachedShot.assetPath) && fs.statSync(diskPath).size >= 1024) {
+          asset = { assetType: cachedShot.assetType, assetPath: cachedShot.assetPath, source: cachedShot.source || 'checkpoint', videoId: cachedShot.videoId || '' };
+          if (asset.videoId) usedVideoIds.add(asset.videoId);
+          usedAssetPaths.add(asset.assetPath);
           if (asset.assetType === 'video') videoShotCount += 1;
           else imageShotCount += 1;
           log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length} reused from checkpoint (${asset.assetPath})`);
@@ -723,11 +949,13 @@ async function render(job, scriptText, workDir, options = {}) {
 
       if (shot.kind === 'video') {
         const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
-        const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight });
+        const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight, excludeVideoIds: usedVideoIds });
         if (fetched) {
-          asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source };
+          asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source, videoId: fetched.videoId || '' };
+          if (asset.videoId) usedVideoIds.add(asset.videoId);
+          usedAssetPaths.add(asset.assetPath);
           videoShotCount += 1;
-          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready (${(shot.dur / FPS).toFixed(1)}s)`);
+          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready (${(shot.dur / FPS).toFixed(1)}s, id=${asset.videoId || 'n/a'})`);
         }
       }
       if (!asset) {
@@ -735,16 +963,35 @@ async function render(job, scriptText, workDir, options = {}) {
         const fetchedImg = await fetchImageAsset(shot.query, shot.sourceUrl, imgStem, { signal });
         if (fetchedImg) {
           asset = { assetType: 'image', assetPath: `images/${path.basename(fetchedImg.path)}`, source: fetchedImg.source };
+          usedAssetPaths.add(asset.assetPath);
           imageShotCount += 1;
           log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: verified image ready`);
         }
       }
+      if (!asset && shot.kind === 'image') {
+        // Cross-lane second chance: an image shot whose stills lanes are
+        // empty gets a fresh related clip before any repeat. A fresh clip
+        // beats a repeated clip; the manifest counts it honestly as video.
+        const clipFile = path.join(projectDir, 'public', 'footage', `shot-${i + 1}.mp4`);
+        const fetched = await fetchVideoClip(shot.query, shot.sourceUrl, clipFile, shot.dur / FPS, { signal, pythonBin, width: renderWidth, height: renderHeight, excludeVideoIds: usedVideoIds });
+        if (fetched) {
+          asset = { assetType: 'video', assetPath: `footage/shot-${i + 1}.mp4`, source: fetched.source, videoId: fetched.videoId || '' };
+          if (asset.videoId) usedVideoIds.add(asset.videoId);
+          usedAssetPaths.add(asset.assetPath);
+          videoShotCount += 1;
+          log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: yt-dlp video ready via cross-lane fallback (${(shot.dur / FPS).toFixed(1)}s, id=${asset.videoId || 'n/a'})`);
+        }
+      }
       if (!asset && verifiedFallbacks.length) {
-        const reused = verifiedFallbacks[i % verifiedFallbacks.length];
+        // Last resort only: spread repeats across the least-used verified
+        // asset instead of round-robin by index, which kept re-picking
+        // the same first clip.
+        const reused = pickLeastUsedFallback(verifiedFallbacks, fallbackUsage);
         asset = { ...reused };
+        fallbackUsage.set(reused.assetPath, (fallbackUsage.get(reused.assetPath) || 0) + 1);
         if (reused.assetType === 'video') videoShotCount += 1;
         else imageShotCount += 1;
-        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: reused verified asset ${reused.assetPath}`);
+        log.info(`[documentary] Shot ${i + 1}/${normalizedShots.length}: reused verified asset ${reused.assetPath} (least-used fallback)`);
       }
       if (!asset) {
         throw new Error(`Documentary shot ${i + 1} ("${shot.query}") could not retrieve any verified video clip or real image.`);
@@ -754,6 +1001,7 @@ async function render(job, scriptText, workDir, options = {}) {
     }
 
     verifiedFallbacks.push(asset);
+    fallbackUsage.set(asset.assetPath, fallbackUsage.get(asset.assetPath) || 0);
     mediaSources.push(asset.source);
     resolvedShots.push({ ...shot, ...asset });
   }
@@ -850,6 +1098,16 @@ module.exports = {
   generateCompositionTsx,
   generateRemotionRootTsx,
   isValidImageBuffer,
+  normalizeYoutubeVideoId,
+  pickUnusedVideoCandidate,
+  pickLeastUsedFallback,
+  relaxedImageQueries,
+  extractImageUrls,
+  fetchImageAsset,
+  searchYandexImages,
+  searchBingImages,
+  searchOpenverseImages,
+  selectTtsEngine,
   synthesizeVoiceover,
   render,
 };

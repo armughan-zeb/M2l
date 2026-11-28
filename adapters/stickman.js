@@ -119,6 +119,7 @@ function stickmanRuntimeStatus(env = process.env) {
     path.join(root, 'tools', 'capture.mjs'),
     path.join(root, 'tools', 'lint.mjs'),
     path.join(root, 'tools', 'plan_captions.mjs'),
+    path.join(root, 'tools', 'voice_muse.py'),
     path.join(root, 'tools', 'voice_edge.py'),
     path.join(root, 'tools', 'mix_audio.py'),
     path.join(root, 'sounds', 'whoosh.wav'),
@@ -137,7 +138,7 @@ function buildScriptJsonMessages({ title, scriptText, voice, profile, format, ca
     'You convert spoken narration into `script.json` for 2D Stickman Cartoon Studio.',
     'Rules:',
     '1. Split the narration faithfully into punchy sentences (`lines` array), ~8-15 words per line, preserving EVERY fact cleanly without adding filler.',
-    '2. In `say`, spell out years/numbers/acronyms clearly for Edge TTS.',
+    '2. In `say`, spell out years/numbers/acronyms clearly for TTS.',
     '3. In `caps`, split each line into 2-5 short phrases separated by ` | `, marking 1-2 important keywords with a leading `*` (e.g. "Rule one: | *never run, | it triggers *pursuit.").',
     `4. Use exact fields: profile="${profile}", format="${format}", voice="${voice}", captions="${captions}", speed=1.0.`,
     '5. Choose the most fitting ambience `sound.bed` from `drone` | `jungle` | `tense` | `wind`, with `mode: "auto"`, `transitions: true`.',
@@ -318,12 +319,12 @@ async function render(job, scriptText, workDir, options = {}) {
   const linesJsonPath = path.join(projectDir, 'data', 'lines.json');
   const wordsJsonPath = path.join(projectDir, 'data', 'words.json');
   if (!fs.existsSync(mixWavPath) || !fs.existsSync(linesJsonPath)) {
-    log.info(`[2d-stickman] Job ${job.jobId}: synthesizing Edge TTS narration (${voice})`);
-    onProgress(16, `[2d-stickman] Synthesizing Edge TTS narration (${voice})`, true);
-    await runProcess(pythonBin, [path.join('tools', 'voice_edge.py'), '--force'], { cwd: projectDir, signal, label: '2D Stickman TTS' });
+    log.info(`[2d-stickman] Job ${job.jobId}: synthesizing Muse TTS narration (${voice})`);
+    onProgress(16, `[2d-stickman] Synthesizing Muse TTS narration (${voice})`, true);
+    await runProcess(pythonBin, [path.join('tools', 'voice_muse.py'), '--force'], { cwd: projectDir, signal, label: '2D Stickman TTS' });
     checkpoint = writeStageCheckpoint(checkpointPath, inputDigest, { tts: true, captions: false });
   } else {
-    log.info(`[2d-stickman] Job ${job.jobId}: reusing Edge TTS checkpoint`);
+    log.info(`[2d-stickman] Job ${job.jobId}: reusing Muse TTS checkpoint`);
     checkpoint = writeStageCheckpoint(checkpointPath, inputDigest, { tts: true });
   }
   if (!checkpoint?.stages?.captions || !fs.existsSync(wordsJsonPath)) {

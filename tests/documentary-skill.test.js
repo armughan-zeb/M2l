@@ -136,6 +136,69 @@ test('adapters/script routes documentary and stickman jobs via Muse inference wi
   }
 });
 
+test('normalizeShots differentiates repeated planner queries so shots cannot search the same thing', () => {
+  const shots = documentary.normalizeShots([
+    { beat: 'hook', kind: 'video', durationSec: 6, query: 'GTA VI official trailer Vice City neon skyline night aerial', title: 'THE WAIT IS OVER', sub: 'x', zoomIn: true, center: false },
+    { beat: 'background', kind: 'video', durationSec: 6, query: 'GTA VI official trailer Vice City neon skyline night aerial', title: 'BACK TO VICE CITY', sub: 'x', zoomIn: true, center: false },
+    { beat: 'development', kind: 'video', durationSec: 6, query: 'GTA VI official trailer Vice City neon skyline night aerial', title: 'LUCIA CAMINOS', sub: 'x', zoomIn: true, center: false },
+  ], 540);
+  assert.equal(shots[0].query, 'GTA VI official trailer Vice City neon skyline night aerial');
+  assert.match(shots[1].query, /back to vice city$/);
+  assert.match(shots[2].query, /lucia caminos$/);
+  assert.notEqual(shots[0].query, shots[1].query);
+  assert.notEqual(shots[1].query, shots[2].query);
+});
+
+test('pickUnusedVideoCandidate never returns a video ID already used by an earlier shot', () => {
+  const candidates = [
+    { id: 'QdBZY2fkU-0', title: 'Grand Theft Auto VI Trailer 1' },
+    { id: 'rz1B4B2yBZY', title: 'Grand Theft Auto VI Launch Trailer' },
+    { id: '_yl5ELcmugI', title: 'Grand Theft Auto VI: Out Now' },
+  ];
+  const used = new Set();
+  assert.equal(documentary.pickUnusedVideoCandidate(candidates, used).id, 'QdBZY2fkU-0');
+  used.add('QdBZY2fkU-0');
+  assert.equal(documentary.pickUnusedVideoCandidate(candidates, used).id, 'rz1B4B2yBZY');
+  used.add('rz1B4B2yBZY');
+  assert.equal(documentary.pickUnusedVideoCandidate(candidates, used).id, '_yl5ELcmugI');
+  used.add('_yl5ELcmugI');
+  assert.equal(documentary.pickUnusedVideoCandidate(candidates, used), null);
+
+  assert.equal(documentary.normalizeYoutubeVideoId('https://www.youtube.com/watch?v=QdBZY2fkU-0'), 'QdBZY2fkU-0');
+  assert.equal(documentary.normalizeYoutubeVideoId('https://youtu.be/rz1B4B2yBZY'), 'rz1B4B2yBZY');
+  assert.equal(documentary.normalizeYoutubeVideoId('QdBZY2fkU-0'), 'QdBZY2fkU-0');
+  assert.equal(documentary.normalizeYoutubeVideoId('https://example.com/not-a-video'), '');
+});
+
+test('pickLeastUsedFallback spreads last-resort repeats instead of re-picking the first clip', () => {
+  const fallbacks = [{ assetPath: 'footage/shot-1.mp4' }, { assetPath: 'footage/shot-2.mp4' }];
+  const usage = new Map([['footage/shot-1.mp4', 2], ['footage/shot-2.mp4', 0]]);
+  assert.equal(documentary.pickLeastUsedFallback(fallbacks, usage).assetPath, 'footage/shot-2.mp4');
+  usage.set('footage/shot-2.mp4', 1);
+  assert.equal(documentary.pickLeastUsedFallback(fallbacks, usage).assetPath, 'footage/shot-2.mp4');
+  usage.set('footage/shot-2.mp4', 2);
+  assert.equal(documentary.pickLeastUsedFallback(fallbacks, usage).assetPath, 'footage/shot-1.mp4');
+  assert.equal(documentary.pickLeastUsedFallback([], usage), null);
+});
+
+test('selectTtsEngine keeps Muse TTS primary even when a voice name is set', () => {
+  assert.equal(documentary.selectTtsEngine({ explicitVoice: 'en-US-ChristopherNeural', hatchTtsAvailable: true }), 'hatch');
+  assert.equal(documentary.selectTtsEngine({ explicitVoice: '', hatchTtsAvailable: true }), 'hatch');
+  assert.equal(documentary.selectTtsEngine({ explicitVoice: 'en-US-ChristopherNeural', hatchTtsAvailable: false }), 'edge');
+  assert.equal(documentary.selectTtsEngine({ explicitVoice: '', hatchTtsAvailable: false }), 'edge');
+});
+
+test('buildShotsPlanMessages forbids repeating a query across shots', () => {
+  const msgs = documentary.buildShotsPlanMessages({
+    title: 'GTA VI',
+    scriptText: 'Test narration',
+    voiceDurationSec: 54,
+    targetDurationMinutes: 1,
+    channel: {},
+  }).map((m) => m.content).join('\n');
+  assert.match(msgs, /NEVER repeat a `query`/);
+});
+
 test('createFrameProgressReporter throttles noise and formats CMS frame counters cleanly', () => {
   const events = [];
   const logs = [];
@@ -193,7 +256,12 @@ test('documentary scales cleanly to 20-minute CMS duration, voice, 9:16 aspect, 
     shots: [{ from: 0, dur: 240, assetType: 'video', assetPath: 'footage/shot-1.mp4', title: 'THE CUT', sub: '', zoomIn: true, center: false }],
     captionsEnabled: false,
   });
-  assert.match(compNoCap, /loop/);
+  // No `loop` on the OffthreadVideo element: in Remotion 4.0.547 it leaks
+  // into an internal <Img> Sequence with no durationInFrames and kills the
+  // render at frame 0 (proven live in job gta-vi-doc-fix-proof, 2026-11-27).
+  // (The template comment mentions loop, so match the element itself.)
+  const videoTag = compNoCap.match(/<OffthreadVideo[\s\S]*?\/>/)[0];
+  assert.doesNotMatch(videoTag, /loop/);
   assert.doesNotMatch(compNoCap, /<Caption /);
 });
 
@@ -216,3 +284,36 @@ test('readStageCheckpoint and writeStageCheckpoint persist atomic digest-scoped 
 
 
 
+
+test('relaxedImageQueries shortens a specific shot query for the image lane', () => {
+  assert.deepEqual(
+    documentary.relaxedImageQueries('GTA VI PS5 Xbox Series X launch box art'),
+    ['GTA VI PS5 Xbox Series X launch box art', 'GTA VI PS5 Xbox', 'GTA VI'],
+  );
+  assert.deepEqual(documentary.relaxedImageQueries('GTA VI'), ['GTA VI']);
+  assert.deepEqual(documentary.relaxedImageQueries('  '), []);
+});
+
+test('extractImageUrls pulls Yandex origUrl, Bing murl and direct URLs, never JSON-spanning garbage', () => {
+  const html = [
+    '{"origUrl":"https:\\/\\/i.pinimg.com\\/736x\\/78\\/89\\/92\\/788992678db43890389e3cb641c3bcda.jpg"}',
+    'murl&quot;:&quot;https://static0.gamerantimages.com/wordpress/wp-content/uploads/2023/12/gta-5-cover.jpg&quot;',
+    '<img src="https://images.ctfassets.net/abc/hero.jpg">',
+    'https://ru.pinterest.com/pin/404268504068462670/&quot;},&quot;freshness&quot;:&quot;normal&quot;,&quot;preview&quot;:[{&quot;url&quot;:&quot;https://i.pinimg.com/736x/78/89/92/788992678db43890389e3cb641c3bcda.jpg&quot;',
+  ].join('\n');
+  const urls = documentary.extractImageUrls(html);
+  assert.ok(urls.includes('https://i.pinimg.com/736x/78/89/92/788992678db43890389e3cb641c3bcda.jpg'));
+  assert.ok(urls.includes('https://static0.gamerantimages.com/wordpress/wp-content/uploads/2023/12/gta-5-cover.jpg'));
+  assert.ok(urls.includes('https://images.ctfassets.net/abc/hero.jpg'));
+  assert.ok(!urls.some((u) => u.includes('freshness') || u.includes('pinterest.com/pin')));
+});
+
+test('extractImageUrls drops search-engine chrome hosts', () => {
+  const html = [
+    'https://yastatic.net/s3/fiji-static/_/sprite.png',
+    'https://www.bing.com/sa/simg/facebook_sharing_5.png',
+    'https://i.imgur.com/nEyIaWg.jpg',
+  ].join('\n');
+  const urls = documentary.extractImageUrls(html);
+  assert.deepEqual(urls, ['https://i.imgur.com/nEyIaWg.jpg']);
+});
