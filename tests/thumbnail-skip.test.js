@@ -58,9 +58,16 @@ test('uploadBitrateForDuration fits the cap (74s -> 1080p 7 Mbps recipe)', () =>
   // on the slow tunnel (~0.39 MB/s measured on the GTA job).
   const window64 = ffmpeg.uploadBitrateForDuration(64, ffmpeg.UPLOAD_WINDOW_LIMIT_BYTES);
   assert.ok(window64 >= 3000 && window64 < 4000, `64s window bitrate ${window64} kbps`);
-  // A 679s video cannot fit 30 MB at the 700 kbps floor -> 0, so long
-  // videos keep the 95 MB cap and rely on the transient retry instead.
+  // A 679s video cannot fit 30 MB at the 700 kbps floor -> 0 with the
+  // default floor — but the window floor (150 kbps) lets long videos
+  // ship inside the window instead of 524-looping on a 95 MB file.
   assert.equal(ffmpeg.uploadBitrateForDuration(679, ffmpeg.UPLOAD_WINDOW_LIMIT_BYTES), 0);
+  const window679 = ffmpeg.uploadBitrateForDuration(679, ffmpeg.UPLOAD_WINDOW_LIMIT_BYTES, ffmpeg.UPLOAD_WINDOW_MIN_VIDEO_KBPS);
+  assert.ok(window679 >= 150 && window679 < 700, `679s window bitrate ${window679} kbps`);
+  // A 900s (15 min) video cannot fit 30 MB even at the window floor
+  // (needs ~117 kbps) -> 0, so it keeps the 95 MB cap and fails closed
+  // there instead of looping on an upload that can never land.
+  assert.equal(ffmpeg.uploadBitrateForDuration(900, ffmpeg.UPLOAD_WINDOW_LIMIT_BYTES, ffmpeg.UPLOAD_WINDOW_MIN_VIDEO_KBPS), 0);
 });
 
 test('ensureUploadableMaster passes a small master through untouched', async () => {
