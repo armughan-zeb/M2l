@@ -102,7 +102,7 @@ async function deadPid() {
 }
 
 test('transient CMS errors are the gateway/overload set, terminal ones are not', () => {
-  for (const status of [408, 429, 500, 502, 503, 504, 530]) {
+  for (const status of [408, 429, 500, 502, 503, 504, 524, 525, 526, 530]) {
     assert.equal(isTransientCmsError(cmsError(status)), true, `HTTP ${status} must be transient`);
   }
   for (const status of [400, 401, 403, 404, 409, 422]) {
@@ -110,6 +110,9 @@ test('transient CMS errors are the gateway/overload set, terminal ones are not',
   }
   assert.equal(isTransientCmsError(new Error('Could not reach the CMS at https://cms.vidnets.com: fetch failed')), true);
   assert.equal(isTransientCmsError(new Error('The CMS did not answer in time; its saved job state is unchanged')), true);
+  // Nov 28, 2026: the CMS itself reports a Cloudflare timeout as
+  // "error code: 524" — transient even without an HTTP status attached.
+  assert.equal(isTransientCmsError(new Error('error code: 524')), true);
   assert.equal(isTransientCmsError(new Error('something else broke')), false);
   assert.equal(isTransientCmsError(null), false);
 });
@@ -280,6 +283,21 @@ test('an interrupted delivery keeps the checkpoint and a completed CMS receipt c
   assert.deepEqual(resumed, { ok: true, alreadyDelivered: true });
   assert.equal(executeJob.calls.length, 0, 'an already-delivered job must never execute');
   assert.equal(config.readActiveJob(), null);
+});
+
+test('a Cloudflare 524 upload timeout defers instead of failing the job (Nov 28, 2026)', async () => {
+  // The GTA job's 49 MB master took ~127s per upload attempt over the
+  // slow tunnel, so Cloudflare 524'd all 3 attempts — and 524 was not
+  // transient, so the failure was reported to the CMS and the CMS
+  // abandoned a finished video. A 524 must defer like a 502: the
+  // checkpoint survives and the daemon retries the upload later.
+  const jobId = writeActiveJob();
+  const delivery = await jobRunner.reportExecutionFailure({
+    async fail() { assert.fail('A Cloudflare timeout must not fail the render'); }
+  }, jobId, 1, cmsError(524));
+  assert.equal(delivery.deferred, true);
+  assert.equal(config.readActiveJob().jobId, jobId);
+  config.clearActiveJob();
 });
 
 test('a CMS sync request receives the saved progress history for its attempt', async () => {

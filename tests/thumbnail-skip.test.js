@@ -6,7 +6,10 @@
 // the package default, and `node muse-agent.js deliver --skip-thumbnail`
 // forces the skip per call. Masters over ~95 MB are transcoded to fit the
 // ~100 MB CMS/share-link cap (HTTP 413 on the 277 MB BNSF master, Nov 10)
-// instead of failing delivery after a full render.
+// instead of failing delivery after a full render. Cloudflare window cap
+// (Nov 28, 2026): masters that fit 30 MB at the bitrate floor are
+// transcoded to 30 MB so the tunnel PUT finishes inside Cloudflare's
+// 100s window (the GTA job's 49 MB master 524'd 3 times at ~127s each).
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -50,6 +53,14 @@ test('uploadBitrateForDuration fits the cap (74s -> 1080p 7 Mbps recipe)', () =>
   assert.equal(ffmpeg.uploadBitrateForDuration(900), 0);
   assert.equal(ffmpeg.uploadBitrateForDuration(0), 0);
   assert.equal(ffmpeg.uploadBitrateForDuration(-5), 0);
+  // Cloudflare window cap (Nov 28, 2026): a 64s video fits 30 MB at
+  // ~3.3 Mbps, so its upload stays inside Cloudflare's 100s window even
+  // on the slow tunnel (~0.39 MB/s measured on the GTA job).
+  const window64 = ffmpeg.uploadBitrateForDuration(64, ffmpeg.UPLOAD_WINDOW_LIMIT_BYTES);
+  assert.ok(window64 >= 3000 && window64 < 4000, `64s window bitrate ${window64} kbps`);
+  // A 679s video cannot fit 30 MB at the 700 kbps floor -> 0, so long
+  // videos keep the 95 MB cap and rely on the transient retry instead.
+  assert.equal(ffmpeg.uploadBitrateForDuration(679, ffmpeg.UPLOAD_WINDOW_LIMIT_BYTES), 0);
 });
 
 test('ensureUploadableMaster passes a small master through untouched', async () => {
@@ -89,6 +100,9 @@ test('upload compression replaces corrupt cache and keeps 1080p below 4 Mbps', a
   assert.equal(result.path, reencoded);
   assert.equal(result.transcoded, true);
   assert.ok(result.bytes < ffmpeg.UPLOAD_SIZE_LIMIT_BYTES);
+  // Nov 28, 2026: the 181s video fits the 30 MB Cloudflare window cap,
+  // so the upload copy must be at or under it — not just under 95 MB.
+  assert.ok(result.bytes <= ffmpeg.UPLOAD_WINDOW_LIMIT_BYTES, `upload copy ${result.bytes} bytes must fit the 30 MB window cap`);
   const output = await ffmpeg.probeVideo(reencoded);
   assert.deepEqual([output.width, output.height, output.hasAudio], [1920, 1080, true]);
   assert.ok(ffmpeg.uploadBitrateForDuration(output.duration) < 4000);
